@@ -45,6 +45,12 @@ type SelectionDef = {
 };
 
 /**
+ * Cached regex for numeric string detection
+ * Used to convert PostgreSQL NUMERIC/BIGINT strings to numbers
+ */
+const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
+
+/**
  * Query builder for a table
  */
 export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
@@ -2310,33 +2316,60 @@ export class SelectQueryBuilder<TSelection> {
     // Check if mappers are disabled for performance
     const disableMappers = this.executor?.getOptions().disableMappers ?? false;
 
-    return rows.map(row => {
-      const result: any = {};
+    // Pre-analyze selection structure once instead of per-row
+    // This avoids repeated Object.entries() calls and type checks
+    const selectionKeys = Object.keys(selection);
+    const selectionEntries = Object.entries(selection);
 
-      // First, copy navigation property placeholders from selection
-      for (const [key, value] of Object.entries(selection)) {
-        if (Array.isArray(value) && value.length === 0) {
-          // Empty array placeholder for collection navigation
-          result[key] = [];
-        } else if (value === undefined) {
-          // Undefined placeholder for reference navigation
-          result[key] = undefined;
-        } else if (value && typeof value === 'object' && !('__dbColumnName' in value)) {
-          // Check if it's a navigation property mock (object with getters)
-          const props = Object.getOwnPropertyNames(value);
-          if (props.length > 0) {
-            const firstProp = props[0];
-            const descriptor = Object.getOwnPropertyDescriptor(value, firstProp);
-            if (descriptor && descriptor.get) {
-              // This is a navigation mock - add undefined placeholder
-              result[key] = undefined;
-            }
+    // Pre-cache navigation placeholders to avoid repeated checks
+    // Only cache actual navigation properties (arrays and getter-based navigation)
+    const navigationPlaceholders: Record<string, any> = {};
+    for (const [key, value] of selectionEntries) {
+      if (Array.isArray(value) && value.length === 0) {
+        navigationPlaceholders[key] = [];
+      } else if (value === undefined) {
+        navigationPlaceholders[key] = undefined;
+      } else if (value && typeof value === 'object' && !('__dbColumnName' in value) && !('__fieldName' in value)) {
+        // Check if it's a navigation property mock (object with getters)
+        // Exclude FieldRef objects by checking for __fieldName
+        const props = Object.getOwnPropertyNames(value);
+        if (props.length > 0) {
+          const firstProp = props[0];
+          const descriptor = Object.getOwnPropertyDescriptor(value, firstProp);
+          if (descriptor && descriptor.get) {
+            navigationPlaceholders[key] = undefined;
           }
         }
       }
+    }
+
+    // Pre-build column metadata cache to avoid repeated schema lookups
+    const columnMetadataCache: Record<string, { hasMapper: boolean; mapper?: any; config?: any }> = {};
+    if (!disableMappers) {
+      for (const [key, value] of selectionEntries) {
+        if (typeof value === 'object' && value !== null && '__fieldName' in value) {
+          const fieldName = value.__fieldName as string;
+          const column = this.schema.columns[fieldName];
+          if (column) {
+            const config = column.build();
+            columnMetadataCache[key] = {
+              hasMapper: !!config.mapper,
+              mapper: config.mapper,
+              config: config,
+            };
+          }
+        }
+      }
+    }
+
+    return rows.map(row => {
+      const result: any = {};
+
+      // Copy navigation placeholders without iteration
+      Object.assign(result, navigationPlaceholders);
 
       // Then process actual data fields
-      for (const [key, value] of Object.entries(selection)) {
+      for (const [key, value] of selectionEntries) {
         // Skip if we already set this key as a navigation placeholder
         // UNLESS there's actual data for this key in the row (e.g., from json_build_object)
         if (key in result && (result[key] === undefined || Array.isArray(result[key])) && !(key in row && row[key] !== undefined && row[key] !== null)) {
@@ -2359,7 +2392,7 @@ export class SelectQueryBuilder<TSelection> {
               const rawValue = row[key];
               if (rawValue === null) {
                 result[key] = null;
-              } else if (typeof rawValue === 'string' && /^-?\d+(\.\d+)?$/.test(rawValue)) {
+              } else if (typeof rawValue === 'string' && NUMERIC_REGEX.test(rawValue)) {
                 result[key] = Number(rawValue);
               } else {
                 result[key] = rawValue;
@@ -2413,30 +2446,30 @@ export class SelectQueryBuilder<TSelection> {
           }
         } else if (typeof value === 'object' && value !== null && '__fieldName' in value) {
           // FieldRef object - check if it has a custom mapper
-          const fieldName = value.__fieldName as string;
-          const column = this.schema.columns[fieldName];
-          if (column) {
-            const rawValue = row[key];
+          const rawValue = row[key];
 
-            if (disableMappers) {
-              // Skip mapper transformation for performance
-              result[key] = rawValue === null ? undefined : rawValue;
-            } else {
-              const config = column.build();
-              // Apply fromDriver mapper if present, convert null to undefined
+          if (disableMappers) {
+            // Skip mapper transformation for performance
+            result[key] = rawValue === null ? undefined : rawValue;
+          } else {
+            // Use pre-cached column metadata instead of repeated lookups
+            const cached = columnMetadataCache[key];
+            if (cached) {
+              // Field is in our schema - use cached mapper info
               result[key] = rawValue === null
                 ? undefined
-                : (config.mapper ? config.mapper.fromDriver(rawValue) : rawValue);
+                : (cached.hasMapper ? cached.mapper.fromDriver(rawValue) : rawValue);
+            } else {
+              // Field not in schema (e.g., CTE field, joined table field)
+              // Always call convertValue to handle numeric string conversion
+              result[key] = this.convertValue(row[key]);
             }
-          } else {
-            // Convert null to undefined for fields from joined tables
-            // Also convert numeric strings to numbers for scalar subqueries (PostgreSQL returns NUMERIC as string)
-            result[key] = this.convertValue(row[key]);
           }
         } else {
           // Convert null to undefined for all other values
           // Also convert numeric strings to numbers for scalar subqueries (PostgreSQL returns NUMERIC as string)
-          result[key] = this.convertValue(row[key]);
+          const converted = this.convertValue(row[key]);
+          result[key] = converted;
         }
       }
 
@@ -2453,7 +2486,7 @@ export class SelectQueryBuilder<TSelection> {
     }
     // Check if it's a numeric string (PostgreSQL NUMERIC type)
     // This handles scalar subqueries with aggregates like AVG, SUM, etc.
-    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) {
+    if (typeof value === 'string' && NUMERIC_REGEX.test(value)) {
       const num = Number(value);
       if (!isNaN(num)) {
         return num;
