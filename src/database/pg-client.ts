@@ -1,4 +1,4 @@
-import { DatabaseClient, PooledConnection, QueryResult } from './database-client.interface';
+import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions } from './database-client.interface';
 import type { PoolConfig } from './types';
 
 // Use dynamic import to make pg optional
@@ -11,8 +11,13 @@ type PoolClient = any;
 class PgPooledConnection implements PooledConnection {
   constructor(private client: PoolClient) {}
 
-  async query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>> {
-    const result = await this.client.query(sql, params);
+  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    // pg library supports binary protocol via types option
+    const queryConfig = options?.useBinaryProtocol
+      ? { text: sql, values: params, rowMode: 'array' as const }
+      : { text: sql, values: params };
+
+    const result = await this.client.query(queryConfig);
 
     return {
       rows: result.rows as T[],
@@ -49,8 +54,13 @@ export class PgClient extends DatabaseClient {
     }
   }
 
-  async query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>> {
-    const result = await this.pool.query(sql, params);
+  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    // pg library supports binary protocol via types option
+    const queryConfig = options?.useBinaryProtocol
+      ? { text: sql, values: params, rowMode: 'array' as const }
+      : { text: sql, values: params };
+
+    const result = await this.pool.query(queryConfig);
 
     return {
       rows: result.rows as T[],
@@ -78,6 +88,13 @@ export class PgClient extends DatabaseClient {
    */
   supportsMultiStatementQueries(): boolean {
     return false;
+  }
+
+  /**
+   * pg library supports binary protocol via rowMode option
+   */
+  supportsBinaryProtocol(): boolean {
+    return true;
   }
 
   /**

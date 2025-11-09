@@ -7,11 +7,23 @@ export interface QueryResult<T = any> {
 }
 
 /**
+ * Query execution options
+ */
+export interface QueryExecutionOptions {
+  /**
+   * Use binary protocol for data transfer (when supported by driver).
+   * Binary protocol can improve performance by avoiding string conversions.
+   * Default: false (uses text protocol)
+   */
+  useBinaryProtocol?: boolean;
+}
+
+/**
  * Database-agnostic pooled client/connection interface
  * Represents a single connection from the pool for transactions
  */
 export interface PooledConnection {
-  query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>>;
+  query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>>;
   release(): void;
 }
 
@@ -20,9 +32,9 @@ export interface PooledConnection {
  */
 export abstract class DatabaseClient {
   /**
-   * Execute a query with optional parameters
+   * Execute a query with optional parameters and execution options
    */
-  abstract query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>>;
+  abstract query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>>;
 
   /**
    * Get a connection from the pool for transactions
@@ -47,6 +59,14 @@ export abstract class DatabaseClient {
    * Default: false for safety
    */
   supportsMultiStatementQueries(): boolean {
+    return false;
+  }
+
+  /**
+   * Check if the driver supports binary protocol for improved performance.
+   * Default: false
+   */
+  supportsBinaryProtocol(): boolean {
     return false;
   }
 }

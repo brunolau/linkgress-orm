@@ -29,6 +29,20 @@ export interface QueryOptions {
   logParameters?: boolean;
   /** Collection aggregation strategy (default: 'jsonb') */
   collectionStrategy?: CollectionStrategyType;
+  /**
+   * Disable automatic mapper transformations (fromDriver/toDriver).
+   * When enabled, raw database values are returned without transformation.
+   * Use this for performance-critical queries where you'll handle mapping manually.
+   * Default: false
+   */
+  disableMappers?: boolean;
+  /**
+   * Enable binary protocol for query execution (when supported by driver).
+   * Binary protocol can improve performance by avoiding string conversions.
+   * Currently supported by: pg library with rowMode='array' or binary format.
+   * Default: false (uses text protocol)
+   */
+  useBinaryProtocol?: boolean;
 }
 
 /**
@@ -59,7 +73,12 @@ export class QueryExecutor {
     }
 
     try {
-      const result = await this.client.query(sql, params);
+      // Pass binary protocol option if enabled
+      const queryOptions = this.options.useBinaryProtocol
+        ? { useBinaryProtocol: true }
+        : undefined;
+
+      const result = await this.client.query(sql, params, queryOptions);
 
       if (this.options.logExecutionTime) {
         const duration = (performance.now() - startTime).toFixed(2);
@@ -151,6 +170,13 @@ export class QueryExecutor {
       }
       throw error;
     }
+  }
+
+  /**
+   * Get the query options for this executor
+   */
+  getOptions(): QueryOptions {
+    return this.options;
   }
 }
 

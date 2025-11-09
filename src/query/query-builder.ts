@@ -2307,6 +2307,9 @@ export class SelectQueryBuilder<TSelection> {
    * Transform database results
    */
   private transformResults(rows: any[], selection: any): TSelection[] {
+    // Check if mappers are disabled for performance
+    const disableMappers = this.executor?.getOptions().disableMappers ?? false;
+
     return rows.map(row => {
       const result: any = {};
 
@@ -2382,37 +2385,49 @@ export class SelectQueryBuilder<TSelection> {
           }
         } else if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
           // SqlFragment with custom mapper (check this BEFORE FieldRef to handle subquery/CTE fields with mappers)
-          let mapper = (value as any).getMapper();
           const rawValue = row[key];
 
-          if (mapper && rawValue !== null && rawValue !== undefined) {
-            // If mapper is a CustomTypeBuilder, get the actual type
-            if (typeof mapper.getType === 'function') {
-              mapper = mapper.getType();
-            }
+          if (disableMappers) {
+            // Skip mapper transformation for performance
+            result[key] = this.convertValue(rawValue);
+          } else {
+            let mapper = (value as any).getMapper();
 
-            // Apply the fromDriver transformation
-            if (typeof mapper.fromDriver === 'function') {
-              result[key] = mapper.fromDriver(rawValue);
+            if (mapper && rawValue !== null && rawValue !== undefined) {
+              // If mapper is a CustomTypeBuilder, get the actual type
+              if (typeof mapper.getType === 'function') {
+                mapper = mapper.getType();
+              }
+
+              // Apply the fromDriver transformation
+              if (typeof mapper.fromDriver === 'function') {
+                result[key] = mapper.fromDriver(rawValue);
+              } else {
+                // Fallback if fromDriver doesn't exist
+                result[key] = this.convertValue(rawValue);
+              }
             } else {
-              // Fallback if fromDriver doesn't exist
+              // No mapper or null value - convert normally
               result[key] = this.convertValue(rawValue);
             }
-          } else {
-            // No mapper or null value - convert normally
-            result[key] = this.convertValue(rawValue);
           }
         } else if (typeof value === 'object' && value !== null && '__fieldName' in value) {
           // FieldRef object - check if it has a custom mapper
           const fieldName = value.__fieldName as string;
           const column = this.schema.columns[fieldName];
           if (column) {
-            const config = column.build();
-            // Apply fromDriver mapper if present, convert null to undefined
             const rawValue = row[key];
-            result[key] = rawValue === null
-              ? undefined
-              : (config.mapper ? config.mapper.fromDriver(rawValue) : rawValue);
+
+            if (disableMappers) {
+              // Skip mapper transformation for performance
+              result[key] = rawValue === null ? undefined : rawValue;
+            } else {
+              const config = column.build();
+              // Apply fromDriver mapper if present, convert null to undefined
+              result[key] = rawValue === null
+                ? undefined
+                : (config.mapper ? config.mapper.fromDriver(rawValue) : rawValue);
+            }
           } else {
             // Convert null to undefined for fields from joined tables
             // Also convert numeric strings to numbers for scalar subqueries (PostgreSQL returns NUMERIC as string)
@@ -2453,6 +2468,14 @@ export class SelectQueryBuilder<TSelection> {
   private transformCollectionItems(items: any[], collectionBuilder: CollectionQueryBuilder<any>): any[] {
     const targetSchema = collectionBuilder.getTargetTableSchema();
     if (!targetSchema) {
+      return items;
+    }
+
+    // Check if mappers are disabled for performance
+    const disableMappers = this.executor?.getOptions().disableMappers ?? false;
+
+    if (disableMappers) {
+      // Skip mapper transformation for performance - return items as-is
       return items;
     }
 

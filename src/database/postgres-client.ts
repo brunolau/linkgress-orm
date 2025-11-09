@@ -1,4 +1,4 @@
-import { DatabaseClient, PooledConnection, QueryResult } from './database-client.interface';
+import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions } from './database-client.interface';
 import type { PostgresOptions } from './types';
 
 // Use dynamic import to make postgres optional
@@ -10,7 +10,9 @@ type Sql = any;
 class PostgresPooledConnection implements PooledConnection {
   constructor(private sql: Sql) {}
 
-  async query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>> {
+  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    // postgres library doesn't have explicit binary protocol toggle
+    // It automatically uses the most efficient protocol based on data types
     const result = await this.sql.unsafe(sql, params || []);
 
     return {
@@ -49,7 +51,9 @@ export class PostgresClient extends DatabaseClient {
     }
   }
 
-  async query<T = any>(sql: string, params?: any[]): Promise<QueryResult<T>> {
+  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    // postgres library doesn't have explicit binary protocol toggle
+    // It automatically uses the most efficient protocol based on data types
     const result = await this.sql.unsafe(sql, params || []);
 
     return {
@@ -118,6 +122,14 @@ export class PostgresClient extends DatabaseClient {
    */
   async begin<T>(callback: (sql: Sql) => Promise<T>): Promise<T> {
     return await this.sql.begin(callback);
+  }
+
+  /**
+   * postgres library automatically uses binary protocol where appropriate
+   * No explicit toggle needed
+   */
+  supportsBinaryProtocol(): boolean {
+    return false; // No explicit control, but uses binary internally
   }
 
   /**
