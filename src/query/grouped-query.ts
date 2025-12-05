@@ -123,8 +123,9 @@ export interface GroupedItem<TGroupingKey, TOriginalRow> {
   /**
    * Get the average value of a numeric field across all items in this group
    * Always returns number since average is always numeric
+   * Accepts undefined since SQL AVG ignores NULL values
    */
-  avg(selector: (item: TOriginalRow) => FieldRef<any, number> | number): number;
+  avg(selector: (item: TOriginalRow) => FieldRef<any, number | undefined> | number | undefined): number;
 }
 
 /**
