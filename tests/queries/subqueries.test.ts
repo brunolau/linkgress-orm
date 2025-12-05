@@ -1887,5 +1887,499 @@ describe('Subquery Operations', () => {
         });
       });
     });
+
+    test('should join a complex subquery with navigation to another complex query with CTEs', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Build complex subquery A: Posts with navigation properties, grouped and aggregated
+        const complexSubqueryA = db.posts
+          .where(p => and(
+            eq(p.user!.isActive, true),  // Navigation in filter
+            gt(p.views, 0)
+          ))
+          .select(p => ({
+            postId: p.id,
+            postTitle: p.title,
+            postViews: p.views,
+            postCategory: p.category,
+            authorId: p.userId,
+            authorName: p.user!.username,  // Navigation in select
+            authorAge: p.user!.age,        // Another navigation
+          }))
+          .orderBy(p => p.postViews)
+          .select(p => ({
+            id: p.postId,
+            title: p.postTitle,
+            views: p.postViews,
+            category: p.postCategory,
+            userId: p.authorId,
+            author: p.authorName,
+            age: p.authorAge,
+            viewCategory: sql<string>`CASE WHEN ${p.postViews} > 100 THEN 'high' ELSE 'low' END`,
+          }))
+          .groupBy(p => ({ category: p.category, userId: p.userId }))
+          .select(g => ({
+            category: g.key.category,
+            userId: g.key.userId,
+            postCount: g.count(),
+            totalViews: g.sum(p => p.views),
+            avgViews: g.avg(p => p.views),
+          }))
+          .asSubquery('table');
+
+        // Build CTE for users with order statistics
+        const cteBuilder = new DbCteBuilder();
+        const orderStatsCte = cteBuilder.withAggregation(
+          'order_statistics',
+          db.orders
+            .where(o => and(
+              eq(o.user!.isActive, true),  // Navigation filter
+              gt(o.totalAmount, 0)
+            ))
+            .select(o => ({
+              userId: o.userId,
+              orderId: o.id,
+              amount: o.totalAmount,
+              status: o.status,
+              userEmail: o.user!.email,  // Navigation in select
+            }))
+            .groupBy(o => ({ userId: o.userId }))
+            .select(g => ({
+              userId: g.key.userId,
+              orderCount: g.count(),
+              totalSpent: g.sum(o => o.amount),
+              avgOrder: g.avg(o => o.amount),
+            })),
+          o => ({ userId: o.userId }),
+          'orderData'
+        );
+
+        // Main query: Join complex subquery with users, then join CTE
+        const result = await db.users
+          .with(orderStatsCte)
+          .select(u => ({
+            userId: u.id,
+            userName: u.username,
+            userAge: u.age,
+            userEmail: u.email,
+            isActive: u.isActive,
+          }))
+          .where(u => eq(u.isActive, true))
+          .orderBy(u => u.userName)
+          .select(u => ({
+            id: u.userId,
+            name: u.userName,
+            age: u.userAge,
+            email: u.userEmail,
+            active: u.isActive,
+            nameUpper: sql<string>`UPPER(${u.userName})`,
+          }))
+          .leftJoin(
+            complexSubqueryA,
+            (u: any, posts: any) => eq(u.id, posts.userId),
+            (u: any, posts: any) => ({
+              userId: u.id,
+              userName: u.name,
+              userAge: u.age,
+              userEmail: u.email,
+              nameUpper: u.nameUpper,
+              postCategory: posts.category,
+              postCount: posts.postCount,
+              totalViews: posts.totalViews,
+              avgViews: posts.avgViews,
+            }),
+            'postData'
+          )
+          .select((r: any) => ({
+            id: r.userId,
+            name: r.userName,
+            age: r.userAge,
+            email: r.userEmail,
+            displayName: r.nameUpper,
+            category: r.postCategory,
+            posts: r.postCount,
+            views: r.totalViews,
+            avgPerPost: r.avgViews,
+          }))
+          .orderBy((r: any) => r.id)
+          .leftJoin(
+            orderStatsCte,
+            (u: any, orders: any) => eq(u.id, orders.userId),
+            (u: any, orders: any) => ({
+              userId: u.id,
+              userName: u.name,
+              displayName: u.displayName,
+              age: u.age,
+              email: u.email,
+              postCategory: u.category,
+              postCount: u.posts,
+              totalViews: u.views,
+              avgPostViews: u.avgPerPost,
+              orderData: orders.orderData,
+            })
+          )
+          .select((r: any) => ({
+            finalUserId: r.userId,
+            finalUserName: r.userName,
+            finalDisplayName: r.displayName,
+            finalAge: r.age,
+            finalEmail: r.email,
+            finalPostCategory: r.postCategory,
+            finalPostCount: r.postCount,
+            finalTotalViews: r.totalViews,
+            finalAvgPostViews: r.avgPostViews,
+            finalOrderStats: r.orderData,
+            summary: sql<string>`${r.userName} || ' (' || COALESCE(CAST(${r.postCount} AS VARCHAR), '0') || ' posts)'`,
+          }))
+          .orderBy((r: any) => r.finalUserName)
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach((r: any) => {
+          expect(r).toHaveProperty('finalUserId');
+          expect(r).toHaveProperty('finalUserName');
+          expect(r).toHaveProperty('finalDisplayName');
+          expect(r).toHaveProperty('finalAge');
+          expect(r).toHaveProperty('finalEmail');
+          expect(r).toHaveProperty('summary');
+          expect(typeof r.finalUserName).toBe('string');
+          expect(r.summary).toContain(r.finalUserName);
+        });
+      });
+    });
+
+    test('should join two complex subqueries with navigations and multiple transformations', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Build complex subquery A: Posts with navigation and transformations
+        const complexSubqueryA = db.posts
+          .where(p => and(
+            eq(p.user!.isActive, true),
+            gt(p.views, 0)
+          ))
+          .select(p => ({
+            pId: p.id,
+            pTitle: p.title,
+            pViews: p.views,
+            pCategory: p.category,
+            pAuthorId: p.userId,
+            pAuthorName: p.user!.username,
+          }))
+          .orderBy(p => p.pViews)
+          .select(p => ({
+            id: p.pId,
+            title: p.pTitle,
+            views: p.pViews,
+            category: p.pCategory,
+            userId: p.pAuthorId,
+            author: p.pAuthorName,
+            titleUpper: sql<string>`UPPER(${p.pTitle})`,
+          }))
+          .orderBy((p: any) => p.id)
+          .asSubquery('table');
+
+        // Build complex subquery B: Orders with navigation and transformations
+        const complexSubqueryB = db.orders
+          .where(o => eq(o.user!.isActive, true))
+          .select(o => ({
+            oId: o.id,
+            oAmount: o.totalAmount,
+            oStatus: o.status,
+            oUserId: o.userId,
+            oUserName: o.user!.username,
+            oUserAge: o.user!.age,
+          }))
+          .orderBy(o => o.oAmount)
+          .select(o => ({
+            id: o.oId,
+            amount: o.oAmount,
+            status: o.oStatus,
+            userId: o.oUserId,
+            userName: o.oUserName,
+            userAge: o.oUserAge,
+            amountFormatted: sql<string>`'$' || CAST(${o.oAmount} AS VARCHAR)`,
+          }))
+          .orderBy((o: any) => o.id)
+          .asSubquery('table');
+
+        // Main query: Join both complex subqueries together via users
+        const result = await db.users
+          .select(u => ({
+            uId: u.id,
+            uName: u.username,
+            uAge: u.age,
+            uEmail: u.email,
+            uActive: u.isActive,
+          }))
+          .where(u => eq(u.uActive, true))
+          .orderBy(u => u.uName)
+          .select(u => ({
+            id: u.uId,
+            name: u.uName,
+            age: u.uAge,
+            email: u.uEmail,
+            nameLength: sql<number>`LENGTH(${u.uName})`,
+          }))
+          .leftJoin(
+            complexSubqueryA,
+            (u: any, posts: any) => eq(u.id, posts.userId),
+            (u: any, posts: any) => ({
+              userId: u.id,
+              userName: u.name,
+              userAge: u.age,
+              userEmail: u.email,
+              nameLen: u.nameLength,
+              postId: posts.id,
+              postTitle: posts.title,
+              postTitleUpper: posts.titleUpper,
+              postViews: posts.views,
+              postCategory: posts.category,
+              postAuthor: posts.author,
+            }),
+            'postData'
+          )
+          .select((r: any) => ({
+            id: r.userId,
+            name: r.userName,
+            age: r.userAge,
+            email: r.userEmail,
+            nameLen: r.nameLen,
+            pId: r.postId,
+            pTitle: r.postTitle,
+            pTitleUpper: r.postTitleUpper,
+            pViews: r.postViews,
+            pCategory: r.postCategory,
+          }))
+          .orderBy((r: any) => r.id)
+          .leftJoin(
+            complexSubqueryB,
+            (u: any, orders: any) => eq(u.id, orders.userId),
+            (u: any, orders: any) => ({
+              finalUserId: u.id,
+              finalUserName: u.name,
+              finalUserAge: u.age,
+              finalUserEmail: u.email,
+              finalNameLen: u.nameLen,
+              finalPostId: u.pId,
+              finalPostTitle: u.pTitle,
+              finalPostTitleUpper: u.pTitleUpper,
+              finalPostViews: u.pViews,
+              finalPostCategory: u.pCategory,
+              finalOrderId: orders.id,
+              finalOrderAmount: orders.amount,
+              finalOrderFormatted: orders.formattedAmount,
+              finalOrderStatus: orders.status,
+              finalOrderUserAge: orders.userAge,
+            }),
+            'orderData'
+          )
+          .select((r: any) => ({
+            userId: r.finalUserId,
+            userName: r.finalUserName,
+            userAge: r.finalUserAge,
+            userEmail: r.finalUserEmail,
+            nameLen: r.finalNameLen,
+            postInfo: r.finalPostId ? {
+              id: r.finalPostId,
+              title: r.finalPostTitle,
+              titleUpper: r.finalPostTitleUpper,
+              views: r.finalPostViews,
+              category: r.finalPostCategory,
+            } : null,
+            orderInfo: r.finalOrderId ? {
+              id: r.finalOrderId,
+              amount: r.finalOrderAmount,
+              formatted: r.finalOrderFormatted,
+              status: r.finalOrderStatus,
+            } : null,
+            masterSummary: sql<string>`
+              ${r.finalUserName} ||
+              ' (age: ' || COALESCE(CAST(${r.finalUserAge} AS VARCHAR), 'N/A') || ')' ||
+              ' - Posts: ' || COALESCE(CAST(${r.finalPostId} AS VARCHAR), 'none') ||
+              ' - Orders: ' || COALESCE(CAST(${r.finalOrderId} AS VARCHAR), 'none')
+            `,
+          }))
+          .orderBy((r: any) => r.userId)
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach((r: any) => {
+          expect(r).toHaveProperty('userId');
+          expect(r).toHaveProperty('userName');
+          expect(r).toHaveProperty('userAge');
+          expect(r).toHaveProperty('userEmail');
+          expect(r).toHaveProperty('nameLen');
+          expect(r).toHaveProperty('postInfo');
+          expect(r).toHaveProperty('orderInfo');
+          expect(r).toHaveProperty('masterSummary');
+          expect(typeof r.userName).toBe('string');
+          expect(typeof r.masterSummary).toBe('string');
+          expect(r.masterSummary).toContain(r.userName);
+        });
+      });
+    });
+
+    test('should handle triple nested subqueries joined at multiple levels', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Level 1: Innermost subquery - orders with navigation filter
+        const innerSubquery = db.orders
+          .where(o => and(
+            eq(o.user!.isActive, true),
+            gt(o.totalAmount, 10)
+          ))
+          .select(o => ({
+            userId: o.userId,
+            amount: o.totalAmount,
+            status: o.status,
+            userName: o.user!.username,
+          }))
+          .orderBy(o => o.amount)
+          .asSubquery('table');
+
+        // Level 2: Middle subquery - joins users with inner subquery
+        const middleSubquery = db.users
+          .select(u => ({
+            id: u.id,
+            name: u.username,
+            age: u.age,
+            email: u.email,
+            active: u.isActive,
+          }))
+          .where(u => eq(u.active, true))
+          .leftJoin(
+            innerSubquery,
+            (u: any, orders: any) => eq(u.id, orders.userId),
+            (u: any, orders: any) => ({
+              userId: u.id,
+              userName: u.name,
+              userAge: u.age,
+              userEmail: u.email,
+              orderStatus: orders.status,
+              orderAmount: orders.amount,
+            }),
+            'innerOrders'
+          )
+          .select((r: any) => ({
+            id: r.userId,
+            name: r.userName,
+            age: r.userAge,
+            email: r.userEmail,
+            status: r.orderStatus,
+            spent: r.orderAmount,
+            summary: sql<string>`${r.userName} || ': spent $' || COALESCE(CAST(${r.orderAmount} AS VARCHAR), '0')`,
+          }))
+          .asSubquery('table');
+
+        // Level 3: Outer subquery - posts joined with middle subquery
+        const outerSubquery = db.posts
+          .where(p => eq(p.user!.isActive, true))
+          .select(p => ({
+            postId: p.id,
+            postTitle: p.title,
+            postViews: p.views,
+            postCategory: p.category,
+            authorId: p.userId,
+            authorName: p.user!.username,
+          }))
+          .leftJoin(
+            middleSubquery,
+            (p: any, user: any) => eq(p.authorId, user.id),
+            (p: any, user: any) => ({
+              id: p.postId,
+              title: p.postTitle,
+              views: p.postViews,
+              category: p.postCategory,
+              userId: p.authorId,
+              author: p.authorName,
+              userAge: user.age,
+              userEmail: user.email,
+              userOrderStatus: user.status,
+              userSpent: user.spent,
+              userSummary: user.summary,
+            }),
+            'middleData'
+          )
+          .select((r: any) => ({
+            postId: r.id,
+            postTitle: r.title,
+            postViews: r.views,
+            postCategory: r.category,
+            userId: r.userId,
+            author: r.author,
+            userAge: r.userAge,
+            userEmail: r.userEmail,
+            orderStatus: r.userOrderStatus,
+            spent: r.userSpent,
+            userSummary: r.userSummary,
+          }))
+          .asSubquery('table');
+
+        // Final query: Users joined with the outer subquery (3 levels deep)
+        const result = await db.users
+          .select(u => ({
+            id: u.id,
+            name: u.username,
+            email: u.email,
+            age: u.age,
+          }))
+          .leftJoin(
+            outerSubquery,
+            (u: any, data: any) => eq(u.id, data.userId),
+            (u: any, data: any) => ({
+              userId: u.id,
+              userName: u.name,
+              userEmail: u.email,
+              userAge: u.age,
+              postId: data.postId,
+              postTitle: data.postTitle,
+              postViews: data.postViews,
+              postCategory: data.postCategory,
+              postAuthor: data.author,
+              orderStatus: data.orderStatus,
+              orderSpent: data.spent,
+              userSummary: data.userSummary,
+            }),
+            'outerData'
+          )
+          .select((r: any) => ({
+            finalUserId: r.userId,
+            finalUserName: r.userName,
+            finalUserEmail: r.userEmail,
+            finalUserAge: r.userAge,
+            finalPostId: r.postId,
+            finalPostTitle: r.postTitle,
+            finalPostViews: r.postViews,
+            finalPostCategory: r.postCategory,
+            finalOrderStatus: r.orderStatus,
+            finalOrderSpent: r.orderSpent,
+            finalUserSummary: r.userSummary,
+            megaSummary: sql<string>`
+              'User: ' || ${r.userName} ||
+              ' | Post: ' || COALESCE(${r.postTitle}, 'none') ||
+              ' | Views: ' || COALESCE(CAST(${r.postViews} AS VARCHAR), '0') ||
+              ' | Spent: $' || COALESCE(CAST(${r.orderSpent} AS VARCHAR), '0')
+            `,
+          }))
+          .orderBy((r: any) => r.finalUserId)
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach((r: any) => {
+          expect(r).toHaveProperty('finalUserId');
+          expect(r).toHaveProperty('finalUserName');
+          expect(r).toHaveProperty('finalUserEmail');
+          expect(r).toHaveProperty('finalUserAge');
+          expect(r).toHaveProperty('megaSummary');
+          expect(typeof r.finalUserName).toBe('string');
+          expect(typeof r.megaSummary).toBe('string');
+          expect(r.megaSummary).toContain('User:');
+          expect(r.megaSummary).toContain(r.finalUserName);
+        });
+      });
+    });
   });
 });
