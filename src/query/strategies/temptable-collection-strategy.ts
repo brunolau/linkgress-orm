@@ -4,6 +4,7 @@ import {
   CollectionStrategyType,
   CollectionAggregationConfig,
   CollectionAggregationResult,
+  SelectedField,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
 
@@ -324,8 +325,24 @@ ${aggregationSQL}
   ): string {
     const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue } = config;
 
+    // Helper to collect all leaf fields from a potentially nested structure
+    const collectLeafFields = (fields: SelectedField[], prefix: string = ''): Array<{ alias: string; expression: string }> => {
+      const result: Array<{ alias: string; expression: string }> = [];
+      for (const field of fields) {
+        const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
+        if (field.nested) {
+          result.push(...collectLeafFields(field.nested, fullAlias));
+        } else if (field.expression) {
+          result.push({ alias: fullAlias, expression: field.expression });
+        }
+      }
+      return result;
+    };
+
+    const leafFields = collectLeafFields(selectedFields);
+
     // Build SELECT fields
-    const selectFields = selectedFields
+    const selectFields = leafFields
       .map(f => `${f.expression} as "${f.alias}"`)
       .join(', ');
 
@@ -417,10 +434,24 @@ ${limitOffsetClause}
   ): string {
     const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct } = config;
 
-    // Build the JSONB fields for jsonb_build_object
-    const jsonbFields = selectedFields
-      .map(f => `'${f.alias}', t.${f.expression}`)
-      .join(', ');
+    // Helper to build jsonb_build_object expression (handles nested structures)
+    const buildJsonbObject = (fields: SelectedField[], prefix: string = '', tableAlias: string = 't'): string => {
+      const parts: string[] = [];
+      for (const field of fields) {
+        if (field.nested) {
+          // Nested object - recurse
+          const nestedJsonb = buildJsonbObject(field.nested, prefix ? `${prefix}__${field.alias}` : field.alias, tableAlias);
+          parts.push(`'${field.alias}', ${nestedJsonb}`);
+        } else if (field.expression) {
+          // Leaf field - reference the column via table alias
+          parts.push(`'${field.alias}', ${tableAlias}.${field.expression}`);
+        }
+      }
+      return `jsonb_build_object(${parts.join(', ')})`;
+    };
+
+    // Build the JSONB fields for jsonb_build_object (handles nested structures)
+    const jsonbObjectExpr = buildJsonbObject(selectedFields);
 
     // Build WHERE clause (combine temp table join with additional filters)
     const additionalWhere = whereClause ? ` AND ${whereClause}` : '';
@@ -445,7 +476,7 @@ ${limitOffsetClause}
 SELECT
   t."${foreignKey}" as parent_id,
   jsonb_agg(
-    jsonb_build_object(${jsonbFields})${jsonbAggOrderBy}
+    ${jsonbObjectExpr}${jsonbAggOrderBy}
   ) as data
 FROM (
   SELECT *

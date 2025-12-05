@@ -1521,5 +1521,65 @@ describe('Advanced Navigation Properties', () => {
         expect(users[0].maxViews).toBeNull();
       });
     });
+
+    test('should correctly build object within collection', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const allUsers = await db.users
+          .select(u => ({
+            username: u.username,
+            userId: u.id,
+            posts: u.posts!.select(p => ({
+              id: p.id,
+              texts: {
+                title: p.title,
+                subtitle: p.subtitle
+              }
+            })).toList('posts'),
+            postCount: u.posts!.count()
+          }))
+          .toList();
+
+        // Filter to users with posts in JavaScript
+        const users = allUsers.filter(u => u.postCount > 0);
+
+        // Validate row count
+        expect(users.length).toBeGreaterThan(0);
+
+        // Runtime validation that nested texts object structure is preserved
+        const user = users[0];
+        expect(user).toHaveProperty('username');
+        expect(user).toHaveProperty('userId');
+        expect(user).toHaveProperty('posts');
+        expect(user).toHaveProperty('postCount');
+        expect(user.postCount).toBeGreaterThan(0);
+        expect(Array.isArray(user.posts)).toBe(true);
+        expect(user.posts.length).toBeGreaterThan(0);
+
+        // Validate nested texts object is NOT flattened
+        const post = user.posts[0];
+        expect(post).toHaveProperty('id');
+        expect(post).toHaveProperty('texts');
+        expect(typeof post.texts).toBe('object');
+        expect(post.texts).toHaveProperty('title');
+        expect(post.texts).toHaveProperty('subtitle');
+
+        // Type assertions
+        type UserResult = (typeof users)[number];
+        assertType<string, UserResult['username']>({} as UserResult['username']);
+        assertType<number, UserResult['userId']>({} as UserResult['userId']);
+        assertType<number, UserResult['postCount']>({} as UserResult['postCount']);
+
+        // Assert posts array type with nested texts object (should NOT be flattened)
+        assertType<{ id: number; texts: { title: string; subtitle: string | undefined } }[], UserResult['posts']>(
+          {} as UserResult['posts']
+        );
+
+        // Verify texts object structure is preserved (not flattened)
+        type PostResult = UserResult['posts'][number];
+        assertType<{ title: string; subtitle: string | undefined }, PostResult['texts']>({} as PostResult['texts']);
+      });
+    });
   });
 });

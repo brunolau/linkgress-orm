@@ -4,6 +4,7 @@ import {
   CollectionStrategyType,
   CollectionAggregationConfig,
   CollectionAggregationResult,
+  SelectedField,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
 
@@ -103,10 +104,47 @@ export class JsonbCollectionStrategy implements ICollectionStrategy {
   ): string {
     const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct } = config;
 
+    // Helper to collect all leaf fields from a potentially nested structure
+    // Returns array of { alias, expression } for SELECT clause (flattened with unique aliases)
+    const collectLeafFields = (fields: SelectedField[], prefix: string = ''): Array<{ alias: string; expression: string }> => {
+      const result: Array<{ alias: string; expression: string }> = [];
+      for (const field of fields) {
+        const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
+        if (field.nested) {
+          // Recurse into nested fields
+          result.push(...collectLeafFields(field.nested, fullAlias));
+        } else if (field.expression) {
+          // Leaf field
+          result.push({ alias: fullAlias, expression: field.expression });
+        }
+      }
+      return result;
+    };
+
+    // Helper to build jsonb_build_object expression (handles nested structures)
+    const buildJsonbObject = (fields: SelectedField[], prefix: string = ''): string => {
+      const parts: string[] = [];
+      for (const field of fields) {
+        if (field.nested) {
+          // Nested object - recurse
+          const nestedJsonb = buildJsonbObject(field.nested, prefix ? `${prefix}__${field.alias}` : field.alias);
+          parts.push(`'${field.alias}', ${nestedJsonb}`);
+        } else {
+          // Leaf field - reference the aliased column from subquery
+          const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
+          parts.push(`'${field.alias}', "${fullAlias}"`);
+        }
+      }
+      return `jsonb_build_object(${parts.join(', ')})`;
+    };
+
+    // Collect all leaf fields for the SELECT clause
+    const leafFields = collectLeafFields(selectedFields);
+
     // Build the subquery SELECT fields
     const allSelectFields = [
       `"${foreignKey}" as "__fk_${foreignKey}"`,
-      ...selectedFields.map(f => {
+      ...leafFields.map(f => {
         // Always add alias if expression doesn't already match the quoted alias
         if (f.expression !== `"${f.alias}"`) {
           return `${f.expression} as "${f.alias}"`;
@@ -115,10 +153,8 @@ export class JsonbCollectionStrategy implements ICollectionStrategy {
       }),
     ];
 
-    // Build the JSONB fields for jsonb_build_object using the aliases from the subquery
-    const jsonbFields = selectedFields
-      .map(f => `'${f.alias}', "${f.alias}"`)
-      .join(', ');
+    // Build the JSONB fields for jsonb_build_object (handles nested structures)
+    const jsonbObjectExpr = buildJsonbObject(selectedFields);
 
     // Build WHERE clause
     const whereSQL = whereClause ? `WHERE ${whereClause}` : '';
@@ -145,7 +181,7 @@ export class JsonbCollectionStrategy implements ICollectionStrategy {
 SELECT
   "__fk_${foreignKey}" as parent_id,
   jsonb_agg(
-    jsonb_build_object(${jsonbFields})${jsonbAggOrderBy}
+    ${jsonbObjectExpr}${jsonbAggOrderBy}
   ) as data
 FROM (
   SELECT ${distinctClause}${allSelectFields.join(', ')}

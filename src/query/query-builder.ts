@@ -6,7 +6,7 @@ import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
 import { DbCte, isCte } from './cte-builder';
 import { CollectionStrategyFactory } from './collection-strategy.factory';
-import type { CollectionAggregationConfig } from './collection-strategy.interface';
+import type { CollectionAggregationConfig, SelectedField } from './collection-strategy.interface';
 
 /**
  * Join type
@@ -3524,9 +3524,53 @@ export class CollectionQueryBuilder<TItem = any> {
     const strategyType: CollectionStrategyType = context.collectionStrategy || 'jsonb';
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);
 
-    // Build selected fields configuration
-    const selectedFieldConfigs: Array<{ alias: string; expression: string }> = [];
+    // Build selected fields configuration (supports nested objects)
+    const selectedFieldConfigs: SelectedField[] = [];
     const localParams: any[] = [];
+
+    // Helper function to check if a value is a plain object (not FieldRef, SqlFragment, etc.)
+    const isPlainObject = (val: any): boolean => {
+      return typeof val === 'object' &&
+             val !== null &&
+             !('__dbColumnName' in val) &&
+             !(val instanceof SqlFragment) &&
+             !Array.isArray(val) &&
+             val.constructor === Object;
+    };
+
+    // Helper function to recursively process fields and build SelectedField structures
+    const processField = (alias: string, field: any): SelectedField => {
+      if (field instanceof SqlFragment) {
+        // SQL Fragment - build the SQL expression
+        const sqlBuildContext = {
+          paramCounter: context.paramCounter,
+          params: context.allParams,
+        };
+        const fragmentSql = field.buildSql(sqlBuildContext);
+        context.paramCounter = sqlBuildContext.paramCounter;
+        return { alias, expression: fragmentSql };
+      } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
+        // FieldRef object - use database column name
+        const dbColumnName = (field as any).__dbColumnName;
+        return { alias, expression: `"${dbColumnName}"` };
+      } else if (typeof field === 'string') {
+        // Simple string reference (for backward compatibility)
+        return { alias, expression: `"${field}"` };
+      } else if (isPlainObject(field)) {
+        // Nested object - recursively process its fields
+        const nestedFields: SelectedField[] = [];
+        for (const [nestedAlias, nestedField] of Object.entries(field)) {
+          nestedFields.push(processField(nestedAlias, nestedField));
+        }
+        return { alias, nested: nestedFields };
+      } else {
+        // Literal value or expression
+        const expression = `$${context.paramCounter++}`;
+        context.allParams.push(field);
+        localParams.push(field);
+        return { alias, expression };
+      }
+    };
 
     // Step 1: Build field selection configuration
     if (this.selector) {
@@ -3543,42 +3587,9 @@ export class CollectionQueryBuilder<TItem = any> {
           expression: `"${dbColumnName}"`,
         });
       } else {
-        // Object selection - extract each field
+        // Object selection - extract each field (with support for nested objects)
         for (const [alias, field] of Object.entries(selectedFields)) {
-          if (field instanceof SqlFragment) {
-            // SQL Fragment - build the SQL expression
-            const sqlBuildContext = {
-              paramCounter: context.paramCounter,
-              params: context.allParams,
-            };
-            const fragmentSql = field.buildSql(sqlBuildContext);
-            context.paramCounter = sqlBuildContext.paramCounter;
-            selectedFieldConfigs.push({
-              alias,
-              expression: fragmentSql,
-            });
-          } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            // FieldRef object - use database column name
-            const dbColumnName = (field as any).__dbColumnName;
-            selectedFieldConfigs.push({
-              alias,
-              expression: `"${dbColumnName}"`,
-            });
-          } else if (typeof field === 'string') {
-            // Simple string reference (for backward compatibility)
-            selectedFieldConfigs.push({
-              alias,
-              expression: `"${field}"`,
-            });
-          } else {
-            // Literal value or expression
-            selectedFieldConfigs.push({
-              alias,
-              expression: `$${context.paramCounter++}`,
-            });
-            context.allParams.push(field);
-            localParams.push(field);
-          }
+          selectedFieldConfigs.push(processField(alias, field));
         }
       }
     } else {

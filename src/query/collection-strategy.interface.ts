@@ -2,6 +2,16 @@ import { DatabaseClient } from '../database/database-client.interface';
 import { QueryContext } from './query-builder';
 
 /**
+ * Represents a field in a collection selection that can be either a simple expression
+ * or a nested object structure
+ */
+export interface SelectedField {
+  alias: string;
+  expression?: string;  // SQL expression (for leaf fields)
+  nested?: SelectedField[];  // Nested fields (for object structures)
+}
+
+/**
  * Collection aggregation strategy type
  */
 export type CollectionStrategyType = 'jsonb' | 'temptable';
@@ -90,9 +100,9 @@ export interface CollectionAggregationConfig {
   parentIds?: any[];
 
   /**
-   * Fields to select
+   * Fields to select (supports nested object structures)
    */
-  selectedFields: Array<{ alias: string; expression: string }>;
+  selectedFields: SelectedField[];
 
   /**
    * WHERE clause SQL (without WHERE keyword)
