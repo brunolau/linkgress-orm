@@ -3,6 +3,14 @@ import { QueryBuilder, SelectQueryBuilder } from './query-builder';
 import { SqlBuildContext, FieldRef } from './conditions';
 
 /**
+ * Interface for queries that can be used in CTEs
+ * Supports both SelectQueryBuilder and GroupedJoinedQueryBuilder
+ */
+interface CteCompatibleQuery<TSelection> {
+  toList: () => Promise<TSelection[]>;
+}
+
+/**
  * Type helper to convert value types to FieldRefs for CTE column access
  */
 type ToFieldRefs<T> = T extends object
@@ -120,7 +128,7 @@ export class DbCteBuilder {
     TAlias extends string = 'items'
   >(
     cteName: string,
-    query: SelectQueryBuilder<TSelection> | { toList: () => Promise<TSelection[]> },
+    query: SelectQueryBuilder<TSelection> | CteCompatibleQuery<TSelection>,
     keySelector: (value: TSelection) => TKey,
     aggregationAlias?: TAlias
   ): DbCte<TKey & { [K in TAlias]: Array<AggregatedItemType<TSelection, TKey>> }> {
@@ -129,13 +137,8 @@ export class DbCteBuilder {
       params: [],
     };
 
-    // Build the inner query
-    const innerSql = (query as any).buildQuery((query as any).selector((query as any).createMockRow()), {
-      ctes: new Map(),
-      cteCounter: 0,
-      paramCounter: context.paramCounter,
-      allParams: context.params,
-    }).sql;
+    // Build the inner query - handle different query builder types
+    const innerSql = this.buildInnerQuerySql(query, context);
 
     // Get group by columns
     const mockItem = this.createMockItem();
@@ -176,6 +179,39 @@ export class DbCteBuilder {
     this.ctes.push(cte);
 
     return cte;
+  }
+
+  /**
+   * Build inner query SQL - handles different query builder types
+   * - SelectQueryBuilder: uses createMockRow() and selector()
+   * - GroupedSelectQueryBuilder: uses buildCteQuery()
+   * - GroupedJoinedQueryBuilder: uses buildCteQuery()
+   */
+  private buildInnerQuerySql(query: any, context: SqlBuildContext): string {
+    const queryContext = {
+      ctes: new Map(),
+      cteCounter: 0,
+      paramCounter: context.paramCounter,
+      allParams: context.params,
+    };
+
+    // Check for grouped query builders that have buildCteQuery method
+    if (typeof query.buildCteQuery === 'function') {
+      const result = query.buildCteQuery(queryContext);
+      context.paramCounter = queryContext.paramCounter;
+      return result.sql;
+    }
+
+    // Standard SelectQueryBuilder - uses createMockRow and selector
+    if (typeof query.createMockRow === 'function' && typeof query.selector === 'function') {
+      const mockRow = query.createMockRow();
+      const selectionResult = query.selector(mockRow);
+      const result = query.buildQuery(selectionResult, queryContext);
+      context.paramCounter = queryContext.paramCounter;
+      return result.sql;
+    }
+
+    throw new Error('Unsupported query type for CTE. Query must be a SelectQueryBuilder, GroupedSelectQueryBuilder, or GroupedJoinedQueryBuilder.');
   }
 
   /**

@@ -483,6 +483,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   }
 
   /**
+   * Build SQL for use in CTEs - public interface for CTE builder
+   * @internal
+   */
+  buildCteQuery(queryContext: QueryContext): { sql: string; params: any[] } {
+    return this.buildQuery(queryContext);
+  }
+
+  /**
    * Add a LEFT JOIN to the grouped query result
    * This wraps the grouped query as a subquery and joins to it
    *
@@ -1196,6 +1204,14 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const selectionMetadata = this.resultSelector(mockLeft, mockRight);
 
     return new Subquery(sqlBuilder, mode, selectionMetadata as any) as any;
+  }
+
+  /**
+   * Build SQL for use in CTEs - public interface for CTE builder
+   * @internal
+   */
+  buildCteQuery(queryContext: QueryContext): { sql: string; params: any[] } {
+    return this.buildQuery(queryContext);
   }
 
   /**
