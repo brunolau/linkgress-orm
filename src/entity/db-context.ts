@@ -4,7 +4,7 @@ import { UnwrapDbColumns, InsertData, ExtractDbColumns } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
-import { Condition, ConditionBuilder, SqlFragment, UnwrapSelection } from '../query/conditions';
+import { Condition, ConditionBuilder, SqlFragment, UnwrapSelection, FieldRef } from '../query/conditions';
 import { ResolveCollectionResults, CollectionQueryBuilder, ReferenceQueryBuilder, SelectQueryBuilder, QueryBuilder } from '../query/query-builder';
 import { InferRowType } from '../schema/row-type';
 import { DbSchemaManager } from '../migration/db-schema-manager';
@@ -1206,13 +1206,71 @@ export type EntityUpsertConfig<TEntity extends DbEntity> = {
 };
 
 /**
+ * Type helper to detect if a type is a class instance (has prototype methods)
+ * vs a plain data object. Used to prevent Date, Map, Set, etc. from being
+ * treated as DbEntity.
+ * Excludes DbColumn and SqlFragment which have valueOf but are not value types.
+ */
+type IsClassInstance<T> = T extends { __isDbColumn: true }
+  ? false  // Exclude DbColumn
+  : T extends SqlFragment<any>
+  ? false  // Exclude SqlFragment
+  : T extends { valueOf(): infer V }
+  ? V extends T
+    ? true
+    : V extends number | string | boolean | bigint | symbol
+    ? true
+    : false
+  : false;
+
+
+/**
+ * Check for types with known class method signatures
+ */
+type HasClassMethods<T> = T extends { getTime(): number }  // Date-like
+  ? true
+  : T extends { size: number; has(value: any): boolean }  // Set/Map-like
+  ? true
+  : T extends { byteLength: number }  // ArrayBuffer/TypedArray-like
+  ? true
+  : T extends { then(onfulfilled?: any): any }  // Promise-like
+  ? true
+  : T extends { message: string; name: string }  // Error-like
+  ? true
+  : T extends { exec(string: string): any }  // RegExp-like
+  ? true
+  : false;
+
+/**
+ * Combined check for value types that should not be treated as DbEntity
+ */
+type IsValueType<T> = IsClassInstance<T> extends true
+  ? true
+  : HasClassMethods<T> extends true
+  ? true
+  : false;
+
+/**
+ * Type helper to convert plain object values to FieldRefs for use in conditions
+ * This is used when TSelection is not a DbEntity but needs to be used in where/join conditions
+ */
+type ToFieldRefs<T> = T extends object
+  ? IsValueType<T> extends true
+    ? FieldRef<string, T>  // Wrap value types directly in FieldRef
+    : { [K in keyof T]: FieldRef<string, T[K]> }  // Wrap each property in FieldRef
+  : FieldRef<string, T>;
+
+/**
  * Type helper to build entity query type with navigation support
+ * Preserves class instances (Date, Map, Set, etc.) as-is without recursively mapping them
  */
 export type EntityQuery<TEntity extends DbEntity> = {
   [K in keyof TEntity]: TEntity[K] extends (infer U)[] | undefined
     ? U extends DbEntity
       ? EntityCollectionQuery<U>
       : TEntity[K]
+    : IsValueType<NonNullable<TEntity[K]>> extends true
+    ? TEntity[K]  // Preserve class instances (Date, Map, Set, Temporal, etc.) as-is
     : TEntity[K] extends DbEntity | undefined
     ? EntityQuery<NonNullable<TEntity[K]>>
     : TEntity[K];
@@ -1294,7 +1352,7 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
 
   where(
-    condition: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => any
+    condition: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>) => any
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   orderBy(selector: (row: TSelection) => any): EntitySelectQueryBuilder<TEntity, TSelection>;
@@ -1313,17 +1371,45 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
 
   firstOrThrow(): Promise<ResolveCollectionResults<TSelection>>;
 
-  leftJoin<TRight extends DbEntity | Record<string, any>, TNewSelection>(
-    rightTable: DbEntityTable<TRight extends DbEntity ? TRight : never> | import('../query/subquery').Subquery<TRight, 'table'> | import('../query/cte-builder').DbCte<TRight>,
-    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight extends DbEntity ? (EntityQuery<TRight> | TRight) : TRight) => Condition,
-    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight extends DbEntity ? (EntityQuery<TRight> | TRight) : TRight) => TNewSelection,
+  // Overload for CTE - TRight is NOT a DbEntity, so we don't wrap it in EntityQuery
+  leftJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: import('../query/cte-builder').DbCte<TRight>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight) => TNewSelection
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
+  // Overload for Subquery
+  leftJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight) => TNewSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
+  // Overload for DbEntity table
+  leftJoin<TRight extends DbEntity, TNewSelection>(
+    rightTable: DbEntityTable<TRight>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: EntityQuery<TRight>) => TNewSelection,
     alias?: string
   ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
 
-  innerJoin<TRight extends DbEntity | Record<string, any>, TNewSelection>(
-    rightTable: DbEntityTable<TRight extends DbEntity ? TRight : never> | import('../query/subquery').Subquery<TRight, 'table'> | import('../query/cte-builder').DbCte<TRight>,
-    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight extends DbEntity ? (EntityQuery<TRight> | TRight) : TRight) => Condition,
-    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight extends DbEntity ? (EntityQuery<TRight> | TRight) : TRight) => TNewSelection,
+  // Overload for CTE - TRight is NOT a DbEntity, so we don't wrap it in EntityQuery
+  innerJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: import('../query/cte-builder').DbCte<TRight>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight) => TNewSelection
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
+  // Overload for Subquery
+  innerJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: TRight) => TNewSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
+  // Overload for DbEntity table
+  innerJoin<TRight extends DbEntity, TNewSelection>(
+    rightTable: DbEntityTable<TRight>,
+    condition: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition,
+    selector: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, right: EntityQuery<TRight>) => TNewSelection,
     alias?: string
   ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
 
@@ -1717,29 +1803,59 @@ export class DbEntityTable<TEntity extends DbEntity> {
   }
 
   /**
-   * Left join with another table or subquery and selector
+   * Left join with another table (DbEntity)
    */
   leftJoin<TRight extends DbEntity, TSelection>(
-    rightTable: DbEntityTable<TRight> | import('../query/subquery').Subquery<TRight, 'table'>,
-    condition: (left: EntityQuery<TEntity>, right: EntityQuery<TRight> | TRight) => Condition,
-    selector: (left: EntityQuery<TEntity>, right: EntityQuery<TRight> | TRight) => TSelection,
+    rightTable: DbEntityTable<TRight>,
+    condition: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => TSelection,
     alias?: string
-  ): EntitySelectQueryBuilder<TEntity, TSelection> {
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+  /**
+   * Left join with a subquery (plain object result, not DbEntity)
+   */
+  leftJoin<TRight extends Record<string, any>, TSelection>(
+    rightTable: import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: EntityQuery<TEntity>, right: TRight) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: TRight) => TSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+  leftJoin<TRight, TSelection>(
+    rightTable: DbEntityTable<any> | import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: EntityQuery<TEntity>, right: any) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: any) => TSelection,
+    alias?: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>> {
     const queryBuilder = this.context.getTable(this.tableName).leftJoin(rightTable as any, condition as any, selector as any, alias);
-    return queryBuilder as any as EntitySelectQueryBuilder<TEntity, TSelection>;
+    return queryBuilder as any as EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
   }
 
   /**
-   * Inner join with another table or subquery and selector
+   * Inner join with another table (DbEntity)
    */
   innerJoin<TRight extends DbEntity, TSelection>(
-    rightTable: DbEntityTable<TRight> | import('../query/subquery').Subquery<TRight, 'table'>,
-    condition: (left: EntityQuery<TEntity>, right: EntityQuery<TRight> | TRight) => Condition,
-    selector: (left: EntityQuery<TEntity>, right: EntityQuery<TRight> | TRight) => TSelection,
+    rightTable: DbEntityTable<TRight>,
+    condition: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => TSelection,
     alias?: string
-  ): EntitySelectQueryBuilder<TEntity, TSelection> {
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+  /**
+   * Inner join with a subquery (plain object result, not DbEntity)
+   */
+  innerJoin<TRight extends Record<string, any>, TSelection>(
+    rightTable: import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: EntityQuery<TEntity>, right: TRight) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: TRight) => TSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+  innerJoin<TRight, TSelection>(
+    rightTable: DbEntityTable<any> | import('../query/subquery').Subquery<TRight, 'table'>,
+    condition: (left: EntityQuery<TEntity>, right: any) => Condition,
+    selector: (left: EntityQuery<TEntity>, right: any) => TSelection,
+    alias?: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>> {
     const queryBuilder = this.context.getTable(this.tableName).innerJoin(rightTable as any, condition as any, selector as any, alias);
-    return queryBuilder as any as EntitySelectQueryBuilder<TEntity, TSelection>;
+    return queryBuilder as any as EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
   }
 
   /**

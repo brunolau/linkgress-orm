@@ -2,9 +2,18 @@ import { TableBuilder } from '../schema/table-builder';
 import { ColumnBuilder } from '../schema/column-builder';
 
 /**
+ * Unique symbol for DbEntity type branding
+ * @internal
+ */
+declare const __entityBrandSymbol: unique symbol;
+
+/**
  * Base class for all entities
  */
 export abstract class DbEntity {
+  /** @internal - Type brand to distinguish DbEntity from plain objects in the type system */
+  declare readonly [__entityBrandSymbol]: true;
+
   /** @internal */
   static readonly __isEntity = true;
 

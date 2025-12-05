@@ -969,7 +969,14 @@ describe('Subquery Operations', () => {
           // Type assertions
           assertType<string, typeof r.username>(r.username);
           assertType<number | undefined, typeof r.age>(r.age);
-          assertType<unknown[], typeof r.postStats>(r.postStats);
+          assertType<{
+    postCount: number;
+    totalViews: number;
+    orderDetails: {
+        orderStatus: "pending" | "processing" | "completed" | "cancelled" | "refunded";
+        orderAmount: number;
+    }[];
+}[], typeof r.postStats>(r.postStats);
         });
 
         const aliceResult = result.find((r) => r.username === 'alice');
@@ -1095,7 +1102,7 @@ describe('Subquery Operations', () => {
           // Type assertions
           assertType<number, typeof r.id>(r.id);
           assertType<number, typeof r.titleLength>(r.titleLength);
-          assertType<unknown[], typeof r.categoryInfo>(r.categoryInfo);
+          assertType<{totalPosts: number; avgViews: number;  maxViews: number;}[], typeof r.categoryInfo>(r.categoryInfo);
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('titleLength');
           expect(r).toHaveProperty('categoryInfo');
@@ -1204,8 +1211,8 @@ describe('Subquery Operations', () => {
           // Type assertions
           assertType<number, typeof r.userId>(r.userId);
           assertType<string, typeof r.username>(r.username);
-          assertType<unknown[], typeof r.stats>(r.stats);
-          assertType<unknown[], typeof r.orderInfo>(r.orderInfo);
+          assertType<{userCount: number}[], typeof r.stats>(r.stats);
+          assertType<{totalAmount: number, orderCount: number}[], typeof r.orderInfo>(r.orderInfo);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('username');
         });
@@ -1321,8 +1328,16 @@ describe('Subquery Operations', () => {
           assertType<number, typeof r.userId>(r.userId);
           assertType<string, typeof r.userName>(r.userName);
           assertType<string, typeof r.ageCategory>(r.ageCategory);
-          assertType<unknown[], typeof r.postInfo>(r.postInfo);
-          assertType<unknown[], typeof r.orderInfo>(r.orderInfo);
+          assertType<{
+              postCount: number;
+              totalViews: number;
+              avgAuthorAge: number;
+          }[], typeof r.postInfo>(r.postInfo);
+          assertType<{
+            status: "pending" | "processing" | "completed" | "cancelled" | "refunded";
+            count: number;
+            total: number;
+          }[], typeof r.orderInfo>(r.orderInfo);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('userName');
           expect(r).toHaveProperty('ageCategory');
@@ -1425,7 +1440,9 @@ describe('Subquery Operations', () => {
           assertType<string, typeof r.title>(r.title);
           assertType<number, typeof r.views>(r.views);
           assertType<number | undefined, typeof r.authorAge>(r.authorAge);
-          assertType<unknown[], typeof r.userInfo>(r.userInfo);
+          assertType<{
+    count: number;
+}[], typeof r.userInfo>(r.userInfo);
           expect(r).toHaveProperty('postId');
           expect(r).toHaveProperty('title');
           expect(r).toHaveProperty('views');
@@ -1541,8 +1558,11 @@ describe('Subquery Operations', () => {
           assertType<string, typeof r.title>(r.title);
           assertType<string | null, typeof r.category>(r.category);
           assertType<string | undefined, typeof r.email>(r.email);
-          assertType<unknown[], typeof r.stats>(r.stats);
-          assertType<unknown[], typeof r.userInfo>(r.userInfo);
+          assertType<{
+    postCount: number;
+    totalViews: number;
+}[], typeof r.stats>(r.stats);
+          assertType<{userCount: number}[], typeof r.userInfo>(r.userInfo);
           expect(r).toHaveProperty('postId');
           expect(r).toHaveProperty('title');
           expect(r).toHaveProperty('category');
@@ -1755,8 +1775,18 @@ describe('Subquery Operations', () => {
           assertType<number | undefined, typeof r.age>(r.age);
           assertType<string, typeof r.contactEmail>(r.contactEmail);
           assertType<string, typeof r.fullInfo>(r.fullInfo);
-          assertType<unknown[], typeof r.postStatistics>(r.postStatistics);
-          assertType<unknown[], typeof r.orderStatistics>(r.orderStatistics);
+          assertType<{
+        postCount: number;
+        totalViews: number;
+        avgViews: number;
+        maxViews: number;
+        minViews: number;
+    }[], typeof r.postStatistics>(r.postStatistics);
+          assertType<{
+        orderCount: number;
+        totalSpent: number;
+        avgSpent: number;
+    }[], typeof r.orderStatistics>(r.orderStatistics);
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('name');
           expect(r).toHaveProperty('nameUppercase');
@@ -1977,7 +2007,7 @@ describe('Subquery Operations', () => {
           expect(r).toHaveProperty('nameLen');
           expect(r).toHaveProperty('summary');
           expect(r.summary).toContain(r.name);
-          expect(r.summary).toContain(r.age.toString());
+          expect(r.summary).toContain(r.age!.toString());
         });
       });
     });

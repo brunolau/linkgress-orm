@@ -1,4 +1,5 @@
 import type { DbColumn } from '../entity/db-column';
+import type { Subquery } from './subquery';
 
 /**
  * SQL condition types
@@ -62,21 +63,92 @@ export interface SqlFragmentLike<T = any> {
 export type UnwrapSqlFragment<T> = T extends SqlFragmentLike<infer V> ? V : T;
 
 /**
+ * Type helper to detect if a type is a class instance (has prototype methods)
+ * vs a plain data object (only has data properties).
+ *
+ * Class instances like Date, Map, Set, RegExp, Error, Promise, typed arrays,
+ * and user-defined classes have inherited methods from prototypes.
+ * Plain objects only have their own enumerable properties.
+ *
+ * We detect this by checking for common method signatures that class instances have.
+ * If an object type has valueOf/toString as actual methods (not just from Object.prototype pattern),
+ * it's likely a class instance.
+ *
+ * This approach works for:
+ * - Built-in types: Date, Map, Set, RegExp, Error, Promise, ArrayBuffer, etc.
+ * - Temporal API types (when available)
+ * - BigInt, Symbol
+ * - User-defined classes with methods
+ * - Third-party library types like Decimal.js, moment, etc.
+ *
+ * EXCLUDES:
+ * - DbColumn - has valueOf but should NOT be treated as a value type
+ * - SqlFragment - has valueOf but should NOT be treated as a value type
+ */
+type IsClassInstance<T> = T extends { __isDbColumn: true }
+  ? false  // Explicitly exclude DbColumn from being a value type
+  : T extends SqlFragmentLike<any>
+  ? false  // Explicitly exclude SqlFragment from being a value type
+  : T extends { valueOf(): infer V }
+  ? // Has valueOf - check if it's a value-returning class instance
+    // Class instances have valueOf that returns a primitive or itself
+    V extends T
+    ? true  // valueOf returns same type (like Date.valueOf() returns number, but Date itself)
+    : V extends number | string | boolean | bigint | symbol
+    ? true  // valueOf returns a primitive - it's a class instance
+    : false
+  : false;
+
+/**
+ * Alternative check: if type has constructor signature or known class methods
+ * This catches types that might not have valueOf but are still class instances
+ */
+type HasClassMethods<T> = T extends { getTime(): number }  // Date-like
+  ? true
+  : T extends { size: number; has(value: any): boolean }  // Set/Map-like
+  ? true
+  : T extends { byteLength: number }  // ArrayBuffer/TypedArray-like
+  ? true
+  : T extends { then(onfulfilled?: any): any }  // Promise-like
+  ? true
+  : T extends { message: string; name: string }  // Error-like
+  ? true
+  : T extends { exec(string: string): any }  // RegExp-like
+  ? true
+  : false;
+
+/**
+ * Combined check for value types that should not be recursively processed
+ */
+type IsValueType<T> = IsClassInstance<T> extends true
+  ? true
+  : HasClassMethods<T> extends true
+  ? true
+  : false;
+
+/**
  * Recursively unwrap all SqlFragment types in an object type
  * Maps { a: SqlFragment<number>, b: string } to { a: number, b: string }
- * Preserves arrays, functions, and primitive types without recursing into them
+ * Preserves arrays, functions, primitive types, and class instances without recursing into them
+ * Also unwraps Subquery<TResult> to TResult
  */
 export type UnwrapSelection<T> = T extends SqlFragment<infer V>
   ? V
   : T extends SqlFragmentLike<infer V>
     ? V
-    : T extends (infer U)[]
-      ? UnwrapSelection<U>[]
-      : T extends (...args: any[]) => any
-        ? T  // Preserve functions as-is
-        : T extends object
-          ? { [K in keyof T]: UnwrapSelection<T[K]> }
-          : T;
+    : T extends DbColumn<infer V>
+      ? V  // Unwrap DbColumn<T> to T
+      : T extends Subquery<infer R, any>
+        ? R  // Unwrap Subquery<TResult, TMode> to TResult
+        : T extends (infer U)[]
+          ? UnwrapSelection<U>[]
+          : T extends (...args: any[]) => any
+            ? T  // Preserve functions as-is
+            : T extends object
+              ? IsValueType<T> extends true
+                ? T  // Preserve class instances (Date, Map, Set, Temporal, etc.) as-is
+                : { [K in keyof T]: UnwrapSelection<T[K]> }
+              : T;
 
 /**
  * Context for building SQL with parameter tracking

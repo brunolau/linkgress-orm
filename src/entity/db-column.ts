@@ -35,22 +35,68 @@ export class DbColumn<TValue> {
 }
 
 /**
+ * Type helper to detect if a type is a class instance (has prototype methods)
+ * vs a plain data object. See conditions.ts for detailed explanation.
+ * Excludes DbColumn and SqlFragment which have valueOf but are not value types.
+ */
+type IsClassInstance<T> = T extends { __isDbColumn: true }
+  ? false  // Exclude DbColumn
+  : T extends { mapWith: any; as: any; buildSql: any }  // SqlFragment-like
+  ? false  // Exclude SqlFragment
+  : T extends { valueOf(): infer V }
+  ? V extends T
+    ? true
+    : V extends number | string | boolean | bigint | symbol
+    ? true
+    : false
+  : false;
+
+/**
+ * Check for types with known class method signatures
+ */
+type HasClassMethods<T> = T extends { getTime(): number }  // Date-like
+  ? true
+  : T extends { size: number; has(value: any): boolean }  // Set/Map-like
+  ? true
+  : T extends { byteLength: number }  // ArrayBuffer/TypedArray-like
+  ? true
+  : T extends { then(onfulfilled?: any): any }  // Promise-like
+  ? true
+  : T extends { message: string; name: string }  // Error-like
+  ? true
+  : T extends { exec(string: string): any }  // RegExp-like
+  ? true
+  : false;
+
+/**
+ * Combined check for value types that should not be recursively processed
+ */
+type IsValueType<T> = IsClassInstance<T> extends true
+  ? true
+  : HasClassMethods<T> extends true
+  ? true
+  : false;
+
+/**
  * Type helper to unwrap DbColumn types to their underlying values
+ * Preserves class instances (Date, Map, Set, Temporal, etc.) as-is
  */
 export type UnwrapDbColumns<T> = T extends DbColumn<infer V>
   ? V
   : T extends object
-  ? {
-      [K in keyof T]: T[K] extends DbColumn<infer V>
-        ? V
-        : T[K] extends (infer U)[] | undefined
-        ? U extends DbEntity
-          ? UnwrapDbColumns<U>[]
-          : T[K]
-        : T[K] extends DbEntity | undefined
-        ? UnwrapDbColumns<NonNullable<T[K]>>
-        : T[K];
-    }
+  ? IsValueType<T> extends true
+    ? T  // Preserve class instances as-is
+    : {
+        [K in keyof T]: T[K] extends DbColumn<infer V>
+          ? V
+          : T[K] extends (infer U)[] | undefined
+          ? U extends DbEntity
+            ? UnwrapDbColumns<U>[]
+            : T[K]
+          : T[K] extends DbEntity | undefined
+          ? UnwrapDbColumns<NonNullable<T[K]>>
+          : T[K];
+      }
   : T;
 
 /**

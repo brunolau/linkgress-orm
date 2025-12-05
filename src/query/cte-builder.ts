@@ -1,20 +1,67 @@
 import { DatabaseClient } from '../database/database-client.interface';
-import { QueryBuilder, SelectQueryBuilder } from './query-builder';
-import { SqlBuildContext, FieldRef } from './conditions';
+import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults } from './query-builder';
+import { SqlBuildContext, FieldRef, UnwrapSelection } from './conditions';
 
 /**
  * Interface for queries that can be used in CTEs
- * Supports both SelectQueryBuilder and GroupedJoinedQueryBuilder
+ * Supports SelectQueryBuilder, EntitySelectQueryBuilder, GroupedJoinedQueryBuilder
+ * The TSelection type is inferred from the query's type parameter
  */
 interface CteCompatibleQuery<TSelection> {
-  toList: () => Promise<TSelection[]>;
+  toList: () => Promise<ResolveCollectionResults<TSelection>[] | TSelection[]>;
 }
 
 /**
+ * Type helper to detect if a type is a class instance (has prototype methods)
+ * vs a plain data object. See conditions.ts for detailed explanation.
+ * Excludes DbColumn and SqlFragment which have valueOf but are not value types.
+ */
+type IsClassInstance<T> = T extends { __isDbColumn: true }
+  ? false  // Exclude DbColumn
+  : T extends { mapWith: any; as: any; buildSql: any }  // SqlFragment-like
+  ? false  // Exclude SqlFragment
+  : T extends { valueOf(): infer V }
+  ? V extends T
+    ? true
+    : V extends number | string | boolean | bigint | symbol
+    ? true
+    : false
+  : false;
+
+/**
+ * Check for types with known class method signatures
+ */
+type HasClassMethods<T> = T extends { getTime(): number }  // Date-like
+  ? true
+  : T extends { size: number; has(value: any): boolean }  // Set/Map-like
+  ? true
+  : T extends { byteLength: number }  // ArrayBuffer/TypedArray-like
+  ? true
+  : T extends { then(onfulfilled?: any): any }  // Promise-like
+  ? true
+  : T extends { message: string; name: string }  // Error-like
+  ? true
+  : T extends { exec(string: string): any }  // RegExp-like
+  ? true
+  : false;
+
+/**
+ * Combined check for value types that should not be recursively processed
+ */
+type IsValueType<T> = IsClassInstance<T> extends true
+  ? true
+  : HasClassMethods<T> extends true
+  ? true
+  : false;
+
+/**
  * Type helper to convert value types to FieldRefs for CTE column access
+ * Preserves class instances (Date, Map, Set, Temporal, etc.) as-is
  */
 type ToFieldRefs<T> = T extends object
-  ? { [K in keyof T]: FieldRef<string, T[K]> }
+  ? IsValueType<T> extends true
+    ? FieldRef<string, T>  // Preserve class instances, wrap in FieldRef
+    : { [K in keyof T]: FieldRef<string, T[K]> }
   : FieldRef<string, T>;
 
 /**
@@ -24,11 +71,14 @@ type ExtractValueType<T> = T extends FieldRef<any, infer V> ? V : T;
 
 /**
  * Type helper to resolve FieldRefs in an object to their value types
+ * Preserves class instances (Date, Map, Set, Temporal, etc.) as-is
  */
 type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
   ? V
   : T extends object
-  ? { [K in keyof T]: ResolveFieldRefs<T[K]> }
+  ? IsValueType<T> extends true
+    ? T  // Preserve class instances as-is
+    : { [K in keyof T]: ResolveFieldRefs<T[K]> }
   : T;
 
 /**
@@ -131,7 +181,7 @@ export class DbCteBuilder {
     query: SelectQueryBuilder<TSelection> | CteCompatibleQuery<TSelection>,
     keySelector: (value: TSelection) => TKey,
     aggregationAlias?: TAlias
-  ): DbCte<TKey & { [K in TAlias]: Array<AggregatedItemType<TSelection, TKey>> }> {
+  ): DbCte<UnwrapSelection<TKey> & { [K in TAlias]: Array<AggregatedItemType<TSelection, TKey>> }> {
     const context: SqlBuildContext = {
       paramCounter: this.paramOffset,
       params: [],
@@ -262,12 +312,13 @@ export type InferCteColumns<T> = T extends DbCte<infer TColumns> ? TColumns : ne
 
 /**
  * Type helper for aggregated items - removes the grouping keys from the selection
+ * and unwraps DbColumn/SqlFragment types to their underlying values
  */
 export type AggregatedItemType<
   TSelection extends Record<string, unknown>,
   TKey extends Record<string, unknown>
 > = {
-  [K in Exclude<keyof TSelection, keyof TKey>]: TSelection[K];
+  [K in Exclude<keyof TSelection, keyof TKey>]: UnwrapSelection<TSelection[K]>;
 };
 
 /**

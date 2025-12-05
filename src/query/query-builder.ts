@@ -813,6 +813,27 @@ export class SelectQueryBuilder<TSelection> {
    * Note: After select(), the left parameter in the join will be the selected shape (TSelection)
    * UnwrapSelection extracts the value types from SqlFragment<T> expressions
    */
+  // Overload for CTE
+  leftJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: DbCte<TRight>,
+    condition: (left: TSelection, right: TRight) => Condition,
+    selector: (left: TSelection, right: TRight) => TNewSelection
+  ): SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
+  // Overload for Subquery
+  leftJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: Subquery<TRight, 'table'>,
+    condition: (left: TSelection, right: TRight) => Condition,
+    selector: (left: TSelection, right: TRight) => TNewSelection,
+    alias: string
+  ): SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
+  // Overload for Table
+  leftJoin<TRight extends Record<string, any>, TNewSelection>(
+    rightTable: { _getSchema: () => TableSchema },
+    condition: (left: TSelection, right: TRight) => Condition,
+    selector: (left: TSelection, right: TRight) => TNewSelection,
+    alias?: string
+  ): SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
+  // Implementation
   leftJoin<TRight extends Record<string, any>, TNewSelection>(
     rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: TSelection, right: TRight) => Condition,
@@ -2897,8 +2918,52 @@ type ExtractFieldValue<T> = T extends FieldRef<any, infer V>
   : T;
 
 /**
+ * Type helper to detect if a type is a class instance (has prototype methods)
+ * vs a plain data object. See conditions.ts for detailed explanation.
+ * Excludes DbColumn and SqlFragment which have valueOf but are not value types.
+ */
+type IsClassInstance<T> = T extends { __isDbColumn: true }
+  ? false  // Exclude DbColumn
+  : T extends SqlFragment<any>
+  ? false  // Exclude SqlFragment
+  : T extends { valueOf(): infer V }
+  ? V extends T
+    ? true
+    : V extends number | string | boolean | bigint | symbol
+    ? true
+    : false
+  : false;
+
+/**
+ * Check for types with known class method signatures
+ */
+type HasClassMethods<T> = T extends { getTime(): number }  // Date-like
+  ? true
+  : T extends { size: number; has(value: any): boolean }  // Set/Map-like
+  ? true
+  : T extends { byteLength: number }  // ArrayBuffer/TypedArray-like
+  ? true
+  : T extends { then(onfulfilled?: any): any }  // Promise-like
+  ? true
+  : T extends { message: string; name: string }  // Error-like
+  ? true
+  : T extends { exec(string: string): any }  // RegExp-like
+  ? true
+  : false;
+
+/**
+ * Combined check for value types that should not be recursively processed
+ */
+type IsValueType<T> = IsClassInstance<T> extends true
+  ? true
+  : HasClassMethods<T> extends true
+  ? true
+  : false;
+
+/**
  * Type helper to resolve all FieldRef and SqlFragment types to their value types
  * Recursively processes nested objects and arrays
+ * Preserves class instances (Date, Map, Set, Temporal, etc.) as-is
  */
 export type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
   ? V
@@ -2908,8 +2973,12 @@ export type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
   ? T  // Preserve CollectionResult for ResolveCollectionResults to handle
   : T extends Array<infer U>
   ? Array<ResolveFieldRefs<U>>
+  : T extends (...args: any[]) => any
+  ? T  // Preserve functions as-is
   : T extends object
-  ? { [K in keyof T]: ResolveFieldRefs<T[K]> }
+  ? IsValueType<T> extends true
+    ? T  // Preserve class instances (Date, Map, Set, Temporal, etc.) as-is
+    : { [K in keyof T]: ResolveFieldRefs<T[K]> }
   : T;
 
 /**
