@@ -1,6 +1,7 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, DbCteBuilder } from '../../src';
+import { assertType } from '../utils/type-tester';
 
 describe('Grouping and Aggregation', () => {
   describe('Basic GROUP BY', () => {
@@ -26,6 +27,9 @@ describe('Grouping and Aggregation', () => {
 
         // Verify types are numbers
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.postCount>(r.postCount);
           expect(typeof r.postCount).toBe('number');
           expect(r.postCount).toBeGreaterThan(0);
         });
@@ -58,6 +62,9 @@ describe('Grouping and Aggregation', () => {
 
         // Verify result types
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.totalViews>(r.totalViews);
           expect(typeof r.totalViews).toBe('number');
           expect(r.totalViews).toBeGreaterThan(0);
         });
@@ -88,6 +95,12 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.minViews>(r.minViews);
+          assertType<number, typeof r.maxViews>(r.maxViews);
+        });
 
         const aliceStats = result.find(r => r.userId === 1);
         expect(aliceStats?.minViews).toBe(100);
@@ -117,6 +130,9 @@ describe('Grouping and Aggregation', () => {
 
         // Verify result type is number
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.avgViews>(r.avgViews);
           expect(typeof r.avgViews).toBe('number');
         });
 
@@ -149,6 +165,15 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.count>(r.count);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<number, typeof r.avgViews>(r.avgViews);
+          assertType<number, typeof r.minViews>(r.minViews);
+          assertType<number, typeof r.maxViews>(r.maxViews);
+        });
 
         const aliceStats = result.find(r => r.userId === 1);
         expect(aliceStats).toBeDefined();
@@ -188,6 +213,12 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(3);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string | undefined, typeof r.title>(r.title);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+        });
 
         // Each combination of userId + title should be unique
         const uniqueKeys = new Set(result.map(r => `${r.userId}-${r.title}`));
@@ -218,6 +249,9 @@ describe('Grouping and Aggregation', () => {
         // Only users with more than 1 post
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.postCount>(r.postCount);
           expect(r.postCount).toBeGreaterThan(1);
         });
       });
@@ -245,6 +279,9 @@ describe('Grouping and Aggregation', () => {
 
         // WHERE filters before grouping, HAVING filters after
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.postCount>(r.postCount);
           expect(r.postCount).toBeGreaterThan(1);
         });
       });
@@ -288,6 +325,10 @@ describe('Grouping and Aggregation', () => {
 
         // Verify aggregates are numbers
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<number, typeof r.postCount>(r.postCount);
           expect(typeof r.totalViews).toBe('number');
           expect(typeof r.postCount).toBe('number');
         });
@@ -344,6 +385,11 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string | undefined, typeof r.subtitle>(r.subtitle);
+          assertType<number, typeof r.count>(r.count);
+        });
         // Should have a group for NULL subtitles
         const nullGroup = result.find(r => r.subtitle === null || r.subtitle === undefined);
         expect(nullGroup).toBeDefined();
@@ -395,6 +441,14 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<number, typeof r.postCount>(r.postCount);
+          assertType<string | undefined, typeof r.username>(r.username);
+          assertType<string | undefined, typeof r.email>(r.email);
+        });
 
         // Verify we got user details joined
         const aliceStats = result.find(r => r.username === 'alice');
@@ -449,6 +503,10 @@ describe('Grouping and Aggregation', () => {
 
         // All results should be from active users
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<string, typeof r.username>(r.username);
           expect(r.username).toBeDefined();
         });
       });
@@ -496,6 +554,14 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.maxViews>(r.maxViews);
+          assertType<number, typeof r.minViews>(r.minViews);
+          assertType<string | undefined, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.age>(r.age);
+        });
 
         // Verify we got user details joined
         const aliceStats = result.find(r => r.username === 'alice');
@@ -544,6 +610,12 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<string | undefined, typeof r.username>(r.username);
+        });
 
         // Verify ordering - totalViews should be descending
         for (let i = 1; i < result.length; i++) {
@@ -590,6 +662,12 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<number, typeof r.totalViews>(r.totalViews);
+          assertType<string | undefined, typeof r.username>(r.username);
+        });
       });
     });
 
@@ -646,6 +724,13 @@ describe('Grouping and Aggregation', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.email>(r.email);
+          assertType<number | undefined, typeof r.totalViews>(r.totalViews);
+          assertType<string | undefined, typeof r.username>(r.username);
+        });
 
         const alice = result.find(r => r.email === 'alice@test.com');
         expect(alice).toBeDefined();
@@ -690,6 +775,12 @@ describe('Grouping and Aggregation', () => {
           .first();
 
         expect(result).not.toBeNull();
+        if (result) {
+          // Type assertions
+          assertType<number, typeof result.userId>(result.userId);
+          assertType<number, typeof result.totalViews>(result.totalViews);
+          assertType<string | undefined, typeof result.username>(result.username);
+        }
         expect(result?.userId).toBeDefined();
         expect(result?.totalViews).toBeDefined();
         expect(result?.username).toBeDefined();

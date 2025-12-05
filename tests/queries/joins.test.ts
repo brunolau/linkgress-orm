@@ -1,6 +1,7 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt } from '../../src';
+import { assertType } from '../utils/type-tester';
 
 describe('JOIN Operations', () => {
   describe('INNER JOIN', () => {
@@ -21,6 +22,9 @@ describe('JOIN Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string, typeof r.postTitle>(r.postTitle);
           expect(r).toHaveProperty('username');
           expect(r).toHaveProperty('postTitle');
         });
@@ -44,6 +48,11 @@ describe('JOIN Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string, typeof r.postTitle>(r.postTitle);
+        });
         // Should only include posts from active users
       });
     });
@@ -75,6 +84,10 @@ describe('JOIN Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string, typeof r.postTitle>(r.postTitle);
+          assertType<number, typeof r.orderAmount>(r.orderAmount);
           expect(r).toHaveProperty('username');
           expect(r).toHaveProperty('postTitle');
           expect(r).toHaveProperty('orderAmount');
@@ -101,6 +114,11 @@ describe('JOIN Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThanOrEqual(3);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string | undefined, typeof r.postTitle>(r.postTitle);
+        });
 
         // Check that user without posts is included
         const charlieResults = result.filter(r => r.username === 'charlie');

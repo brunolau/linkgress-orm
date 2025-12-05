@@ -1,5 +1,6 @@
 import { withDatabase, seedTestData, createTestDatabase, setupDatabase, cleanupDatabase } from '../utils/test-database';
 import { gt, and, eq } from '../../src/query/conditions';
+import { assertType } from '../utils/type-tester';
 
 describe('Collection Strategy Comparison', () => {
   describe('Basic collection queries', () => {
@@ -49,6 +50,18 @@ describe('Collection Strategy Comparison', () => {
       // Verify results are identical
       expect(jsonbResults.length).toBe(tempTableResults.length);
       expect(jsonbResults.length).toBeGreaterThan(0);
+
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<{ postId: number; title: string | undefined; views: number }[], typeof u.posts>(u.posts);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<{ postId: number; title: string | undefined; views: number }[], typeof u.posts>(u.posts);
+      });
 
       for (let i = 0; i < jsonbResults.length; i++) {
         const jsonbUser = jsonbResults[i];
@@ -107,6 +120,18 @@ describe('Collection Strategy Comparison', () => {
 
       await cleanupDatabase(tempTableDb);
 
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<{ title: string | undefined; views: number }[], typeof u.highViewPosts>(u.highViewPosts);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<{ title: string | undefined; views: number }[], typeof u.highViewPosts>(u.highViewPosts);
+      });
+
       // Verify results are identical
       expect(jsonbResults).toEqual(tempTableResults);
     });
@@ -143,6 +168,18 @@ describe('Collection Strategy Comparison', () => {
         .toList();
 
       await cleanupDatabase(tempTableDb);
+
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number, typeof u.postCount>(u.postCount);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number, typeof u.postCount>(u.postCount);
+      });
 
       // Verify results are identical
       expect(jsonbResults).toEqual(tempTableResults);
@@ -181,6 +218,20 @@ describe('Collection Strategy Comparison', () => {
 
       await cleanupDatabase(tempTableDb);
 
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number | null, typeof u.maxViews>(u.maxViews);
+        assertType<number | null, typeof u.minViews>(u.minViews);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number | null, typeof u.maxViews>(u.maxViews);
+        assertType<number | null, typeof u.minViews>(u.minViews);
+      });
+
       // Verify results are identical
       expect(jsonbResults).toEqual(tempTableResults);
     });
@@ -215,6 +266,18 @@ describe('Collection Strategy Comparison', () => {
         .toList();
 
       await cleanupDatabase(tempTableDb);
+
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number | null, typeof u.totalViews>(u.totalViews);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number | null, typeof u.totalViews>(u.totalViews);
+      });
 
       // Verify results are identical
       expect(jsonbResults).toEqual(tempTableResults);
@@ -355,6 +418,18 @@ describe('Collection Strategy Comparison', () => {
 
       await cleanupDatabase(tempTableDb);
 
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<string[], typeof u.postTitles>(u.postTitles);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<string[], typeof u.postTitles>(u.postTitles);
+      });
+
       // Sort arrays to ensure consistent ordering for comparison
       jsonbResults.forEach(u => u.postTitles.sort());
       tempTableResults.forEach(u => u.postTitles.sort());
@@ -393,6 +468,18 @@ describe('Collection Strategy Comparison', () => {
         .toList();
 
       await cleanupDatabase(tempTableDb);
+
+      // Type assertions
+      jsonbResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number[], typeof u.allViews>(u.allViews);
+      });
+      tempTableResults.forEach(u => {
+        assertType<number, typeof u.userId>(u.userId);
+        assertType<string, typeof u.username>(u.username);
+        assertType<number[], typeof u.allViews>(u.allViews);
+      });
 
       // Sort arrays to ensure consistent ordering for comparison
       jsonbResults.forEach(u => u.allViews.sort((a, b) => a - b));

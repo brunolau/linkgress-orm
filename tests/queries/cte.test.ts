@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, lt, gt, sql, DbCteBuilder } from '../../src';
+import { assertType } from '../utils/type-tester';
 
 describe('CTE (Common Table Expression) Support', () => {
   describe('Regular CTEs with with()', () => {
@@ -39,6 +40,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.name>(r.name);
+          assertType<string | undefined, typeof r.cteUsername>(r.cteUsername);
+          assertType<Date | undefined, typeof r.cteCreatedAt>(r.cteCreatedAt);
+        });
         expect(result[0].id).toBe(users.alice.id);
         expect(result[0].name).toBe('alice');
         expect(result[0].cteUsername).toBe('alice');
@@ -79,6 +87,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.name>(r.name);
+          assertType<number | undefined, typeof r.postCount>(r.postCount);
+          assertType<number | null | undefined, typeof r.maxViews>(r.maxViews);
+        });
         expect(result[0].postCount).toBeGreaterThan(0);
         expect(typeof result[0].postCount).toBe('number');
         if (result[0].maxViews !== null) {
@@ -123,6 +138,13 @@ describe('CTE (Common Table Expression) Support', () => {
 
         expect(result).toBeDefined();
         expect(Array.isArray(result)).toBe(true);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<string | undefined, typeof r.popularPostTitle>(r.popularPostTitle);
+          assertType<number | undefined, typeof r.popularPostViews>(r.popularPostViews);
+        });
       });
     });
   });
@@ -162,6 +184,12 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.username>(r.username);
+          assertType<unknown[], typeof r.aggregatedPosts>(r.aggregatedPosts);
+        });
         expect(result[0].aggregatedPosts).toBeDefined();
         const aggregatedPostsArray = result[0].aggregatedPosts as any[];
         expect(Array.isArray(aggregatedPostsArray)).toBe(true);
@@ -209,6 +237,12 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.username>(r.username);
+          assertType<unknown[], typeof r.orders>(r.orders);
+        });
         expect(result[0].orders).toBeDefined();
         expect(Array.isArray(result[0].orders)).toBe(true);
       });
@@ -250,6 +284,12 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<unknown[], typeof r.groupedItems>(r.groupedItems);
+        });
         expect(result[0].groupedItems).toBeDefined();
       });
     });
@@ -298,6 +338,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.name>(r.name);
+          assertType<number | undefined, typeof r.postCount>(r.postCount);
+          assertType<string | undefined, typeof r.statsUsername>(r.statsUsername);
+        });
         expect(result[0].postCount).toBeDefined();
         expect(typeof result[0].postCount).toBe('number');
       });
@@ -342,6 +389,11 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string | undefined, typeof r.cteUsername>(r.cteUsername);
+        });
         expect(result[0].cteUsername).toBe('alice');
       });
     });
@@ -389,6 +441,14 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<number | undefined, typeof r.cteUserId>(r.cteUserId);
+          assertType<string | undefined, typeof r.cteUsername>(r.cteUsername);
+          assertType<string | undefined, typeof r.cteEmail>(r.cteEmail);
+          assertType<boolean | undefined, typeof r.cteIsActive>(r.cteIsActive);
+        });
         expect(result[0].cteUsername).toBe('alice');
         expect(result[0].cteEmail).toBe('alice@test.com');
       });
@@ -430,6 +490,11 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<unknown[], typeof r.posts>(r.posts);
+        });
         expect(Array.isArray(result[0].posts)).toBe(true);
       });
     });
@@ -467,6 +532,12 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.name>(r.name);
+          assertType<string | undefined, typeof r.cteUsername>(r.cteUsername);
+        });
         expect(result[0].id).toBe(users.alice.id);
         // cteUsername should be null or undefined due to LEFT JOIN
       });
@@ -507,6 +578,12 @@ describe('CTE (Common Table Expression) Support', () => {
 
         expect(result).toBeDefined();
         expect(Array.isArray(result)).toBe(true);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string | undefined, typeof r.topPostTitle>(r.topPostTitle);
+          assertType<number | undefined, typeof r.topPostViews>(r.topPostViews);
+        });
       });
     });
 
@@ -541,6 +618,12 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<number | undefined, typeof r.postCount>(r.postCount);
+          assertType<number | null | undefined, typeof r.maxViews>(r.maxViews);
+        });
         expect(typeof result[0].postCount).toBe('number');
       });
     });
@@ -634,6 +717,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<number | undefined, typeof r.originalAge>(r.originalAge);
+          assertType<number | undefined, typeof r.transformedAge>(r.transformedAge);
+          assertType<string | undefined, typeof r.transformedUsername>(r.transformedUsername);
+        });
         expect(result[0].originalAge).toBe(25);
         // Age should be multiplied by 100
         expect(result[0].transformedAge).toBe(2500);
@@ -680,6 +770,11 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<UserSummary | undefined, typeof r.summary>(r.summary);
+        });
         expect(result[0].summary).toHaveProperty('username', 'bob');
         expect(result[0].summary).toHaveProperty('emailDomain', 'test.com');
       });
@@ -719,11 +814,18 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.originalViews>(r.originalViews);
+          assertType<number | undefined, typeof r.boostedViews>(r.boostedViews);
+          assertType<string | undefined, typeof r.lowerTitle>(r.lowerTitle);
+        });
         expect(result[0].username).toBe('alice');
         // Original views should be 100 or 150
         expect([100, 150]).toContain(result[0].originalViews);
         // Boosted views should be original + 5000
-        expect(result[0].boostedViews).toBe(result[0].originalViews + 5000);
+        expect(result[0].boostedViews).toBe(result[0].originalViews! + 5000);
         // Title should be lowercase
         expect(result[0].lowerTitle).toMatch(/^alice post \d$/);
       });
@@ -765,6 +867,11 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<unknown[], typeof r.posts>(r.posts);
+        });
         expect(result[0].username).toBe('alice');
         const posts = result[0].posts as any;
         expect(Array.isArray(posts)).toBe(true);
@@ -823,6 +930,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string | undefined, typeof r.reversed>(r.reversed);
+          assertType<number | undefined, typeof r.tripled>(r.tripled);
+          assertType<boolean | undefined, typeof r.negated>(r.negated);
+          assertType<string | undefined, typeof r.emailUpper>(r.emailUpper);
+        });
         // Username 'alice' reversed is 'ecila'
         expect(result[0].reversed).toBe('ecila');
         // Age 25 tripled is 75
@@ -869,6 +983,11 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<number | undefined, typeof r.transformedAge>(r.transformedAge);
+        });
         // NULL age becomes 0, then multiplied by 10 = 0
         expect(result[0].transformedAge).toBe(0);
       });
@@ -924,6 +1043,13 @@ describe('CTE (Common Table Expression) Support', () => {
           .toList();
 
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.doubledAge>(r.doubledAge);
+          assertType<string | undefined, typeof r.capsUsername>(r.capsUsername);
+        });
         expect(result[0].username).toBe('bob');
         // Bob's age is 35, doubled is 70
         expect(result[0].doubledAge).toBe(70);

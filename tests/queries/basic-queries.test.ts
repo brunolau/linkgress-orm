@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, lt, gte, lte, like, and, or, not } from '../../src';
+import { assertType } from '../utils/type-tester';
 
 describe('Basic Query Operations', () => {
   describe('SELECT queries', () => {
@@ -11,6 +12,14 @@ describe('Basic Query Operations', () => {
         const users = await db.users.toList();
 
         expect(users).toHaveLength(3);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.username>(u.username);
+          assertType<string, typeof u.email>(u.email);
+          assertType<number | undefined, typeof u.age>(u.age);
+          assertType<boolean, typeof u.isActive>(u.isActive);
+        });
         expect(users[0]).toHaveProperty('username');
         expect(users[0]).toHaveProperty('email');
       });
@@ -28,6 +37,11 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(3);
+        users.forEach(u => {
+          // Type assertions
+          assertType<string, typeof u.name>(u.name);
+          assertType<string, typeof u.userEmail>(u.userEmail);
+        });
         expect(users[0]).toHaveProperty('name');
         expect(users[0]).toHaveProperty('userEmail');
         expect(users[0]).not.toHaveProperty('username');
@@ -47,6 +61,11 @@ describe('Basic Query Operations', () => {
           .selectDistinct(p => ({ title: p.title }))
           .toList();
 
+        titles.forEach(t => {
+          // Type assertions
+          assertType<string | undefined, typeof t.title>(t.title);
+        });
+
         const duplicates = titles.filter(t => t.title === 'Duplicate');
         expect(duplicates).toHaveLength(1);
       });
@@ -63,6 +82,12 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(1);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.username>(u.username);
+          assertType<string, typeof u.email>(u.email);
+        });
         expect(users[0].username).toBe('alice');
       });
     });
@@ -77,6 +102,10 @@ describe('Basic Query Operations', () => {
 
         expect(users.length).toBeGreaterThanOrEqual(2);
         users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.username>(u.username);
+          assertType<number | undefined, typeof u.age>(u.age);
           expect(u.age).toBeGreaterThan(30);
         });
       });
@@ -95,6 +124,10 @@ describe('Basic Query Operations', () => {
 
         expect(users.length).toBeGreaterThan(0);
         users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<number | undefined, typeof u.age>(u.age);
+          assertType<boolean, typeof u.isActive>(u.isActive);
           expect(u.age).toBeGreaterThan(20);
           expect(u.isActive).toBe(true);
         });
@@ -113,6 +146,11 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(2);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.username>(u.username);
+        });
       });
     });
 
@@ -126,6 +164,9 @@ describe('Basic Query Operations', () => {
 
         expect(users.length).toBeGreaterThan(0);
         users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<boolean, typeof u.isActive>(u.isActive);
           expect(u.isActive).toBe(false);
         });
       });
@@ -141,6 +182,9 @@ describe('Basic Query Operations', () => {
 
         expect(users.length).toBeGreaterThan(0);
         users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.email>(u.email);
           expect(u.email).toContain('test.com');
         });
       });
@@ -159,6 +203,11 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(3);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<number | undefined, typeof u.age>(u.age);
+        });
         expect(users[0].age).toBeLessThanOrEqual(users[1].age!);
         expect(users[1].age).toBeLessThanOrEqual(users[2].age!);
       });
@@ -173,6 +222,11 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(3);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<number | undefined, typeof u.age>(u.age);
+        });
         expect(users[0].age).toBeGreaterThanOrEqual(users[1].age!);
         expect(users[1].age).toBeGreaterThanOrEqual(users[2].age!);
       });
@@ -187,6 +241,11 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(users).toHaveLength(2);
+        users.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+          assertType<string, typeof u.username>(u.username);
+        });
       });
     });
 
@@ -201,6 +260,14 @@ describe('Basic Query Operations', () => {
           .toList();
 
         expect(offsetUsers).toHaveLength(2);
+        allUsers.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+        });
+        offsetUsers.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+        });
         expect(offsetUsers[0].id).toBe(allUsers[1].id);
       });
     });
@@ -223,6 +290,14 @@ describe('Basic Query Operations', () => {
 
         expect(page1).toHaveLength(2);
         expect(page2).toHaveLength(1);
+        page1.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+        });
+        page2.forEach(u => {
+          // Type assertions
+          assertType<number, typeof u.id>(u.id);
+        });
         expect(page1[0].id).not.toBe(page2[0].id);
       });
     });
@@ -238,6 +313,10 @@ describe('Basic Query Operations', () => {
           .first();
 
         expect(user).toBeDefined();
+        // Type assertions
+        assertType<number, typeof user.id>(user.id);
+        assertType<string, typeof user.username>(user.username);
+        assertType<string, typeof user.email>(user.email);
         expect(user.username).toBe('alice');
       });
     });
@@ -251,6 +330,11 @@ describe('Basic Query Operations', () => {
           .firstOrDefault();
 
         expect(user).not.toBeNull();
+        if (user) {
+          // Type assertions
+          assertType<number, typeof user.id>(user.id);
+          assertType<string, typeof user.username>(user.username);
+        }
         expect(user?.username).toBe('alice');
       });
     });

@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { createTestDatabase, setupDatabase, cleanupDatabase, seedTestData } from '../utils/test-database';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { sql, eq, gt, and, DbCteBuilder } from '../../src';
+import { assertType } from '../utils/type-tester';
 
 describe('CTE JOIN Operations', () => {
   let db: AppDatabase;
@@ -64,6 +65,14 @@ describe('CTE JOIN Operations', () => {
         .toList();
 
       expect(result.length).toBeGreaterThan(0);
+      result.forEach(r => {
+        // Type assertions
+        assertType<string, typeof r.username>(r.username);
+        assertType<string, typeof r.email>(r.email);
+        assertType<string | undefined, typeof r.formattedInfo>(r.formattedInfo);
+        assertType<string | undefined, typeof r.viewCategory>(r.viewCategory);
+        assertType<number | undefined, typeof r.originalViews>(r.originalViews);
+      });
 
       // Verify the custom formatter was applied
       const alicePost2 = result.find(r => r.username === 'alice' && r.originalViews === 150);
@@ -135,6 +144,16 @@ describe('CTE JOIN Operations', () => {
         .toList();
 
       expect(result.length).toBeGreaterThan(0);
+      result.forEach(r => {
+        // Type assertions
+        assertType<string, typeof r.username>(r.username);
+        assertType<number | undefined, typeof r.age>(r.age);
+        assertType<string | undefined, typeof r.postTitle>(r.postTitle);
+        assertType<number | undefined, typeof r.score>(r.score);
+        assertType<string | undefined, typeof r.performance>(r.performance);
+        assertType<string | undefined, typeof r.meta>(r.meta);
+        assertType<number, typeof r.userScore>(r.userScore);
+      });
 
       // Verify transformations
       const bobPost = result.find(r => r.username === 'bob');
@@ -184,6 +203,14 @@ describe('CTE JOIN Operations', () => {
         .toList();
 
       expect(result.length).toBeGreaterThan(0);
+      result.forEach(r => {
+        // Type assertions
+        assertType<string, typeof r.username>(r.username);
+        assertType<string | undefined, typeof r.postTitle>(r.postTitle);
+        assertType<string | undefined, typeof r.category>(r.category);
+        assertType<number | undefined, typeof r.totalViews>(r.totalViews);
+        assertType<number | undefined, typeof r.postCount>(r.postCount);
+      });
 
       // Filter out NULL results from LEFT JOIN
       const validResults = result.filter(row => row.category != null);
@@ -236,6 +263,13 @@ describe('CTE JOIN Operations', () => {
         .toList();
 
       expect(joinedData.length).toBeGreaterThan(0);
+      joinedData.forEach(row => {
+        // Type assertions
+        assertType<string, typeof row.username>(row.username);
+        assertType<string | undefined, typeof row.category>(row.category);
+        assertType<number | undefined, typeof row.views>(row.views);
+        assertType<number | undefined, typeof row.score>(row.score);
+      });
 
       // Filter out NULL results from LEFT JOIN
       const validData = joinedData.filter(row => row.category != null);
@@ -322,6 +356,17 @@ describe('CTE JOIN Operations', () => {
         .toList();
 
       expect(joinedData.length).toBeGreaterThan(0);
+      joinedData.forEach(row => {
+        // Type assertions
+        assertType<number, typeof row.userId>(row.userId);
+        assertType<string, typeof row.username>(row.username);
+        assertType<number | undefined, typeof row.age>(row.age);
+        assertType<string | undefined, typeof row.tier>(row.tier);
+        assertType<number | undefined, typeof row.score>(row.score);
+        assertType<number | undefined, typeof row.views>(row.views);
+        assertType<string | undefined, typeof row.title>(row.title);
+        assertType<string | undefined, typeof row.summary>(row.summary);
+      });
 
       // Filter out NULL results from LEFT JOIN
       const validData = joinedData.filter(row => row.tier != null);

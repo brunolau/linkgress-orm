@@ -4,6 +4,7 @@ import { eq, gt, sql, DbCteBuilder, exists, and, gte, lte, EntityQuery } from '.
 import { Post } from '../../debug/model/post';
 import { Order } from '../../debug/model/order';
 import { User } from '../../debug/model/user';
+import { assertType } from '../utils/type-tester';
 
 describe('Subquery Operations', () => {
   describe('Scalar subqueries', () => {
@@ -25,6 +26,10 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.age>(r.age);
+          assertType<number, typeof r.avgAge>(r.avgAge);
           expect(r).toHaveProperty('avgAge');
           expect(typeof r.avgAge).toBe('number');
         });
@@ -54,7 +59,11 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        // All posts should be from active users
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.userId>(r.userId);
+        });
       });
     });
   });
@@ -88,6 +97,10 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string, typeof r.postTitle>(r.postTitle);
+          assertType<number, typeof r.views>(r.views);
           expect(r.views).toBeGreaterThan(100);
         });
       });
@@ -123,6 +136,10 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string, typeof r.topPostTitle>(r.topPostTitle);
+          assertType<number, typeof r.topPostViews>(r.topPostViews);
           expect(r).toHaveProperty('username');
           expect(r).toHaveProperty('topPostTitle');
           expect(r.topPostViews).toBeGreaterThan(50);
@@ -184,6 +201,9 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number, typeof r.totalViews>(r.totalViews);
           expect(typeof r.totalViews).toBe('number');
         });
       });
@@ -204,6 +224,10 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+        });
         // Should only include Alice and Bob (who have posts)
         expect(result.length).toBeLessThanOrEqual(2);
       });
@@ -222,6 +246,10 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+        });
         // Should include Charlie (who has no posts)
         const charlie = result.find(r => r.username === 'charlie');
         expect(charlie).toBeDefined();
@@ -247,6 +275,11 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.views>(r.views);
+        });
         // Should return the post with max views (200)
         expect(result[0].views).toBe(200);
       });
@@ -283,6 +316,12 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<number | undefined, typeof r.originalAge>(r.originalAge);
+            assertType<number, typeof r.multipliedAge>(r.multipliedAge);
+          });
           expect(result[0].originalAge).toBe(25);
           // If mapWith works, this should be 250 (25 * 10)
           expect(result[0].multipliedAge).toBe(250);
@@ -303,6 +342,11 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.originalUsername>(r.originalUsername);
+            assertType<string, typeof r.uppercaseUsername>(r.uppercaseUsername);
+          });
           expect(result[0].originalUsername).toBe('alice');
           // If mapWith works, this should be 'ALICE'
           expect(result[0].uppercaseUsername).toBe('ALICE');
@@ -323,6 +367,11 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<string, typeof r.prefixedInfo>(r.prefixedInfo);
+          });
           expect(result[0].username).toBe('bob');
           // If mapWith works, should have 'User: ' prefix
           expect(result[0].prefixedInfo).toMatch(/^User: bob - bob@test\.com$/);
@@ -351,6 +400,11 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<UserInfo, typeof r.userInfo>(r.userInfo);
+          });
           expect(result[0].username).toBe('charlie');
           // If mapWith works, should be transformed to object
           expect(result[0].userInfo).toHaveProperty('name', 'charlie');
@@ -377,6 +431,11 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<number, typeof r.roundedAvgViews>(r.roundedAvgViews);
+          });
           // Average of 100, 150, 200 is 150
           // If mapWith works, should be rounded (already whole number, but proves mapper is called)
           expect(result[0].roundedAvgViews).toBe(150);
@@ -412,6 +471,12 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBeGreaterThan(0);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<number, typeof r.originalViews>(r.originalViews);
+            assertType<number, typeof r.transformedViews>(r.transformedViews);
+          });
           // Alice's first post has 100 views
           expect(result[0].originalViews).toBe(100);
           // If mapWith works, doubled views should be 200
@@ -451,6 +516,12 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          result.forEach(r => {
+            // Type assertions
+            assertType<number, typeof r.id>(r.id);
+            assertType<string, typeof r.original>(r.original);
+            assertType<string, typeof r.transformed>(r.transformed);
+          });
           expect(result[0].original).toBe('bob');
           // If mapWith works, should have ' [CTE]' suffix
           expect(result[0].transformed).toBe('bob@bob@test.com [CTE]');
@@ -478,6 +549,12 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBeGreaterThan(0);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<string, typeof r.title>(r.title);
+            assertType<string, typeof r.bracketedCombined>(r.bracketedCombined);
+          });
           expect(result[0].username).toBe('alice');
           // If mapWith works, should be wrapped in brackets
           expect(result[0].bracketedCombined).toMatch(/^\[alice - Alice Post \d\]$/);
@@ -513,6 +590,12 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBeGreaterThan(0);
+          result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.username>(r.username);
+            assertType<number, typeof r.original>(r.original);
+            assertType<number, typeof r.transformed>(r.transformed);
+          });
           expect(result[0].username).toBe('bob');
           // Bob's post has 200 views
           expect(result[0].original).toBe(200);
@@ -544,6 +627,9 @@ describe('Subquery Operations', () => {
           expect(result.length).toBeGreaterThan(0);
           // Posts with views > 150 (the average)
           result.forEach(r => {
+            // Type assertions
+            assertType<string, typeof r.title>(r.title);
+            assertType<number, typeof r.views>(r.views);
             expect(r.views).toBeGreaterThan(150);
           });
         });
@@ -566,11 +652,16 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          const r = result[0];
+          // Type assertions
+          assertType<string, typeof r.reversedUsername>(r.reversedUsername);
+          assertType<number, typeof r.tripledAge>(r.tripledAge);
+          assertType<string, typeof r.email>(r.email);
           // If mapWith works, username should be reversed
-          expect(result[0].reversedUsername).toBe('ecila'); // 'alice' reversed
+          expect(r.reversedUsername).toBe('ecila'); // 'alice' reversed
           // If mapWith works, age should be tripled
-          expect(result[0].tripledAge).toBe(75); // 25 * 3
-          expect(result[0].email).toBe('alice@test.com');
+          expect(r.tripledAge).toBe(75); // 25 * 3
+          expect(r.email).toBe('alice@test.com');
         });
       });
     });
@@ -595,9 +686,13 @@ describe('Subquery Operations', () => {
             .toList();
 
           expect(result.length).toBe(1);
+          const r = result[0];
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number, typeof r.roundedAvgViews>(r.roundedAvgViews);
           // Average is 150, floor to nearest 10 is still 150
           // If mapWith works, should be 150
-          expect(result[0].roundedAvgViews).toBe(150);
+          expect(r.roundedAvgViews).toBe(150);
         });
       });
     });
@@ -620,6 +715,9 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBe(2); // Alice has 2 posts
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.userId>(r.userId);
           expect(r.title).toMatch(/Alice Post/);
         });
       });
@@ -640,6 +738,11 @@ describe('Subquery Operations', () => {
 
         // Alice and Bob are active, so 3 posts total
         expect(result.length).toBe(3);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.userId>(r.userId);
+        });
       });
     });
 
@@ -658,6 +761,11 @@ describe('Subquery Operations', () => {
 
         // Only Bob (age 35) has a post with views > 100 (200 views)
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.views>(r.views);
+        });
         expect(result[0].title).toBe('Bob Post');
         expect(result[0].views).toBe(200);
       });
@@ -679,6 +787,10 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBe(3); // Alice (2) + Bob (1)
         result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<string, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.userAge>(r.userAge);
           expect(r).toHaveProperty('username');
           expect(r).toHaveProperty('userAge');
         });
@@ -715,6 +827,11 @@ describe('Subquery Operations', () => {
         // Only Bob (age 35) has both posts AND orders, and age >= 30
         // Alice (age 25) has orders but age < 30
         expect(result.length).toBe(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.userId>(r.userId);
+        });
         expect(result[0].title).toBe('Bob Post');
       });
     });
@@ -744,6 +861,11 @@ describe('Subquery Operations', () => {
         // Alice (age 25, active) and Bob (age 35, active) both have orders
         // Both are between 20-40 and active
         expect(result.length).toBe(3); // Alice's 2 posts + Bob's 1 post
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.userId>(r.userId);
+        });
       });
     });
 
@@ -843,6 +965,12 @@ describe('Subquery Operations', () => {
         // - Bob (age 35) has posts and orders, so should be included with stats
         // - Charlie (age 45) is not active, so filtered out
         expect(result.length).toBe(2);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<number | undefined, typeof r.age>(r.age);
+          assertType<unknown[], typeof r.postStats>(r.postStats);
+        });
 
         const aliceResult = result.find((r) => r.username === 'alice');
         const bobResult = result.find((r) => r.username === 'bob');
@@ -886,7 +1014,11 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.titleUpper>(r.titleUpper);
+          assertType<number | undefined, typeof r.age>(r.age);
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('titleUpper');
           expect(r).toHaveProperty('age');
@@ -960,6 +1092,10 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<number, typeof r.titleLength>(r.titleLength);
+          assertType<unknown[], typeof r.categoryInfo>(r.categoryInfo);
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('titleLength');
           expect(r).toHaveProperty('categoryInfo');
@@ -1065,6 +1201,11 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<unknown[], typeof r.stats>(r.stats);
+          assertType<unknown[], typeof r.orderInfo>(r.orderInfo);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('username');
         });
@@ -1176,6 +1317,12 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.userName>(r.userName);
+          assertType<string, typeof r.ageCategory>(r.ageCategory);
+          assertType<unknown[], typeof r.postInfo>(r.postInfo);
+          assertType<unknown[], typeof r.orderInfo>(r.orderInfo);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('userName');
           expect(r).toHaveProperty('ageCategory');
@@ -1273,6 +1420,12 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.postId>(r.postId);
+          assertType<string, typeof r.title>(r.title);
+          assertType<number, typeof r.views>(r.views);
+          assertType<number | undefined, typeof r.authorAge>(r.authorAge);
+          assertType<unknown[], typeof r.userInfo>(r.userInfo);
           expect(r).toHaveProperty('postId');
           expect(r).toHaveProperty('title');
           expect(r).toHaveProperty('views');
@@ -1382,7 +1535,14 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.postId>(r.postId);
+          assertType<string, typeof r.title>(r.title);
+          assertType<string | null, typeof r.category>(r.category);
+          assertType<string | undefined, typeof r.email>(r.email);
+          assertType<unknown[], typeof r.stats>(r.stats);
+          assertType<unknown[], typeof r.userInfo>(r.userInfo);
           expect(r).toHaveProperty('postId');
           expect(r).toHaveProperty('title');
           expect(r).toHaveProperty('category');
@@ -1440,6 +1600,13 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.orderId>(r.orderId);
+          assertType<string, typeof r.displayAmount>(r.displayAmount);
+          assertType<string, typeof r.customerName>(r.customerName);
+          assertType<number | undefined, typeof r.customerAge>(r.customerAge);
+          assertType<string, typeof r.sizeCategory>(r.sizeCategory);
+          assertType<string, typeof r.computedField>(r.computedField);
           expect(r).toHaveProperty('orderId');
           expect(r).toHaveProperty('displayAmount');
           expect(r).toHaveProperty('customerName');
@@ -1581,6 +1748,15 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.id>(r.id);
+          assertType<string, typeof r.name>(r.name);
+          assertType<string, typeof r.nameUppercase>(r.nameUppercase);
+          assertType<number | undefined, typeof r.age>(r.age);
+          assertType<string, typeof r.contactEmail>(r.contactEmail);
+          assertType<string, typeof r.fullInfo>(r.fullInfo);
+          assertType<unknown[], typeof r.postStatistics>(r.postStatistics);
+          assertType<unknown[], typeof r.orderStatistics>(r.orderStatistics);
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('name');
           expect(r).toHaveProperty('nameUppercase');
@@ -1784,6 +1960,16 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.name>(r.name);
+          assertType<number | undefined, typeof r.age>(r.age);
+          assertType<boolean, typeof r.active>(r.active);
+          assertType<number, typeof r.nameLen>(r.nameLen);
+          assertType<string, typeof r.summary>(r.summary);
+          assertType<unknown[], typeof r.baseStats>(r.baseStats);
+          assertType<unknown[], typeof r.postStats>(r.postStats);
+          assertType<unknown[], typeof r.orderStats>(r.orderStats);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('name');
           expect(r).toHaveProperty('age');
@@ -1872,6 +2058,17 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.finalId>(r.finalId);
+          assertType<string, typeof r.finalTitle>(r.finalTitle);
+          assertType<string, typeof r.finalAuthor>(r.finalAuthor);
+          assertType<number | undefined, typeof r.finalAge>(r.finalAge);
+          assertType<string, typeof r.finalEmail>(r.finalEmail);
+          assertType<number, typeof r.finalViews>(r.finalViews);
+          assertType<string | null, typeof r.finalCategory>(r.finalCategory);
+          assertType<string, typeof r.finalSummary>(r.finalSummary);
+          assertType<string, typeof r.finalViewCategory>(r.finalViewCategory);
+          assertType<number, typeof r.finalTitleLen>(r.finalTitleLen);
           expect(r).toHaveProperty('finalId');
           expect(r).toHaveProperty('finalTitle');
           expect(r).toHaveProperty('finalAuthor');
@@ -2040,6 +2237,18 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.finalUserId>(r.finalUserId);
+          assertType<string, typeof r.finalUserName>(r.finalUserName);
+          assertType<string, typeof r.finalDisplayName>(r.finalDisplayName);
+          assertType<number | undefined, typeof r.finalAge>(r.finalAge);
+          assertType<string, typeof r.finalEmail>(r.finalEmail);
+          assertType<string | null, typeof r.finalPostCategory>(r.finalPostCategory);
+          assertType<number, typeof r.finalPostCount>(r.finalPostCount);
+          assertType<number, typeof r.finalTotalViews>(r.finalTotalViews);
+          assertType<number, typeof r.finalAvgPostViews>(r.finalAvgPostViews);
+          assertType<unknown[], typeof r.finalOrderStats>(r.finalOrderStats);
+          assertType<string, typeof r.summary>(r.summary);
           // Type inference tests - these will fail at compile time if types are wrong
           expect(r.finalUserId != 999999).toBe(true); // number type check
           expect(r.summary != 'impossible_string_match_xyz').toBe(true); // string (from sql<string>) type check
@@ -2212,7 +2421,13 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
-          expect(r.nameLen != 345345345).toBe(true);
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.userName>(r.userName);
+          assertType<number | undefined, typeof r.userAge>(r.userAge);
+          assertType<string, typeof r.userEmail>(r.userEmail);
+          assertType<number, typeof r.nameLen>(r.nameLen);
+          assertType<string, typeof r.masterSummary>(r.masterSummary);
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('userName');
           expect(r).toHaveProperty('userAge');
@@ -2376,6 +2591,19 @@ describe('Subquery Operations', () => {
 
         expect(result.length).toBeGreaterThan(0);
         result.forEach((r) => {
+          // Type assertions
+          assertType<number, typeof r.finalUserId>(r.finalUserId);
+          assertType<string, typeof r.finalUserName>(r.finalUserName);
+          assertType<string, typeof r.finalUserEmail>(r.finalUserEmail);
+          assertType<number | undefined, typeof r.finalUserAge>(r.finalUserAge);
+          assertType<number | undefined, typeof r.finalPostId>(r.finalPostId);
+          assertType<string | undefined, typeof r.finalPostTitle>(r.finalPostTitle);
+          assertType<number | undefined, typeof r.finalPostViews>(r.finalPostViews);
+          assertType<string | null | undefined, typeof r.finalPostCategory>(r.finalPostCategory);
+          assertType<string | undefined, typeof r.finalOrderStatus>(r.finalOrderStatus);
+          assertType<number | undefined, typeof r.finalOrderSpent>(r.finalOrderSpent);
+          assertType<string | undefined, typeof r.finalUserSummary>(r.finalUserSummary);
+          assertType<string, typeof r.megaSummary>(r.megaSummary);
           // Type inference tests - these will fail at compile time if types are wrong
           expect(r.finalUserId != 999999).toBe(true); // number type check
           expect(r.finalUserAge != 999999).toBe(true); // number (from navigation through 3 levels) type check

@@ -3,6 +3,7 @@ import { AppDatabase } from '../../debug/schema/appDatabase';
 import { withDatabase } from '../utils/test-database';
 import { eq, DbCteBuilder } from '../../src';
 import { HourMinute } from '../../debug/types/hour-minute';
+import { assertType } from '../utils/type-tester';
 
 /**
  * These tests validate that the CTE builder type system properly preserves
@@ -72,6 +73,14 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string, typeof r.username>(r.username);
+          assertType<string | undefined, typeof r.postTitle>(r.postTitle);
+          assertType<HourMinute | undefined, typeof r.publishTime>(r.publishTime);
+          assertType<Date | undefined, typeof r.customDate>(r.customDate);
+          assertType<number | undefined, typeof r.views>(r.views);
+        });
         expect(result[0].username).toBe('type_test_user');
         expect(result[0].postTitle).toBe('Post with Custom Types');
         expect(result[0].views).toBe(100);
@@ -125,6 +134,11 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<string | undefined, typeof r.title>(r.title);
+          assertType<Date | undefined, typeof r.customDate>(r.customDate);
+        });
         expect(result[0].title).toBe('Post without Custom Date');
         // NULL values should be preserved
         expect(result[0].customDate == null).toBe(true);
@@ -189,6 +203,12 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<{ postId: number; title: string | undefined; views: number; publishTime: HourMinute | undefined; customDate: Date | undefined }[] | undefined, typeof r.posts>(r.posts);
+        });
         expect(result[0].username).toBe('agg_type_user');
         expect(result[0].posts).toBeDefined();
         expect(Array.isArray(result[0].posts)).toBe(true);
@@ -256,6 +276,11 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           .toList();
 
         expect(result).toHaveLength(1);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<{ postId: number; title: string | undefined; publishTime: HourMinute | undefined; customDate: Date | undefined; views: number }[] | undefined, typeof r.items>(r.items);
+        });
         expect(result[0].userId).toBe(user.id);
         expect(result[0].items).toBeDefined();
 
@@ -336,6 +361,12 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<Date | undefined, typeof r.customDate>(r.customDate);
+          assertType<{ postId: number; title: string | undefined; views: number; publishTime: HourMinute | undefined }[] | undefined, typeof r.posts>(r.posts);
+        });
 
         result.forEach((group: any) => {
           expect(group.userId).toBeDefined();

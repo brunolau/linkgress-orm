@@ -1,5 +1,6 @@
 import { withDatabase, createTestDatabase, setupDatabase, seedTestData, cleanupDatabase } from '../utils/test-database';
 import { gt, eq } from '../../src/query/conditions';
+import { assertType } from '../utils/type-tester';
 
 describe('withQueryOptions Method', () => {
   describe('Query logging control', () => {
@@ -158,6 +159,12 @@ describe('withQueryOptions Method', () => {
           .toList();
 
         expect(results.length).toBe(3);
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<{ title: string | undefined }[], typeof r.posts>(r.posts);
+        });
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.posts.length).toBe(2);
       });
@@ -180,6 +187,12 @@ describe('withQueryOptions Method', () => {
           .toList();
 
         expect(results.length).toBe(3);
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<{ title: string | undefined; views: number }[], typeof r.highViewPosts>(r.highViewPosts);
+        });
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.highViewPosts.length).toBe(1); // Only "Alice Post 2" with 150 views
       });
@@ -200,6 +213,13 @@ describe('withQueryOptions Method', () => {
               .toList('posts'),
           }))
           .toList();
+
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<{ title: string | undefined; views: number }[], typeof r.posts>(r.posts);
+        });
 
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.posts[0].views).toBe(150); // Alice Post 2
@@ -245,6 +265,15 @@ describe('withQueryOptions Method', () => {
           }))
           .toList();
 
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<number, typeof r.postCount>(r.postCount);
+          assertType<number | null, typeof r.maxViews>(r.maxViews);
+          assertType<number | null, typeof r.totalViews>(r.totalViews);
+        });
+
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.postCount).toBe(2);
         expect(alice?.maxViews).toBe(150);
@@ -268,6 +297,14 @@ describe('withQueryOptions Method', () => {
             })).toList('orders'),
           }))
           .toList();
+
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<{ title: string | undefined }[], typeof r.posts>(r.posts);
+          assertType<{ status: string; totalAmount: number }[], typeof r.orders>(r.orders);
+        });
 
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.posts.length).toBe(2);
@@ -326,6 +363,13 @@ describe('withQueryOptions Method', () => {
           }))
           .toList();
 
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<string[], typeof r.postTitles>(r.postTitles);
+        });
+
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.postTitles.length).toBe(2);
         expect(alice?.postTitles).toContain('Alice Post 1');
@@ -345,6 +389,13 @@ describe('withQueryOptions Method', () => {
             viewCounts: u.posts!.select(p => p.views!).toNumberList('viewCounts'),
           }))
           .toList();
+
+        results.forEach(r => {
+          // Type assertions
+          assertType<number, typeof r.userId>(r.userId);
+          assertType<string, typeof r.username>(r.username);
+          assertType<number[], typeof r.viewCounts>(r.viewCounts);
+        });
 
         const alice = results.find(u => u.username === 'alice');
         expect(alice?.viewCounts.length).toBe(2);
