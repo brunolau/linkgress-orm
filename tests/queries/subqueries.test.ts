@@ -1,6 +1,9 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt, sql, DbCteBuilder, exists, and, gte, lte } from '../../src';
+import { eq, gt, sql, DbCteBuilder, exists, and, gte, lte, EntityQuery } from '../../src';
+import { Post } from '../../debug/model/post';
+import { Order } from '../../debug/model/order';
+import { User } from '../../debug/model/user';
 
 describe('Subquery Operations', () => {
   describe('Scalar subqueries', () => {
@@ -756,7 +759,7 @@ describe('Subquery Operations', () => {
 
         // Step 1: Create a dynamic filter with EXISTS subquery that accesses navigation property
         // This filter checks if a post's user has any orders
-        const hasOrdersFilter = (post: any) => exists(
+        const hasOrdersFilter = (post: EntityQuery<Post>) => exists(
           db.orders
             .where(o => and(
               eq(o.userId, post.userId),
@@ -821,13 +824,13 @@ describe('Subquery Operations', () => {
 
         // Step 4: Final query using the CTEs
         const result = await db.users
-          .where((u: any) => eq(u.isActive, true))
+          .where((u) => eq(u.isActive, true))
           .with(orderStatsCte)
           .with(postStatsCte)
           .leftJoin(
             postStatsCte,
-            (user: any, stats: any) => eq(user.id, stats.userId),
-            (user: any, stats: any) => ({
+            (user, stats) => eq(user.id, stats.userId),
+            (user, stats) => ({
               username: user.username,
               age: user.age,
               postStats: stats.postStats,
@@ -841,8 +844,8 @@ describe('Subquery Operations', () => {
         // - Charlie (age 45) is not active, so filtered out
         expect(result.length).toBe(2);
 
-        const aliceResult = result.find((r: any) => r.username === 'alice');
-        const bobResult = result.find((r: any) => r.username === 'bob');
+        const aliceResult = result.find((r) => r.username === 'alice');
+        const bobResult = result.find((r) => r.username === 'bob');
 
         expect(aliceResult).toBeDefined();
         expect(bobResult).toBeDefined();
@@ -969,7 +972,7 @@ describe('Subquery Operations', () => {
         await seedTestData(db);
 
         // Create filter using navigation: find orders where user has posts
-        const userHasPostsFilter = (order: any) => exists(
+        const userHasPostsFilter = (order: EntityQuery<Order>) => exists(
           db.posts
             .where(p => and(
               eq(p.userId, order.userId),
@@ -1186,7 +1189,7 @@ describe('Subquery Operations', () => {
         await seedTestData(db);
 
         // Complex exists filter using navigation in multiple levels
-        const complexFilter = (user: any) => and(
+        const complexFilter = (user: EntityQuery<User>) => and(
           exists(
             db.posts
               .where(p => and(
@@ -1344,8 +1347,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             postsByCategoryCte,
-            (p: any, stats: any) => eq(p.category, stats.category),
-            (p: any, stats: any) => ({
+            (p, stats) => eq(p.category, stats.category),
+            (p, stats) => ({
               postId: p.postId,
               title: p.postTitle,
               category: p.category,
@@ -1354,7 +1357,7 @@ describe('Subquery Operations', () => {
               categoryStats: stats.stats,
             })
           )
-          .select((p: any) => ({
+          .select((p) => ({
             id: p.postId,
             titleUpper: sql<string>`UPPER(${p.title})`,
             cat: p.category,
@@ -1362,11 +1365,11 @@ describe('Subquery Operations', () => {
             email: p.authorEmail,
             stats: p.categoryStats,
           }))
-          .orderBy((p: any) => p.titleUpper)
+          .orderBy((p) => p.titleUpper)
           .leftJoin(
             usersWithOrdersCte,
-            (p: any, u: any) => eq(p.authorId, u.userId),
-            (p: any, u: any) => ({
+            (p, u) => eq(p.authorId, u.userId),
+            (p, u) => ({
               postId: p.id,
               title: p.titleUpper,
               category: p.cat,
@@ -1375,11 +1378,11 @@ describe('Subquery Operations', () => {
               userInfo: u.userInfo,
             })
           )
-          .orderBy((p: any) => p.postId)
+          .orderBy((p) => p.postId)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('postId');
           expect(r).toHaveProperty('title');
           expect(r).toHaveProperty('category');
@@ -1436,7 +1439,7 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('orderId');
           expect(r).toHaveProperty('displayAmount');
           expect(r).toHaveProperty('customerName');
@@ -1455,7 +1458,7 @@ describe('Subquery Operations', () => {
         await seedTestData(db);
 
         // Create complex filter with navigation properties
-        const activeUserWithHighViewsFilter = (post: any) => and(
+        const activeUserWithHighViewsFilter = (post: EntityQuery<Post>) => and(
           eq(post.user!.isActive, true), // Navigation in filter
           gte(post.user!.age, 25), // Another navigation
           gt(post.views, 50)
@@ -1514,17 +1517,17 @@ describe('Subquery Operations', () => {
 
         // Complex final query with multiple selects, joins, and orderings
         const result = await db.users
-          .where((u: any) => eq(u.isActive, true))
+          .where((u) => eq(u.isActive, true))
           .with(postAggCte)
           .with(orderAggCte)
-          .select((u: any) => ({
+          .select((u) => ({
             userId: u.id,
             userName: u.username,
             userAge: u.age,      // Include for later use
             userEmail: u.email,  // Include for later use
           }))
-          .orderBy((u: any) => u.userName)
-          .select((u: any) => ({
+          .orderBy((u) => u.userName)
+          .select((u) => ({
             id: u.userId,
             name: u.userName,
             age: u.userAge,
@@ -1532,8 +1535,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             postAggCte,
-            (u: any, posts: any) => eq(u.id, posts.userId),
-            (u: any, posts: any) => ({
+            (u, posts) => eq(u.id, posts.userId),
+            (u, posts) => ({
               userId: u.id,
               userName: u.name,
               userAge: u.age,
@@ -1541,7 +1544,7 @@ describe('Subquery Operations', () => {
               postAggregations: posts.aggregations,
             })
           )
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.userId,
             name: u.userName,
             age: u.userAge,
@@ -1549,11 +1552,11 @@ describe('Subquery Operations', () => {
             postData: u.postAggregations,
             nameUpper: sql<string>`UPPER(${u.userName})`,
           }))
-          .orderBy((u: any) => u.age)
+          .orderBy((u) => u.age)
           .leftJoin(
             orderAggCte,
-            (u: any, orders: any) => eq(u.id, orders.userId),
-            (u: any, orders: any) => ({
+            (u, orders) => eq(u.id, orders.userId),
+            (u, orders) => ({
               userId: u.id,
               displayName: u.name,
               nameUpper: u.nameUpper,
@@ -1563,7 +1566,7 @@ describe('Subquery Operations', () => {
               orders: orders.orderStats,
             })
           )
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.userId,
             name: u.displayName,
             nameUppercase: u.nameUpper,
@@ -1573,11 +1576,11 @@ describe('Subquery Operations', () => {
             orderStatistics: u.orders,
             fullInfo: sql<string>`${u.displayName} || ' <' || ${u.email} || '>'`,
           }))
-          .orderBy((u: any) => u.nameUppercase)
+          .orderBy((u) => u.nameUppercase)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('id');
           expect(r).toHaveProperty('name');
           expect(r).toHaveProperty('nameUppercase');
@@ -1596,7 +1599,7 @@ describe('Subquery Operations', () => {
         await seedTestData(db);
 
         // Multi-level exists filters with navigation
-        const hasActivePostsFilter = (user: any) => exists(
+        const hasActivePostsFilter = (user: EntityQuery<User>) => exists(
           db.posts
             .where(p => and(
               eq(p.userId, user.id),
@@ -1607,7 +1610,7 @@ describe('Subquery Operations', () => {
             .asSubquery('table')
         );
 
-        const hasCompletedOrdersFilter = (user: any) => exists(
+        const hasCompletedOrdersFilter = (user) => exists(
           db.orders
             .where(o => and(
               eq(o.userId, user.id),
@@ -1684,7 +1687,7 @@ describe('Subquery Operations', () => {
 
         // Complex final query with 3 CTEs, multiple joins, and transformation layers
         const result = await db.users
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.id,
             username: u.username,
             age: u.age,
@@ -1693,14 +1696,14 @@ describe('Subquery Operations', () => {
           .with(userBaseCte)
           .with(postStatsCte)
           .with(orderStatsCte)
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.id,
             name: u.username,
             age: u.age,
             isActive: u.isActive,
           }))
-          .orderBy((u: any) => u.id)
-          .select((u: any) => ({
+          .orderBy((u) => u.id)
+          .select((u) => ({
             userId: u.id,
             userName: u.name,
             userAge: u.age,
@@ -1708,8 +1711,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             userBaseCte,
-            (u: any, base: any) => eq(u.userId, base.userId),
-            (u: any, base: any) => ({
+            (u, base) => eq(u.userId, base.userId),
+            (u, base) => ({
               userId: u.userId,
               userName: u.userName,
               age: u.userAge,
@@ -1717,18 +1720,18 @@ describe('Subquery Operations', () => {
               baseInfo: base.baseData,
             })
           )
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.userId,
             name: u.userName,
             age: u.age,
             active: u.active,
             base: u.baseInfo,
           }))
-          .orderBy((u: any) => u.age)
+          .orderBy((u) => u.age)
           .leftJoin(
             postStatsCte,
-            (u: any, posts: any) => eq(u.id, posts.userId),
-            (u: any, posts: any) => ({
+            (u, posts) => eq(u.id, posts.userId),
+            (u, posts) => ({
               userId: u.id,
               userName: u.name,
               age: u.age,
@@ -1737,7 +1740,7 @@ describe('Subquery Operations', () => {
               postData: posts.postData,
             })
           )
-          .select((u: any) => ({
+          .select((u) => ({
             id: u.userId,
             name: u.userName,
             age: u.age,
@@ -1746,11 +1749,11 @@ describe('Subquery Operations', () => {
             posts: u.postData,
             nameLength: sql<number>`LENGTH(${u.userName})`,
           }))
-          .orderBy((u: any) => u.nameLength)
+          .orderBy((u) => u.nameLength)
           .leftJoin(
             orderStatsCte,
-            (u: any, orders: any) => eq(u.id, orders.userId),
-            (u: any, orders: any) => ({
+            (u, orders) => eq(u.id, orders.userId),
+            (u, orders) => ({
               userId: u.id,
               displayName: u.name,
               age: u.age,
@@ -1761,7 +1764,7 @@ describe('Subquery Operations', () => {
               nameLength: u.nameLength,
             })
           )
-          .select((u: any) => ({
+          .select((u) => ({
             userId: u.userId,
             name: u.displayName,
             age: u.age,
@@ -1776,11 +1779,11 @@ describe('Subquery Operations', () => {
               ', active: ' || CAST(${u.isActive} AS VARCHAR) || ')'
             `,
           }))
-          .orderBy((u: any) => u.userId)
+          .orderBy((u) => u.userId)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('name');
           expect(r).toHaveProperty('age');
@@ -1868,7 +1871,7 @@ describe('Subquery Operations', () => {
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('finalId');
           expect(r).toHaveProperty('finalTitle');
           expect(r).toHaveProperty('finalAuthor');
@@ -1977,8 +1980,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             complexSubqueryA,
-            (u: any, posts: any) => eq(u.id, posts.userId),
-            (u: any, posts: any) => ({
+            (u, posts) => eq(u.id, posts.userId),
+            (u, posts) => ({
               userId: u.id,
               userName: u.name,
               userAge: u.age,
@@ -1991,7 +1994,7 @@ describe('Subquery Operations', () => {
             }),
             'postData'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             id: r.userId,
             name: r.userName,
             age: r.userAge,
@@ -2002,11 +2005,11 @@ describe('Subquery Operations', () => {
             views: r.totalViews,
             avgPerPost: r.avgViews,
           }))
-          .orderBy((r: any) => r.id)
+          .orderBy((r) => r.id)
           .leftJoin(
             orderStatsCte,
-            (u: any, orders: any) => eq(u.id, orders.userId),
-            (u: any, orders: any) => ({
+            (u, orders) => eq(u.id, orders.userId),
+            (u, orders) => ({
               userId: u.id,
               userName: u.name,
               displayName: u.displayName,
@@ -2019,7 +2022,7 @@ describe('Subquery Operations', () => {
               orderData: orders.orderData,
             })
           )
-          .select((r: any) => ({
+          .select((r) => ({
             finalUserId: r.userId,
             finalUserName: r.userName,
             finalDisplayName: r.displayName,
@@ -2032,11 +2035,11 @@ describe('Subquery Operations', () => {
             finalOrderStats: r.orderData,
             summary: sql<string>`${r.userName} || ' (' || COALESCE(CAST(${r.postCount} AS VARCHAR), '0') || ' posts)'`,
           }))
-          .orderBy((r: any) => r.finalUserName)
+          .orderBy((r) => r.finalUserName)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('finalUserId');
           expect(r).toHaveProperty('finalUserName');
           expect(r).toHaveProperty('finalDisplayName');
@@ -2077,7 +2080,7 @@ describe('Subquery Operations', () => {
             author: p.pAuthorName,
             titleUpper: sql<string>`UPPER(${p.pTitle})`,
           }))
-          .orderBy((p: any) => p.id)
+          .orderBy((p) => p.id)
           .asSubquery('table');
 
         // Build complex subquery B: Orders with navigation and transformations
@@ -2101,7 +2104,7 @@ describe('Subquery Operations', () => {
             userAge: o.oUserAge,
             amountFormatted: sql<string>`'$' || CAST(${o.oAmount} AS VARCHAR)`,
           }))
-          .orderBy((o: any) => o.id)
+          .orderBy((o) => o.id)
           .asSubquery('table');
 
         // Main query: Join both complex subqueries together via users
@@ -2124,8 +2127,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             complexSubqueryA,
-            (u: any, posts: any) => eq(u.id, posts.userId),
-            (u: any, posts: any) => ({
+            (u, posts) => eq(u.id, posts.userId),
+            (u, posts) => ({
               userId: u.id,
               userName: u.name,
               userAge: u.age,
@@ -2140,7 +2143,7 @@ describe('Subquery Operations', () => {
             }),
             'postData'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             id: r.userId,
             name: r.userName,
             age: r.userAge,
@@ -2152,11 +2155,11 @@ describe('Subquery Operations', () => {
             pViews: r.postViews,
             pCategory: r.postCategory,
           }))
-          .orderBy((r: any) => r.id)
+          .orderBy((r) => r.id)
           .leftJoin(
             complexSubqueryB,
-            (u: any, orders: any) => eq(u.id, orders.userId),
-            (u: any, orders: any) => ({
+            (u, orders) => eq(u.id, orders.userId),
+            (u, orders) => ({
               finalUserId: u.id,
               finalUserName: u.name,
               finalUserAge: u.age,
@@ -2169,13 +2172,13 @@ describe('Subquery Operations', () => {
               finalPostCategory: u.pCategory,
               finalOrderId: orders.id,
               finalOrderAmount: orders.amount,
-              finalOrderFormatted: orders.formattedAmount,
+              finalOrderFormatted: orders.amountFormatted,
               finalOrderStatus: orders.status,
               finalOrderUserAge: orders.userAge,
             }),
             'orderData'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             userId: r.finalUserId,
             userName: r.finalUserName,
             userAge: r.finalUserAge,
@@ -2201,11 +2204,11 @@ describe('Subquery Operations', () => {
               ' - Orders: ' || COALESCE(CAST(${r.finalOrderId} AS VARCHAR), 'none')
             `,
           }))
-          .orderBy((r: any) => r.userId)
+          .orderBy((r) => r.userId)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('userId');
           expect(r).toHaveProperty('userName');
           expect(r).toHaveProperty('userAge');
@@ -2252,8 +2255,8 @@ describe('Subquery Operations', () => {
           .where(u => eq(u.active, true))
           .leftJoin(
             innerSubquery,
-            (u: any, orders: any) => eq(u.id, orders.userId),
-            (u: any, orders: any) => ({
+            (u, orders) => eq(u.id, orders.userId),
+            (u, orders) => ({
               userId: u.id,
               userName: u.name,
               userAge: u.age,
@@ -2263,7 +2266,7 @@ describe('Subquery Operations', () => {
             }),
             'innerOrders'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             id: r.userId,
             name: r.userName,
             age: r.userAge,
@@ -2287,8 +2290,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             middleSubquery,
-            (p: any, user: any) => eq(p.authorId, user.id),
-            (p: any, user: any) => ({
+            (p, user) => eq(p.authorId, user.id),
+            (p, user) => ({
               id: p.postId,
               title: p.postTitle,
               views: p.postViews,
@@ -2303,7 +2306,7 @@ describe('Subquery Operations', () => {
             }),
             'middleData'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             postId: r.id,
             postTitle: r.title,
             postViews: r.views,
@@ -2328,8 +2331,8 @@ describe('Subquery Operations', () => {
           }))
           .leftJoin(
             outerSubquery,
-            (u: any, data: any) => eq(u.id, data.userId),
-            (u: any, data: any) => ({
+            (u, data) => eq(u.id, data.userId),
+            (u, data) => ({
               userId: u.id,
               userName: u.name,
               userEmail: u.email,
@@ -2345,7 +2348,7 @@ describe('Subquery Operations', () => {
             }),
             'outerData'
           )
-          .select((r: any) => ({
+          .select((r) => ({
             finalUserId: r.userId,
             finalUserName: r.userName,
             finalUserEmail: r.userEmail,
@@ -2364,11 +2367,11 @@ describe('Subquery Operations', () => {
               ' | Spent: $' || COALESCE(CAST(${r.orderSpent} AS VARCHAR), '0')
             `,
           }))
-          .orderBy((r: any) => r.finalUserId)
+          .orderBy((r) => r.finalUserId)
           .toList();
 
         expect(result.length).toBeGreaterThan(0);
-        result.forEach((r: any) => {
+        result.forEach((r) => {
           expect(r).toHaveProperty('finalUserId');
           expect(r).toHaveProperty('finalUserName');
           expect(r).toHaveProperty('finalUserEmail');
