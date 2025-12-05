@@ -2720,8 +2720,6 @@ export class SelectQueryBuilder<TSelection> {
         executor: this.executor,
       };
 
-      console.log('##LINKED 3242342####');
-
       // Analyze the selector to extract nested queries
       const mockRow = this.createMockRow();
       const selectionResult = this.selector(mockRow);

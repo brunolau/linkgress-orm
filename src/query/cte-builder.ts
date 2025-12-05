@@ -1,6 +1,27 @@
 import { DatabaseClient } from '../database/database-client.interface';
 import { QueryBuilder, SelectQueryBuilder } from './query-builder';
-import { SqlBuildContext } from './conditions';
+import { SqlBuildContext, FieldRef } from './conditions';
+
+/**
+ * Type helper to convert value types to FieldRefs for CTE column access
+ */
+type ToFieldRefs<T> = T extends object
+  ? { [K in keyof T]: FieldRef<string, T[K]> }
+  : FieldRef<string, T>;
+
+/**
+ * Type helper to extract the underlying value type from a FieldRef or keep as-is
+ */
+type ExtractValueType<T> = T extends FieldRef<any, infer V> ? V : T;
+
+/**
+ * Type helper to resolve FieldRefs in an object to their value types
+ */
+type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
+  ? V
+  : T extends object
+  ? { [K in keyof T]: ResolveFieldRefs<T[K]> }
+  : T;
 
 /**
  * Represents a Common Table Expression (CTE) with strong typing

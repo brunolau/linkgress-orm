@@ -30,10 +30,11 @@ type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
 /**
  * Type helper to convert resolved value types back to FieldRef for join conditions
  * This allows join conditions to accept either the value or FieldRef
+ * If a field is already a FieldRef, it preserves it without double-wrapping
  */
 type ToFieldRefs<T> = T extends object
-  ? { [K in keyof T]: FieldRef<string, T[K]> }
-  : FieldRef<string, T>;
+  ? { [K in keyof T]: T[K] extends FieldRef<any, infer V> ? FieldRef<string, V> : FieldRef<string, T[K]> }
+  : T extends FieldRef<any, infer V> ? FieldRef<string, V> : FieldRef<string, T>;
 
 /**
  * Represents a grouped item with access to the grouping key and aggregate functions
@@ -499,10 +500,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    */
   leftJoin<TRight extends Record<string, any>, TNewSelection>(
     rightSource: Subquery<TRight, 'table'> | DbCte<TRight>,
-    condition: (left: ToFieldRefs<TSelection>, right: TRight) => Condition,
-    selector: (left: ToFieldRefs<TSelection>, right: TRight) => TNewSelection,
+    condition: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => TNewSelection,
     alias?: string
-  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, TRight> {
+  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, ToFieldRefs<TRight>> {
     return this.joinInternal('LEFT', rightSource, condition, selector, alias);
   }
 
@@ -512,10 +513,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    */
   innerJoin<TRight extends Record<string, any>, TNewSelection>(
     rightSource: Subquery<TRight, 'table'> | DbCte<TRight>,
-    condition: (left: ToFieldRefs<TSelection>, right: TRight) => Condition,
-    selector: (left: ToFieldRefs<TSelection>, right: TRight) => TNewSelection,
+    condition: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => TNewSelection,
     alias?: string
-  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, TRight> {
+  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, ToFieldRefs<TRight>> {
     return this.joinInternal('INNER', rightSource, condition, selector, alias);
   }
 
@@ -525,10 +526,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   private joinInternal<TRight extends Record<string, any>, TNewSelection>(
     joinType: JoinType,
     rightSource: Subquery<TRight, 'table'> | DbCte<TRight>,
-    condition: (left: ToFieldRefs<TSelection>, right: TRight) => Condition,
-    selector: (left: ToFieldRefs<TSelection>, right: TRight) => TNewSelection,
+    condition: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => Condition,
+    selector: (left: ToFieldRefs<TSelection>, right: ToFieldRefs<TRight>) => TNewSelection,
     alias?: string
-  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, TRight> {
+  ): GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, ToFieldRefs<TRight>> {
     // Wrap this grouped query as a subquery
     const leftSubquery = this.asSubquery('table');
     const leftAlias = 'grouped_0';
@@ -552,26 +553,26 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     // Create mock for left (the grouped query result)
     const mockLeft = this.createMockForSelection(leftAlias) as unknown as ToFieldRefs<TSelection>;
 
-    // Create mock for right
-    const mockRight = isCteJoin
+    // Create mock for right - at runtime these are already FieldRef-like objects
+    const mockRight = (isCteJoin
       ? this.createMockForCte(cte!)
-      : this.createMockForSubquery<TRight>(rightAlias, rightSource as Subquery<TRight, 'table'>);
+      : this.createMockForSubquery<TRight>(rightAlias, rightSource as Subquery<TRight, 'table'>)) as unknown as ToFieldRefs<TRight>;
 
     // Evaluate the join condition
-    const joinCondition = condition(mockLeft, mockRight as TRight);
+    const joinCondition = condition(mockLeft, mockRight);
 
     // Create the result selector
     const createLeftMock = () => this.createMockForSelection(leftAlias) as unknown as ToFieldRefs<TSelection>;
-    const createRightMock = () => isCteJoin
+    const createRightMock = () => (isCteJoin
       ? this.createMockForCte(cte!)
-      : this.createMockForSubquery<TRight>(rightAlias, rightSource as Subquery<TRight, 'table'>);
+      : this.createMockForSubquery<TRight>(rightAlias, rightSource as Subquery<TRight, 'table'>)) as unknown as ToFieldRefs<TRight>;
 
-    return new GroupedJoinedQueryBuilder(
+    return new GroupedJoinedQueryBuilder<TNewSelection, ToFieldRefs<TSelection>, ToFieldRefs<TRight>>(
       this.schema,
       this.client,
       leftSubquery,
       leftAlias,
-      rightSource,
+      rightSource as any,
       rightAlias,
       joinType,
       joinCondition,
@@ -579,7 +580,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       createLeftMock,
       createRightMock,
       this.executor,
-      isCteJoin ? cte : undefined
+      isCteJoin ? cte as any : undefined
     );
   }
 
