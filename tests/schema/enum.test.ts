@@ -67,7 +67,7 @@ describe('PostgreSQL ENUM Support', () => {
           title: 'Test task',
           status: 'pending',
           priority: 'high',
-        });
+        }).returning();
 
         expect(task.title).toBe('Test task');
         expect(task.status).toBe('pending');

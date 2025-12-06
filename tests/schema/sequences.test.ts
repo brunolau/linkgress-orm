@@ -176,15 +176,15 @@ describe('Sequence Support', () => {
 
     const entity1 = await db.entities.insert({
       code: `CODE-${code1}`,
-    });
+    }).returning();
 
     const entity2 = await db.entities.insert({
       code: `CODE-${code2}`,
-    });
+    }).returning();
 
     const entity3 = await db.entities.insert({
       code: `CODE-${code3}`,
-    });
+    }).returning();
 
     expect(entity1.code).toMatch(/CODE-\d+/);
     expect(entity2.code).toMatch(/CODE-\d+/);

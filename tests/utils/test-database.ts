@@ -46,27 +46,27 @@ export async function cleanupDatabase(db: AppDatabase): Promise<void> {
  * Seed database with test data
  */
 export async function seedTestData(db: AppDatabase) {
-  // Create users
+  // Create users with .returning() to get the inserted entities with IDs
   const alice = await db.users.insert({
     username: 'alice',
     email: 'alice@test.com',
     age: 25,
     isActive: true,
-  });
+  }).returning();
 
   const bob = await db.users.insert({
     username: 'bob',
     email: 'bob@test.com',
     age: 35,
     isActive: true,
-  });
+  }).returning();
 
   const charlie = await db.users.insert({
     username: 'charlie',
     email: 'charlie@test.com',
     age: 45,
     isActive: false,
-  });
+  }).returning();
 
   // Create posts
   const alicePost1 = await db.posts.insert({
@@ -74,34 +74,34 @@ export async function seedTestData(db: AppDatabase) {
     content: 'Content from Alice',
     userId: alice.id,
     views: 100,
-  });
+  }).returning();
 
   const alicePost2 = await db.posts.insert({
     title: 'Alice Post 2',
     content: 'More content from Alice',
     userId: alice.id,
     views: 150,
-  });
+  }).returning();
 
   const bobPost = await db.posts.insert({
     title: 'Bob Post',
     content: 'Content from Bob',
     userId: bob.id,
     views: 200,
-  });
+  }).returning();
 
   // Create orders
   const aliceOrder = await db.orders.insert({
     userId: alice.id,
     status: 'completed',
     totalAmount: 99.99,
-  });
+  }).returning();
 
   const bobOrder = await db.orders.insert({
     userId: bob.id,
     status: 'pending',
     totalAmount: 149.99,
-  });
+  }).returning();
 
   return {
     users: { alice, bob, charlie },

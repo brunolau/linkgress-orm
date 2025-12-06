@@ -109,7 +109,7 @@ describe('PostgreSQL Schema Support', () => {
         username: 'testuser',
         email: 'test@example.com',
         isActive: true,
-      });
+      }).returning();
 
       expect(user.username).toBe('testuser');
       expect(user.email).toBe('test@example.com');
@@ -137,13 +137,13 @@ describe('PostgreSQL Schema Support', () => {
         username: 'author',
         email: 'author@example.com',
         isActive: true,
-      });
+      }).returning();
 
       // Create post in public schema (default) referencing auth.schema_users
       const post = await db.posts.insert({
         title: 'Test Post',
         userId: user.id,
-      });
+      }).returning();
 
       expect(post.userId).toBe(user.id);
 

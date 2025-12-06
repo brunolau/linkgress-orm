@@ -23,7 +23,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           username: 'type_test_user',
           email: 'typetest@example.com',
           age: 30,
-        });
+        }).returning();
 
         const customTime: HourMinute = { hour: 14, minute: 30 };
         const customDate = new Date('2025-06-15T10:30:00Z');
@@ -34,7 +34,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           views: 100,
           publishTime: customTime,
           customDate: customDate,
-        });
+        }).returning();
 
         // Create a CTE that selects custom type fields
         const cteBuilder = new DbCteBuilder();
@@ -98,7 +98,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           username: 'null_test_user',
           email: 'nulltest@example.com',
           age: 28,
-        });
+        }).returning();
 
         const post = await db.posts.insert({
           title: 'Post without Custom Date',
@@ -106,7 +106,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           views: 75,
           publishTime: { hour: 12, minute: 0 },
           // customDate is undefined/null
-        });
+        }).returning();
 
         const cteBuilder = new DbCteBuilder();
         const nullCte = cteBuilder.with(
@@ -153,7 +153,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           username: 'agg_type_user',
           email: 'aggtype@example.com',
           age: 30,
-        });
+        }).returning();
 
         await db.posts.insert({
           title: 'Post 1',
@@ -237,7 +237,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           username: 'exclusion_test_user',
           email: 'exclusion@example.com',
           age: 32,
-        });
+        }).returning();
 
         await db.posts.insert({
           title: 'Test Post',
@@ -308,7 +308,7 @@ describe('CTE Type Safety and Custom Type Fields', () => {
           username: 'multikey_user',
           email: 'multikey@example.com',
           age: 28,
-        });
+        }).returning();
 
         const targetDate = new Date('2025-07-01T00:00:00Z');
 

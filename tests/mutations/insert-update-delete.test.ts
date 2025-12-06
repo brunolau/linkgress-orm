@@ -11,7 +11,7 @@ describe('Insert, Update, Delete Operations', () => {
           email: 'new@test.com',
           age: 30,
           isActive: true,
-        });
+        }).returning();
 
         expect(user).toBeDefined();
         expect(user.id).toBeDefined();
@@ -26,7 +26,7 @@ describe('Insert, Update, Delete Operations', () => {
         const user = await db.users.insert({
           username: 'minimal',
           email: 'minimal@test.com',
-        });
+        }).returning();
 
         expect(user).toBeDefined();
         expect(user.isActive).toBe(true); // Default value
@@ -40,7 +40,7 @@ describe('Insert, Update, Delete Operations', () => {
           { username: 'user1', email: 'user1@test.com' },
           { username: 'user2', email: 'user2@test.com' },
           { username: 'user3', email: 'user3@test.com' },
-        ]);
+        ]).returning();
 
         expect(users).toHaveLength(3);
         users.forEach(u => {
@@ -56,7 +56,7 @@ describe('Insert, Update, Delete Operations', () => {
           email: 'nullable@test.com',
           age: null,
           metadata: null,
-        });
+        }).returning();
 
         expect(user.age).toBeNull();
         expect(user.metadata).toBeNull();
@@ -89,7 +89,7 @@ describe('Insert, Update, Delete Operations', () => {
         const updated = await db.users.update(
           { age: 26, isActive: false },
           u => eq(u.id, users.alice.id)
-        );
+        ).returning();
 
         expect(updated).toHaveLength(1);
         expect(updated[0].age).toBe(26);
@@ -105,7 +105,7 @@ describe('Insert, Update, Delete Operations', () => {
         const updated = await db.users.update(
           { isActive: false },
           u => eq(u.isActive, true)
-        );
+        ).returning();
 
         expect(updated.length).toBeGreaterThanOrEqual(2);
         updated.forEach(u => {
@@ -121,7 +121,7 @@ describe('Insert, Update, Delete Operations', () => {
         const updated = await db.users.update(
           { age: null },
           u => eq(u.id, users.alice.id)
-        );
+        ).returning();
 
         expect(updated[0].age).toBeNull();
       });
@@ -134,7 +134,7 @@ describe('Insert, Update, Delete Operations', () => {
         const updated = await db.users.update(
           { age: 99 },
           u => eq(u.username, 'nonexistent')
-        );
+        ).returning();
 
         expect(updated).toHaveLength(0);
       });
@@ -241,7 +241,7 @@ describe('Insert, Update, Delete Operations', () => {
             primaryKey: ['username'],
             updateColumns: ['email', 'age'],
           }
-        );
+        ).returning();
 
         expect(result).toHaveLength(1);
         expect(result[0].username).toBe('upsertuser');
@@ -258,7 +258,7 @@ describe('Insert, Update, Delete Operations', () => {
             primaryKey: ['username'],
             updateColumns: ['email', 'age'],
           }
-        );
+        ).returning();
 
         expect(result).toHaveLength(1);
         expect(result[0].email).toBe('newalice@test.com');
@@ -279,7 +279,7 @@ describe('Insert, Update, Delete Operations', () => {
             primaryKey: ['username'],
             updateColumns: ['email', 'age'],
           }
-        );
+        ).returning();
 
         expect(result).toHaveLength(2);
         const alice = result.find(u => u.username === 'alice');

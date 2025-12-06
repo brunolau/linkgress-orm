@@ -956,7 +956,7 @@ describe('CTE (Common Table Expression) Support', () => {
           email: 'null@test.com',
           age: null as any,
           isActive: true,
-        });
+        }).returning();
 
         const cteBuilder = new DbCteBuilder();
         const nullHandlingCTE = cteBuilder.with(

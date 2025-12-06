@@ -7,12 +7,12 @@ describe('Bulk Update', () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);
 
-        // Update multiple users at once
+        // Update multiple users at once with .returning() to get updated records
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: 100 },
           { id: users.bob.id, age: 200 },
           { id: users.charlie.id, age: 300 },
-        ]);
+        ]).returning();
 
         // Verify all records were updated
         expect(updated.length).toBe(3);
@@ -37,7 +37,7 @@ describe('Bulk Update', () => {
           { id: users.alice.id, age: 50 },
           { id: users.bob.id, isActive: false },
           { id: users.charlie.id, age: 99, isActive: true },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(3);
 
@@ -62,7 +62,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: 99 },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(1);
         expect(updated[0].id).toBe(users.alice.id);
@@ -73,10 +73,33 @@ describe('Bulk Update', () => {
       });
     });
 
-    test('should return empty array when no data provided', async () => {
+    test('should return void by default when no .returning() is called', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const result = await db.users.bulkUpdate([
+          { id: users.alice.id, age: 99 },
+        ]);
+
+        expect(result).toBeUndefined();
+
+        // Verify the update happened
+        const alice = await db.users.where(u => eq(u.id, users.alice.id)).toList();
+        expect(alice[0].age).toBe(99);
+      });
+    });
+
+    test('should return empty array when no data provided with .returning()', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.bulkUpdate([]).returning();
+        expect(result).toEqual([]);
+      });
+    });
+
+    test('should return void when no data provided without .returning()', async () => {
       await withDatabase(async (db) => {
         const result = await db.users.bulkUpdate([]);
-        expect(result).toEqual([]);
+        expect(result).toBeUndefined();
       });
     });
   });
@@ -89,7 +112,7 @@ describe('Bulk Update', () => {
         // Should work without specifying primaryKey config
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: 77 },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(1);
         expect(updated[0].age).toBe(77);
@@ -104,7 +127,7 @@ describe('Bulk Update', () => {
         const updated = await db.users.bulkUpdate(
           [{ username: 'alice', age: 88 }],
           { primaryKey: 'username' }
-        );
+        ).returning();
 
         expect(updated.length).toBe(1);
         expect(updated[0].username).toBe('alice');
@@ -144,7 +167,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, email: 'newemail@test.com' },
-        ]);
+        ]).returning();
 
         expect(updated[0].email).toBe('newemail@test.com');
       });
@@ -157,7 +180,7 @@ describe('Bulk Update', () => {
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, isActive: false },
           { id: users.bob.id, isActive: false },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(2);
         const alice = updated.find(u => u.id === users.alice.id);
@@ -173,7 +196,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: null as any },
-        ]);
+        ]).returning();
 
         expect(updated[0].age).toBeNull();
       });
@@ -185,7 +208,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, metadata: { role: 'admin', level: 5 } },
-        ]);
+        ]).returning();
 
         expect(updated[0].metadata).toEqual({ role: 'admin', level: 5 });
       });
@@ -193,7 +216,7 @@ describe('Bulk Update', () => {
   });
 
   describe('Query validation', () => {
-    test('should generate correct SQL structure', async () => {
+    test('should not include RETURNING when no .returning() called', async () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);
 
@@ -214,7 +237,37 @@ describe('Bulk Update', () => {
         expect(queries.length).toBe(1);
         const sql = queries[0];
 
-        // Check for UPDATE...FROM VALUES pattern
+        // Check for UPDATE...FROM VALUES pattern without RETURNING
+        expect(sql).toContain('UPDATE "users" AS t');
+        expect(sql).toContain('SET');
+        expect(sql).toContain('FROM (VALUES');
+        expect(sql).toContain('WHERE t."id" = v."id"');
+        expect(sql.toUpperCase()).not.toContain('RETURNING');
+      });
+    });
+
+    test('should include RETURNING when .returning() is called', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Capture queries
+        const queries: string[] = [];
+        const originalQuery = (db as any).client.query.bind((db as any).client);
+        (db as any).client.query = async (sql: string, params: any[]) => {
+          queries.push(sql);
+          return originalQuery(sql, params);
+        };
+
+        await db.users.bulkUpdate([
+          { id: users.alice.id, age: 50 },
+          { id: users.bob.id, age: 60 },
+        ]).returning();
+
+        // Verify SQL structure
+        expect(queries.length).toBe(1);
+        const sql = queries[0];
+
+        // Check for UPDATE...FROM VALUES pattern with RETURNING
         expect(sql).toContain('UPDATE "users" AS t');
         expect(sql).toContain('SET');
         expect(sql).toContain('FROM (VALUES');
@@ -238,7 +291,7 @@ describe('Bulk Update', () => {
         await db.users.bulkUpdate([
           { id: users.alice.id, age: 50 },
           { id: users.bob.id, age: 60 },
-        ]);
+        ]).returning();
 
         // Check that values are passed as parameters
         expect(capturedParams).toContain(users.alice.id);
@@ -256,7 +309,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: 42 },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(1);
         expect(updated[0].age).toBe(42);
@@ -269,7 +322,7 @@ describe('Bulk Update', () => {
 
         const updated = await db.users.bulkUpdate([
           { id: 99999, age: 50 }, // Non-existent ID
-        ]);
+        ]).returning();
 
         // Should return empty since no records matched
         expect(updated.length).toBe(0);
@@ -284,7 +337,7 @@ describe('Bulk Update', () => {
           { id: users.alice.id, age: 50 },
           { id: 99999, age: 60 }, // Non-existent
           { id: users.bob.id, age: 70 },
-        ]);
+        ]).returning();
 
         // Should only return the 2 existing records
         expect(updated.length).toBe(2);
@@ -299,7 +352,7 @@ describe('Bulk Update', () => {
         // Update with same age value
         const updated = await db.users.bulkUpdate([
           { id: users.alice.id, age: 25 }, // Same as original
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(1);
         expect(updated[0].age).toBe(25);
@@ -316,7 +369,7 @@ describe('Bulk Update', () => {
           { id: posts.alicePost1.id, views: 500 },
           { id: posts.alicePost2.id, views: 600 },
           { id: posts.bobPost.id, views: 700 },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(3);
 
@@ -337,7 +390,7 @@ describe('Bulk Update', () => {
         const updated = await db.posts.bulkUpdate([
           { id: posts.alicePost1.id, title: 'Updated Title 1', content: 'Updated content 1' },
           { id: posts.bobPost.id, title: 'Updated Title 2' },
-        ]);
+        ]).returning();
 
         expect(updated.length).toBe(2);
 
@@ -355,20 +408,20 @@ describe('Bulk Update', () => {
   describe('Chunking', () => {
     test('should handle large batch with custom chunk size', async () => {
       await withDatabase(async (db) => {
-        // Insert many users
+        // Insert many users with .returning() to get their IDs
         const userIds: number[] = [];
         for (let i = 0; i < 10; i++) {
           const user = await db.users.insert({
             username: `user${i}`,
             email: `user${i}@test.com`,
             isActive: true,
-          });
+          }).returning();
           userIds.push(user.id);
         }
 
         // Update all with small chunk size
         const updates = userIds.map(id => ({ id, age: 99 }));
-        const updated = await db.users.bulkUpdate(updates, { chunkSize: 3 });
+        const updated = await db.users.bulkUpdate(updates, { chunkSize: 3 }).returning();
 
         expect(updated.length).toBe(10);
         expect(updated.every(u => u.age === 99)).toBe(true);

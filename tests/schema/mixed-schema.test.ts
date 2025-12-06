@@ -11,14 +11,14 @@ describe('Mixed Schema Support in AppDatabase', () => {
         email: 'regular@example.com',
         age: 30,
         isActive: true,
-      });
+      }).returning();
 
       // Insert a schema user (auth schema)
       const schemaUser = await db.schemaUsers.insert({
         username: 'schema_user',
         email: 'schema@example.com',
         isActive: true,
-      });
+      }).returning();
 
       // Verify both users were created
       expect(regularUser.username).toBe('regular_user');
@@ -43,13 +43,13 @@ describe('Mixed Schema Support in AppDatabase', () => {
         username: 'author',
         email: 'author@example.com',
         isActive: true,
-      });
+      }).returning();
 
       // Create a schema post in public schema that references auth.schema_users
       const post = await db.schemaPosts.insert({
         title: 'Cross-Schema Post',
         userId: author.id,
-      });
+      }).returning();
 
       expect(post.userId).toBe(author.id);
 
@@ -76,13 +76,13 @@ describe('Mixed Schema Support in AppDatabase', () => {
         username: 'alice',
         email: 'alice@example.com',
         isActive: true,
-      });
+      }).returning();
 
       const user2 = await db.schemaUsers.insert({
         username: 'bob',
         email: 'bob@example.com',
         isActive: false,
-      });
+      }).returning();
 
       // Create posts for both users
       await db.schemaPosts.insert({
@@ -138,7 +138,7 @@ describe('Mixed Schema Support in AppDatabase', () => {
         username: 'testuser',
         email: 'test@example.com',
         isActive: true,
-      });
+      }).returning();
 
       // Update the user
       const updated = await db.schemaUsers.update(
@@ -147,7 +147,7 @@ describe('Mixed Schema Support in AppDatabase', () => {
           isActive: false,
         },
         u => eq(u.id, user.id)
-      );
+      ).returning();
 
       expect(updated).toHaveLength(1);
       expect(updated[0].username).toBe('updateduser');
@@ -211,7 +211,7 @@ describe('Mixed Schema Support in AppDatabase', () => {
         username: 'author',
         email: 'author@example.com',
         isActive: true,
-      });
+      }).returning();
 
       // Create posts for this user
       await db.schemaPosts.insert({
