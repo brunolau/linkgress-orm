@@ -166,6 +166,8 @@ export {
   EntityInsertBuilder,
   EntityUpsertConfig,
   EntityCollectionQuery,
+  IEntityQueryable,
+  EntitySelectQueryBuilder,
 } from './entity/db-context';
 
 // Types

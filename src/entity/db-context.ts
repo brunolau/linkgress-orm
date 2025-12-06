@@ -1428,6 +1428,73 @@ export interface EntityCollectionQueryWithSelect<TEntity extends DbEntity, TSele
 }
 
 /**
+ * Interface for queryable entity collections that can be filtered with .where()
+ * Use this type when you need to store a query in a variable and add more .where() conditions.
+ *
+ * @example
+ * ```typescript
+ * let query: IEntityQueryable<User> = db.users;
+ * if (onlyActive) {
+ *   query = query.where(u => eq(u.isActive, true));
+ * }
+ * if (minAge) {
+ *   query = query.where(u => gte(u.age, minAge));
+ * }
+ * const results = await query.toList();
+ * ```
+ */
+export interface IEntityQueryable<TEntity extends DbEntity> {
+  /**
+   * Add a WHERE condition. Multiple where() calls are chained with AND logic.
+   */
+  where(condition: (entity: EntityQuery<TEntity>) => any): IEntityQueryable<TEntity>;
+
+  /**
+   * Select specific fields from the entity
+   */
+  select<TSelection>(
+    selector: (entity: EntityQuery<TEntity>) => TSelection
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+
+  /**
+   * Order by field(s)
+   */
+  orderBy(selector: (row: TEntity) => any): EntitySelectQueryBuilder<TEntity, TEntity>;
+  orderBy(selector: (row: TEntity) => any[]): EntitySelectQueryBuilder<TEntity, TEntity>;
+  orderBy(selector: (row: TEntity) => Array<[any, 'ASC' | 'DESC']>): EntitySelectQueryBuilder<TEntity, TEntity>;
+
+  /**
+   * Limit results
+   */
+  limit(count: number): EntitySelectQueryBuilder<TEntity, TEntity>;
+
+  /**
+   * Offset results
+   */
+  offset(count: number): EntitySelectQueryBuilder<TEntity, TEntity>;
+
+  /**
+   * Execute query and return all results
+   */
+  toList(): Promise<UnwrapDbColumns<TEntity>[]>;
+
+  /**
+   * Execute query and return first result
+   */
+  first(): Promise<UnwrapDbColumns<TEntity>>;
+
+  /**
+   * Execute query and return first result or null if not found
+   */
+  firstOrDefault(): Promise<UnwrapDbColumns<TEntity> | null>;
+
+  /**
+   * Count matching records
+   */
+  count(): Promise<number>;
+}
+
+/**
  * Strongly-typed query builder for entities
  * Results automatically unwrap DbColumn<T> to T and SqlFragment<T> to T
  */
@@ -1725,6 +1792,67 @@ export class DbEntityTable<TEntity extends DbEntity> {
       : await client.query(sql, []);
 
     return this.mapResultsToEntities(result.rows);
+  }
+
+  /**
+   * Get first record
+   * @throws Error if no records exist
+   */
+  async first(): Promise<UnwrapDbColumns<TEntity>> {
+    const queryBuilder = this.context.getTable(this.tableName);
+    const schema = this._getSchema();
+
+    // Build SELECT with all columns and LIMIT 1
+    const columns = Object.entries(schema.columns)
+      .map(([_, col]) => `"${(col as any).build().name}"`)
+      .join(', ');
+
+    const qualifiedTableName = this._getQualifiedTableName();
+    const sql = `SELECT ${columns} FROM ${qualifiedTableName} LIMIT 1`;
+
+    const executor = this._getExecutor();
+    const client = this._getClient();
+
+    const result = executor
+      ? await executor.query(sql, [])
+      : await client.query(sql, []);
+
+    if (result.rows.length === 0) {
+      throw new Error('Sequence contains no elements');
+    }
+
+    const mapped = this.mapResultsToEntities(result.rows);
+    return mapped[0];
+  }
+
+  /**
+   * Get first record or null if none exist
+   */
+  async firstOrDefault(): Promise<UnwrapDbColumns<TEntity> | null> {
+    const queryBuilder = this.context.getTable(this.tableName);
+    const schema = this._getSchema();
+
+    // Build SELECT with all columns and LIMIT 1
+    const columns = Object.entries(schema.columns)
+      .map(([_, col]) => `"${(col as any).build().name}"`)
+      .join(', ');
+
+    const qualifiedTableName = this._getQualifiedTableName();
+    const sql = `SELECT ${columns} FROM ${qualifiedTableName} LIMIT 1`;
+
+    const executor = this._getExecutor();
+    const client = this._getClient();
+
+    const result = executor
+      ? await executor.query(sql, [])
+      : await client.query(sql, []);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    const mapped = this.mapResultsToEntities(result.rows);
+    return mapped[0];
   }
 
   /**
