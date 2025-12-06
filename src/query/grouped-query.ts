@@ -1,7 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, WhereConditionBase } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
-import type { QueryExecutor } from '../entity/db-context';
+import type { QueryExecutor, OrderDirection } from '../entity/db-context';
 import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
 import { CollectionQueryBuilder, ReferenceQueryBuilder } from './query-builder';
@@ -438,17 +438,17 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * .orderBy(p => [p.colName, p.otherCol])
    * .orderBy(p => [[p.colName, 'ASC'], [p.otherCol, 'DESC']])
    */
-  orderBy(selector: (row: TSelection) => any): this;
-  orderBy(selector: (row: TSelection) => any[]): this;
-  orderBy(selector: (row: TSelection) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (row: TSelection) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (row: TSelection) => T): this;
+  orderBy<T>(selector: (row: TSelection) => T[]): this;
+  orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockGroup = this.createMockGroupedItem();
     const mockResult = this.resultSelector(mockGroup);
     const result = selector(mockResult);
 
     // Handle array of [field, direction] tuples
     if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
+      for (const [fieldRef, direction] of result as Array<[any, OrderDirection]>) {
         if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
           this.orderByFields.push({
             field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
@@ -1348,17 +1348,17 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
   /**
    * Order by field(s) from the selected result
    */
-  orderBy(selector: (row: TSelection) => any): this;
-  orderBy(selector: (row: TSelection) => any[]): this;
-  orderBy(selector: (row: TSelection) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (row: TSelection) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (row: TSelection) => T): this;
+  orderBy<T>(selector: (row: TSelection) => T[]): this;
+  orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockLeft = this.createLeftMock();
     const mockRight = this.createRightMock();
     const mockResult = this.resultSelector(mockLeft, mockRight);
     const result = selector(mockResult);
 
     if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
+      for (const [fieldRef, direction] of result as Array<[any, OrderDirection]>) {
         if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
           const alias = (fieldRef as any).__tableAlias || '';
           const colName = (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName;

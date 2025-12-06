@@ -1,7 +1,7 @@
 import { Condition, ConditionBuilder, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
-import type { QueryExecutor } from '../entity/db-context';
+import type { QueryExecutor, OrderDirection } from '../entity/db-context';
 
 /**
  * Join type
@@ -124,17 +124,17 @@ export class JoinQueryBuilder<TLeft, TRight> {
    * .orderBy((l, r) => [l.colName, r.otherCol])
    * .orderBy((l, r) => [[l.colName, 'ASC'], [r.otherCol, 'DESC']])
    */
-  orderBy(selector: (left: TLeft, right: TRight) => any): this;
-  orderBy(selector: (left: TLeft, right: TRight) => any[]): this;
-  orderBy(selector: (left: TLeft, right: TRight) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (left: TLeft, right: TRight) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (left: TLeft, right: TRight) => T): this;
+  orderBy<T>(selector: (left: TLeft, right: TRight) => T[]): this;
+  orderBy<T>(selector: (left: TLeft, right: TRight) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (left: TLeft, right: TRight) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockLeft = this.createMockRow(this.leftSchema, this.leftAlias);
     const mockRight = this.createMockRow(this.rightSchema, this.rightAlias);
     const result = selector(mockLeft, mockRight);
 
     // Handle array of [field, direction] tuples
     if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
+      for (const [fieldRef, direction] of result as Array<[T, OrderDirection]>) {
         if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
           this.orderByFields.push({
             table: (fieldRef as any).__tableAlias || this.leftAlias,

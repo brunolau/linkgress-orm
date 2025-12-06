@@ -1,6 +1,6 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
-import type { QueryExecutor, CollectionStrategyType } from '../entity/db-context';
+import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult } from '../entity/db-context';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
@@ -502,10 +502,10 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
    * .orderBy(p => [p.colName, p.otherCol])
    * .orderBy(p => [[p.colName, 'ASC'], [p.otherCol, 'DESC']])
    */
-  orderBy(selector: (row: TRow) => any): this;
-  orderBy(selector: (row: TRow) => any[]): this;
-  orderBy(selector: (row: TRow) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (row: TRow) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (row: TRow) => T): this;
+  orderBy<T>(selector: (row: TRow) => T[]): this;
+  orderBy<T>(selector: (row: TRow) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (row: TRow) => OrderByResult<T>): this {
     const mockRow = this.createMockRow();
     const result = selector(mockRow);
 
@@ -688,10 +688,10 @@ export class SelectQueryBuilder<TSelection> {
    * .orderBy(p => [p.colName, p.otherCol])
    * .orderBy(p => [[p.colName, 'ASC'], [p.otherCol, 'DESC']])
    */
-  orderBy(selector: (row: TSelection) => any): this;
-  orderBy(selector: (row: TSelection) => any[]): this;
-  orderBy(selector: (row: TSelection) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (row: TSelection) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (row: TSelection) => T): this;
+  orderBy<T>(selector: (row: TSelection) => T[]): this;
+  orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockRow = this.createMockRow();
     const selectedMock = this.selector(mockRow);
     // Wrap selectedMock in a proxy that returns FieldRefs for property access
@@ -3391,10 +3391,10 @@ export class CollectionQueryBuilder<TItem = any> {
    * .orderBy(p => [p.colName, p.otherCol])
    * .orderBy(p => [[p.colName, 'ASC'], [p.otherCol, 'DESC']])
    */
-  orderBy(selector: (item: TItem) => any): this;
-  orderBy(selector: (item: TItem) => any[]): this;
-  orderBy(selector: (item: TItem) => Array<[any, 'ASC' | 'DESC']>): this;
-  orderBy(selector: (item: TItem) => any | any[] | Array<[any, 'ASC' | 'DESC']>): this {
+  orderBy<T>(selector: (item: TItem) => T): this;
+  orderBy<T>(selector: (item: TItem) => T[]): this;
+  orderBy<T>(selector: (item: TItem) => Array<[T, OrderDirection]>): this;
+  orderBy<T>(selector: (item: TItem) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockItem = this.createMockItem();
     const result = selector(mockItem);
 
