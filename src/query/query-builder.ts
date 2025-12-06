@@ -3496,8 +3496,8 @@ export class CollectionQueryBuilder<TItem = any> {
    * Returns full CollectionAggregationResult for strategies that need special handling (like LATERAL)
    */
   buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string } {
-    // Determine strategy type - default to 'cte' if not specified
-    const strategyType: CollectionStrategyType = context.collectionStrategy || 'cte';
+    // Determine strategy type - default to 'lateral' if not specified
+    const strategyType: CollectionStrategyType = context.collectionStrategy || 'lateral';
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);
 
     // Build selected fields configuration (supports nested objects)

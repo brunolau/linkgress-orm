@@ -9,14 +9,14 @@ A type-safe ORM for PostgreSQL and TypeScript with automatic type inference and 
 
 **LINQ-Inspired Query Syntax:** The query API is designed to feel familiar to developers coming from C# LINQ, with chainable methods like `select()`, `where()`, `orderBy()`, and `groupBy()`. You also get magic SQL string interpolation for when you need raw SQL power without sacrificing type safety.
 
-**PostgreSQL-First Philosophy:** While other ORMs aim high and try to support all platforms, Linkgress is built exclusively for PostgreSQL. This allows it to leverage PostgreSQL's advanced features to the maximum—particularly in how collections and aggregations are retrieved using CTEs, JSON aggregations, and native PostgreSQL optimizations.
+**PostgreSQL-First Philosophy:** While other ORMs aim high and try to support all platforms, Linkgress is built exclusively for PostgreSQL. This allows it to leverage PostgreSQL's advanced features to the maximum—particularly in how collections and aggregations are retrieved using CTEs, LATERAL joins, JSON aggregations, and native PostgreSQL optimizations.
 
 ## Features
 
 - **Entity-First Approach** - Define entities with `DbColumn<T>`, no decorators needed
 - **Fluent Configuration API** - Intuitive `DbContext` pattern with method chaining
 - **Automatic Type Inference** - Full TypeScript support without manual type annotations
-- **Nested Collection Queries** - Query one-to-many relationships with automatic CTE optimization
+- **Nested Collection Queries** - Query one-to-many relationships with CTE, LATERAL, or temp table strategies
 - **Type-Safe Aggregations** - `count()`, `sum()`, `max()`, `min()` return proper types
 - **Powerful Filtering** - Type-checked query conditions
 - **Transaction Support** - Safe, type-checked transactions
@@ -168,7 +168,7 @@ Array<{
 - **[Insert/Update/Upsert/BULK](./docs/guides/insert-update-guide.md)** - Insert, update, delete, and bulk operations
 
 ### Advanced
-- **[Collection Strategies](./docs/collection-strategies.md)** - JSONB vs temp table strategies, performance optimization, and multi-statement execution
+- **[Collection Strategies](./docs/collection-strategies.md)** - CTE, LATERAL, and temp table strategies for one-to-many queries
 - **[Subqueries](./docs/guides/subquery-guide.md)** - Using subqueries in your queries
 - **[Custom Types](./docs/guides/schema-configuration.md#custom-types)** - Create custom type mappers
 

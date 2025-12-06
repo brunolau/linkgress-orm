@@ -239,7 +239,7 @@ const usersWithPosts = await db.users
 // }>
 ```
 
-See [Collection Strategies](./collection-strategies.md) to learn about JSONB vs temp table strategies for loading collections.
+See [Collection Strategies](./collection-strategies.md) to learn about CTE, LATERAL, and temp table strategies for loading collections.
 
 ## Key Features
 
@@ -262,7 +262,7 @@ const users = await db.users
 
 ### 2. Nested Collection Queries
 
-Query one-to-many relationships with automatic CTE optimization:
+Query one-to-many relationships with automatic optimization (CTE, LATERAL, or temp table strategies):
 
 ```typescript
 const usersWithOrders = await db.users
@@ -319,7 +319,7 @@ const results = await db.users
 - **[Migrations](./guides/migrations.md)** - Database migrations, schema management, and workflow integration
 - **[Querying](./guides/querying.md)** - Master type-safe queries, joins, aggregations, and advanced patterns
 - **[Insert/Update/Upsert/BULK](./guides/insert-update-guide.md)** - Master insert, update, delete, and bulk operations
-- **[Collection Strategies](./collection-strategies.md)** - Understand JSONB vs temp table strategies for loading collections
+- **[Collection Strategies](./collection-strategies.md)** - Understand CTE, LATERAL, and temp table strategies for loading collections
 - **[Subqueries](./guides/subquery-guide.md)** - Using subqueries in your queries
 
 ## Examples

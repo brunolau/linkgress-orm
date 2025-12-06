@@ -2,6 +2,8 @@
 
 This guide demonstrates how to use Common Table Expressions (CTEs) in Linkgress ORM for complex queries with reusable subqueries.
 
+> **Note:** This guide covers the explicit `DbCteBuilder` API for creating custom CTEs in your queries. For information about how Linkgress automatically uses CTEs (or LATERAL joins) for collection navigation properties, see the [Collection Strategies](../collection-strategies.md) documentation.
+
 ## What are CTEs?
 
 Common Table Expressions (CTEs) are temporary named result sets that you can reference within a SELECT, INSERT, UPDATE, or DELETE statement. They improve query readability and allow you to break down complex queries into manageable parts.

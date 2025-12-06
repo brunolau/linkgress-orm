@@ -65,7 +65,8 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 ### 🚀 Advanced Topics
 
 - **[Collection Strategies](./collection-strategies.md)** - Collection loading and performance
-  - JSONB/CTE strategy (default, recommended)
+  - LATERAL strategy (default, recommended)
+  - CTE strategy (alternative)
   - Temp table strategy (experimental)
   - Multi-statement optimization
   - Global and per-query configuration

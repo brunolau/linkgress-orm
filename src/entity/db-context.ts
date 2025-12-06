@@ -64,7 +64,7 @@ export interface QueryOptions {
   logExecutionTime?: boolean;
   /** Log query parameters */
   logParameters?: boolean;
-  /** Collection aggregation strategy (default: 'cte') */
+  /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: CollectionStrategyType;
   /**
    * Disable automatic mapper transformations (fromDriver/toDriver).

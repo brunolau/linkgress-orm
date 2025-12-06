@@ -4,14 +4,18 @@ This document explains the collection strategy pattern implemented in Linkgress 
 
 ## Overview
 
-Linkgress ORM supports two strategies for loading collection navigation properties (one-to-many relationships):
+Linkgress ORM supports three strategies for loading collection navigation properties (one-to-many relationships):
 
-1. **JSONB Strategy** (default, recommended) - Uses CTEs with JSONB aggregation in a single query
-2. **Temp Table Strategy** (experimental) - Uses PostgreSQL temporary tables with optimized execution
+1. **LATERAL Strategy** (default, recommended) - Uses `LEFT JOIN LATERAL` subqueries for per-row correlation
+2. **CTE Strategy** - Uses CTEs with JSONB aggregation in a single query
+3. **Temp Table Strategy** (experimental) - Uses PostgreSQL temporary tables with optimized execution
 
-**⚠️ Important:** The JSONB strategy is the **recommended default** for most use cases. The temp table strategy is **experimental** and requires manual parameter escaping due to PostgreSQL's multi-statement execution design. Only use the temp table strategy for very large datasets (>100k rows) where you have benchmarked and verified significant performance benefits. For typical workloads, the JSONB strategy is safer and more reliable.
+**Strategy Selection Guide:**
+- **LATERAL** (`'lateral'`): Default. Correctly applies LIMIT/OFFSET per parent row. Best for "top N per parent" queries and general use.
+- **CTE** (`'cte'`): Single query with GROUP BY. Slightly simpler SQL but LIMIT/OFFSET applies globally, not per parent.
+- **Temp Table** (`'temptable'`): Experimental. Only for very large datasets (>100k rows) with benchmarked performance gains.
 
-Both strategies produce **identical results** but use different SQL execution approaches. You can configure the strategy globally at the database level or override it per-query using `withQueryOptions()`.
+All strategies produce **identical results** for basic queries, but LATERAL handles LIMIT/OFFSET differently (correctly per-parent). You can configure the strategy globally at the database level or override it per-query using `withQueryOptions()`.
 
 ## Usage
 
@@ -25,12 +29,17 @@ import { PostgresClient } from 'linkgress-orm';
 
 const client = new PostgresClient('postgres://user:pass@localhost/db');
 
-// Option 1: Use JSONB strategy (default, recommended)
+// Option 1: Use LATERAL strategy (default, recommended)
 const db = new AppDatabase(client, {
-  collectionStrategy: 'jsonb'  // Optional - this is the default
+  collectionStrategy: 'lateral'  // Optional - this is the default
 });
 
-// Option 2: Use temp table strategy globally (experimental - only for very large datasets)
+// Option 2: Use CTE strategy
+const db = new AppDatabase(client, {
+  collectionStrategy: 'cte'  // Single query with GROUP BY
+});
+
+// Option 3: Use temp table strategy globally (experimental - only for very large datasets)
 const db = new AppDatabase(client, {
   collectionStrategy: 'temptable'  // ⚠️ Experimental: requires manual parameter escaping
 });
@@ -41,14 +50,14 @@ const db = new AppDatabase(client, {
 You can override the collection strategy for specific queries using `withQueryOptions()`:
 
 ```typescript
-// Database configured with JSONB strategy
+// Database configured with LATERAL strategy (default)
 const db = new AppDatabase(client, {
-  collectionStrategy: 'jsonb'
+  collectionStrategy: 'lateral'
 });
 
-// Override to use temp table strategy for this specific query
+// Override to use CTE strategy for this specific query
 const users = await db.users
-  .withQueryOptions({ collectionStrategy: 'temptable' })
+  .withQueryOptions({ collectionStrategy: 'cte' })
   .select(u => ({
     id: u.id,
     username: u.username,
@@ -59,7 +68,7 @@ const users = await db.users
   }))
   .toList();
 
-// This query uses the global JSONB strategy
+// This query uses the global LATERAL strategy
 const otherUsers = await db.users
   .select(u => ({
     id: u.id,
@@ -85,7 +94,7 @@ const users = await db.users
   .toList();
 ```
 
-### JSONB Strategy (Default)
+### CTE Strategy (Default)
 
 ```typescript
 const users = await db.users
@@ -119,6 +128,51 @@ SELECT
 FROM "users"
 LEFT JOIN "cte_0" ON "users"."id" = "cte_0".parent_id
 ```
+
+### LATERAL Strategy
+
+The LATERAL strategy uses `LEFT JOIN LATERAL` to fetch related records for each parent row. This is the **only strategy that correctly applies LIMIT/OFFSET per parent**.
+
+```typescript
+// Get top 3 posts per user
+const users = await db.users
+  .withQueryOptions({ collectionStrategy: 'lateral' })
+  .select(u => ({
+    id: u.id,
+    username: u.username,
+    topPosts: u.posts!.select(p => ({
+      title: p.title,
+      views: p.views
+    }))
+      .orderBy(p => [[p.views, 'DESC']])
+      .limit(3)
+      .toList('topPosts')
+  }))
+  .toList();
+```
+
+**SQL Pattern:**
+```sql
+SELECT
+  "users"."id",
+  "users"."username",
+  COALESCE("lateral_0".data, '[]'::jsonb) as "topPosts"
+FROM "users"
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+    jsonb_build_object('title', "title", 'views', "views")
+  ) as data
+  FROM (
+    SELECT "title", "views"
+    FROM "posts"
+    WHERE "posts"."user_id" = "users"."id"
+    ORDER BY "views" DESC
+    LIMIT 3
+  ) sub
+) "lateral_0" ON true
+```
+
+**Key difference from CTE:** The LATERAL subquery references `"users"."id"` from the outer query, enabling per-row correlation. The LIMIT is applied within the subquery, so each user gets their top 3 posts.
 
 ### Temp Table Strategy
 
@@ -190,26 +244,46 @@ DROP TABLE IF EXISTS tmp_parent_ids_0, tmp_parent_ids_0_agg;
 
 ## When to Use Each Strategy
 
-### JSONB/CTE Strategy (Default, Recommended)
+### LATERAL Strategy (Default, Recommended)
 
 **Pros:**
-- ✅ **Recommended for most use cases**
+- ✅ **Default and recommended for most use cases**
+- ✅ **Correctly applies LIMIT/OFFSET per parent row** (the only strategy that does this)
+- ✅ Single query execution
+- ✅ Uses PostgreSQL's native prepared statements (safe parameter binding)
+- ✅ Natural support for correlated subqueries
+- ✅ Production-ready and thoroughly vetted
+
+**Cons:**
+- ❌ May be slightly slower than CTE for simple queries without LIMIT
+- ❌ Query plan depends on indexes (ensure foreign keys are indexed)
+- ❌ Slightly more complex generated SQL
+
+**Best for:**
+- **Most applications (recommended default)**
+- **"Top N per parent" queries** (e.g., "top 5 posts per user", "latest 3 orders per customer")
+- Queries with `.limit()` or `.offset()` on collections
+- When you need per-row subquery correlation
+
+### CTE Strategy
+
+**Pros:**
 - ✅ Single query execution
 - ✅ No temp table management overhead
 - ✅ Works well for moderate data sizes
 - ✅ Simpler query plan
 - ✅ Uses PostgreSQL's native prepared statements (safe parameter binding)
-- ✅ Production-ready and thoroughly vetted
+- ✅ Production-ready
 
 **Cons:**
 - ❌ Can be slower for very large datasets (>100k rows)
 - ❌ Higher memory usage for large result sets
+- ❌ LIMIT/OFFSET applies globally, not per parent row
 
 **Best for:**
-- **Most applications (recommended default)**
+- Simple aggregations without LIMIT/OFFSET on collections
+- When you prefer simpler generated SQL
 - Moderate-sized datasets (< 100k rows)
-- Simple aggregations
-- Production workloads where safety and reliability are priorities
 
 ### Temp Table Strategy (Experimental)
 
@@ -237,7 +311,7 @@ DROP TABLE IF EXISTS tmp_parent_ids_0, tmp_parent_ids_0_agg;
 
 ## Supported Features
 
-Both strategies support **all collection operations**:
+All three strategies support **all collection operations**:
 
 ### Collection Queries
 ```typescript
@@ -297,7 +371,8 @@ The implementation follows the **Strategy Pattern**:
 
 ```
 CollectionStrategyFactory
-  ├── JsonbCollectionStrategy
+  ├── LateralCollectionStrategy (default)
+  ├── CteCollectionStrategy
   └── TempTableCollectionStrategy
 ```
 
@@ -305,13 +380,20 @@ CollectionStrategyFactory
 
 - `CollectionStrategyFactory` - Creates strategy instances
 - `ICollectionStrategy` - Strategy interface
-- `JsonbCollectionStrategy` - CTE + JSONB implementation
+- `LateralCollectionStrategy` - LEFT JOIN LATERAL implementation (default)
+- `CteCollectionStrategy` - CTE + JSONB implementation
 - `TempTableCollectionStrategy` - Temp table implementation
 - `QueryContext` - Carries strategy configuration through query building
 
 ### Query Execution Flow
 
-#### JSONB Strategy (Single-Phase)
+#### LATERAL Strategy (Single-Phase, Default)
+
+1. Build main query with LEFT JOIN LATERAL subqueries
+2. Execute single query (subqueries correlate with each parent row)
+3. Transform results
+
+#### CTE Strategy (Single-Phase)
 
 1. Build main query with CTEs
 2. Execute single query
@@ -349,7 +431,13 @@ supportsMultiStatementQueries(): boolean {
 
 ### Security Considerations
 
-**JSONB Strategy:**
+**LATERAL Strategy (Default):**
+- ✅ Uses PostgreSQL's native prepared statements
+- ✅ Automatic parameter binding (safe by default)
+- ✅ No manual escaping required
+- ✅ Production-ready
+
+**CTE Strategy:**
 - ✅ Uses PostgreSQL's native prepared statements
 - ✅ Automatic parameter binding (safe by default)
 - ✅ No manual escaping required
@@ -364,7 +452,7 @@ supportsMultiStatementQueries(): boolean {
 
 ### Type Safety
 
-Both strategies maintain full TypeScript type safety:
+All three strategies maintain full TypeScript type safety:
 
 ```typescript
 const users = await db.users
@@ -435,8 +523,8 @@ interface QueryOptions {
   logExecutionTime?: boolean;
   /** Log query parameters */
   logParameters?: boolean;
-  /** Collection aggregation strategy (default: 'jsonb') */
-  collectionStrategy?: 'jsonb' | 'temptable';
+  /** Collection aggregation strategy (default: 'lateral') */
+  collectionStrategy?: 'cte' | 'lateral' | 'temptable';
 }
 ```
 
@@ -462,7 +550,7 @@ const results = await db.users
 ### CollectionStrategyType
 
 ```typescript
-type CollectionStrategyType = 'jsonb' | 'temptable';
+type CollectionStrategyType = 'cte' | 'lateral' | 'temptable';
 ```
 
 ### Legacy Type Alias
@@ -489,34 +577,42 @@ import {
 
 ### Upgrading from Previous Versions
 
-No breaking changes! The default behavior is unchanged.
+**Note:** The default collection strategy changed from `'cte'` to `'lateral'`. LATERAL correctly applies LIMIT/OFFSET per parent row, which is the expected behavior for most use cases.
 
-**Before:**
+**Before (CTE was default):**
 ```typescript
 const db = new DbContext(pool, schema);
 ```
 
-**After (same behavior):**
+**After (LATERAL is now default):**
 ```typescript
 const db = new DbContext(pool, schema, {
-  collectionStrategy: 'jsonb'  // Optional - this is the default
+  collectionStrategy: 'lateral'  // Optional - this is the new default
+});
+```
+
+**To keep using CTE (previous default):**
+```typescript
+const db = new DbContext(pool, schema, {
+  collectionStrategy: 'cte'  // Explicitly use CTE strategy
 });
 ```
 
 **To use temp tables:**
 ```typescript
 const db = new DbContext(pool, schema, {
-  collectionStrategy: 'temptable'  // Enable new strategy
+  collectionStrategy: 'temptable'  // Enable temp table strategy
 });
 ```
 
 ## Contributing
 
-When adding new collection features, ensure both strategies are updated:
+When adding new collection features, ensure all three strategies are updated:
 
-1. Update `JsonbCollectionStrategy.buildAggregation()`
-2. Update `TempTableCollectionStrategy.buildAggregation()`
-3. Update this documentation
+1. Update `CteCollectionStrategy.buildAggregation()`
+2. Update `LateralCollectionStrategy.buildAggregation()`
+3. Update `TempTableCollectionStrategy.buildAggregation()`
+4. Update this documentation
 
 ## License
 
