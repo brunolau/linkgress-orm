@@ -11,6 +11,19 @@ import { DbSchemaManager } from '../migration/db-schema-manager';
 import { DbSequence, SequenceConfig } from '../schema/sequence-builder';
 import type { DbCte } from '../query/cte-builder';
 import type { Subquery } from '../query/subquery';
+import {
+  getQualifiedTableName,
+  buildReturningColumnList,
+  buildColumnNamesList,
+  detectPrimaryKeys,
+  calculateOptimalChunkSize,
+  extractUniqueColumnKeys,
+  buildValuesClause,
+  buildColumnConfigs,
+  applyToDriverMapper,
+  hasAutoIncrementPrimaryKey,
+  type ColumnConfig,
+} from '../query/sql-utils';
 
 /**
  * Collection aggregation strategy type
@@ -381,15 +394,6 @@ export class InsertBuilder<TSchema extends TableSchema> {
   ) {}
 
   /**
-   * Get qualified table name with schema prefix if specified
-   */
-  private getQualifiedTableName(): string {
-    return this.schema.schema
-      ? `"${this.schema.schema}"."${this.schema.name}"`
-      : `"${this.schema.name}"`;
-  }
-
-  /**
    * Set the values to insert (single row or multiple rows)
    */
   values(data: Partial<InferTableType<TSchema>> | Partial<InferTableType<TSchema>>[]): this {
@@ -502,17 +506,10 @@ export class InsertBuilder<TSchema extends TableSchema> {
       valuePlaceholders.push(`(${rowPlaceholders.join(', ')})`);
     }
 
-    const columnNames = columns.map(key => {
-      const column = this.schema.columns[key as string];
-      const config = column.build();
-      return `"${config.name}"`;
-    });
+    const columnNames = buildColumnNamesList(this.schema, columns);
+    const returningColumns = buildReturningColumnList(this.schema);
+    const qualifiedTableName = getQualifiedTableName(this.schema);
 
-    const returningColumns = Object.entries(this.schema.columns)
-      .map(([_, col]) => `"${(col as any).build().name}"`)
-      .join(', ');
-
-    const qualifiedTableName = this.getQualifiedTableName();
     let sql = `INSERT INTO ${qualifiedTableName} (${columnNames.join(', ')})`;
 
     // Add OVERRIDING SYSTEM VALUE if specified
@@ -710,15 +707,6 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
   }
 
   /**
-   * Get qualified table name with schema prefix if specified
-   */
-  private getQualifiedTableName(): string {
-    return this.schema.schema
-      ? `"${this.schema.schema}"."${this.schema.name}"`
-      : `"${this.schema.name}"`;
-  }
-
-  /**
    * Insert a row
    */
   async insert(data: Partial<InferTableType<TableSchema>>): Promise<InferTableType<TableSchema>> {
@@ -743,11 +731,8 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       }
     }
 
-    const returningColumns = Object.entries(this.schema.columns)
-      .map(([_, col]) => `"${(col as any).build().name}"`)
-      .join(', ');
-
-    const qualifiedTableName = this.getQualifiedTableName();
+    const returningColumns = buildReturningColumnList(this.schema);
+    const qualifiedTableName = getQualifiedTableName(this.schema);
     const sql = `
       INSERT INTO ${qualifiedTableName} (${columns.join(', ')})
       VALUES (${placeholders.join(', ')})
@@ -774,17 +759,11 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     }
 
     // Calculate chunk size based on max rows per batch
-    let chunkSize = insertConfig?.chunkSize;
-
-    if (chunkSize == null && dataArray.length > 0) {
-      const POSTGRES_MAX_PARAMS = 65535; // PostgreSQL parameter limit
-      const columnCount = Object.keys(dataArray[0]).length;
-      const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-      chunkSize = Math.floor(maxRowsPerBatch * 0.6); // Use 60% of max to be safe
-    }
+    const columnCount = Object.keys(dataArray[0]).length;
+    const chunkSize = calculateOptimalChunkSize(columnCount, insertConfig?.chunkSize);
 
     // Check if we need to chunk
-    if (chunkSize && dataArray.length > chunkSize) {
+    if (dataArray.length > chunkSize) {
       const results: InferTableType<TableSchema>[] = [];
 
       for (let i = 0; i < dataArray.length; i += chunkSize) {
@@ -811,64 +790,38 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     }
 
     // Extract all unique column names from all data objects
-    const columnSet = new Set<string>();
-    for (const data of dataArray) {
-      for (const key of Object.keys(data)) {
-        const column = this.schema.columns[key];
-        if (column) {
-          const config = column.build();
-          if (!config.autoIncrement || insertConfig?.overridingSystemValue) {
-            columnSet.add(key);
-          }
-        }
-      }
+    const columns = extractUniqueColumnKeys(
+      dataArray as Record<string, any>[],
+      this.schema,
+      insertConfig?.overridingSystemValue
+    );
+
+    if (columns.length === 0) {
+      return [];
     }
 
-    const columns = Array.from(columnSet);
-    const values: any[] = [];
-    const valuePlaceholders: string[] = [];
-    let paramIndex = 1;
+    const columnConfigs = buildColumnConfigs(this.schema, columns, insertConfig?.overridingSystemValue);
+    const { valueClauses, params } = buildValuesClause(dataArray as Record<string, any>[], columnConfigs);
+    const columnNames = columnConfigs.map(c => `"${c.dbName}"`);
+    const returningColumns = buildReturningColumnList(this.schema);
+    const qualifiedTableName = getQualifiedTableName(this.schema);
 
-    // Build placeholders for each row
-    for (const data of dataArray) {
-      const rowPlaceholders: string[] = [];
-      for (const key of columns) {
-        const value = (data as any)[key];
-        const column = this.schema.columns[key as string];
-        const config = column.build();
-        // Apply toDriver mapper if present
-        const mappedValue = config.mapper
-          ? config.mapper.toDriver(value !== undefined ? value : null)
-          : (value !== undefined ? value : null);
-        values.push(mappedValue);
-        rowPlaceholders.push(`$${paramIndex++}`);
-      }
-      valuePlaceholders.push(`(${rowPlaceholders.join(', ')})`);
-    }
+    let sql = `
+      INSERT INTO ${qualifiedTableName} (${columnNames.join(', ')})`;
 
-    const columnNames = columns.map(key => {
-      const column = this.schema.columns[key as string];
-      const config = column.build();
-      return `"${config.name}"`;
-    });
-
-    const returningColumns = Object.entries(this.schema.columns)
-      .map(([_, col]) => `"${(col as any).build().name}"`)
-      .join(', ');
-
-    const qualifiedTableName = this.getQualifiedTableName();
-    let sql = `INSERT INTO ${qualifiedTableName} (${columnNames.join(', ')})`;
-
+    // Add OVERRIDING SYSTEM VALUE if specified
     if (insertConfig?.overridingSystemValue) {
       sql += '\n      OVERRIDING SYSTEM VALUE';
     }
 
-    sql += `\n      VALUES ${valuePlaceholders.join(', ')}
-      RETURNING ${returningColumns}`;
+    sql += `
+      VALUES ${valueClauses.join(', ')}
+      RETURNING ${returningColumns}
+    `;
 
     const result = this.executor
-      ? await this.executor.query(sql, values)
-      : await this.client.query(sql, values);
+      ? await this.executor.query(sql, params)
+      : await this.client.query(sql, params);
     return result.rows as InferTableType<TableSchema>[];
   }
 
@@ -886,33 +839,13 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     const referenceItem = config?.referenceItem || values[0];
 
     // Determine primary keys
-    let primaryKeys: string[] = [];
-    if (config?.primaryKey) {
-      primaryKeys = Array.isArray(config.primaryKey) ? config.primaryKey : [config.primaryKey];
-    } else {
-      // Auto-detect from schema
-      for (const [key, colBuilder] of Object.entries(this.schema.columns)) {
-        const colConfig = (colBuilder as any).build();
-        if (colConfig.primaryKey) {
-          primaryKeys.push(key);
-        }
-      }
-    }
+    const primaryKeys = config?.primaryKey
+      ? (Array.isArray(config.primaryKey) ? config.primaryKey : [config.primaryKey])
+      : detectPrimaryKeys(this.schema);
 
     // Auto-detect overridingSystemValue
-    let overridingSystemValue = config?.overridingSystemValue;
-    if (overridingSystemValue == null) {
-      for (const key of Object.keys(referenceItem)) {
-        const column = this.schema.columns[key];
-        if (column) {
-          const colConfig = (column as any).build();
-          if (colConfig.primaryKey && colConfig.autoIncrement) {
-            overridingSystemValue = true;
-            break;
-          }
-        }
-      }
-    }
+    const overridingSystemValue = config?.overridingSystemValue ??
+      hasAutoIncrementPrimaryKey(this.schema, Object.keys(referenceItem));
 
     // Determine which columns to update
     let updateColumnFilter = config?.updateColumnFilter;
@@ -925,16 +858,11 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     }
 
     // Calculate chunk size based on max rows per batch
-    let chunkSize = config?.chunkSize;
-    if (chunkSize == null && values.length > 0) {
-      const POSTGRES_MAX_PARAMS = 65535;
-      const columnCount = Object.keys(values[0]).length;
-      const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-      chunkSize = Math.floor(maxRowsPerBatch * 0.6); // Use 60% of max to be safe
-    }
+    const columnCount = Object.keys(values[0]).length;
+    const chunkSize = calculateOptimalChunkSize(columnCount, config?.chunkSize);
 
     // Check if we need to chunk
-    if (chunkSize && values.length > chunkSize) {
+    if (values.length > chunkSize) {
       const results: InferTableType<TableSchema>[] = [];
 
       for (let i = 0; i < values.length; i += chunkSize) {
@@ -1041,7 +969,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       .map(([_, col]) => `"${(col as any).build().name}"`)
       .join(', ');
 
-    const qualifiedTableName = this.getQualifiedTableName();
+    const qualifiedTableName = getQualifiedTableName(this.schema);
     const sql = `
       INSERT INTO ${qualifiedTableName} (${columnNames.join(', ')})
       VALUES ${valuePlaceholders.join(', ')}
@@ -1116,7 +1044,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       .map(([_, col]) => `"${(col as any).build().name}"`)
       .join(', ');
 
-    const qualifiedTableName = this.getQualifiedTableName();
+    const qualifiedTableName = getQualifiedTableName(this.schema);
     const sql = `
       UPDATE ${qualifiedTableName}
       SET ${setClauses.join(', ')}
@@ -1148,7 +1076,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       throw new Error(`Table ${this.schema.name} has no primary key`);
     }
 
-    const qualifiedTableName = this.getQualifiedTableName();
+    const qualifiedTableName = getQualifiedTableName(this.schema);
     const sql = `DELETE FROM ${qualifiedTableName} WHERE "${pkColumnName}" = $1`;
     const result = this.executor
       ? await this.executor.query(sql, [id])

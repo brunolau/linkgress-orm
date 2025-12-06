@@ -1,5 +1,5 @@
 import type { FieldRef } from './conditions';
-import type { OrderDirection } from '../entity/db-context';
+import type { OrderDirection, OrderByResult } from '../entity/db-context';
 
 /**
  * Type guard to check if a value is a FieldRef
@@ -48,7 +48,7 @@ export interface OrderByField {
  * 3. Array of tuples: p => [[p.colName, 'ASC'], [p.otherCol, 'DESC']]
  */
 export function parseOrderBy<T>(
-  result: T | T[] | Array<[T, OrderDirection]>,
+  result: OrderByResult<T>,
   orderByFields: OrderByField[],
   getFieldName: (fieldRef: any) => string = defaultGetFieldName,
   getTable?: (fieldRef: any) => string | undefined
