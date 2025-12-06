@@ -2,6 +2,7 @@ import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, Wh
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { QueryExecutor, OrderDirection } from '../entity/db-context';
+import { parseOrderBy, getQualifiedFieldName } from './query-utils';
 import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
 import { CollectionQueryBuilder, ReferenceQueryBuilder } from './query-builder';
@@ -445,37 +446,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const mockGroup = this.createMockGroupedItem();
     const mockResult = this.resultSelector(mockGroup);
     const result = selector(mockResult);
-
-    // Handle array of [field, direction] tuples
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, OrderDirection]>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    }
-    // Handle array of fields (all ASC)
-    else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: 'ASC'
-          });
-        }
-      }
-    }
-    // Handle single field
-    else if (result && typeof result === 'object' && '__fieldName' in result) {
-      this.orderByFields.push({
-        field: (result as any).__dbColumnName || (result as any).__fieldName,
-        direction: 'ASC'
-      });
-    }
-
+    parseOrderBy(result, this.orderByFields);
     return this;
   }
 
@@ -1356,38 +1327,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const mockRight = this.createRightMock();
     const mockResult = this.resultSelector(mockLeft, mockRight);
     const result = selector(mockResult);
-
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, OrderDirection]>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          const alias = (fieldRef as any).__tableAlias || '';
-          const colName = (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName;
-          this.orderByFields.push({
-            field: alias ? `"${alias}"."${colName}"` : `"${colName}"`,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    } else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          const alias = (fieldRef as any).__tableAlias || '';
-          const colName = (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName;
-          this.orderByFields.push({
-            field: alias ? `"${alias}"."${colName}"` : `"${colName}"`,
-            direction: 'ASC'
-          });
-        }
-      }
-    } else if (result && typeof result === 'object' && '__fieldName' in result) {
-      const alias = (result as any).__tableAlias || '';
-      const colName = (result as any).__dbColumnName || (result as any).__fieldName;
-      this.orderByFields.push({
-        field: alias ? `"${alias}"."${colName}"` : `"${colName}"`,
-        direction: 'ASC'
-      });
-    }
-
+    parseOrderBy(result, this.orderByFields, getQualifiedFieldName);
     return this;
   }
 

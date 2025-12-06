@@ -2,6 +2,7 @@ import { Condition, ConditionBuilder, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { QueryExecutor, OrderDirection } from '../entity/db-context';
+import { parseOrderBy, getTableAlias } from './query-utils';
 
 /**
  * Join type
@@ -131,40 +132,13 @@ export class JoinQueryBuilder<TLeft, TRight> {
     const mockLeft = this.createMockRow(this.leftSchema, this.leftAlias);
     const mockRight = this.createMockRow(this.rightSchema, this.rightAlias);
     const result = selector(mockLeft, mockRight);
-
-    // Handle array of [field, direction] tuples
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[T, OrderDirection]>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            table: (fieldRef as any).__tableAlias || this.leftAlias,
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    }
-    // Handle array of fields (all ASC)
-    else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            table: (fieldRef as any).__tableAlias || this.leftAlias,
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: 'ASC'
-          });
-        }
-      }
-    }
-    // Handle single field
-    else if (result && typeof result === 'object' && '__fieldName' in result) {
-      this.orderByFields.push({
-        table: (result as any).__tableAlias || this.leftAlias,
-        field: (result as any).__dbColumnName || (result as any).__fieldName,
-        direction: 'ASC'
-      });
-    }
-
+    const defaultAlias = this.leftAlias;
+    parseOrderBy(
+      result,
+      this.orderByFields,
+      undefined,
+      (fieldRef) => getTableAlias(fieldRef) || defaultAlias
+    );
     return this;
   }
 

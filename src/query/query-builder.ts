@@ -1,6 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult } from '../entity/db-context';
+import { parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
@@ -508,37 +509,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   orderBy<T>(selector: (row: TRow) => OrderByResult<T>): this {
     const mockRow = this.createMockRow();
     const result = selector(mockRow);
-
-    // Handle array of [field, direction] tuples
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    }
-    // Handle array of fields (all ASC)
-    else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: 'ASC'
-          });
-        }
-      }
-    }
-    // Handle single field
-    else if (result && typeof result === 'object' && '__fieldName' in result) {
-      this.orderByFields.push({
-        field: (result as any).__dbColumnName || (result as any).__fieldName,
-        direction: 'ASC'
-      });
-    }
-
+    parseOrderBy(result, this.orderByFields);
     return this;
   }
 }
@@ -700,36 +671,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Clear previous orderBy - last one takes precedence
     this.orderByFields = [];
-
-    // Handle array of [field, direction] tuples
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    }
-    // Handle array of fields (all ASC)
-    else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: 'ASC'
-          });
-        }
-      }
-    }
-    // Handle single field
-    else if (result && typeof result === 'object' && '__fieldName' in result) {
-      this.orderByFields.push({
-        field: (result as any).__dbColumnName || (result as any).__fieldName,
-        direction: 'ASC'
-      });
-    }
+    parseOrderBy(result, this.orderByFields);
 
     return this;
   }
@@ -3397,37 +3339,7 @@ export class CollectionQueryBuilder<TItem = any> {
   orderBy<T>(selector: (item: TItem) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockItem = this.createMockItem();
     const result = selector(mockItem);
-
-    // Handle array of [field, direction] tuples
-    if (Array.isArray(result) && result.length > 0 && Array.isArray(result[0])) {
-      for (const [fieldRef, direction] of result as Array<[any, 'ASC' | 'DESC']>) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: direction || 'ASC'
-          });
-        }
-      }
-    }
-    // Handle array of fields (all ASC)
-    else if (Array.isArray(result)) {
-      for (const fieldRef of result) {
-        if (fieldRef && typeof fieldRef === 'object' && '__fieldName' in fieldRef) {
-          this.orderByFields.push({
-            field: (fieldRef as any).__dbColumnName || (fieldRef as any).__fieldName,
-            direction: 'ASC'
-          });
-        }
-      }
-    }
-    // Handle single field
-    else if (result && typeof result === 'object' && '__fieldName' in result) {
-      this.orderByFields.push({
-        field: (result as any).__dbColumnName || (result as any).__fieldName,
-        direction: 'ASC'
-      });
-    }
-
+    parseOrderBy(result, this.orderByFields);
     return this;
   }
 
