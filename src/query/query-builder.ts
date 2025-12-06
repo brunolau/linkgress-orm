@@ -2059,7 +2059,7 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     const selectParts: string[] = [];
-    const collectionFields: Array<{ name: string; cteName: string }> = [];
+    const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }> = [];
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean }> = [];
 
     // Scan selection for navigation property references and add JOINs
@@ -2089,11 +2089,21 @@ export class SelectQueryBuilder<TSelection> {
       // Process selection object properties
       for (const [key, value] of Object.entries(selection)) {
       if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
-        // Handle collection - create CTE (works for both CollectionQueryBuilder and CollectionResult)
-        const cteName = `cte_${context.cteCounter++}`;
+        // Handle collection - delegate to strategy pattern via buildCTE
+        // The strategy handles CTE/LATERAL specifics and returns necessary info
         const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
-        context.ctes.set(cteName, cteData);
-        collectionFields.push({ name: key, cteName });
+        const isCTE = cteData.isCTE !== false; // Default to CTE if not specified
+
+        // Note: For CTE strategy, context.ctes is already populated by the strategy
+        // We don't need to add it again - the strategy has already done this
+
+        collectionFields.push({
+          name: key,
+          cteName: cteData.tableName || `cte_${context.cteCounter - 1}`, // Use tableName from result or infer from counter
+          isCTE,
+          joinClause: cteData.joinClause,
+          selectExpression: cteData.selectExpression,
+        });
       } else if (value instanceof Subquery || (value && typeof value === 'object' && 'buildSql' in value && typeof (value as any).buildSql === 'function' && '__mode' in value)) {
         // Handle Subquery - build SQL and wrap in parentheses
         // Check both instanceof and duck typing for Subquery
@@ -2283,8 +2293,15 @@ export class SelectQueryBuilder<TSelection> {
       } // End of for loop
     } // End of else block
 
-    // Add collection fields as JSON/array aggregations joined from CTEs
-    for (const { name, cteName } of collectionFields) {
+    // Add collection fields as JSON/array aggregations joined from CTEs or LATERAL joins
+    for (const { name, cteName, selectExpression } of collectionFields) {
+      // If selectExpression is provided (from strategy), use it directly
+      if (selectExpression) {
+        selectParts.push(`${selectExpression} as "${name}"`);
+        continue;
+      }
+
+      // Fallback to old logic for backward compatibility
       // Check if this is an array aggregation (from toNumberList/toStringList)
       const collectionValue = selection[name];
       const isArrayAgg = collectionValue && typeof collectionValue === 'object' && 'isArrayAggregation' in collectionValue && collectionValue.isArrayAggregation();
@@ -2423,9 +2440,15 @@ export class SelectQueryBuilder<TSelection> {
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
-    // Join CTEs for collections
-    for (const { cteName } of collectionFields) {
-      fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${qualifiedTableName}.id`;
+    // Join CTEs and LATERAL subqueries for collections
+    for (const { cteName, isCTE, joinClause } of collectionFields) {
+      if (isCTE) {
+        // CTE strategy - join by parent_id
+        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${qualifiedTableName}.id`;
+      } else if (joinClause) {
+        // LATERAL strategy - use the provided join clause (contains full LATERAL subquery)
+        fromClause += `\n${joinClause}`;
+      }
     }
 
     // Add DISTINCT if needed
@@ -3470,8 +3493,9 @@ export class CollectionQueryBuilder<TItem = any> {
   /**
    * Build CTE for this collection query
    * Now delegates to collection strategy pattern
+   * Returns full CollectionAggregationResult for strategies that need special handling (like LATERAL)
    */
-  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[] } {
+  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string } {
     // Determine strategy type - default to 'cte' if not specified
     const strategyType: CollectionStrategyType = context.collectionStrategy || 'cte';
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);
@@ -3664,10 +3688,14 @@ export class CollectionQueryBuilder<TItem = any> {
       return result as any;
     }
 
-    // Synchronous strategy (JSONB/CTE)
+    // Synchronous strategy (JSONB/CTE/LATERAL)
     return {
       sql: result.sql,
       params: localParams,
+      isCTE: result.isCTE,
+      joinClause: result.joinClause,
+      selectExpression: result.selectExpression,
+      tableName: result.tableName,
     };
   }
 }

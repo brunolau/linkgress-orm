@@ -28,7 +28,7 @@ import {
 /**
  * Collection aggregation strategy type
  */
-export type CollectionStrategyType = 'cte' | 'temptable';
+export type CollectionStrategyType = 'cte' | 'temptable' | 'lateral';
 
 /**
  * Order direction for orderBy clauses

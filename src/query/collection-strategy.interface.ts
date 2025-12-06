@@ -14,7 +14,7 @@ export interface SelectedField {
 /**
  * Collection aggregation strategy type
  */
-export type CollectionStrategyType = 'cte' | 'temptable';
+export type CollectionStrategyType = 'cte' | 'temptable' | 'lateral';
 
 /**
  * Result of building a collection aggregation

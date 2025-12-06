@@ -1,6 +1,7 @@
 import { ICollectionStrategy, CollectionStrategyType } from './collection-strategy.interface';
 import { CteCollectionStrategy } from './strategies/cte-collection-strategy';
 import { TempTableCollectionStrategy } from './strategies/temptable-collection-strategy';
+import { LateralCollectionStrategy } from './strategies/lateral-collection-strategy';
 
 /**
  * Factory for creating collection aggregation strategies
@@ -19,6 +20,9 @@ export class CollectionStrategyFactory {
           break;
         case 'temptable':
           this.strategies.set(type, new TempTableCollectionStrategy());
+          break;
+        case 'lateral':
+          this.strategies.set(type, new LateralCollectionStrategy());
           break;
         default:
           throw new Error(`Unknown collection strategy type: ${type}`);

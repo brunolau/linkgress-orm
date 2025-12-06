@@ -9,7 +9,7 @@ import { Order } from '../../debug/model/order';
  */
 export function createTestDatabase(options?: {
   logQueries?: boolean;
-  collectionStrategy?: 'cte' | 'temptable';
+  collectionStrategy?: 'cte' | 'temptable' | 'lateral';
 }): AppDatabase {
   const client = new PgClient({
     host: process.env.DB_HOST || 'localhost',
@@ -117,7 +117,7 @@ export async function withDatabase<T>(
   testFn: (db: AppDatabase) => Promise<T>,
   options?: {
     logQueries?: boolean;
-    collectionStrategy?: 'cte' | 'temptable';
+    collectionStrategy?: 'cte' | 'temptable' | 'lateral';
   }
 ): Promise<T> {
   const db = createTestDatabase(options);
