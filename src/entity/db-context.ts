@@ -2144,6 +2144,39 @@ export class DbEntityTable<TEntity extends DbEntity> {
     return this.bulkUpdateSingle(data, primaryKeys);
   }
 
+  /** Static type map for PostgreSQL type casting - computed once */
+  private static readonly PG_TYPE_MAP: Record<string, string> = {
+    'smallint': 'smallint',
+    'integer': 'integer',
+    'bigint': 'bigint',
+    'serial': 'integer',
+    'smallserial': 'smallint',
+    'bigserial': 'bigint',
+    'decimal': 'decimal',
+    'numeric': 'numeric',
+    'real': 'real',
+    'double precision': 'double precision',
+    'money': 'money',
+    'varchar': 'varchar',
+    'char': 'char',
+    'text': 'text',
+    'bytea': 'bytea',
+    'timestamp': 'timestamp',
+    'timestamptz': 'timestamptz',
+    'date': 'date',
+    'time': 'time',
+    'timetz': 'timetz',
+    'interval': 'interval',
+    'boolean': 'boolean',
+    'uuid': 'uuid',
+    'json': 'json',
+    'jsonb': 'jsonb',
+    'inet': 'inet',
+    'cidr': 'cidr',
+    'macaddr': 'macaddr',
+    'macaddr8': 'macaddr8',
+  };
+
   /**
    * Execute a single bulk update batch
    * @internal
@@ -2156,8 +2189,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const executor = this._getExecutor();
     const client = this._getClient();
     const qualifiedTableName = this._getQualifiedTableName();
+    const primaryKeySet = new Set(primaryKeys);
 
-    // Collect all unique columns from all records (excluding PKs for SET clause)
+    // Single pass: collect columns and build column info simultaneously
     const updateColumnsSet = new Set<string>();
     const allColumnsSet = new Set<string>(primaryKeys);
 
@@ -2165,44 +2199,55 @@ export class DbEntityTable<TEntity extends DbEntity> {
       for (const key of Object.keys(record)) {
         if (schema.columns[key]) {
           allColumnsSet.add(key);
-          if (!primaryKeys.includes(key)) {
+          if (!primaryKeySet.has(key)) {
             updateColumnsSet.add(key);
           }
         }
       }
     }
 
-    const updateColumns = Array.from(updateColumnsSet);
-    const allColumns = Array.from(allColumnsSet);
-
-    if (updateColumns.length === 0) {
+    if (updateColumnsSet.size === 0) {
       throw new Error('No columns to update (only primary keys provided)');
     }
 
-    // Build column info for SQL generation
-    const columnInfo: Array<{ propName: string; dbName: string; pgType: string }> = [];
-    for (const propName of allColumns) {
-      const colBuilder = schema.columns[propName];
-      if (colBuilder) {
-        const colConfig = (colBuilder as any).build();
-        columnInfo.push({
-          propName,
-          dbName: colConfig.name,
-          pgType: this.getPgTypeForCast(colConfig.type),
-        });
+    // Build column info - access config once per column
+    const columnInfoList: Array<{ propName: string; dbName: string; pgType: string; isPK: boolean }> = [];
+    const valueColumnParts: string[] = [];
+    const setClauses: string[] = [];
+    const whereClauseParts: string[] = [];
+
+    for (const propName of allColumnsSet) {
+      const colConfig = (schema.columns[propName] as any).build();
+      const dbName = colConfig.name;
+      const pgType = DbEntityTable.PG_TYPE_MAP[colConfig.type] || colConfig.type;
+      const isPK = primaryKeySet.has(propName);
+
+      const info = { propName, dbName, pgType, isPK };
+      columnInfoList.push(info);
+
+      // Build VALUES column list
+      valueColumnParts.push(`"${dbName}"`);
+      if (!isPK) {
+        valueColumnParts.push(`"${dbName}__provided"`);
+        // Build SET clause
+        setClauses.push(`"${dbName}" = CASE WHEN v."${dbName}__provided" THEN v."${dbName}" ELSE t."${dbName}" END`);
+      } else {
+        // Build WHERE clause for PK
+        whereClauseParts.push(`t."${dbName}" = v."${dbName}"`);
       }
     }
 
-    // Build VALUES clause with parameters
-    // For each value column, we also add a boolean flag indicating if it was explicitly provided
-    // This allows us to distinguish between undefined (not provided) and null (explicit null)
+    const valueColumnList = valueColumnParts.join(', ');
+    const whereClause = whereClauseParts.join(' AND ');
+
+    // Build VALUES clause with parameters - single pass over data
     const valuesClauses: string[] = [];
     const params: any[] = [];
     let paramIndex = 1;
 
     for (const record of data) {
       const rowValues: string[] = [];
-      for (const col of columnInfo) {
+      for (const col of columnInfoList) {
         const hasKey = col.propName in record;
         const value = record[col.propName];
 
@@ -2215,39 +2260,16 @@ export class DbEntityTable<TEntity extends DbEntity> {
         }
 
         // Add the "was provided" flag for non-PK columns
-        if (!primaryKeys.includes(col.propName)) {
+        if (!col.isPK) {
           rowValues.push(hasKey ? 'true' : 'false');
         }
       }
       valuesClauses.push(`(${rowValues.join(', ')})`);
     }
 
-    // Build column list for VALUES alias (includes flags for non-PK columns)
-    const valueColumnParts: string[] = [];
-    for (const col of columnInfo) {
-      valueColumnParts.push(`"${col.dbName}"`);
-      if (!primaryKeys.includes(col.propName)) {
-        valueColumnParts.push(`"${col.dbName}__provided"`);
-      }
-    }
-    const valueColumnList = valueColumnParts.join(', ');
-
-    // Build SET clause using CASE to handle provided vs not provided
-    // If the flag is true, use the new value (even if null); otherwise keep existing
-    const setClauses = updateColumns.map(propName => {
-      const col = columnInfo.find(c => c.propName === propName)!;
-      return `"${col.dbName}" = CASE WHEN v."${col.dbName}__provided" THEN v."${col.dbName}" ELSE t."${col.dbName}" END`;
-    });
-
-    // Build WHERE clause for PK matching
-    const whereClause = primaryKeys.map(pk => {
-      const col = columnInfo.find(c => c.propName === pk)!;
-      return `t."${col.dbName}" = v."${col.dbName}"`;
-    }).join(' AND ');
-
-    // Build RETURNING clause (qualified with table alias to avoid ambiguity with VALUES columns)
-    const returningColumns = Object.entries(schema.columns)
-      .map(([_, col]) => `t."${(col as any).build().name}"`)
+    // Build RETURNING clause - use cached column configs
+    const returningColumns = Object.values(schema.columns)
+      .map(col => `t."${(col as any).build().name}"`)
       .join(', ');
 
     const sql = `
@@ -2263,46 +2285,6 @@ RETURNING ${returningColumns}
       : await client.query(sql, params);
 
     return this.mapResultsToEntities(result.rows);
-  }
-
-  /**
-   * Get PostgreSQL type string for casting in VALUES clause
-   * @internal
-   */
-  private getPgTypeForCast(columnType: string): string {
-    const typeMap: Record<string, string> = {
-      'smallint': 'smallint',
-      'integer': 'integer',
-      'bigint': 'bigint',
-      'serial': 'integer',
-      'smallserial': 'smallint',
-      'bigserial': 'bigint',
-      'decimal': 'decimal',
-      'numeric': 'numeric',
-      'real': 'real',
-      'double precision': 'double precision',
-      'money': 'money',
-      'varchar': 'varchar',
-      'char': 'char',
-      'text': 'text',
-      'bytea': 'bytea',
-      'timestamp': 'timestamp',
-      'timestamptz': 'timestamptz',
-      'date': 'date',
-      'time': 'time',
-      'timetz': 'timetz',
-      'interval': 'interval',
-      'boolean': 'boolean',
-      'uuid': 'uuid',
-      'json': 'json',
-      'jsonb': 'jsonb',
-      'inet': 'inet',
-      'cidr': 'cidr',
-      'macaddr': 'macaddr',
-      'macaddr8': 'macaddr8',
-    };
-
-    return typeMap[columnType] || columnType;
   }
 
   /**
