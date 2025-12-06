@@ -439,6 +439,135 @@ describe('Returning Clause (Fluent API)', () => {
     });
   });
 
+  describe('Strict void return verification', () => {
+    test('insert without returning should return undefined, not entity', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.insert({
+          username: 'voidtest',
+          email: 'void@test.com',
+          isActive: true,
+        });
+
+        // CRITICAL: This must be undefined, not an entity with id
+        expect(result).toBeUndefined();
+
+        // Extra check: result should NOT have an id property
+        expect((result as any)?.id).toBeUndefined();
+      });
+    });
+
+    test('insertMany without returning should return undefined, not array', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.insertMany([
+          { username: 'void1', email: 'void1@test.com', isActive: true },
+          { username: 'void2', email: 'void2@test.com', isActive: true },
+        ]);
+
+        expect(result).toBeUndefined();
+        expect(Array.isArray(result)).toBe(false);
+      });
+    });
+
+    test('update without returning should return undefined, not array', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const result = await db.users.update(
+          { age: 99 },
+          u => eq(u.id, users.alice.id)
+        );
+
+        expect(result).toBeUndefined();
+        expect(Array.isArray(result)).toBe(false);
+      });
+    });
+
+    test('bulkUpdate without returning should return undefined, not array', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const result = await db.users.bulkUpdate([
+          { id: users.alice.id, age: 99 },
+        ]);
+
+        expect(result).toBeUndefined();
+        expect(Array.isArray(result)).toBe(false);
+      });
+    });
+
+    test('upsertBulk without returning should return undefined, not array', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.upsertBulk([
+          { username: 'voidupsert', email: 'voidupsert@test.com', isActive: true },
+        ], {
+          primaryKey: 'username',
+        });
+
+        expect(result).toBeUndefined();
+        expect(Array.isArray(result)).toBe(false);
+      });
+    });
+  });
+
+  describe('Only specified fields returned', () => {
+    test('returning with selector should only return specified fields', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.insert({
+          username: 'selectivetest',
+          email: 'selective@test.com',
+          age: 25,
+          isActive: true,
+        }).returning(u => ({ id: u.id }));
+
+        // Should have id
+        expect(result).toHaveProperty('id');
+        expect(typeof result.id).toBe('number');
+
+        // Should NOT have other fields
+        expect(Object.keys(result)).toEqual(['id']);
+        expect(result).not.toHaveProperty('username');
+        expect(result).not.toHaveProperty('email');
+        expect(result).not.toHaveProperty('age');
+        expect(result).not.toHaveProperty('isActive');
+      });
+    });
+
+    test('returning with multiple fields should only return those fields', async () => {
+      await withDatabase(async (db) => {
+        const result = await db.users.insert({
+          username: 'multifield',
+          email: 'multi@test.com',
+          age: 30,
+          isActive: true,
+        }).returning(u => ({ id: u.id, username: u.username }));
+
+        // Should have only id and username
+        expect(Object.keys(result).sort()).toEqual(['id', 'username']);
+        expect(result.id).toBeDefined();
+        expect(result.username).toBe('multifield');
+        expect(result).not.toHaveProperty('email');
+        expect(result).not.toHaveProperty('age');
+      });
+    });
+
+    test('update with selector should only return specified fields', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const results = await db.users.update(
+          { age: 50 },
+          u => eq(u.id, users.alice.id)
+        ).returning(u => ({ age: u.age }));
+
+        expect(results.length).toBe(1);
+        expect(Object.keys(results[0])).toEqual(['age']);
+        expect(results[0].age).toBe(50);
+        expect(results[0]).not.toHaveProperty('id');
+        expect(results[0]).not.toHaveProperty('username');
+      });
+    });
+  });
+
   describe('Edge cases', () => {
     test('empty array insert should return void by default', async () => {
       await withDatabase(async (db) => {

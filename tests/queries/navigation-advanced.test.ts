@@ -666,7 +666,7 @@ describe('Advanced Navigation Properties', () => {
           email: 'noposts_user@test.com',
           age: 30,
           isActive: true,
-        });
+        }).returning(u => ({ id: u.id }));
 
         const usersWithPosts = await db.users
           .select(u => ({
@@ -702,7 +702,7 @@ describe('Advanced Navigation Properties', () => {
           email: 'noposts@test.com',
           age: 30,
           isActive: true,
-        });
+        }).returning(u => ({ id: u.id }));
 
         const usersWithStats = await db.users
           .select(u => ({
@@ -1360,7 +1360,7 @@ describe('Advanced Navigation Properties', () => {
           username: 'empty_user',
           email: 'empty@test.com',
           isActive: true,
-        });
+        }).returning(u => ({ id: u.id }));
 
         const users = await db.users
           .select(u => ({
@@ -1468,7 +1468,7 @@ describe('Advanced Navigation Properties', () => {
           username: 'lonely_user',
           email: 'lonely@test.com',
           isActive: true,
-        });
+        }).returning(u => ({ id: u.id }));
 
         const users = await db.users
           .select(u => ({
@@ -1498,7 +1498,7 @@ describe('Advanced Navigation Properties', () => {
           username: 'no_data_user',
           email: 'nodata@test.com',
           isActive: true,
-        });
+        }).returning(u => ({ id: u.id }));
 
         const users = await db.users
           .select(u => ({
