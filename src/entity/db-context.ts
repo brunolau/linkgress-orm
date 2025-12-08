@@ -2332,7 +2332,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
       const rowValues: string[] = [];
       for (const col of columnConfigs) {
         const value = (record as any)[col.propName];
-        const mappedValue = col.mapper ? col.mapper.toDriver(value) : value;
+        // Convert undefined to null - undefined values are not allowed by postgres drivers
+        const normalizedValue = value === undefined ? null : value;
+        const mappedValue = col.mapper ? col.mapper.toDriver(normalizedValue) : normalizedValue;
         rowValues.push(`$${paramIndex++}`);
         params.push(mappedValue);
       }
