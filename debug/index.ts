@@ -6,7 +6,9 @@ import {
   and,
   like,
   PgClient,
-  PostgresClient
+  PostgresClient,
+  DbCteBuilder,
+  lt
 } from '../src';
 import { AppDatabase } from './schema/appDatabase';
 
@@ -946,12 +948,75 @@ async function main() {
     const bob = await db.users.insert({ username: 'bob', email: 'bob@test.com', age: 35, isActive: true }).returning();
     const charlie = await db.users.insert({ username: 'charlie', email: 'charlie@test.com', age: 45, isActive: false }).returning();
 
+    const dte = new Date();
+    await db.posts.insert({ title: 'Alice Post 1', content: 'Content 1', userId: alice.id, views: 100, customDate: dte });
+    await db.posts.insert({ title: 'Alice Post 2', content: 'Content 2', userId: alice.id, views: 150, customDate: dte });
+    await db.posts.insert({ title: 'Bob Post 1', content: 'Content 3', userId: bob.id, views: 200, customDate: dte });
+    await db.posts.insert({ title: 'Bob Post 2', content: 'Content 4', userId: bob.id, views: 75, customDate: dte });
+    await db.posts.insert({ title: 'Charlie Post 1', content: 'Content 5', userId: charlie.id, views: 300, customDate: dte });
 
-    await db.posts.insert({ title: 'Alice Post 1', content: 'Content 1', userId: alice.id, views: 100 });
-    await db.posts.insert({ title: 'Alice Post 2', content: 'Content 2', userId: alice.id, views: 150 });
-    await db.posts.insert({ title: 'Bob Post 1', content: 'Content 3', userId: bob.id, views: 200 });
-    await db.posts.insert({ title: 'Bob Post 2', content: 'Content 4', userId: bob.id, views: 75 });
-    await db.posts.insert({ title: 'Charlie Post 1', content: 'Content 5', userId: charlie.id, views: 300 });
+    const reproBuilder = new DbCteBuilder();
+    const groupingCte = reproBuilder.withAggregation(
+      'product_price_advance_cte',
+      db.posts
+        .where(u => gt(u.id, -1))
+        .select(u => ({
+          postId: u.id,
+          userId: u.userId,
+          username: u.content,
+          createdAt: u.customDate,
+        })),
+      p => ({ advancePriceId: p.userId }),
+      'advancePrices',
+    );
+
+    const failingCte = reproBuilder.withAggregation(
+      'order_stats',
+      db.posts.select(p => ({
+        postId: p.id,
+        userId: p.userId,
+        identifier: sql<number>`CASE WHEN ${p.user!.id} < ${10} THEN ${p.id} ELSE -1 END`.as('id'),
+        kekes: p.content,
+        distinctDay: p.customDate
+      })).groupBy(p => ({
+        userId: p.userId,
+        identifier: p.identifier,
+        distinctDay: p.distinctDay,
+      })).select(p => ({
+        userId: p.key.userId,
+        identifier: p.key.identifier,
+        distinctDay: p.key.distinctDay,
+        minId: p.min(pr => pr.postId),
+      })).leftJoin(
+        groupingCte,
+        (secondCte, firstCte) => eq(secondCte.userId, firstCte.advancePriceId),
+        (secondCte, firstCte) => ({
+          userIdOfPost: secondCte.userId,
+          distinctDay: secondCte.distinctDay,
+          customerCategoryId: secondCte.identifier,
+          advancePrices: firstCte.advancePrices,
+        }),
+      ).orderBy(p => [
+        p.userIdOfPost,
+        p.distinctDay,
+        p.customerCategoryId,
+      ]),
+      p => ({ userIdOfPost: p.userIdOfPost }),
+      'orders',
+    );
+
+    const searchProducts = await db.users.where(p => gt(p.id, -1)).with(...reproBuilder.getCtes()).leftJoin(
+      failingCte,
+      (user, cte) => eq(user.id, cte.userIdOfPost),
+      (user, cte) => ({
+        id: user.id,
+        age: user.age,
+        email: user.email,
+        username: user.username,
+        orders: cte.orders
+      }),
+    ).toList();
+
 
     console.log('Test 1: Basic grouping with count');
     console.log('Group posts by userId and count posts per user\n');

@@ -72,11 +72,13 @@ export async function seedTestData(db: AppDatabase) {
   }).returning();
 
   // Create posts
+  const baseDate = new Date('2024-01-15T10:00:00Z');
   const alicePost1 = await db.posts.insert({
     title: 'Alice Post 1',
     content: 'Content from Alice',
     userId: alice.id,
     views: 100,
+    customDate: baseDate,
   }).returning();
 
   const alicePost2 = await db.posts.insert({
@@ -84,6 +86,7 @@ export async function seedTestData(db: AppDatabase) {
     content: 'More content from Alice',
     userId: alice.id,
     views: 150,
+    customDate: new Date('2024-01-16T10:00:00Z'),
   }).returning();
 
   const bobPost = await db.posts.insert({
@@ -91,6 +94,7 @@ export async function seedTestData(db: AppDatabase) {
     content: 'Content from Bob',
     userId: bob.id,
     views: 200,
+    customDate: baseDate,
   }).returning();
 
   // Create orders

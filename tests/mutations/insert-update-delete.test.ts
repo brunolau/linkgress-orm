@@ -49,6 +49,43 @@ describe('Insert, Update, Delete Operations', () => {
       });
     });
 
+    test('should insert multiple records with insertBulk when rows have different optional fields', async () => {
+      await withDatabase(async (db) => {
+        const users = await db.users.insertBulk([
+          {
+            username: 'alice_jones',
+            email: 'alice@example.com',
+            age: 25,
+            isActive: true,
+          },
+          {
+            username: 'bob_wilson',
+            email: 'bob@example.com',
+            age: 32,
+            isActive: false,
+          },
+          {
+            username: 'charlie_brown',
+            email: 'charlie@example.com',
+            isActive: true,
+            // age is optional, can be omitted
+          },
+        ]).returning(p => ({
+          id: p.id,
+          username: p.username,
+          age: p.age,
+        }));
+
+        expect(users).toHaveLength(3);
+        expect(users[0].username).toBe('alice_jones');
+        expect(users[0].age).toBe(25);
+        expect(users[1].username).toBe('bob_wilson');
+        expect(users[1].age).toBe(32);
+        expect(users[2].username).toBe('charlie_brown');
+        expect(users[2].age).toBeNull(); // Should be null, not undefined
+      });
+    });
+
     test('should handle insert with NULL values', async () => {
       await withDatabase(async (db) => {
         const user = await db.users.insert({

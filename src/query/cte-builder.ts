@@ -206,14 +206,25 @@ export class DbCteBuilder {
     // Build the inner query - handle different query builder types
     const innerSql = this.buildInnerQuerySql(query, context);
 
-    // Get group by columns
+    // Get group by columns - the keySelector maps output alias -> inner column name
+    // e.g., p => ({ advancePriceId: p.userId }) means alias "advancePriceId" from inner column "userId"
     const mockItem = this.createMockItem();
     const groupByResult = keySelector(mockItem);
-    const groupByColumns = Object.keys(groupByResult);
+    const groupByEntries = Object.entries(groupByResult);
 
-    // Build the aggregation query
-    const selectColumns = groupByColumns.map(col => `"${col}"`).join(', ');
-    const groupByClause = groupByColumns.map(col => `"${col}"`).join(', ');
+    // Build SELECT and GROUP BY with proper aliasing
+    // SELECT "innerColumn" AS "outputAlias", ... GROUP BY "innerColumn"
+    const selectColumns = groupByEntries
+      .map(([outputAlias, innerColumn]) => {
+        const innerCol = String(innerColumn);
+        // If the alias differs from the inner column name, add AS clause
+        if (outputAlias !== innerCol) {
+          return `"${innerCol}" AS "${outputAlias}"`;
+        }
+        return `"${innerCol}"`;
+      })
+      .join(', ');
+    const groupByClause = groupByEntries.map(([, innerColumn]) => `"${String(innerColumn)}"`).join(', ');
 
     // Use provided alias or default to 'items'
     const finalAggregationAlias = (aggregationAlias || 'items') as TAlias;
@@ -234,10 +245,10 @@ export class DbCteBuilder {
     // Update parameter offset
     this.paramOffset = context.paramCounter;
 
-    // Create column definitions
+    // Create column definitions using output alias names
     const columnDefs: any = {};
-    groupByColumns.forEach(col => {
-      columnDefs[col] = col;
+    groupByEntries.forEach(([outputAlias]) => {
+      columnDefs[outputAlias] = outputAlias;
     });
     columnDefs[finalAggregationAlias] = finalAggregationAlias;
 
