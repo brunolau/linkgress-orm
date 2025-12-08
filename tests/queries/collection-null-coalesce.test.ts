@@ -325,7 +325,7 @@ describe('Collection Null Coalesce', () => {
 
     test('should return empty array instead of null for CTE aggregation field when no match in leftJoin', async () => {
       await withDatabase(async (db) => {
-        const { users } = await seedTestData(db);
+        await seedTestData(db);
 
         // Import CTE builder
         const { DbCteBuilder } = await import('../../src/query/cte-builder');
@@ -386,7 +386,7 @@ describe('Collection Null Coalesce', () => {
         await seedTestData(db);
 
         const { DbCteBuilder } = await import('../../src/query/cte-builder');
-        const { eq, gt, sql } = await import('../../src');
+        const { eq, gt } = await import('../../src');
 
         const cteBuilder = new DbCteBuilder();
 
@@ -451,6 +451,96 @@ describe('Collection Null Coalesce', () => {
         expect(Array.isArray(emptyUser!.posts)).toBe(true);
         expect(emptyUser!.posts).toEqual([]);
       });
+    });
+  });
+
+  describe('CTE withAggregation works with all collection strategies', () => {
+    test('CTE aggregation leftJoin should coalesce to empty array with CTE collection strategy', async () => {
+      await withDatabase(async (db) => {
+        const { DbCteBuilder } = await import('../../src/query/cte-builder');
+        const { eq, gt } = await import('../../src');
+
+        const cteBuilder = new DbCteBuilder();
+
+        const postsCte = cteBuilder.withAggregation(
+          'posts_cte',
+          db.posts.select(p => ({
+            postUserId: p.userId,
+            postTitle: p.title,
+          })),
+          p => ({ postUserId: p.postUserId }),
+          'posts',
+        );
+
+        await db.users.insert({
+          username: 'cte_strat_empty',
+          email: 'cte_strat_empty@test.com',
+          age: 30,
+          isActive: true,
+        }).returning();
+
+        const result = await db.users
+          .where(u => gt(u.id, 0))
+          .with(...cteBuilder.getCtes())
+          .leftJoin(
+            postsCte,
+            (user, cte) => eq(user.id, cte.postUserId),
+            (user, cte) => ({
+              id: user.id,
+              username: user.username,
+              posts: cte.posts,
+            }),
+          )
+          .toList();
+
+        const user = result.find(r => r.username === 'cte_strat_empty');
+        expect(user!.posts).not.toBeNull();
+        expect(user!.posts).toEqual([]);
+      }, { collectionStrategy: 'cte' });
+    });
+
+    test('CTE aggregation leftJoin should coalesce to empty array with LATERAL collection strategy', async () => {
+      await withDatabase(async (db) => {
+        const { DbCteBuilder } = await import('../../src/query/cte-builder');
+        const { eq, gt } = await import('../../src');
+
+        const cteBuilder = new DbCteBuilder();
+
+        const postsCte = cteBuilder.withAggregation(
+          'posts_cte',
+          db.posts.select(p => ({
+            postUserId: p.userId,
+            postTitle: p.title,
+          })),
+          p => ({ postUserId: p.postUserId }),
+          'posts',
+        );
+
+        await db.users.insert({
+          username: 'lateral_strat_empty',
+          email: 'lateral_strat_empty@test.com',
+          age: 30,
+          isActive: true,
+        }).returning();
+
+        const result = await db.users
+          .where(u => gt(u.id, 0))
+          .with(...cteBuilder.getCtes())
+          .leftJoin(
+            postsCte,
+            (user, cte) => eq(user.id, cte.postUserId),
+            (user, cte) => ({
+              id: user.id,
+              username: user.username,
+              posts: cte.posts,
+            }),
+          )
+          .toList();
+
+        const user = result.find(r => r.username === 'lateral_strat_empty');
+        expect(user!.posts).not.toBeNull();
+        expect(user!.posts).toEqual([]);
+      }, { collectionStrategy: 'lateral' });
     });
   });
 
