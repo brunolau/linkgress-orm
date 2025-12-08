@@ -69,22 +69,24 @@ export function customType<TData = any, TDriver = any>(config: {
 
 /**
  * JSON type with automatic serialization
+ * Note: PostgreSQL drivers return jsonb as already-parsed objects
  */
 export const json = <T = any>() =>
-  customType<T, string>({
+  customType<T, T>({
     dataType: 'jsonb',
-    toDriver: (value: T) => JSON.stringify(value),
-    fromDriver: (value: string) => JSON.parse(value),
+    toDriver: (value: T) => value as any, // Driver accepts objects directly
+    fromDriver: (value: T) => value,       // Driver returns parsed objects
   });
 
 /**
  * Array type
+ * Note: PostgreSQL drivers return arrays as already-parsed
  */
 export const array = <T = any>(itemType: string) =>
-  customType<T[], string>({
+  customType<T[], T[]>({
     dataType: `${itemType}[]`,
-    toDriver: (value: T[]) => JSON.stringify(value),
-    fromDriver: (value: string) => JSON.parse(value),
+    toDriver: (value: T[]) => value as any, // Driver accepts arrays directly
+    fromDriver: (value: T[]) => value,       // Driver returns parsed arrays
   });
 
 /**

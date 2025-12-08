@@ -652,9 +652,9 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   mapWith<TData = TValueType, TDriver = any>(
     mapper: ((value: TDriver) => TData) | any
   ): SqlFragment<TData> {
-    // If mapper is a function, wrap it in a simple mapper object
+    // If mapper is a function, wrap it in a null-safe mapper object
     const normalizedMapper = typeof mapper === 'function'
-      ? { fromDriver: mapper }
+      ? { fromDriver: (v: TDriver) => v == null ? v : mapper(v) }
       : mapper;
 
     return new SqlFragment<TData>(this.sqlParts, this.values, normalizedMapper, this.alias);

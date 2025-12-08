@@ -10,6 +10,22 @@ import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 
 /**
+ * Field type categories for optimized result transformation
+ * const enum is inlined at compile time for zero runtime overhead
+ */
+const enum FieldType {
+  NAVIGATION = 0,
+  COLLECTION_SCALAR = 1,
+  COLLECTION_ARRAY = 2,
+  COLLECTION_JSON = 3,
+  CTE_AGGREGATION = 4,
+  SQL_FRAGMENT_MAPPER = 5,
+  FIELD_REF_MAPPER = 6,
+  FIELD_REF_NO_MAPPER = 7,
+  SIMPLE = 8,
+}
+
+/**
  * Performance utility: Get column name map from schema, using cached version if available
  */
 export function getColumnNameMapForSchema(schema: TableSchema): Map<string, string> {
@@ -265,18 +281,28 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     }
 
     const mock: any = {};
+    const tableAlias = this.schema.name;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
 
+    // Performance: Lazy-cache FieldRef objects - only create when first accessed
+    const fieldRefCache: Record<string, any> = {};
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: this.schema.name,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -513,14 +539,23 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(schema);
 
+    // Performance: Lazy-cache FieldRef objects
+    const fieldRefCache: Record<string, any> = {};
+
     // Add columns as FieldRef objects with table alias
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: alias,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: alias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -1151,14 +1186,23 @@ export class SelectQueryBuilder<TSelection> {
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(schema);
 
+    // Performance: Lazy-cache FieldRef objects
+    const fieldRefCache: Record<string, any> = {};
+
     // Add columns as FieldRef objects with table alias
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: alias,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: alias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -1907,18 +1951,28 @@ export class SelectQueryBuilder<TSelection> {
    */
   private createMockRow(): any {
     const mock: any = {};
+    const tableAlias = this.schema.name;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
 
+    // Performance: Lazy-cache FieldRef objects
+    const fieldRefCache: Record<string, any> = {};
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: this.schema.name,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -1936,13 +1990,23 @@ export class SelectQueryBuilder<TSelection> {
       if (!mock[join.alias]) {
         mock[join.alias] = {};
       }
+
+      // Lazy-cache for joined table
+      const joinFieldRefCache: Record<string, any> = {};
+      const joinAlias = join.alias;
       for (const [colName, dbColumnName] of joinColumnNameMap) {
         Object.defineProperty(mock[join.alias], colName, {
-          get: () => ({
-            __fieldName: colName,
-            __dbColumnName: dbColumnName,
-            __tableAlias: join.alias,
-          }),
+          get() {
+            let cached = joinFieldRefCache[colName];
+            if (!cached) {
+              cached = joinFieldRefCache[colName] = {
+                __fieldName: colName,
+                __dbColumnName: dbColumnName,
+                __tableAlias: joinAlias,
+              };
+            }
+            return cached;
+          },
           enumerable: true,
           configurable: true,
         });
@@ -2678,19 +2742,6 @@ export class SelectQueryBuilder<TSelection> {
     };
   }
 
-  /**
-   * Field type categories for optimized result transformation
-   * Pre-categorizing fields allows the per-row loop to use simple switch instead of repeated type checks
-   */
-  private static readonly FIELD_TYPE_NAVIGATION = 0;
-  private static readonly FIELD_TYPE_COLLECTION_SCALAR = 1;
-  private static readonly FIELD_TYPE_COLLECTION_ARRAY = 2;
-  private static readonly FIELD_TYPE_COLLECTION_JSON = 3;
-  private static readonly FIELD_TYPE_CTE_AGGREGATION = 4;
-  private static readonly FIELD_TYPE_SQL_FRAGMENT_MAPPER = 5;
-  private static readonly FIELD_TYPE_FIELD_REF_MAPPER = 6;
-  private static readonly FIELD_TYPE_FIELD_REF_NO_MAPPER = 7;
-  private static readonly FIELD_TYPE_SIMPLE = 8;
 
   /**
    * Transform database results
@@ -2722,17 +2773,17 @@ export class SelectQueryBuilder<TSelection> {
 
       // Check for navigation placeholders first (most common early exit)
       if (Array.isArray(value) && value.length === 0) {
-        fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_NAVIGATION, value: [] });
+        fieldConfigs.push({ key, type: FieldType.NAVIGATION, value: [] });
         continue;
       }
       if (value === undefined) {
-        fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_NAVIGATION, value: undefined });
+        fieldConfigs.push({ key, type: FieldType.NAVIGATION, value: undefined });
         continue;
       }
 
       // Check for navigation property mocks (objects with getters)
       // These are treated as SIMPLE because the actual value comes from json_build_object in the row
-      // The navigation mock is just a placeholder - actual data processing happens via FIELD_TYPE_SIMPLE
+      // The navigation mock is just a placeholder - actual data processing happens via FieldType.SIMPLE
       if (value && typeof value === 'object' && !('__dbColumnName' in value) && !('__fieldName' in value) && !('__collectionResult' in value) && !('__isAggregationArray' in value)) {
         const props = Object.getOwnPropertyNames(value);
         if (props.length > 0) {
@@ -2740,7 +2791,7 @@ export class SelectQueryBuilder<TSelection> {
           if (descriptor && descriptor.get) {
             // Navigation mock - treat as simple, data will come from row via json_build_object
             // If row has no data, convertValue will return undefined
-            fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_SIMPLE, value });
+            fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
             continue;
           }
         }
@@ -2753,18 +2804,18 @@ export class SelectQueryBuilder<TSelection> {
           const aggregationType = value.getAggregationType();
           fieldConfigs.push({
             key,
-            type: SelectQueryBuilder.FIELD_TYPE_COLLECTION_SCALAR,
+            type: FieldType.COLLECTION_SCALAR,
             value,
             aggregationType
           });
         } else {
           const isArrayAgg = value && typeof value === 'object' && 'isArrayAggregation' in value && value.isArrayAggregation();
           if (isArrayAgg) {
-            fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_COLLECTION_ARRAY, value });
+            fieldConfigs.push({ key, type: FieldType.COLLECTION_ARRAY, value });
           } else {
             fieldConfigs.push({
               key,
-              type: SelectQueryBuilder.FIELD_TYPE_COLLECTION_JSON,
+              type: FieldType.COLLECTION_JSON,
               value,
               collectionBuilder: value instanceof CollectionQueryBuilder ? value : undefined
             });
@@ -2777,7 +2828,7 @@ export class SelectQueryBuilder<TSelection> {
       if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
         fieldConfigs.push({
           key,
-          type: SelectQueryBuilder.FIELD_TYPE_CTE_AGGREGATION,
+          type: FieldType.CTE_AGGREGATION,
           value,
           innerMetadata: (value as any).__innerSelectionMetadata
         });
@@ -2791,9 +2842,9 @@ export class SelectQueryBuilder<TSelection> {
           mapper = mapper.getType();
         }
         if (mapper && typeof mapper.fromDriver === 'function') {
-          fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_SQL_FRAGMENT_MAPPER, value, mapper });
+          fieldConfigs.push({ key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper });
         } else {
-          fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_SIMPLE, value });
+          fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
         }
         continue;
       }
@@ -2801,39 +2852,44 @@ export class SelectQueryBuilder<TSelection> {
       // FieldRef with potential mapper
       if (typeof value === 'object' && value !== null && '__fieldName' in value) {
         if (disableMappers) {
-          fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_FIELD_REF_NO_MAPPER, value });
+          fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
         } else {
           const fieldName = value.__fieldName as string;
           const cached = schemaColumnCache?.get(fieldName);
           if (cached && cached.hasMapper) {
-            fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_FIELD_REF_MAPPER, value, mapper: cached.mapper });
+            fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: cached.mapper });
           } else if (cached) {
-            fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_FIELD_REF_NO_MAPPER, value });
+            fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
           } else {
             // Not in schema - treat as simple value
-            fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_SIMPLE, value });
+            fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
           }
         }
         continue;
       }
 
       // Default: simple value
-      fieldConfigs.push({ key, type: SelectQueryBuilder.FIELD_TYPE_SIMPLE, value });
+      fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
     }
 
     // Transform each row using pre-analyzed field configs
+    // Using while(i--) for maximum performance - decrement and compare to 0 is faster
     const results: TSelection[] = new Array(rows.length);
-    for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const configCount = fieldConfigs.length;
+    let rowIdx = rows.length;
+
+    while (rowIdx--) {
       const row = rows[rowIdx];
       const result: any = {};
+      let i = configCount;
 
       // Process all fields using pre-computed types
-      for (let i = 0; i < fieldConfigs.length; i++) {
+      while (i--) {
         const config = fieldConfigs[i];
         const key = config.key;
 
         // Handle navigation placeholders separately
-        if (config.type === SelectQueryBuilder.FIELD_TYPE_NAVIGATION) {
+        if (config.type === FieldType.NAVIGATION) {
           result[key] = config.value;
           continue;
         }
@@ -2841,7 +2897,7 @@ export class SelectQueryBuilder<TSelection> {
         const rawValue = row[key];
 
         switch (config.type) {
-          case SelectQueryBuilder.FIELD_TYPE_COLLECTION_SCALAR: {
+          case FieldType.COLLECTION_SCALAR: {
             if (config.aggregationType === 'COUNT') {
               result[key] = this.convertValue(rawValue);
             } else {
@@ -2849,17 +2905,17 @@ export class SelectQueryBuilder<TSelection> {
               if (rawValue === null) {
                 result[key] = null;
               } else if (typeof rawValue === 'string' && NUMERIC_REGEX.test(rawValue)) {
-                result[key] = Number(rawValue);
+                result[key] = +rawValue;
               } else {
                 result[key] = rawValue;
               }
             }
             break;
           }
-          case SelectQueryBuilder.FIELD_TYPE_COLLECTION_ARRAY:
+          case FieldType.COLLECTION_ARRAY:
             result[key] = rawValue || [];
             break;
-          case SelectQueryBuilder.FIELD_TYPE_COLLECTION_JSON: {
+          case FieldType.COLLECTION_JSON: {
             const items = rawValue || [];
             if (config.collectionBuilder) {
               result[key] = this.transformCollectionItems(items, config.collectionBuilder);
@@ -2868,7 +2924,7 @@ export class SelectQueryBuilder<TSelection> {
             }
             break;
           }
-          case SelectQueryBuilder.FIELD_TYPE_CTE_AGGREGATION: {
+          case FieldType.CTE_AGGREGATION: {
             const items = rawValue || [];
             if (config.innerMetadata && !disableMappers) {
               result[key] = this.transformCteAggregationItems(items, config.innerMetadata);
@@ -2877,21 +2933,18 @@ export class SelectQueryBuilder<TSelection> {
             }
             break;
           }
-          case SelectQueryBuilder.FIELD_TYPE_SQL_FRAGMENT_MAPPER: {
-            if (rawValue !== null && rawValue !== undefined && config.mapper) {
-              result[key] = config.mapper.fromDriver(rawValue);
-            } else {
-              result[key] = this.convertValue(rawValue);
-            }
+          case FieldType.SQL_FRAGMENT_MAPPER:
+            // mapWith wraps user functions to handle null
+            result[key] = config.mapper.fromDriver(rawValue);
             break;
-          }
-          case SelectQueryBuilder.FIELD_TYPE_FIELD_REF_MAPPER:
-            result[key] = rawValue === null ? undefined : config.mapper.fromDriver(rawValue);
+          case FieldType.FIELD_REF_MAPPER:
+            // Column mappers (customType) - null check done here
+            result[key] = config.mapper.fromDriver(rawValue);
             break;
-          case SelectQueryBuilder.FIELD_TYPE_FIELD_REF_NO_MAPPER:
-            result[key] = rawValue === null ? undefined : rawValue;
+          case FieldType.FIELD_REF_NO_MAPPER:
+            result[key] = rawValue;
             break;
-          case SelectQueryBuilder.FIELD_TYPE_SIMPLE:
+          case FieldType.SIMPLE:
           default:
             result[key] = this.convertValue(rawValue);
             break;
@@ -2960,8 +3013,11 @@ export class SelectQueryBuilder<TSelection> {
       });
     }
 
-    // Optimized path using cached metadata
-    return items.map(item => {
+    // Optimized path using cached metadata and while(i--) loop
+    const results: any[] = new Array(items.length);
+    let i = items.length;
+    while (i--) {
+      const item = items[i];
       const transformedItem: any = {};
       for (const key in item) {
         const value = item[key];
@@ -2972,8 +3028,9 @@ export class SelectQueryBuilder<TSelection> {
           transformedItem[key] = value;
         }
       }
-      return transformedItem;
-    });
+      results[i] = transformedItem;
+    }
+    return results;
   }
 
   /**
@@ -3024,20 +3081,25 @@ export class SelectQueryBuilder<TSelection> {
       }
     }
 
-    // Transform items using for-in loop (faster than Object.entries)
-    return items.map(item => {
+    // Transform items using while(i--) loop - decrement and compare to 0 is fastest
+    const results: any[] = new Array(items.length);
+    let i = items.length;
+    while (i--) {
+      const item = items[i];
       const transformedItem: any = {};
       for (const key in item) {
         const value = item[key];
         const mapper = mapperCache[key];
-        if (mapper && value !== null && value !== undefined) {
+        // Mappers handle null internally (mapWith wraps user functions)
+        if (mapper) {
           transformedItem[key] = mapper.fromDriver(value);
         } else {
           transformedItem[key] = value;
         }
       }
-      return transformedItem;
-    });
+      results[i] = transformedItem;
+    }
+    return results;
   }
 
   /**
@@ -3421,13 +3483,24 @@ export class ReferenceQueryBuilder<TItem = any> {
       const mock: any = {};
       // Add columns - use pre-computed column name map if available
       const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
+
+      // Performance: Lazy-cache FieldRef objects
+      const fieldRefCache: Record<string, any> = {};
+      const tableAlias = this.relationName;
+
       for (const [colName, dbColumnName] of columnNameMap) {
         Object.defineProperty(mock, colName, {
-          get: () => ({
-            __fieldName: colName,
-            __dbColumnName: dbColumnName,
-            __tableAlias: this.relationName,  // Mark which table this belongs to
-          }),
+          get() {
+            let cached = fieldRefCache[colName];
+            if (!cached) {
+              cached = fieldRefCache[colName] = {
+                __fieldName: colName,
+                __dbColumnName: dbColumnName,
+                __tableAlias: tableAlias,  // Mark which table this belongs to
+              };
+            }
+            return cached;
+          },
           enumerable: true,
           configurable: true,
         });
@@ -3607,13 +3680,22 @@ export class CollectionQueryBuilder<TItem = any> {
       // Performance: Use pre-computed column name map if available
       const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
 
+      // Performance: Lazy-cache FieldRef objects
+      const fieldRefCache: Record<string, any> = {};
+
       // Add columns
       for (const [colName, dbColumnName] of columnNameMap) {
         Object.defineProperty(mock, colName, {
-          get: () => ({
-            __fieldName: colName,
-            __dbColumnName: dbColumnName,
-          }),
+          get() {
+            let cached = fieldRefCache[colName];
+            if (!cached) {
+              cached = fieldRefCache[colName] = {
+                __fieldName: colName,
+                __dbColumnName: dbColumnName,
+              };
+            }
+            return cached;
+          },
           enumerable: true,
           configurable: true,
         });

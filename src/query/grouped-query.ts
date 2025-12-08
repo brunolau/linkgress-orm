@@ -271,16 +271,27 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
    */
   private createMockRow(): any {
     const mock: any = {};
+    const tableAlias = this.schema.name;
 
     // Add columns as FieldRef objects - use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
+
+    // Performance: Lazy-cache FieldRef objects
+    const fieldRefCache: Record<string, any> = {};
+
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: this.schema.name,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -333,16 +344,26 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       }
 
       const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
+      if (!mock[join.alias]) {
+        mock[join.alias] = {};
+      }
+
+      // Lazy-cache for joined table
+      const joinFieldRefCache: Record<string, any> = {};
+      const joinAlias = join.alias;
       for (const [colName, dbColumnName] of joinColumnNameMap) {
-        if (!mock[join.alias]) {
-          mock[join.alias] = {};
-        }
         Object.defineProperty(mock[join.alias], colName, {
-          get: () => ({
-            __fieldName: colName,
-            __dbColumnName: dbColumnName,
-            __tableAlias: join.alias,
-          }),
+          get() {
+            let cached = joinFieldRefCache[colName];
+            if (!cached) {
+              cached = joinFieldRefCache[colName] = {
+                __fieldName: colName,
+                __dbColumnName: dbColumnName,
+                __tableAlias: joinAlias,
+              };
+            }
+            return cached;
+          },
           enumerable: true,
           configurable: true,
         });
@@ -1293,16 +1314,27 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    */
   private createMockRow(): any {
     const mock: any = {};
+    const tableAlias = this.schema.name;
 
     // Add columns as FieldRef objects - use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
+
+    // Performance: Lazy-cache FieldRef objects
+    const fieldRefCache: Record<string, any> = {};
+
     for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
-        get: () => ({
-          __fieldName: colName,
-          __dbColumnName: dbColumnName,
-          __tableAlias: this.schema.name,
-        }),
+        get() {
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,
+            };
+          }
+          return cached;
+        },
         enumerable: true,
         configurable: true,
       });
@@ -1355,16 +1387,26 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       }
 
       const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
+      if (!mock[join.alias]) {
+        mock[join.alias] = {};
+      }
+
+      // Lazy-cache for joined table
+      const joinFieldRefCache: Record<string, any> = {};
+      const joinAlias = join.alias;
       for (const [colName, dbColumnName] of joinColumnNameMap) {
-        if (!mock[join.alias]) {
-          mock[join.alias] = {};
-        }
         Object.defineProperty(mock[join.alias], colName, {
-          get: () => ({
-            __fieldName: colName,
-            __dbColumnName: dbColumnName,
-            __tableAlias: join.alias,
-          }),
+          get() {
+            let cached = joinFieldRefCache[colName];
+            if (!cached) {
+              cached = joinFieldRefCache[colName] = {
+                __fieldName: colName,
+                __dbColumnName: dbColumnName,
+                __tableAlias: joinAlias,
+              };
+            }
+            return cached;
+          },
           enumerable: true,
           configurable: true,
         });
