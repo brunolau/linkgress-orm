@@ -267,7 +267,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
           computedId: sql<number>`CASE WHEN ${p.user!.isActive} = true THEN ${p.id} ELSE -1 END`.as('computedId'),
           postId: p.id,
           views: p.views,
-          userId: p.userId,
+          userId: p.user!.id,
         })).groupBy(p => ({
           computedId: p.computedId,
           postId: p.postId,

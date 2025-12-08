@@ -139,11 +139,13 @@ export class AppDatabase extends DbContext {
 
             entity.hasOne(e => e.order, () => Order)
                 .withForeignKey(e => e.orderId)
-                .withPrincipalKey(e => e.id);
+                .withPrincipalKey(e => e.id)
+                .onDelete('cascade');
 
             entity.hasOne(e => e.task, () => Task)
                 .withForeignKey(e => e.taskId)
-                .withPrincipalKey(e => e.id);
+                .withPrincipalKey(e => e.id)
+                .onDelete('cascade');
         });
 
         // Configure TaskLevel entity
@@ -156,7 +158,8 @@ export class AppDatabase extends DbContext {
 
             entity.hasOne(e => e.createdBy, () => User)
                 .withForeignKey(e => e.createdById)
-                .withPrincipalKey(u => u.id);
+                .withPrincipalKey(u => u.id)
+                .onDelete('cascade');
         });
 
         // Configure Task entity
@@ -171,7 +174,8 @@ export class AppDatabase extends DbContext {
 
             entity.hasOne(e => e.level, () => TaskLevel)
                 .withForeignKey(e => sql`${e.levelId}`)
-                .withPrincipalKey(l => l.id);
+                .withPrincipalKey(l => l.id)
+                .onDelete('cascade');
         });
 
         // Configure SchemaUser entity (in auth schema)
