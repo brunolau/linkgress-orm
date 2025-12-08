@@ -85,19 +85,35 @@ type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
  * Represents a Common Table Expression (CTE) with strong typing
  */
 export class DbCte<TColumns> {
+  /**
+   * Set of column names that contain aggregated JSONB arrays.
+   * These columns need COALESCE(..., '[]'::jsonb) when used in LEFT JOINs.
+   */
+  public readonly aggregationColumns: Set<string>;
+
   constructor(
     public readonly name: string,
     public readonly query: string,
     public readonly params: unknown[],
     public readonly columnDefs: TColumns,
-    public readonly selectionMetadata?: Record<string, any>
-  ) {}
+    public readonly selectionMetadata?: Record<string, any>,
+    aggregationColumns?: string[]
+  ) {
+    this.aggregationColumns = new Set(aggregationColumns || []);
+  }
 
   /**
    * Get a typed reference to a CTE column
    */
   getColumn<K extends keyof TColumns>(columnName: K): TColumns[K] {
     return columnName as TColumns[K];
+  }
+
+  /**
+   * Check if a column is an aggregation column (JSONB array)
+   */
+  isAggregationColumn(columnName: string): boolean {
+    return this.aggregationColumns.has(columnName);
   }
 }
 
@@ -225,7 +241,8 @@ export class DbCteBuilder {
     });
     columnDefs[finalAggregationAlias] = finalAggregationAlias;
 
-    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs);
+    // Pass the aggregation alias as an aggregation column so it can be COALESCE'd in LEFT JOINs
+    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, undefined, [finalAggregationAlias]);
     this.ctes.push(cte);
 
     return cte;

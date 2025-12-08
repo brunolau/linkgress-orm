@@ -2322,6 +2322,7 @@ export class SelectQueryBuilder<TSelection> {
         if ('__tableAlias' in value && value.__tableAlias && typeof value.__tableAlias === 'string') {
           // This is a field from a joined table
           const tableAlias = value.__tableAlias as string;
+          const columnName = value.__dbColumnName as string;
 
           // Find the relation config for this navigation
           const relConfig = this.schema.relations[tableAlias];
@@ -2346,7 +2347,14 @@ export class SelectQueryBuilder<TSelection> {
             }
           }
 
-          selectParts.push(`"${tableAlias}"."${value.__dbColumnName}" as "${key}"`);
+          // Check if this is a CTE aggregation column that needs COALESCE
+          const cteJoin = this.manualJoins.find(j => j.cte && j.cte.name === tableAlias);
+          if (cteJoin && cteJoin.cte && cteJoin.cte.isAggregationColumn(columnName)) {
+            // CTE aggregation column - wrap with COALESCE to return empty array instead of null
+            selectParts.push(`COALESCE("${tableAlias}"."${columnName}", '[]'::jsonb) as "${key}"`);
+          } else {
+            selectParts.push(`"${tableAlias}"."${columnName}" as "${key}"`);
+          }
         } else {
           // Regular field from the main table
           selectParts.push(`"${this.schema.name}"."${value.__dbColumnName}" as "${key}"`);
