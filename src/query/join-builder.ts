@@ -3,7 +3,7 @@ import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { QueryExecutor, OrderDirection } from '../entity/db-context';
 import { parseOrderBy, getTableAlias } from './query-utils';
-import { createNestedFieldRefProxy } from './query-builder';
+import { createNestedFieldRefProxy, getColumnNameMapForSchema } from './query-builder';
 
 /**
  * Join type
@@ -199,9 +199,9 @@ export class JoinQueryBuilder<TLeft, TRight> {
   private createMockRow(schema: TableSchema, alias: string): any {
     const mock: any = {};
 
-    // Add columns as FieldRef objects
-    for (const [colName, colBuilder] of Object.entries(schema.columns)) {
-      const dbColumnName = (colBuilder as any).build().name;
+    // Add columns as FieldRef objects - use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(schema);
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -226,8 +226,8 @@ export class JoinQueryBuilder<TLeft, TRight> {
             }
 
             const nestedMock: any = {};
-            for (const [nestedColName, nestedColBuilder] of Object.entries(targetSchema.columns)) {
-              const nestedDbColumnName = (nestedColBuilder as any).build().name;
+            const nestedColumnNameMap = getColumnNameMapForSchema(targetSchema);
+            for (const [nestedColName, nestedDbColumnName] of nestedColumnNameMap) {
               Object.defineProperty(nestedMock, nestedColName, {
                 get: () => ({
                   __fieldName: nestedColName,

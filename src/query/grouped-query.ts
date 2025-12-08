@@ -5,7 +5,7 @@ import type { QueryExecutor, OrderDirection } from '../entity/db-context';
 import { parseOrderBy, getQualifiedFieldName } from './query-utils';
 import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
-import { CollectionQueryBuilder, ReferenceQueryBuilder } from './query-builder';
+import { CollectionQueryBuilder, ReferenceQueryBuilder, getColumnNameMapForSchema, getRelationEntriesForSchema, getTargetSchemaForRelation } from './query-builder';
 import { DbCte, isCte } from './cte-builder';
 
 /**
@@ -272,9 +272,9 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   private createMockRow(): any {
     const mock: any = {};
 
-    // Add columns as FieldRef objects
-    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
-      const dbColumnName = (colBuilder as any).build().name;
+    // Add columns as FieldRef objects - use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.schema);
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -287,16 +287,13 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     }
 
     // Add navigation properties (collections and single references)
-    const relationSchemas = new Map<string, TableSchema | undefined>();
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
-      if (relConfig.targetTableBuilder) {
-        relationSchemas.set(relName, relConfig.targetTableBuilder.build());
-      }
-    }
+    // Performance: Use pre-computed relation entries and cached schemas
+    const relationEntries = getRelationEntriesForSchema(this.schema);
 
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
+    for (const [relName, relConfig] of relationEntries) {
+      const targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+
       if (relConfig.type === 'many') {
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             return new CollectionQueryBuilder(
@@ -311,7 +308,6 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
           configurable: true,
         });
       } else {
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
@@ -336,8 +332,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
         continue;
       }
 
-      for (const [colName, colBuilder] of Object.entries(join.schema.columns)) {
-        const dbColumnName = (colBuilder as any).build().name;
+      const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
+      for (const [colName, dbColumnName] of joinColumnNameMap) {
         if (!mock[join.alias]) {
           mock[join.alias] = {};
         }
@@ -980,9 +976,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   private createMockRow(): any {
     const mock: any = {};
 
-    // Add columns as FieldRef objects
-    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
-      const dbColumnName = (colBuilder as any).build().name;
+    // Add columns as FieldRef objects - use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.schema);
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -995,16 +991,13 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     }
 
     // Add navigation properties (collections and single references)
-    const relationSchemas = new Map<string, TableSchema | undefined>();
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
-      if (relConfig.targetTableBuilder) {
-        relationSchemas.set(relName, relConfig.targetTableBuilder.build());
-      }
-    }
+    // Performance: Use pre-computed relation entries and cached schemas
+    const relationEntries = getRelationEntriesForSchema(this.schema);
 
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
+    for (const [relName, relConfig] of relationEntries) {
+      const targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+
       if (relConfig.type === 'many') {
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             return new CollectionQueryBuilder(
@@ -1019,7 +1012,6 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           configurable: true,
         });
       } else {
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
@@ -1044,8 +1036,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         continue;
       }
 
-      for (const [colName, colBuilder] of Object.entries(join.schema.columns)) {
-        const dbColumnName = (colBuilder as any).build().name;
+      const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
+      for (const [colName, dbColumnName] of joinColumnNameMap) {
         if (!mock[join.alias]) {
           mock[join.alias] = {};
         }

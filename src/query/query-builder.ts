@@ -10,6 +10,51 @@ import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField } from './collection-strategy.interface';
 
 /**
+ * Performance utility: Get column name map from schema, using cached version if available
+ */
+export function getColumnNameMapForSchema(schema: TableSchema): Map<string, string> {
+  if (schema.columnNameMap) {
+    return schema.columnNameMap;
+  }
+  // Fallback: build the map (for schemas that weren't built with the new TableBuilder)
+  const map = new Map<string, string>();
+  for (const [colName, colBuilder] of Object.entries(schema.columns)) {
+    map.set(colName, (colBuilder as any).build().name);
+  }
+  return map;
+}
+
+/**
+ * Performance utility: Get relation entries array from schema, using cached version if available
+ */
+export function getRelationEntriesForSchema(schema: TableSchema): Array<[string, any]> {
+  if (schema.relationEntries) {
+    return schema.relationEntries;
+  }
+  // Fallback: build the array (for schemas that weren't built with the new TableBuilder)
+  return Object.entries(schema.relations);
+}
+
+/**
+ * Performance utility: Get target schema for a relation, using cached version if available
+ */
+export function getTargetSchemaForRelation(schema: TableSchema, relName: string, relConfig: { targetTableBuilder?: { build(): TableSchema } }): TableSchema | undefined {
+  // Try cached version first
+  if (schema.relationSchemaCache) {
+    const cached = schema.relationSchemaCache.get(relName);
+    if (cached) return cached;
+  }
+  // Fallback: build the schema
+  if (relConfig.targetTableBuilder) {
+    return relConfig.targetTableBuilder.build();
+  }
+  return undefined;
+}
+
+// Performance: Cache nested field ref proxies per table alias
+const nestedFieldRefProxyCache = new Map<string, any>();
+
+/**
  * Creates a nested proxy that supports accessing properties at any depth.
  * This allows patterns like `p.product.priceMode` to work even without full schema information.
  * Each property access returns an object that is both a FieldRef and can be further accessed.
@@ -18,6 +63,10 @@ import type { CollectionAggregationConfig, SelectedField } from './collection-st
  * @returns A proxy that creates FieldRefs for any property access
  */
 export function createNestedFieldRefProxy(tableAlias: string): any {
+  // Return cached proxy if available
+  const cached = nestedFieldRefProxyCache.get(tableAlias);
+  if (cached) return cached;
+
   const handler: ProxyHandler<any> = {
     get: (_target: any, prop: string | symbol) => {
       // Handle Symbol.toPrimitive for string conversion (used in template literals)
@@ -58,7 +107,9 @@ export function createNestedFieldRefProxy(tableAlias: string): any {
       return true;
     },
   };
-  return new Proxy({}, handler);
+  const proxy = new Proxy({}, handler);
+  nestedFieldRefProxyCache.set(tableAlias, proxy);
+  return proxy;
 }
 
 /**
@@ -213,16 +264,11 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     const mock: any = {};
 
-    // Performance: Build column configs once and cache them
-    const columnEntries = Object.entries(this.schema.columns);
-    const columnConfigs = new Map<string, string>();
-
-    for (const [colName, colBuilder] of columnEntries) {
-      columnConfigs.set(colName, (colBuilder as any).build().name);
-    }
+    // Performance: Use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.schema);
 
     // Add columns as FieldRef objects - type-safe with property name and database column name
-    for (const [colName, dbColumnName] of columnConfigs) {
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -234,18 +280,15 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       });
     }
 
-    // Performance: Cache target schemas for relations to avoid repeated .build() calls
-    const relationSchemas = new Map<string, TableSchema | undefined>();
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
-      if (relConfig.targetTableBuilder) {
-        relationSchemas.set(relName, relConfig.targetTableBuilder.build());
-      }
-    }
+    // Performance: Use pre-computed relation entries and cached schemas
+    const relationEntries = getRelationEntriesForSchema(this.schema);
 
     // Add relations (both collections and single references)
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
+    for (const [relName, relConfig] of relationEntries) {
+      // Performance: Use cached target schema
+      const targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+
       if (relConfig.type === 'many') {
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             return new CollectionQueryBuilder(
@@ -261,7 +304,6 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         });
       } else {
         // Single reference navigation (many-to-one, one-to-one)
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
@@ -461,16 +503,11 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   private createMockRowForTable(schema: TableSchema, alias: string): any {
     const mock: any = {};
 
-    // Performance: Build column configs once and cache them
-    const columnEntries = Object.entries(schema.columns);
-    const columnConfigs = new Map<string, string>();
-
-    for (const [colName, colBuilder] of columnEntries) {
-      columnConfigs.set(colName, (colBuilder as any).build().name);
-    }
+    // Performance: Use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(schema);
 
     // Add columns as FieldRef objects with table alias
-    for (const [colName, dbColumnName] of columnConfigs) {
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -482,19 +519,16 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       });
     }
 
-    // Performance: Cache target schemas for relations
-    const relationSchemas = new Map<string, TableSchema | undefined>();
-    for (const [relName, relConfig] of Object.entries(schema.relations)) {
-      if (relConfig.targetTableBuilder) {
-        relationSchemas.set(relName, relConfig.targetTableBuilder.build());
-      }
-    }
+    // Performance: Use pre-computed relation entries and cached schemas
+    const relationEntries = getRelationEntriesForSchema(schema);
 
     // Add navigation properties (single references and collections)
-    for (const [relName, relConfig] of Object.entries(schema.relations)) {
+    for (const [relName, relConfig] of relationEntries) {
+      // Performance: Use cached target schema
+      const targetSchema = getTargetSchemaForRelation(schema, relName, relConfig);
+
       if (relConfig.type === 'many') {
         // Collection navigation
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             return new CollectionQueryBuilder(
@@ -510,7 +544,6 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         });
       } else {
         // Single reference navigation
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
@@ -1108,16 +1141,11 @@ export class SelectQueryBuilder<TSelection> {
   private createMockRowForTable(schema: TableSchema, alias: string): any {
     const mock: any = {};
 
-    // Performance: Build column configs once and cache them
-    const columnEntries = Object.entries(schema.columns);
-    const columnConfigs = new Map<string, string>();
-
-    for (const [colName, colBuilder] of columnEntries) {
-      columnConfigs.set(colName, (colBuilder as any).build().name);
-    }
+    // Performance: Use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(schema);
 
     // Add columns as FieldRef objects with table alias
-    for (const [colName, dbColumnName] of columnConfigs) {
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -1129,19 +1157,16 @@ export class SelectQueryBuilder<TSelection> {
       });
     }
 
-    // Performance: Cache target schemas for relations
-    const relationSchemas = new Map<string, TableSchema | undefined>();
-    for (const [relName, relConfig] of Object.entries(schema.relations)) {
-      if (relConfig.targetTableBuilder) {
-        relationSchemas.set(relName, relConfig.targetTableBuilder.build());
-      }
-    }
+    // Performance: Use pre-computed relation entries and cached schemas
+    const relationEntries = getRelationEntriesForSchema(schema);
 
     // Add navigation properties (single references and collections)
-    for (const [relName, relConfig] of Object.entries(schema.relations)) {
+    for (const [relName, relConfig] of relationEntries) {
+      // Performance: Use cached target schema
+      const targetSchema = getTargetSchemaForRelation(schema, relName, relConfig);
+
       if (relConfig.type === 'many') {
         // Collection navigation
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             return new CollectionQueryBuilder(
@@ -1157,7 +1182,6 @@ export class SelectQueryBuilder<TSelection> {
         });
       } else {
         // Single reference navigation
-        const targetSchema = relationSchemas.get(relName);
         Object.defineProperty(mock, relName, {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
@@ -1864,9 +1888,11 @@ export class SelectQueryBuilder<TSelection> {
   private createMockRow(): any {
     const mock: any = {};
 
+    // Performance: Use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.schema);
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
-    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
-      const dbColumnName = (colBuilder as any).build().name;
+    for (const [colName, dbColumnName] of columnNameMap) {
       Object.defineProperty(mock, colName, {
         get: () => ({
           __fieldName: colName,
@@ -1885,13 +1911,12 @@ export class SelectQueryBuilder<TSelection> {
         continue;
       }
 
-      for (const [colName, colBuilder] of Object.entries(join.schema.columns)) {
-        const dbColumnName = (colBuilder as any).build().name;
-        // Create a unique property name by prefixing with table alias or using the column name directly
-        // For now, we'll create nested objects for each joined table
-        if (!mock[join.alias]) {
-          mock[join.alias] = {};
-        }
+      // Performance: Use pre-computed column name map for joined schema
+      const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
+      if (!mock[join.alias]) {
+        mock[join.alias] = {};
+      }
+      for (const [colName, dbColumnName] of joinColumnNameMap) {
         Object.defineProperty(mock[join.alias], colName, {
           get: () => ({
             __fieldName: colName,
@@ -1904,15 +1929,19 @@ export class SelectQueryBuilder<TSelection> {
       }
     }
 
+    // Performance: Use pre-computed relation entries
+    const relationEntries = getRelationEntriesForSchema(this.schema);
+
     // Add relations as CollectionQueryBuilder or ReferenceQueryBuilder
-    for (const [relName, relConfig] of Object.entries(this.schema.relations)) {
-      // Try to get target schema from registry (preferred, has full relations) or targetTableBuilder
+    for (const [relName, relConfig] of relationEntries) {
+      // Try to get target schema from registry (preferred, has full relations) or cached schema
       let targetSchema: TableSchema | undefined;
       if (this.schemaRegistry) {
         targetSchema = this.schemaRegistry.get(relConfig.targetTable);
       }
-      if (!targetSchema && relConfig.targetTableBuilder) {
-        targetSchema = relConfig.targetTableBuilder.build();
+      if (!targetSchema) {
+        // Performance: Use cached target schema
+        targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
       }
 
       if (relConfig.type === 'many') {
@@ -2273,9 +2302,10 @@ export class SelectQueryBuilder<TSelection> {
               // Select all columns from the target table and group them
               // We'll need to use JSON object building in SQL
               const fieldParts: string[] = [];
-              for (const [colKey, col] of Object.entries(targetSchema.columns)) {
-                const config = (col as any).build();
-                fieldParts.push(`'${colKey}', "${alias}"."${config.name}"`);
+              // Performance: Use cached column name map
+              const targetColMap = getColumnNameMapForSchema(targetSchema);
+              for (const [colKey, dbColName] of targetColMap) {
+                fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
               }
 
               selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
@@ -2307,11 +2337,8 @@ export class SelectQueryBuilder<TSelection> {
 
                     if (relConfig && relConfig.type === 'one') {
                       // This is a reference navigation - select all fields from the target table
-                      // Find the target table schema
-                      let targetSchema: TableSchema | undefined;
-                      if (relConfig.targetTableBuilder) {
-                        targetSchema = relConfig.targetTableBuilder.build();
-                      }
+                      // Performance: Use cached target schema
+                      const targetSchema = getTargetSchemaForRelation(this.schema, alias, relConfig);
 
                       if (targetSchema) {
                         // Add JOIN if not already added
@@ -2333,9 +2360,10 @@ export class SelectQueryBuilder<TSelection> {
 
                         // Select all columns from the target table and group them into a JSON object
                         const fieldParts: string[] = [];
-                        for (const [colKey, col] of Object.entries(targetSchema.columns)) {
-                          const config = (col as any).build();
-                          fieldParts.push(`'${colKey}', "${alias}"."${config.name}"`);
+                        // Performance: Use cached column name map
+                        const targetColMap = getColumnNameMapForSchema(targetSchema);
+                        for (const [colKey, dbColName] of targetColMap) {
+                          fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
                         }
 
                         selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
@@ -3136,9 +3164,9 @@ export class ReferenceQueryBuilder<TItem = any> {
   createMockTargetRow(): any {
     if (this.targetTableSchema) {
       const mock: any = {};
-      // Add columns
-      for (const [colName, colBuilder] of Object.entries(this.targetTableSchema.columns)) {
-        const dbColumnName = (colBuilder as any).build().name;
+      // Add columns - use pre-computed column name map if available
+      const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
+      for (const [colName, dbColumnName] of columnNameMap) {
         Object.defineProperty(mock, colName, {
           get: () => ({
             __fieldName: colName,
@@ -3320,16 +3348,11 @@ export class CollectionQueryBuilder<TItem = any> {
       // If we have schema information, create a properly typed mock
       const mock: any = {};
 
-      // Performance: Build column configs once and cache them
-      const columnEntries = Object.entries(this.targetTableSchema.columns);
-      const columnConfigs = new Map<string, string>();
-
-      for (const [colName, colBuilder] of columnEntries) {
-        columnConfigs.set(colName, (colBuilder as any).build().name);
-      }
+      // Performance: Use pre-computed column name map if available
+      const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
 
       // Add columns
-      for (const [colName, dbColumnName] of columnConfigs) {
+      for (const [colName, dbColumnName] of columnNameMap) {
         Object.defineProperty(mock, colName, {
           get: () => ({
             __fieldName: colName,
@@ -3632,9 +3655,9 @@ export class CollectionQueryBuilder<TItem = any> {
     } else {
       // No selector - select all fields from the target table schema
       if (this.targetTableSchema && this.targetTableSchema.columns) {
-        for (const [colName, colBuilder] of Object.entries(this.targetTableSchema.columns)) {
-          const colConfig = (colBuilder as any).build ? (colBuilder as any).build() : colBuilder;
-          const dbColumnName = colConfig.name || colName;
+        // Performance: Use cached column name map
+        const colNameMap = getColumnNameMapForSchema(this.targetTableSchema);
+        for (const [colName, dbColumnName] of colNameMap) {
           selectedFieldConfigs.push({
             alias: colName,
             expression: `"${dbColumnName}"`,
@@ -3665,13 +3688,11 @@ export class CollectionQueryBuilder<TItem = any> {
     // Step 3: Build ORDER BY clause SQL (without ORDER BY keyword)
     let orderByClause: string | undefined;
     if (this.orderByFields.length > 0) {
+      // Performance: Pre-compute column name map for ORDER BY lookups
+      const colNameMap = this.targetTableSchema ? getColumnNameMapForSchema(this.targetTableSchema) : null;
       const orderParts = this.orderByFields.map(({ field, direction }) => {
-        // Look up the database column name from the schema if available
-        let dbColumnName = field;
-        if (this.targetTableSchema && this.targetTableSchema.columns[field]) {
-          const colBuilder = this.targetTableSchema.columns[field];
-          dbColumnName = (colBuilder as any).build().name;
-        }
+        // Look up the database column name from the cached map if available
+        const dbColumnName = colNameMap?.get(field) ?? field;
         return `"${dbColumnName}" ${direction}`;
       });
       orderByClause = orderParts.join(', ');

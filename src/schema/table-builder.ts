@@ -65,6 +65,21 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   relations: Record<string, RelationConfig>;
   indexes: IndexDefinition[];
   foreignKeys: ForeignKeyConstraint[];
+  /**
+   * Performance optimization: Pre-computed map of property names to database column names
+   * Avoids repeated .build().name calls during query building
+   */
+  columnNameMap?: Map<string, string>;
+  /**
+   * Performance optimization: Pre-computed array of relation entries
+   * Avoids repeated Object.entries() calls during query building
+   */
+  relationEntries?: Array<[string, RelationConfig]>;
+  /**
+   * Performance optimization: Cache of built target schemas for relations
+   * Avoids repeated targetTableBuilder.build() calls
+   */
+  relationSchemaCache?: Map<string, TableSchema>;
 }
 
 /**
@@ -164,18 +179,47 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
     }
   }
 
+  // Performance: Cache the built schema to avoid repeated builds
+  private _cachedSchema?: TableSchema<any>;
+
   /**
    * Build the final table schema
    */
   build(): TableSchema<any> {
-    return {
+    // Return cached schema if available
+    if (this._cachedSchema) {
+      return this._cachedSchema;
+    }
+
+    // Performance: Pre-compute column name map once during build
+    const columnNameMap = new Map<string, string>();
+    for (const [propName, colBuilder] of Object.entries(this.columnDefs)) {
+      columnNameMap.set(propName, (colBuilder as ColumnBuilder).build().name);
+    }
+
+    // Performance: Pre-compute relation entries array
+    const relationEntries = Object.entries(this.relationDefs) as Array<[string, RelationConfig]>;
+
+    // Performance: Pre-build and cache target schemas for all relations
+    const relationSchemaCache = new Map<string, TableSchema>();
+    for (const [relName, relConfig] of relationEntries) {
+      if (relConfig.targetTableBuilder) {
+        relationSchemaCache.set(relName, relConfig.targetTableBuilder.build());
+      }
+    }
+
+    this._cachedSchema = {
       name: this.tableName,
       schema: this.schemaName,
       columns: this.columnDefs,
       relations: this.relationDefs,
       indexes: this.indexDefs,
       foreignKeys: this.foreignKeyDefs,
+      columnNameMap,
+      relationEntries,
+      relationSchemaCache,
     };
+    return this._cachedSchema;
   }
 
   /**
