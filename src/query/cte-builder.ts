@@ -204,7 +204,8 @@ export class DbCteBuilder {
     };
 
     // Build the inner query - handle different query builder types
-    const innerSql = this.buildInnerQuerySql(query, context);
+    // Also extract selection metadata for mapper preservation
+    const { sql: innerSql, selectionMetadata: innerSelectionMetadata } = this.buildInnerQuerySqlWithMetadata(query, context);
 
     // Get group by columns - the keySelector maps output alias -> inner column name
     // e.g., p => ({ advancePriceId: p.userId }) means alias "advancePriceId" from inner column "userId"
@@ -252,11 +253,74 @@ export class DbCteBuilder {
     });
     columnDefs[finalAggregationAlias] = finalAggregationAlias;
 
+    // Store inner selection metadata for mapper preservation during result transformation
+    // The aggregation column contains items that need mappers applied
+    const selectionMetadata: Record<string, any> = {};
+    groupByEntries.forEach(([outputAlias]) => {
+      selectionMetadata[outputAlias] = outputAlias;
+    });
+    // Store inner selection metadata under the aggregation alias so mappers can be applied to items
+    selectionMetadata[finalAggregationAlias] = {
+      __isAggregationArray: true,
+      __innerSelectionMetadata: innerSelectionMetadata,
+    };
+
     // Pass the aggregation alias as an aggregation column so it can be COALESCE'd in LEFT JOINs
-    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, undefined, [finalAggregationAlias]);
+    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, selectionMetadata, [finalAggregationAlias]);
     this.ctes.push(cte);
 
     return cte;
+  }
+
+  /**
+   * Build inner query SQL with metadata - handles different query builder types
+   * Returns both the SQL and the selection metadata for mapper preservation
+   */
+  private buildInnerQuerySqlWithMetadata(query: any, context: SqlBuildContext): { sql: string; selectionMetadata: Record<string, any> | undefined } {
+    const queryContext = {
+      ctes: new Map(),
+      cteCounter: 0,
+      paramCounter: context.paramCounter,
+      allParams: context.params,
+    };
+
+    // Extract referenced CTEs from the query and add them to this builder
+    if (typeof query.getReferencedCtes === 'function') {
+      const referencedCtes = query.getReferencedCtes() as DbCte<any>[];
+      for (const cte of referencedCtes) {
+        if (!this.ctes.some(existing => existing.name === cte.name)) {
+          this.ctes.push(cte);
+        }
+      }
+    }
+
+    let sql: string;
+    let selectionMetadata: Record<string, any> | undefined;
+
+    // Check for grouped query builders that have buildCteQuery method
+    if (typeof query.buildCteQuery === 'function') {
+      const result = query.buildCteQuery(queryContext);
+      context.paramCounter = queryContext.paramCounter;
+      sql = result.sql;
+
+      // Try to extract selection metadata from grouped query
+      if (typeof query.getSelectionMetadata === 'function') {
+        selectionMetadata = query.getSelectionMetadata();
+      }
+    }
+    // Standard SelectQueryBuilder - uses createMockRow and selector
+    else if (typeof query.createMockRow === 'function' && typeof query.selector === 'function') {
+      const mockRow = query.createMockRow();
+      const selectionResult = query.selector(mockRow);
+      const result = query.buildQuery(selectionResult, queryContext);
+      context.paramCounter = queryContext.paramCounter;
+      sql = result.sql;
+      selectionMetadata = selectionResult;
+    } else {
+      throw new Error('Unsupported query type for CTE. Query must be a SelectQueryBuilder, GroupedSelectQueryBuilder, or GroupedJoinedQueryBuilder.');
+    }
+
+    return { sql, selectionMetadata };
   }
 
   /**

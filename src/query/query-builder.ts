@@ -1276,7 +1276,7 @@ export class SelectQueryBuilder<TSelection> {
       get(target, prop: string | symbol) {
         if (typeof prop === 'symbol') return undefined;
 
-        // If we have selection metadata, check if this property has a mapper
+        // If we have selection metadata, check if this property has a mapper or is an aggregation array
         if (cte.selectionMetadata && prop in cte.selectionMetadata) {
           const value = cte.selectionMetadata[prop];
 
@@ -1288,6 +1288,17 @@ export class SelectQueryBuilder<TSelection> {
               __dbColumnName: prop,
               __tableAlias: cte.name,
               getMapper: () => (value as any).getMapper(),
+            };
+          }
+
+          // If it's a CTE aggregation array marker, preserve it with inner metadata
+          if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
+            return {
+              __fieldName: prop,
+              __dbColumnName: prop,
+              __tableAlias: cte.name,
+              __isAggregationArray: true,
+              __innerSelectionMetadata: (value as any).__innerSelectionMetadata,
             };
           }
         }
@@ -2772,6 +2783,15 @@ export class SelectQueryBuilder<TSelection> {
               }
             }
           }
+        } else if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
+          // CTE withAggregation array - apply mappers to items inside
+          const collectionItems = row[key] || [];
+          const innerMetadata = (value as any).__innerSelectionMetadata;
+          if (innerMetadata && !disableMappers) {
+            result[key] = this.transformCteAggregationItems(collectionItems, innerMetadata);
+          } else {
+            result[key] = collectionItems;
+          }
         } else if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
           // SqlFragment with custom mapper (check this BEFORE FieldRef to handle subquery/CTE fields with mappers)
           const rawValue = row[key];
@@ -2879,6 +2899,56 @@ export class SelectQueryBuilder<TSelection> {
           transformedItem[key] = config.mapper
             ? config.mapper.fromDriver(value)
             : value;
+        } else {
+          transformedItem[key] = value;
+        }
+      }
+      return transformedItem;
+    });
+  }
+
+  /**
+   * Transform CTE aggregation items applying fromDriver mappers from selection metadata
+   */
+  private transformCteAggregationItems(items: any[], selectionMetadata: Record<string, any>): any[] {
+    if (!items || items.length === 0) {
+      return [];
+    }
+
+    // Build mapper cache from selection metadata
+    const mapperCache: Record<string, any> = {};
+    for (const [key, value] of Object.entries(selectionMetadata)) {
+      // Check if value has getMapper (SqlFragment or field with mapper)
+      if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
+        let mapper = (value as any).getMapper();
+        // If mapper is a CustomTypeBuilder, get the actual type
+        if (mapper && typeof mapper.getType === 'function') {
+          mapper = mapper.getType();
+        }
+        if (mapper && typeof mapper.fromDriver === 'function') {
+          mapperCache[key] = mapper;
+        }
+      }
+      // Check if it's a FieldRef with schema column mapper
+      else if (typeof value === 'object' && value !== null && '__fieldName' in value) {
+        const fieldName = (value as any).__fieldName as string;
+        const column = this.schema.columns[fieldName];
+        if (column) {
+          const config = column.build();
+          if (config.mapper && typeof config.mapper.fromDriver === 'function') {
+            mapperCache[key] = config.mapper;
+          }
+        }
+      }
+    }
+
+    // Transform items
+    return items.map(item => {
+      const transformedItem: any = {};
+      for (const [key, value] of Object.entries(item)) {
+        const mapper = mapperCache[key];
+        if (mapper && value !== null && value !== undefined) {
+          transformedItem[key] = mapper.fromDriver(value);
         } else {
           transformedItem[key] = value;
         }

@@ -469,12 +469,54 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   }
 
   /**
-   * Transform database results - convert aggregate values from strings to numbers
+   * Transform database results - convert aggregate values and apply mappers
    */
   private transformResults(rows: any[]): any[] {
-    // Get the mock result to identify which fields are aggregates
+    // Get the mock result to identify which fields are aggregates and have mappers
     const mockGroup = this.createMockGroupedItem();
     const mockResult = this.resultSelector(mockGroup);
+
+    // Also get the original selection to track field origins for mapper lookup
+    const mockRow = this.createMockRow();
+    const mockOriginalSelection = this.originalSelector(mockRow);
+
+    // Build column metadata cache from schema for mapper lookup
+    const columnMetadataCache: Record<string, { hasMapper: boolean; mapper?: any }> = {};
+    for (const [key, mockValue] of Object.entries(mockResult as object)) {
+      // Check if mockValue has getMapper (SqlFragment or aliased field with mapper)
+      if (typeof mockValue === 'object' && mockValue !== null && typeof (mockValue as any).getMapper === 'function') {
+        const mapper = (mockValue as any).getMapper();
+        if (mapper) {
+          columnMetadataCache[key] = { hasMapper: true, mapper };
+        }
+      }
+      // Check if this is a FieldRef from schema column
+      else if (typeof mockValue === 'object' && mockValue !== null && '__fieldName' in mockValue) {
+        const fieldName = (mockValue as any).__fieldName as string;
+        // Look up in schema
+        const column = this.schema.columns[fieldName];
+        if (column) {
+          const config = column.build();
+          if (config.mapper) {
+            columnMetadataCache[key] = { hasMapper: true, mapper: config.mapper };
+          }
+        }
+        // Also check original selection for mapper (for aliased fields like p.key.distinctDay)
+        else if (mockOriginalSelection && fieldName in mockOriginalSelection) {
+          const origValue = mockOriginalSelection[fieldName];
+          if (typeof origValue === 'object' && origValue !== null && '__fieldName' in origValue) {
+            const origFieldName = (origValue as any).__fieldName as string;
+            const origColumn = this.schema.columns[origFieldName];
+            if (origColumn) {
+              const config = origColumn.build();
+              if (config.mapper) {
+                columnMetadataCache[key] = { hasMapper: true, mapper: config.mapper };
+              }
+            }
+          }
+        }
+      }
+    }
 
     return rows.map(row => {
       const transformed: any = {};
@@ -492,14 +534,87 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           } else {
             transformed[key] = value;
           }
+        }
+        // Check if this field has a mapper
+        else if (columnMetadataCache[key]?.hasMapper) {
+          const mapper = columnMetadataCache[key].mapper;
+          if (value === null || value === undefined) {
+            transformed[key] = null;
+          } else if (typeof mapper.fromDriver === 'function') {
+            transformed[key] = mapper.fromDriver(value);
+          } else {
+            transformed[key] = value;
+          }
         } else {
-          // Non-aggregate field - keep as is
+          // Non-aggregate field without mapper - keep as is
           transformed[key] = value;
         }
       }
 
       return transformed;
     });
+  }
+
+  /**
+   * Get selection metadata for mapper preservation in CTEs
+   * Enhances the selection result with mapper info from original schema columns
+   * @internal
+   */
+  getSelectionMetadata(): Record<string, any> {
+    const mockGroup = this.createMockGroupedItem();
+    const mockResult = this.resultSelector(mockGroup);
+
+    // Get original selection to map field names back to schema columns
+    const mockRow = this.createMockRow();
+    const mockOriginalSelection = this.originalSelector(mockRow);
+
+    // Build enhanced metadata with mappers
+    const enhancedMetadata: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(mockResult as object)) {
+      // Check if it's a FieldRef
+      if (typeof value === 'object' && value !== null && '__fieldName' in value) {
+        const fieldName = (value as any).__fieldName as string;
+
+        // First check if schema has mapper for this field
+        const column = this.schema.columns[fieldName];
+        if (column) {
+          const config = column.build();
+          if (config.mapper) {
+            // Add mapper info to the metadata
+            enhancedMetadata[key] = {
+              ...value,
+              getMapper: () => config.mapper,
+            };
+            continue;
+          }
+        }
+
+        // Check original selection for mapper (for aliased fields like p.key.distinctDay)
+        if (mockOriginalSelection && fieldName in mockOriginalSelection) {
+          const origValue = mockOriginalSelection[fieldName];
+          if (typeof origValue === 'object' && origValue !== null && '__fieldName' in origValue) {
+            const origFieldName = (origValue as any).__fieldName as string;
+            const origColumn = this.schema.columns[origFieldName];
+            if (origColumn) {
+              const config = origColumn.build();
+              if (config.mapper) {
+                enhancedMetadata[key] = {
+                  ...value,
+                  getMapper: () => config.mapper,
+                };
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // No mapper found, use original value
+      enhancedMetadata[key] = value;
+    }
+
+    return enhancedMetadata;
   }
 
   /**
@@ -541,7 +656,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       return sql;
     };
 
-    return new Subquery(sqlBuilder, mode) as any;
+    // Get selection metadata with mappers for table subqueries
+    const selectionMetadata = mode === 'table' ? this.getSelectionMetadata() : undefined;
+
+    return new Subquery(sqlBuilder, mode, selectionMetadata) as any;
   }
 
   /**
@@ -1446,6 +1564,47 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
    */
   getReferencedCtes(): DbCte<any>[] {
     return this.cte ? [this.cte] : [];
+  }
+
+  /**
+   * Get selection metadata for mapper preservation in CTEs
+   * Enhances the selection result with mapper info from the left subquery
+   * @internal
+   */
+  getSelectionMetadata(): Record<string, any> {
+    const mockLeft = this.createLeftMock();
+    const mockRight = this.createRightMock();
+    const mockResult = this.resultSelector(mockLeft, mockRight);
+
+    // Get mapper metadata from the left subquery
+    const leftMetadata = this.leftSubquery.getSelectionMetadata();
+
+    // Build enhanced metadata with mappers
+    const enhancedMetadata: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(mockResult as object)) {
+      // Check if it's a FieldRef from the left side
+      if (typeof value === 'object' && value !== null && '__fieldName' in value) {
+        const fieldName = (value as any).__fieldName as string;
+
+        // Check if left metadata has mapper for this field
+        if (leftMetadata && fieldName in leftMetadata) {
+          const leftValue = leftMetadata[fieldName];
+          if (typeof leftValue === 'object' && leftValue !== null && typeof (leftValue as any).getMapper === 'function') {
+            enhancedMetadata[key] = {
+              ...value,
+              getMapper: (leftValue as any).getMapper,
+            };
+            continue;
+          }
+        }
+      }
+
+      // No mapper found, use original value
+      enhancedMetadata[key] = value;
+    }
+
+    return enhancedMetadata;
   }
 
   /**
