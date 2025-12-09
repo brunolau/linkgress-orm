@@ -115,6 +115,23 @@ export class CteCollectionStrategy implements ICollectionStrategy {
   }
 
   /**
+   * Helper to collect nested CTE joins from selected fields
+   * These are joins to CTEs created for nested collections (collections within collections)
+   */
+  private collectNestedCteJoins(fields: SelectedField[]): string[] {
+    const joins: string[] = [];
+    for (const field of fields) {
+      if (field.nestedCteJoin) {
+        joins.push(field.nestedCteJoin.joinClause);
+      }
+      if (field.nested) {
+        joins.push(...this.collectNestedCteJoins(field.nested));
+      }
+    }
+    return joins;
+  }
+
+  /**
    * Helper to build json_build_object expression (handles nested structures)
    * Uses JSON instead of JSONB for better aggregation performance
    */
@@ -194,10 +211,14 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     // Build navigation JOINs for multi-level navigation
     const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
 
+    // Collect nested CTE joins (for collections within collections)
+    const nestedCteJoins = this.collectNestedCteJoins(selectedFields);
+    const nestedCteJoinsSQL = nestedCteJoins.length > 0 ? nestedCteJoins.join('\n  ') : '';
+
     // If LIMIT or OFFSET is specified, use ROW_NUMBER() for per-parent pagination
     if (limitValue !== undefined || offsetValue !== undefined) {
       return this.buildJsonbAggregationWithRowNumber(
-        config, leafFields, jsonbObjectExpr, whereSQL, distinctClause, navJoinsSQL
+        config, leafFields, jsonbObjectExpr, whereSQL, distinctClause, navJoinsSQL, nestedCteJoinsSQL
       );
     }
 
@@ -240,6 +261,7 @@ FROM (
   SELECT ${distinctClause}${allSelectFields.join(', ')}
   FROM "${targetTable}"
   ${navJoinsSQL}
+  ${nestedCteJoinsSQL}
   ${whereSQL}
   ${orderBySQL}
 ) sub
@@ -269,7 +291,8 @@ GROUP BY "__fk_${foreignKey}"
     jsonbObjectExpr: string,
     whereSQL: string,
     distinctClause: string,
-    navJoinsSQL: string
+    navJoinsSQL: string,
+    nestedCteJoinsSQL: string = ''
   ): string {
     const { targetTable, foreignKey, orderByClause, limitValue, offsetValue, navigationJoins } = config;
 
@@ -322,6 +345,7 @@ FROM (
     SELECT ${distinctClause}${innerSelectFields.join(', ')}
     FROM "${targetTable}"
     ${navJoinsSQL}
+    ${nestedCteJoinsSQL}
     ${whereSQL}
   ) inner_sub
 ) sub

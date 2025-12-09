@@ -88,6 +88,176 @@ export interface QueryOptions {
    * Default: false
    */
   rawResult?: boolean;
+  /**
+   * Enable detailed time tracing for query phases.
+   * When enabled, logs timing information for:
+   * - Query building (SQL generation, context setup)
+   * - Query execution (database round-trip)
+   * - Result processing (transformation, mapping, merging)
+   * Useful for performance debugging and optimization.
+   * Default: false
+   */
+  traceTime?: boolean;
+}
+
+/**
+ * Time trace entry for a single operation
+ */
+export interface TimeTraceEntry {
+  phase: string;
+  operation: string;
+  durationMs: number;
+  startTime: number;
+  endTime: number;
+  details?: Record<string, any>;
+}
+
+/**
+ * Complete time trace for a query execution
+ */
+export interface QueryTimeTrace {
+  totalMs: number;
+  phases: {
+    queryBuild?: number;
+    queryExecution?: number;
+    resultProcessing?: number;
+  };
+  entries: TimeTraceEntry[];
+  rowCount?: number;
+}
+
+/**
+ * Time tracer utility for measuring query phases
+ */
+export class TimeTracer {
+  private entries: TimeTraceEntry[] = [];
+  private startTime: number = 0;
+  private currentPhase: string = '';
+  private phaseStartTime: number = 0;
+  private phases: Record<string, number> = {};
+
+  constructor(private enabled: boolean, private logger?: (message: string) => void) {
+    if (enabled) {
+      this.startTime = performance.now();
+    }
+  }
+
+  /**
+   * Start timing a phase
+   */
+  startPhase(phase: string): void {
+    if (!this.enabled) return;
+    this.currentPhase = phase;
+    this.phaseStartTime = performance.now();
+  }
+
+  /**
+   * End timing a phase
+   */
+  endPhase(): number {
+    if (!this.enabled) return 0;
+    const duration = performance.now() - this.phaseStartTime;
+    this.phases[this.currentPhase] = (this.phases[this.currentPhase] || 0) + duration;
+    return duration;
+  }
+
+  /**
+   * Time a specific operation within a phase
+   */
+  trace<T>(operation: string, fn: () => T, details?: Record<string, any>): T {
+    if (!this.enabled) return fn();
+
+    const opStart = performance.now();
+    const result = fn();
+    const opEnd = performance.now();
+    const duration = opEnd - opStart;
+
+    this.entries.push({
+      phase: this.currentPhase,
+      operation,
+      durationMs: duration,
+      startTime: opStart - this.startTime,
+      endTime: opEnd - this.startTime,
+      details,
+    });
+
+    return result;
+  }
+
+  /**
+   * Time an async operation within a phase
+   */
+  async traceAsync<T>(operation: string, fn: () => Promise<T>, details?: Record<string, any>): Promise<T> {
+    if (!this.enabled) return fn();
+
+    const opStart = performance.now();
+    const result = await fn();
+    const opEnd = performance.now();
+    const duration = opEnd - opStart;
+
+    this.entries.push({
+      phase: this.currentPhase,
+      operation,
+      durationMs: duration,
+      startTime: opStart - this.startTime,
+      endTime: opEnd - this.startTime,
+      details,
+    });
+
+    return result;
+  }
+
+  /**
+   * Get the complete trace
+   */
+  getTrace(rowCount?: number): QueryTimeTrace {
+    const totalMs = performance.now() - this.startTime;
+    return {
+      totalMs,
+      phases: {
+        queryBuild: this.phases['queryBuild'],
+        queryExecution: this.phases['queryExecution'],
+        resultProcessing: this.phases['resultProcessing'],
+      },
+      entries: this.entries,
+      rowCount,
+    };
+  }
+
+  /**
+   * Log the trace summary
+   */
+  logSummary(rowCount?: number): void {
+    if (!this.enabled) return;
+
+    const trace = this.getTrace(rowCount);
+    const log = this.logger || console.log;
+
+    log('\n[Time Trace Summary]');
+    log(`  Total: ${trace.totalMs.toFixed(2)}ms`);
+    if (trace.phases.queryBuild !== undefined) {
+      log(`  Query Build: ${trace.phases.queryBuild.toFixed(2)}ms`);
+    }
+    if (trace.phases.queryExecution !== undefined) {
+      log(`  Query Execution: ${trace.phases.queryExecution.toFixed(2)}ms`);
+    }
+    if (trace.phases.resultProcessing !== undefined) {
+      log(`  Result Processing: ${trace.phases.resultProcessing.toFixed(2)}ms`);
+    }
+    if (rowCount !== undefined) {
+      log(`  Rows: ${rowCount}`);
+    }
+
+    // Log detailed entries if there are any significant operations
+    const significantEntries = this.entries.filter(e => e.durationMs > 0.1);
+    if (significantEntries.length > 0) {
+      log('\n[Detailed Trace]');
+      for (const entry of significantEntries) {
+        const details = entry.details ? ` (${JSON.stringify(entry.details)})` : '';
+        log(`  [${entry.phase}] ${entry.operation}: ${entry.durationMs.toFixed(2)}ms${details}`);
+      }
+    }
+  }
 }
 
 /**

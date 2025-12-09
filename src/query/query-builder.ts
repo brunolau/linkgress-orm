@@ -1,6 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult } from '../entity/db-context';
+import { TimeTracer } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
@@ -1529,43 +1530,64 @@ export class SelectQueryBuilder<TSelection> {
    * Collection results are automatically resolved to arrays
    */
   async toList(): Promise<ResolveCollectionResults<TSelection>[]> {
-    const context: QueryContext = {
+    const options = this.executor?.getOptions();
+    const tracer = new TimeTracer(options?.traceTime ?? false, options?.logger);
+
+    // Query Build Phase
+    tracer.startPhase('queryBuild');
+
+    const context: QueryContext = tracer.trace('createContext', () => ({
       ctes: new Map(),
       cteCounter: 0,
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
       executor: this.executor,
-    };
+    }));
 
     // Analyze the selector to extract nested queries
-    const mockRow = this.createMockRow();
-    const selectionResult = this.selector(mockRow);
+    const mockRow = tracer.trace('createMockRow', () => this.createMockRow());
+    const selectionResult = tracer.trace('evaluateSelector', () => this.selector(mockRow));
 
     // Check if we're using temp table strategy and have collections
-    const collections = this.detectCollections(selectionResult);
+    const collections = tracer.trace('detectCollections', () => this.detectCollections(selectionResult));
     const useTempTableStrategy = this.collectionStrategy === 'temptable' && collections.length > 0;
 
+    tracer.endPhase();
+
+    let results: any[];
     if (useTempTableStrategy) {
       // Two-phase execution for temp table strategy
-      return this.executeWithTempTables(selectionResult, context, collections);
+      results = await this.executeWithTempTables(selectionResult, context, collections, tracer);
     } else {
       // Single-phase execution for JSONB strategy (current behavior)
-      return this.executeSinglePhase(selectionResult, context);
+      results = await this.executeSinglePhase(selectionResult, context, tracer);
     }
+
+    // Log trace summary if tracing is enabled
+    tracer.logSummary(results.length);
+
+    return results;
   }
 
   /**
    * Execute query using single-phase approach (JSONB/CTE strategy)
    */
-  private async executeSinglePhase(selectionResult: any, context: QueryContext): Promise<any[]> {
+  private async executeSinglePhase(selectionResult: any, context: QueryContext, tracer: TimeTracer): Promise<any[]> {
     // Build the query
-    const { sql, params } = this.buildQuery(selectionResult, context);
+    tracer.startPhase('queryBuild');
+    const { sql, params } = tracer.trace('buildQuery', () => this.buildQuery(selectionResult, context));
+    tracer.endPhase();
 
     // Execute using executor if available, otherwise use client directly
-    const result = this.executor
-      ? await this.executor.query(sql, params)
-      : await this.client.query(sql, params);
+    tracer.startPhase('queryExecution');
+    const result = await tracer.traceAsync('executeQuery', async () =>
+      this.executor
+        ? await this.executor.query(sql, params)
+        : await this.client.query(sql, params),
+      { rowCount: 'pending' }
+    );
+    tracer.endPhase();
 
     // If rawResult is enabled, return raw rows without any processing
     if (this.executor?.getOptions().rawResult) {
@@ -1573,7 +1595,14 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     // Transform results
-    return this.transformResults(result.rows, selectionResult) as any;
+    tracer.startPhase('resultProcessing');
+    const transformed = tracer.trace('transformResults', () =>
+      this.transformResults(result.rows, selectionResult),
+      { rowCount: result.rows.length }
+    );
+    tracer.endPhase();
+
+    return transformed as any;
   }
 
   /**
@@ -1582,14 +1611,21 @@ export class SelectQueryBuilder<TSelection> {
   private async executeWithTempTables(
     selectionResult: any,
     context: QueryContext,
-    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>
+    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>,
+    tracer: TimeTracer
   ): Promise<any[]> {
     // Build base selection (excludes collections, includes foreign keys)
-    const baseSelection = this.buildBaseSelection(selectionResult, collections);
-    const { sql: baseSql, params: baseParams } = this.buildQuery(baseSelection, {
-      ...context,
-      ctes: new Map(), // Clear CTEs since we're not using them for collections
-    });
+    tracer.startPhase('queryBuild');
+    const baseSelection = tracer.trace('buildBaseSelection', () =>
+      this.buildBaseSelection(selectionResult, collections)
+    );
+    const { sql: baseSql, params: baseParams } = tracer.trace('buildBaseQuery', () =>
+      this.buildQuery(baseSelection, {
+        ...context,
+        ctes: new Map(), // Clear CTEs since we're not using them for collections
+      })
+    );
+    tracer.endPhase();
 
     // Check if we can use fully optimized single-query approach
     // Requirements: PostgresClient with querySimpleMulti support AND no parameters in base query
@@ -1599,20 +1635,25 @@ export class SelectQueryBuilder<TSelection> {
       collections.length > 0;
 
     if (canUseFullOptimization) {
-      return this.executeFullyOptimized(baseSql, baseSelection, selectionResult, context, collections);
+      return this.executeFullyOptimized(baseSql, baseSelection, selectionResult, context, collections, tracer);
     }
 
     // Legacy two-phase approach: execute base query first
-    const baseResult = this.executor
-      ? await this.executor.query(baseSql, baseParams)
-      : await this.client.query(baseSql, baseParams);
+    tracer.startPhase('queryExecution');
+    const baseResult = await tracer.traceAsync('executeBaseQuery', async () =>
+      this.executor
+        ? await this.executor.query(baseSql, baseParams)
+        : await this.client.query(baseSql, baseParams)
+    );
 
     // If rawResult is enabled, return raw rows without any processing
     if (this.executor?.getOptions().rawResult) {
+      tracer.endPhase();
       return baseResult.rows;
     }
 
     if (baseResult.rows.length === 0) {
+      tracer.endPhase();
       return [];
     }
 
@@ -1627,7 +1668,9 @@ export class SelectQueryBuilder<TSelection> {
       const builder = collection.builder;
 
       // Call buildCTE with parent IDs - this will use the temp table strategy
-      const aggResult = await builder.buildCTE(context, this.client, parentIds);
+      const aggResult = await tracer.traceAsync(`buildCTE:${collection.name}`, async () =>
+        builder.buildCTE(context, this.client, parentIds)
+      );
 
       // aggResult is a Promise<CollectionAggregationResult> for temp table strategy
       const result = await (aggResult as any as Promise<any>);
@@ -1641,9 +1684,11 @@ export class SelectQueryBuilder<TSelection> {
         } else {
           // Temp table strategy (legacy) - query the aggregation table
           const aggQuery = `SELECT parent_id, data FROM ${result.tableName}`;
-          const aggQueryResult = this.executor
-            ? await this.executor.query(aggQuery, [])
-            : await this.client.query(aggQuery, []);
+          const aggQueryResult = await tracer.traceAsync(`queryCollection:${collection.name}`, async () =>
+            this.executor
+              ? await this.executor.query(aggQuery, [])
+              : await this.client.query(aggQuery, [])
+          );
 
           // Cleanup temp tables if needed
           if (result.cleanupSql) {
@@ -1662,22 +1707,33 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Expected temp table result but got CTE');
       }
     }
+    tracer.endPhase();
 
     // Phase 3: Merge base results with collection results
-    const mergedRows = baseResult.rows.map(baseRow => {
-      const merged = { ...baseRow };
-      for (const collection of collections) {
-        const resultMap = collectionResults.get(collection.name);
-        const parentId = baseRow.__pk_id;
-        merged[collection.name] = resultMap?.get(parentId) || this.getDefaultValueForCollection(collection.builder);
-      }
-      // Remove the internal __pk_id field before returning
-      delete merged.__pk_id;
-      return merged;
-    });
+    tracer.startPhase('resultProcessing');
+    const mergedRows = tracer.trace('mergeResults', () =>
+      baseResult.rows.map(baseRow => {
+        const merged = { ...baseRow };
+        for (const collection of collections) {
+          const resultMap = collectionResults.get(collection.name);
+          const parentId = baseRow.__pk_id;
+          merged[collection.name] = resultMap?.get(parentId) || this.getDefaultValueForCollection(collection.builder);
+        }
+        // Remove the internal __pk_id field before returning
+        delete merged.__pk_id;
+        return merged;
+      }),
+      { rowCount: baseResult.rows.length }
+    );
 
     // Transform results using the original selection
-    return this.transformResults(mergedRows, selectionResult) as any;
+    const transformed = tracer.trace('transformResults', () =>
+      this.transformResults(mergedRows, selectionResult),
+      { rowCount: mergedRows.length }
+    );
+    tracer.endPhase();
+
+    return transformed as any;
   }
 
   /**
@@ -1689,64 +1745,74 @@ export class SelectQueryBuilder<TSelection> {
     baseSelection: any,
     selectionResult: any,
     context: QueryContext,
-    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>
+    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>,
+    tracer: TimeTracer
   ): Promise<any[]> {
+    tracer.startPhase('queryBuild');
     const baseTempTable = `tmp_base_${context.cteCounter++}`;
 
     // Build SQL for each collection
-    const collectionSQLs: string[] = [];
+    const collectionSQLs: string[] = tracer.trace('buildCollectionSQLs', () => {
+      const sqls: string[] = [];
+      for (const collection of collections) {
+        const builderAny = collection.builder as any;
+        const targetTable = builderAny.targetTable;
+        const foreignKey = builderAny.foreignKey;
+        const selector = builderAny.selector;
+        const orderByFields = builderAny.orderByFields || [];
 
-    for (const collection of collections) {
-      const builderAny = collection.builder as any;
-      const targetTable = builderAny.targetTable;
-      const foreignKey = builderAny.foreignKey;
-      const selector = builderAny.selector;
-      const orderByFields = builderAny.orderByFields || [];
+        // Build selected fields
+        let selectedFieldsSQL = '';
+        if (selector) {
+          const mockItem = builderAny.createMockItem();
+          const selectedFields = selector(mockItem);
 
-      // Build selected fields
-      let selectedFieldsSQL = '';
-      if (selector) {
-        const mockItem = builderAny.createMockItem();
-        const selectedFields = selector(mockItem);
-
-        const fieldParts: string[] = [];
-        for (const [alias, field] of Object.entries(selectedFields)) {
-          if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            const dbColumnName = (field as any).__dbColumnName;
-            fieldParts.push(`"${dbColumnName}" as "${alias}"`);
+          const fieldParts: string[] = [];
+          for (const [alias, field] of Object.entries(selectedFields)) {
+            if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
+              const dbColumnName = (field as any).__dbColumnName;
+              fieldParts.push(`"${dbColumnName}" as "${alias}"`);
+            }
           }
+          selectedFieldsSQL = fieldParts.join(', ');
         }
-        selectedFieldsSQL = fieldParts.join(', ');
+
+        // Build ORDER BY
+        let orderBySQL = orderByFields.length > 0
+          ? ` ORDER BY ${orderByFields.map(({ field, direction }: any) => `"${field}" ${direction}`).join(', ')}`
+          : ` ORDER BY "id" DESC`;
+
+        const collectionSQL = `SELECT "${foreignKey}" as parent_id, ${selectedFieldsSQL} FROM "${targetTable}" WHERE "${foreignKey}" IN (SELECT "__pk_id" FROM ${baseTempTable})${orderBySQL}`;
+        sqls.push(collectionSQL);
       }
-
-      // Build ORDER BY
-      let orderBySQL = orderByFields.length > 0
-        ? ` ORDER BY ${orderByFields.map(({ field, direction }: any) => `"${field}" ${direction}`).join(', ')}`
-        : ` ORDER BY "id" DESC`;
-
-      const collectionSQL = `SELECT "${foreignKey}" as parent_id, ${selectedFieldsSQL} FROM "${targetTable}" WHERE "${foreignKey}" IN (SELECT "__pk_id" FROM ${baseTempTable})${orderBySQL}`;
-      collectionSQLs.push(collectionSQL);
-    }
+      return sqls;
+    });
 
     // Build mega multi-statement SQL
-    const statements = [
-      `CREATE TEMP TABLE ${baseTempTable} AS ${baseSql}`,
-      `SELECT * FROM ${baseTempTable}`,
-      ...collectionSQLs,
-      `DROP TABLE IF EXISTS ${baseTempTable}`
-    ];
-
-    const multiStatementSQL = statements.join(';\n');
+    const multiStatementSQL = tracer.trace('buildMultiStatement', () => {
+      const statements = [
+        `CREATE TEMP TABLE ${baseTempTable} AS ${baseSql}`,
+        `SELECT * FROM ${baseTempTable}`,
+        ...collectionSQLs,
+        `DROP TABLE IF EXISTS ${baseTempTable}`
+      ];
+      return statements.join(';\n');
+    });
+    tracer.endPhase();
 
     // Execute via querySimpleMulti
+    tracer.startPhase('queryExecution');
     const executor = this.executor || this.client;
     let resultSets: QueryResult[];
 
     if ('querySimpleMulti' in executor && typeof (executor as any).querySimpleMulti === 'function') {
-      resultSets = await (executor as any).querySimpleMulti(multiStatementSQL);
+      resultSets = await tracer.traceAsync('executeMultiStatement', async () =>
+        (executor as any).querySimpleMulti(multiStatementSQL)
+      );
     } else {
       throw new Error('Fully optimized mode requires querySimpleMulti support');
     }
+    tracer.endPhase();
 
     // Parse result sets: [0]=CREATE, [1]=base, [2..N]=collections, [N+1]=DROP
     const baseResult = resultSets[1];
@@ -1760,37 +1826,52 @@ export class SelectQueryBuilder<TSelection> {
       return [];
     }
 
+    // Result processing phase
+    tracer.startPhase('resultProcessing');
+
     // Group collection results by parent_id
-    const collectionResults = new Map<string, Map<number, any>>();
-    collections.forEach((collection, idx) => {
-      const collectionResultSet = resultSets[2 + idx];
-      const dataMap = new Map<number, any>();
+    const collectionResults = tracer.trace('groupCollectionResults', () => {
+      const results = new Map<string, Map<number, any>>();
+      collections.forEach((collection, idx) => {
+        const collectionResultSet = resultSets[2 + idx];
+        const dataMap = new Map<number, any>();
 
-      for (const row of collectionResultSet.rows) {
-        const parentId = row.parent_id;
-        if (!dataMap.has(parentId)) {
-          dataMap.set(parentId, []);
+        for (const row of collectionResultSet.rows) {
+          const parentId = row.parent_id;
+          if (!dataMap.has(parentId)) {
+            dataMap.set(parentId, []);
+          }
+          const { parent_id, ...rowData } = row;
+          dataMap.get(parentId)!.push(rowData);
         }
-        const { parent_id, ...rowData } = row;
-        dataMap.get(parentId)!.push(rowData);
-      }
 
-      collectionResults.set(collection.name, dataMap);
+        results.set(collection.name, dataMap);
+      });
+      return results;
     });
 
     // Merge base results with collection results
-    const mergedRows = baseResult.rows.map((baseRow: any) => {
-      const merged = { ...baseRow };
-      for (const collection of collections) {
-        const resultMap = collectionResults.get(collection.name);
-        const parentId = baseRow.__pk_id;
-        merged[collection.name] = resultMap?.get(parentId) || [];
-      }
-      delete merged.__pk_id;
-      return merged;
-    });
+    const mergedRows = tracer.trace('mergeResults', () =>
+      baseResult.rows.map((baseRow: any) => {
+        const merged = { ...baseRow };
+        for (const collection of collections) {
+          const resultMap = collectionResults.get(collection.name);
+          const parentId = baseRow.__pk_id;
+          merged[collection.name] = resultMap?.get(parentId) || [];
+        }
+        delete merged.__pk_id;
+        return merged;
+      }),
+      { rowCount: baseResult.rows.length }
+    );
 
-    return this.transformResults(mergedRows, selectionResult) as any;
+    const transformed = tracer.trace('transformResults', () =>
+      this.transformResults(mergedRows, selectionResult),
+      { rowCount: mergedRows.length }
+    );
+    tracer.endPhase();
+
+    return transformed as any;
   }
 
   /**
@@ -4076,9 +4157,12 @@ export class CollectionQueryBuilder<TItem = any> {
   ): void {
     // Keep resolving until we've resolved all aliases or can't make progress
     let resolved = new Set<string>();
-    let maxIterations = allTableAliases.size * 2; // Prevent infinite loops
+    let lastResolvedCount = -1;
+    let maxIterations = 100; // Prevent infinite loops
 
-    while (resolved.size < allTableAliases.size && maxIterations-- > 0) {
+    while (resolved.size < allTableAliases.size && resolved.size !== lastResolvedCount && maxIterations-- > 0) {
+      lastResolvedCount = resolved.size;
+
       // Build a map of already joined schemas for path resolution
       const joinedSchemas = new Map<string, TableSchema>();
       joinedSchemas.set(this.targetTable, startSchema);
@@ -4100,19 +4184,101 @@ export class CollectionQueryBuilder<TItem = any> {
           continue;
         }
 
-        // Look for this alias in any of the already joined schemas
+        // First, look for this alias in any of the already joined schemas (direct lookup)
+        let found = false;
         for (const [schemaAlias, schema] of joinedSchemas) {
           if (schema.relations && schema.relations[alias]) {
             const relation = schema.relations[alias];
             if (relation.type === 'one') {
               this.addNavigationJoin(alias, relation, joins, schemaAlias);
               resolved.add(alias);
+              found = true;
               break;
             }
           }
         }
+
+        // If not found directly, search transitively through all schemas in registry
+        // to find an intermediate path
+        if (!found && this.schemaRegistry) {
+          const path = this.findNavigationPath(alias, joinedSchemas, startSchema);
+          if (path.length > 0) {
+            // Add all intermediate joins
+            for (const step of path) {
+              if (!joins.some(j => j.alias === step.alias)) {
+                this.addNavigationJoin(step.alias, step.relation, joins, step.sourceAlias);
+              }
+            }
+            resolved.add(alias);
+          }
+        }
       }
     }
+  }
+
+  /**
+   * Find a path from already-joined schemas to the target alias
+   * Uses BFS to find the shortest path through the schema graph
+   */
+  private findNavigationPath(
+    targetAlias: string,
+    joinedSchemas: Map<string, TableSchema>,
+    _startSchema: TableSchema
+  ): Array<{ alias: string; relation: any; sourceAlias: string }> {
+    if (!this.schemaRegistry) {
+      return [];
+    }
+
+    // BFS to find path from any joined schema to the target alias
+    const queue: Array<{
+      schemaAlias: string;
+      schema: TableSchema;
+      path: Array<{ alias: string; relation: any; sourceAlias: string }>;
+    }> = [];
+
+    // Start from all currently joined schemas
+    for (const [schemaAlias, schema] of joinedSchemas) {
+      queue.push({ schemaAlias, schema, path: [] });
+    }
+
+    const visited = new Set<string>();
+    for (const [alias] of joinedSchemas) {
+      visited.add(alias);
+    }
+
+    while (queue.length > 0) {
+      const { schemaAlias, schema, path } = queue.shift()!;
+
+      if (!schema.relations) {
+        continue;
+      }
+
+      for (const [relName, relConfig] of Object.entries(schema.relations)) {
+        if (relConfig.type !== 'one') {
+          continue; // Only follow reference (one-to-one/many-to-one) relations
+        }
+
+        if (visited.has(relName)) {
+          continue;
+        }
+
+        const newPath = [...path, { alias: relName, relation: relConfig, sourceAlias: schemaAlias }];
+
+        // Found the target!
+        if (relName === targetAlias) {
+          return newPath;
+        }
+
+        // Continue searching through this relation's schema
+        visited.add(relName);
+        const nextSchema = this.schemaRegistry.get(relConfig.targetTable);
+        if (nextSchema) {
+          queue.push({ schemaAlias: relName, schema: nextSchema, path: newPath });
+        }
+      }
+    }
+
+    return []; // No path found
   }
 
   /**
@@ -4167,6 +4333,34 @@ export class CollectionQueryBuilder<TItem = any> {
         };
         const nestedResult = field.buildCTE(nestedCtx, client);
         context.cteCounter = nestedCtx.cteCounter;
+
+        // For CTE/LATERAL strategy, we need to track the nested join
+        // The nested aggregation needs to be joined in the outer collection's subquery
+        if (nestedResult.tableName) {
+          let nestedJoinClause: string;
+
+          if (nestedResult.isCTE) {
+            // CTE strategy: join by parent_id
+            // The join should be: this.targetTable.id = nestedCte.parent_id
+            nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+          } else if (nestedResult.joinClause) {
+            // LATERAL strategy: use the provided join clause (contains full LATERAL subquery)
+            nestedJoinClause = nestedResult.joinClause;
+          } else {
+            // Fallback for other strategies
+            nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+          }
+
+          return {
+            alias,
+            expression: nestedResult.selectExpression || nestedResult.sql,
+            nestedCteJoin: {
+              cteName: nestedResult.tableName,
+              joinClause: nestedJoinClause,
+            },
+          };
+        }
+
         // The nested collection becomes a correlated subquery in SELECT
         return { alias, expression: nestedResult.selectExpression || nestedResult.sql };
       } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {

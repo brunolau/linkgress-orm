@@ -111,6 +111,9 @@ export {
   QueryOptions,
   LoggingOptions,
   CollectionStrategyType,
+  TimeTracer,
+  TimeTraceEntry,
+  QueryTimeTrace,
 } from './entity/db-context';
 
 // Collection strategy pattern

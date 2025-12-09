@@ -235,6 +235,23 @@ WHERE ${whereSQL})`;
   }
 
   /**
+   * Helper to collect nested CTE/LATERAL joins from selected fields
+   * These are joins to CTEs or LATERAL subqueries created for nested collections
+   */
+  private collectNestedCteJoins(fields: SelectedField[]): string[] {
+    const joins: string[] = [];
+    for (const field of fields) {
+      if (field.nestedCteJoin) {
+        joins.push(field.nestedCteJoin.joinClause);
+      }
+      if (field.nested) {
+        joins.push(...this.collectNestedCteJoins(field.nested));
+      }
+    }
+    return joins;
+  }
+
+  /**
    * Build navigation JOINs SQL for multi-level navigation in collection queries
    */
   private buildNavigationJoins(navigationJoins: NavigationJoin[] | undefined, targetTable: string): string {
@@ -334,6 +351,10 @@ WHERE ${whereSQL})`;
     // Build navigation JOINs for multi-level navigation
     const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
 
+    // Collect nested CTE/LATERAL joins (for collections within collections)
+    const nestedCteJoins = this.collectNestedCteJoins(selectedFields);
+    const nestedCteJoinsSQL = nestedCteJoins.length > 0 ? nestedCteJoins.join('\n  ') : '';
+
     // Build WHERE clause - LATERAL correlates with parent via foreign key
     // The correlation is: target.foreignKey = source.id
     let whereSQL = `WHERE "${targetTable}"."${foreignKey}" = "${sourceTable}"."id"`;
@@ -369,6 +390,7 @@ FROM (
   SELECT ${distinctClause}${allSelectFields.join(', ')}
   FROM "${targetTable}"
   ${navJoinsSQL}
+  ${nestedCteJoinsSQL}
   ${whereSQL}
   ${orderBySQL}
   ${limitOffsetClause}

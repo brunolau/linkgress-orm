@@ -9,6 +9,14 @@ export interface SelectedField {
   alias: string;
   expression?: string;  // SQL expression (for leaf fields)
   nested?: SelectedField[];  // Nested fields (for object structures)
+  /**
+   * When this field is a nested CTE (collection within collection),
+   * this specifies how to join that CTE.
+   */
+  nestedCteJoin?: {
+    cteName: string;
+    joinClause: string;  // e.g., 'LEFT JOIN "cte_0" ON "orders"."id" = "cte_0".parent_id'
+  };
 }
 
 /**
