@@ -659,6 +659,59 @@ describe('toDriver Mapper Tests', () => {
         });
       });
     });
+
+    test('should apply toDriver when customDate is passed as external parameter variable', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Store the date in a variable (simulates args.from / args.to pattern)
+        const fromDate: Date = new Date(2020,0,1);
+        const toDate: Date = new Date(2090,0,1);
+
+        // Use the external variable in the where clause - this tests that
+        // toDriver is applied even when the value comes from outside the lambda
+        const results = await db.posts
+          .where(p => and(
+            gte(p.customDate, fromDate),
+            lte(p.customDate, toDate)
+          ))
+          .toList();
+
+        expect(results.length).toBeGreaterThan(0);
+        results.forEach(r => {
+          expect(r.customDate).toBeInstanceOf(Date);
+          expect(r.customDate!.getTime()).toBeGreaterThanOrEqual(fromDate.getTime());
+          expect(r.customDate!.getTime()).toBeLessThanOrEqual(toDate.getTime());
+        });
+      });
+    });
+
+    // test('should apply toDriver when using sql magic string with customDate', async () => {
+    //   await withDatabase(async (db) => {
+    //     await seedTestData(db);
+
+    //     const fromDate = new Date(2024, 0, 1);
+    //     const toDate = new Date(2030, 0, 1);
+
+    //     // Use sql`` magic string to compare customDate - this tests that
+    //     // toDriver is applied when the field is used in a raw SQL expression
+    //     const results = await db.posts
+    //       .where(p => and(
+    //         gt(p.id, 0),
+    //         sql<boolean>`${p.customDate} >= ${fromDate} AND ${p.customDate} <= ${toDate}`
+    //       ))
+    //       .toList();
+
+    //     expect(Array.isArray(results)).toBe(true);
+    //     results.forEach(r => {
+    //       if (r.customDate !== null) {
+    //         expect(r.customDate).toBeInstanceOf(Date);
+    //         expect(r.customDate!.getTime()).toBeGreaterThanOrEqual(fromDate.getTime());
+    //         expect(r.customDate!.getTime()).toBeLessThanOrEqual(toDate.getTime());
+    //       }
+    //     });
+    //   });
+    // });
   });
 
   describe('Edge Cases', () => {
