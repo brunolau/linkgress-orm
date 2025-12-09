@@ -290,8 +290,18 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     // Performance: Lazy-cache FieldRef objects - only create when first accessed
     const fieldRefCache: Record<string, any> = {};
 
+    // Build a mapper lookup for columns (only when needed)
+    const columnMappers: Record<string, any> = {};
+    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
+      const config = (colBuilder as any).build();
+      if (config.mapper) {
+        columnMappers[colName] = config.mapper;
+      }
+    }
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
+      const mapper = columnMappers[colName];
       Object.defineProperty(mock, colName, {
         get() {
           let cached = fieldRefCache[colName];
@@ -300,6 +310,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
+              // Include mapper for toDriver transformation in conditions
+              __mapper: mapper,
             };
           }
           return cached;
@@ -2056,8 +2068,18 @@ export class SelectQueryBuilder<TSelection> {
     // Performance: Lazy-cache FieldRef objects
     const fieldRefCache: Record<string, any> = {};
 
+    // Build a mapper lookup for columns (only when needed)
+    const columnMappers: Record<string, any> = {};
+    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
+      const config = (colBuilder as any).build();
+      if (config.mapper) {
+        columnMappers[colName] = config.mapper;
+      }
+    }
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
+      const mapper = columnMappers[colName];
       Object.defineProperty(mock, colName, {
         get() {
           let cached = fieldRefCache[colName];
@@ -2066,6 +2088,8 @@ export class SelectQueryBuilder<TSelection> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
+              // Include mapper for toDriver transformation in conditions
+              __mapper: mapper,
             };
           }
           return cached;
@@ -2192,12 +2216,13 @@ export class SelectQueryBuilder<TSelection> {
         // If the value is already a FieldRef
         if (value && typeof value === 'object' && '__fieldName' in value && '__dbColumnName' in value) {
           if (preserveOriginal) {
-            // For WHERE: preserve original column name and table alias
-            // This ensures WHERE references the actual database column
+            // For WHERE: preserve original column name, table alias, and mapper
+            // This ensures WHERE references the actual database column with proper type conversion
             return {
               __fieldName: prop as string,
               __dbColumnName: (value as any).__dbColumnName,
               __tableAlias: (value as any).__tableAlias,
+              __mapper: (value as any).__mapper,  // Preserve mapper for toDriver in conditions
             };
           } else {
             // For ORDER BY: use the alias (property name) as the column name

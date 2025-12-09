@@ -213,8 +213,11 @@ export abstract class WhereConditionBase {
   /**
    * Helper to get the right-hand side of a comparison
    * Returns either a column reference or a parameter placeholder
+   * @param value The value to process (field reference or literal)
+   * @param context The SQL build context
+   * @param sourceField Optional source field that may contain a mapper for toDriver transformation
    */
-  protected getRightSide<V>(value: FieldLike<V> | V, context: SqlBuildContext): string {
+  protected getRightSide<V>(value: FieldLike<V> | V, context: SqlBuildContext, sourceField?: FieldLike<V> | string): string {
     if (this.isFieldRef(value)) {
       // Value is a field reference, use it with table alias if present
       if ('__tableAlias' in value && (value as any).__tableAlias) {
@@ -223,7 +226,15 @@ export abstract class WhereConditionBase {
       return `"${value.__dbColumnName}"`;
     } else {
       // Value is a literal, use a parameter
-      context.params.push(value);
+      // Apply toDriver mapper if the source field has one
+      let mappedValue = value;
+      if (sourceField && this.isFieldRef(sourceField) && '__mapper' in sourceField && (sourceField as any).__mapper) {
+        const mapper = (sourceField as any).__mapper;
+        if (typeof mapper.toDriver === 'function') {
+          mappedValue = mapper.toDriver(value);
+        }
+      }
+      context.params.push(mappedValue);
       return `$${context.paramCounter++}`;
     }
   }
@@ -268,7 +279,8 @@ export abstract class WhereComparisonBase<V = any> extends WhereConditionBase {
     const operator = this.getOperator();
 
     if (this.value !== undefined) {
-      const rightSide = this.getRightSide(this.value, context);
+      // Pass the field to getRightSide so it can apply toDriver mapper if present
+      const rightSide = this.getRightSide(this.value, context, this.field);
       return `${fieldName} ${operator} ${rightSide}`;
     } else {
       // For operators like IS NULL that don't have a value
@@ -428,8 +440,17 @@ export class InComparison<V = any> extends WhereComparisonBase<V> {
       return '1=0'; // No matches
     }
 
-    const params = this.values.map(() => `$${context.paramCounter++}`).join(', ');
-    context.params.push(...this.values);
+    // Apply toDriver mapper if the field has one
+    let mappedValues = this.values;
+    if (this.isFieldRef(this.field) && '__mapper' in this.field && (this.field as any).__mapper) {
+      const mapper = (this.field as any).__mapper;
+      if (typeof mapper.toDriver === 'function') {
+        mappedValues = this.values.map(v => mapper.toDriver(v));
+      }
+    }
+
+    const params = mappedValues.map(() => `$${context.paramCounter++}`).join(', ');
+    context.params.push(...mappedValues);
     return `${fieldName} IN (${params})`;
   }
 
@@ -456,8 +477,17 @@ export class NotInComparison<V = any> extends WhereComparisonBase<V> {
       return '1=1'; // All match
     }
 
-    const params = this.values.map(() => `$${context.paramCounter++}`).join(', ');
-    context.params.push(...this.values);
+    // Apply toDriver mapper if the field has one
+    let mappedValues = this.values;
+    if (this.isFieldRef(this.field) && '__mapper' in this.field && (this.field as any).__mapper) {
+      const mapper = (this.field as any).__mapper;
+      if (typeof mapper.toDriver === 'function') {
+        mappedValues = this.values.map(v => mapper.toDriver(v));
+      }
+    }
+
+    const params = mappedValues.map(() => `$${context.paramCounter++}`).join(', ');
+    context.params.push(...mappedValues);
     return `${fieldName} NOT IN (${params})`;
   }
 
@@ -494,8 +524,9 @@ export class BetweenComparison<V = any> extends WhereComparisonBase<V> {
 
   buildSql(context: SqlBuildContext): string {
     const fieldName = this.getDbColumnName(this.field); // Returns already quoted name
-    const minSide = this.getRightSide(this.min, context);
-    const maxSide = this.getRightSide(this.max, context);
+    // Pass the field to getRightSide so it can apply toDriver mapper
+    const minSide = this.getRightSide(this.min, context, this.field);
+    const maxSide = this.getRightSide(this.max, context, this.field);
     return `${fieldName} BETWEEN ${minSide} AND ${maxSide}`;
   }
 

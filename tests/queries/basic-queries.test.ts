@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, lt, gte, lte, like, and, or, not } from '../../src';
 import { assertType } from '../utils/type-tester';
+import PgIntDateTimeUtils from '../../debug/types/pgIntDatetimeUtils';
 
 describe('Basic Query Operations', () => {
   describe('SELECT queries', () => {
@@ -269,6 +270,38 @@ describe('Basic Query Operations', () => {
           assertType<number, typeof u.id>(u.id);
         });
         expect(offsetUsers[0].id).toBe(allUsers[1].id);
+      });
+    });
+
+    test('should properly work with toDriver', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test that toDriver mapper is applied in WHERE conditions
+        // customDate uses pgIntDatetime mapper which converts Date to integer
+        const from = new Date(2024, 0, 1);
+        const to = new Date(2030, 0, 1);
+
+        // Query posts with date range using the custom mapper
+        const posts = await db.posts
+          .where(p => gt(p.id, 0))
+          .where(p => PgIntDateTimeUtils.between(
+            p.customDate,
+            from,
+            to,
+            'none',
+          ))
+          .toList();
+
+        // Should return posts that have customDate within the range
+        expect(Array.isArray(posts)).toBe(true);
+
+        // Verify that customDate is properly converted back to Date (fromDriver)
+        posts.forEach(p => {
+          if (p.customDate !== null) {
+            expect(p.customDate).toBeInstanceOf(Date);
+          }
+        });
       });
     });
 

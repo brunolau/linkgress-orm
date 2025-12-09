@@ -3260,6 +3260,8 @@ WHERE ${whereClause}`.trim();
           __fieldName: propName,
           __dbColumnName: config.name,
           __isDbColumn: true,
+          // Include mapper for toDriver transformation in conditions
+          __mapper: config.mapper,
         }),
         enumerable: true,
       });
