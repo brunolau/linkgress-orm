@@ -530,6 +530,11 @@ export class DbSchemaManager {
       await this.createTable(tableName, tableSchema);
     }
 
+    // Create indexes
+    for (const [tableName, tableSchema] of sortedTables) {
+      await this.createIndexes(tableName, tableSchema);
+    }
+
     if (this.logQueries) {
       console.log('✓ Database schema created successfully\n');
     }
@@ -543,6 +548,16 @@ export class DbSchemaManager {
       if (this.logQueries) {
         console.log('✓ Post-migration scripts completed\n');
       }
+    }
+  }
+
+  /**
+   * Create indexes for a table
+   */
+  private async createIndexes(tableName: string, tableSchema: TableSchema): Promise<void> {
+    const indexes = tableSchema.indexes || [];
+    for (const index of indexes) {
+      await this.executeCreateIndex(tableName, index.name, index.columns, index.isUnique);
     }
   }
 
@@ -1142,7 +1157,7 @@ export class DbSchemaManager {
     console.log(`  Creating ${uniqueStr}index "${indexName}" on "${tableName}"...`);
 
     const columnList = columns.map(col => `"${col}"`).join(', ');
-    const sql = `CREATE ${uniqueStr}INDEX "${indexName}" ON "${tableName}" (${columnList})`;
+    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${indexName}" ON "${tableName}" (${columnList})`;
 
     await this.client.query(sql);
     console.log(`  ✓ ${uniqueStr}Index "${indexName}" created\n`);
