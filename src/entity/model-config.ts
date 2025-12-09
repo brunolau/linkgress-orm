@@ -126,7 +126,8 @@ export class DbModelConfig {
         if (!targetMetadata) continue;
 
         // Only create FK constraint if this table contains the foreign key
-        if (navMetadata.relationType === 'one') {
+        // Skip if this is an inverse navigation (FK is defined on the other side)
+        if (navMetadata.relationType === 'one' && !navMetadata.isInverseNavigation) {
           // For hasOne: FK is on current table
           const foreignKeyProp = navMetadata.foreignKey;
           const principalKeyProp = navMetadata.principalKey;

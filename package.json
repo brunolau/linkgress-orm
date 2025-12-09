@@ -1,6 +1,6 @@
 {
   "name": "linkgress-orm",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "A lightweight, type-safe ORM for PostgreSQL with LINQ-style queries and automatic type inference",
   "main": "dist/index.js",
   "module": "dist/index.js",

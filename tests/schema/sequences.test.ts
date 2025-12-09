@@ -275,4 +275,43 @@ describe('Sequence Support', () => {
     // Recreate for other tests
     await db.getSchemaManager().ensureCreated();
   });
+
+  test('should create sequences during migrate()', async () => {
+    // First, drop all sequences and tables
+    await db.getSchemaManager().ensureDeleted();
+
+    // Verify sequences don't exist
+    let result = await client.query(`
+      SELECT COUNT(*) as count
+      FROM information_schema.sequences
+      WHERE sequence_name IN ('basic_seq', 'custom_seq', 'cached_seq', 'schema_seq')
+    `);
+    expect(Number(result.rows[0].count)).toBe(0);
+
+    // Run migrate() instead of ensureCreated()
+    await db.getSchemaManager().migrate();
+
+    // Verify sequences were created
+    result = await client.query(`
+      SELECT sequence_name
+      FROM information_schema.sequences
+      WHERE sequence_name IN ('basic_seq', 'custom_seq', 'cached_seq', 'schema_seq')
+      ORDER BY sequence_name
+    `);
+
+    expect(result.rows).toHaveLength(4);
+    expect(result.rows.map(r => r.sequence_name)).toEqual([
+      'basic_seq',
+      'cached_seq',
+      'custom_seq',
+      'schema_seq',
+    ]);
+
+    // Verify sequences work correctly after migrate
+    const val1 = await db.basicSeq.nextValue();
+    expect(val1).toBe(1);
+
+    const val2 = await db.customSeq.nextValue();
+    expect(val2).toBe(100);
+  });
 });

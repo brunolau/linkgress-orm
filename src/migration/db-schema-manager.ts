@@ -4,6 +4,7 @@ import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
+import { RawSql } from '../query/conditions';
 
 /**
  * Database column information from pg
@@ -44,6 +45,7 @@ interface DbForeignKeyInfo {
 type MigrationOperation =
   | { type: 'create_schema'; schemaName: string }
   | { type: 'create_enum'; enumName: string; values: readonly string[] }
+  | { type: 'create_sequence'; config: SequenceConfig }
   | { type: 'create_table'; tableName: string; schema: TableSchema }
   | { type: 'drop_table'; tableName: string }
   | { type: 'add_column'; tableName: string; columnName: string; config: ColumnConfig }
@@ -668,6 +670,26 @@ export class DbSchemaManager {
       }
     }
 
+    // Check sequences
+    for (const [_, config] of this.sequenceRegistry.entries()) {
+      const checkSQL = config.schema
+        ? `SELECT EXISTS (
+            SELECT 1 FROM information_schema.sequences
+            WHERE sequence_schema = $1 AND sequence_name = $2
+          ) as exists`
+        : `SELECT EXISTS (
+            SELECT 1 FROM information_schema.sequences
+            WHERE sequence_name = $1 AND sequence_schema = 'public'
+          ) as exists`;
+
+      const checkParams = config.schema ? [config.schema, config.name] : [config.name];
+      const result = await this.client.query(checkSQL, checkParams);
+
+      if (!result.rows[0]?.exists) {
+        operations.push({ type: 'create_sequence', config });
+      }
+    }
+
     // Get all existing tables
     const existingTables = await this.getExistingTables();
     const modelTables = new Set(this.schemaRegistry.keys());
@@ -776,7 +798,7 @@ export class DbSchemaManager {
       const tablesToCreate = new Set<string>();
 
       for (const op of operations) {
-        if (op.type === 'create_schema' || op.type === 'create_enum') {
+        if (op.type === 'create_schema' || op.type === 'create_enum' || op.type === 'create_sequence') {
           phase1Ops.push(op);
         } else if (op.type === 'create_table') {
           phase1Ops.push(op);
@@ -894,6 +916,10 @@ export class DbSchemaManager {
         await this.executeCreateEnum(operation.enumName, operation.values);
         break;
 
+      case 'create_sequence':
+        await this.executeCreateSequence(operation.config);
+        break;
+
       case 'create_table':
         await this.createTable(operation.tableName, operation.schema, { skipForeignKeys: options?.skipForeignKeys });
         break;
@@ -965,6 +991,47 @@ export class DbSchemaManager {
     const valueList = values.map(v => `'${v}'`).join(', ');
     await this.client.query(`CREATE TYPE "${enumName}" AS ENUM (${valueList})`);
     console.log(`  ✓ ENUM type "${enumName}" created\n`);
+  }
+
+  /**
+   * Execute create sequence
+   */
+  private async executeCreateSequence(config: SequenceConfig): Promise<void> {
+    const qualifiedName = config.schema
+      ? `"${config.schema}"."${config.name}"`
+      : `"${config.name}"`;
+
+    console.log(`  Creating sequence ${qualifiedName}...`);
+
+    // Build CREATE SEQUENCE statement
+    let createSQL = `CREATE SEQUENCE ${qualifiedName}`;
+    const options: string[] = [];
+
+    if (config.startWith !== undefined) {
+      options.push(`START WITH ${config.startWith}`);
+    }
+    if (config.incrementBy !== undefined) {
+      options.push(`INCREMENT BY ${config.incrementBy}`);
+    }
+    if (config.minValue !== undefined) {
+      options.push(`MINVALUE ${config.minValue}`);
+    }
+    if (config.maxValue !== undefined) {
+      options.push(`MAXVALUE ${config.maxValue}`);
+    }
+    if (config.cache !== undefined) {
+      options.push(`CACHE ${config.cache}`);
+    }
+    if (config.cycle) {
+      options.push(`CYCLE`);
+    }
+
+    if (options.length > 0) {
+      createSQL += ` ${options.join(' ')}`;
+    }
+
+    await this.client.query(createSQL);
+    console.log(`  ✓ Sequence ${qualifiedName} created\n`);
   }
 
   /**
@@ -1380,6 +1447,11 @@ export class DbSchemaManager {
         return `Create schema "${operation.schemaName}"`;
       case 'create_enum':
         return `Create ENUM type "${operation.enumName}" (${operation.values.join(', ')})`;
+      case 'create_sequence':
+        const seqName = operation.config.schema
+          ? `"${operation.config.schema}"."${operation.config.name}"`
+          : `"${operation.config.name}"`;
+        return `Create sequence ${seqName}`;
       case 'create_table':
         return `Create table "${operation.tableName}"`;
       case 'drop_table':
@@ -1429,15 +1501,14 @@ export class DbSchemaManager {
 
   /**
    * Format default value for SQL
+   * Accepts RawSql to pass through raw SQL without formatting
    */
   private formatDefaultValue(value: any): string {
     if (value === null) return 'NULL';
+    // RawSql passes through without any formatting
+    if (value instanceof RawSql) return value.value;
     if (typeof value === 'string') {
-      // Check if it's a SQL function
-      if (value.toUpperCase().includes('NOW()') || value.toUpperCase().includes('CURRENT_')) {
-        return value;
-      }
-      return `'${value}'`;
+      return value;
     }
     if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
     if (value instanceof Date) return `'${value.toISOString()}'`;

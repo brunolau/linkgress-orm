@@ -72,6 +72,11 @@ export interface NavigationMetadata<TTarget extends DbEntity> {
   onDelete?: ForeignKeyAction;
   onUpdate?: ForeignKeyAction;
   constraintName?: string;
+  /**
+   * If true, this is an inverse navigation (the FK constraint is defined on the other side).
+   * No FK constraint will be created for this navigation.
+   */
+  isInverseNavigation?: boolean;
 }
 
 /**

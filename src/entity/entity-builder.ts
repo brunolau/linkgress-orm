@@ -219,6 +219,38 @@ abstract class BaseNavigationBuilder<TEntity extends DbEntity, TTarget extends D
     metadata.navigations.set(this.propertyKey, navMetadata);
     return this;
   }
+
+  /**
+   * Mark this as an inverse navigation (no FK constraint will be created).
+   *
+   * Use this when the FK constraint is defined on the OTHER entity.
+   * This is useful for 1-to-1 relationships where you want navigation
+   * from both sides but the FK only exists on one side.
+   *
+   * @example
+   * // UserEshopVerification has the FK to UserEshop
+   * model.entity(UserEshopVerification, entity => {
+   *   entity.hasOne(e => e.userEshop, () => UserEshop)
+   *     .withForeignKey(e => e.userEshopId)
+   *     .withPrincipalKey(e => e.id)
+   *     .onDelete('cascade');
+   * });
+   *
+   * // UserEshop has inverse navigation (no FK created)
+   * model.entity(UserEshop, entity => {
+   *   entity.hasOne(e => e.userEshopVerification, () => UserEshopVerification)
+   *     .withForeignKey(e => e.id)
+   *     .withPrincipalKey(e => e.userEshopId)
+   *     .isInverseNavigation();  // <-- No FK constraint created
+   * });
+   */
+  isInverseNavigation(): this {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+    const navMetadata = metadata.navigations.get(this.propertyKey)!;
+    navMetadata.isInverseNavigation = true;
+    metadata.navigations.set(this.propertyKey, navMetadata);
+    return this;
+  }
 }
 
 /**
