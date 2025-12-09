@@ -51,7 +51,7 @@ type MigrationOperation =
   | { type: 'add_column'; tableName: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; columnName: string }
   | { type: 'alter_column'; tableName: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; indexName: string; columns: string[] }
+  | { type: 'create_index'; tableName: string; indexName: string; columns: string[]; isUnique?: boolean }
   | { type: 'drop_index'; tableName: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; constraintName: string };
@@ -742,7 +742,8 @@ export class DbSchemaManager {
               type: 'create_index',
               tableName,
               indexName: modelIndex.name,
-              columns: modelIndex.columns
+              columns: modelIndex.columns,
+              isUnique: modelIndex.isUnique
             });
           }
         }
@@ -949,7 +950,7 @@ export class DbSchemaManager {
         break;
 
       case 'create_index':
-        await this.executeCreateIndex(operation.tableName, operation.indexName, operation.columns);
+        await this.executeCreateIndex(operation.tableName, operation.indexName, operation.columns, operation.isUnique);
         break;
 
       case 'drop_index':
@@ -1136,14 +1137,15 @@ export class DbSchemaManager {
   /**
    * Execute create index
    */
-  private async executeCreateIndex(tableName: string, indexName: string, columns: string[]): Promise<void> {
-    console.log(`  Creating index "${indexName}" on "${tableName}"...`);
+  private async executeCreateIndex(tableName: string, indexName: string, columns: string[], isUnique?: boolean): Promise<void> {
+    const uniqueStr = isUnique ? 'UNIQUE ' : '';
+    console.log(`  Creating ${uniqueStr}index "${indexName}" on "${tableName}"...`);
 
     const columnList = columns.map(col => `"${col}"`).join(', ');
-    const sql = `CREATE INDEX "${indexName}" ON "${tableName}" (${columnList})`;
+    const sql = `CREATE ${uniqueStr}INDEX "${indexName}" ON "${tableName}" (${columnList})`;
 
     await this.client.query(sql);
-    console.log(`  ✓ Index "${indexName}" created\n`);
+    console.log(`  ✓ ${uniqueStr}Index "${indexName}" created\n`);
   }
 
   /**
@@ -1463,7 +1465,8 @@ export class DbSchemaManager {
       case 'alter_column':
         return `Alter column "${operation.tableName}"."${operation.columnName}"`;
       case 'create_index':
-        return `Create index "${operation.indexName}" on "${operation.tableName}" (${operation.columns.join(', ')})`;
+        const uniquePrefix = operation.isUnique ? 'unique ' : '';
+        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}" (${operation.columns.join(', ')})`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':

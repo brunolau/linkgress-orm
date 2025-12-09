@@ -85,6 +85,7 @@ export interface NavigationMetadata<TTarget extends DbEntity> {
 export interface IndexMetadata {
   name: string;
   columns: string[];
+  isUnique?: boolean;
 }
 
 /**

@@ -1,4 +1,4 @@
-import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction } from './entity-base';
+import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import { TypeMapper } from '../types/type-mapper';
 import { DbColumn } from './db-column';
@@ -399,7 +399,7 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
   hasIndex(
     indexName: string,
     selector: (entity: TEntity) => Array<TEntity[keyof TEntity]>
-  ): this {
+  ): IndexBuilder<TEntity> {
     const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
 
     // Create a temporary entity to extract column names
@@ -424,12 +424,13 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
     selector(proxy);
 
     // Add the index metadata
-    metadata.indexes.push({
+    const indexMetadata: IndexMetadata = {
       name: indexName,
       columns: columnNames
-    });
+    };
+    metadata.indexes.push(indexMetadata);
 
-    return this;
+    return new IndexBuilder<TEntity>(this.entityClass, indexMetadata);
   }
 
   /**
@@ -442,6 +443,24 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
       throw new Error('Could not extract property name from selector');
     }
     return match[1] as keyof TEntity;
+  }
+}
+
+/**
+ * Index configuration builder
+ */
+export class IndexBuilder<TEntity extends DbEntity> {
+  constructor(
+    private entityClass: EntityConstructor<TEntity>,
+    private indexMetadata: IndexMetadata
+  ) {}
+
+  /**
+   * Mark the index as unique
+   */
+  isUnique(): this {
+    this.indexMetadata.isUnique = true;
+    return this;
   }
 }
 

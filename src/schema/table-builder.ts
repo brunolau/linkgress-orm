@@ -36,6 +36,7 @@ export interface RelationConfig {
 export interface IndexDefinition {
   name: string;
   columns: string[];
+  isUnique?: boolean;
 }
 
 /**
