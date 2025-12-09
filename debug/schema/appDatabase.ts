@@ -63,7 +63,7 @@ export class AppDatabase extends DbContext {
             entity.property(e => e.email).hasType(text('email')).isRequired();
             entity.property(e => e.age).hasType(integer('age'));
             entity.property(e => e.isActive).hasType(boolean('is_active')).hasDefaultValue(true);
-            entity.property(e => e.createdAt).hasType(timestamp('created_at')).hasDefaultValue('NOW()');
+            entity.property(e => e.createdAt).hasType(timestamp('created_at')).hasDefaultValue(`'NOW()'`);
             entity.property(e => e.metadata).hasType(jsonb('metadata'));
 
             entity.hasMany(e => e.posts, () => Post)
@@ -84,11 +84,11 @@ export class AppDatabase extends DbContext {
             entity.property(e => e.subtitle).hasType(varchar('subtitle', 200));
             entity.property(e => e.content).hasType(text('content'));
             entity.property(e => e.userId).hasType(integer('user_id')).isRequired();
-            entity.property(e => e.publishedAt).hasType(timestamp('published_at')).hasDefaultValue('NOW()');
+            entity.property(e => e.publishedAt).hasType(timestamp('published_at')).hasDefaultValue(`'NOW()'`);
             entity.property(e => e.views).hasType(integer('views')).hasDefaultValue(0);
             entity.property(e => e.publishTime).hasType(smallint('publish_time')).hasCustomMapper(pgHourMinute);
             entity.property(e => e.customDate).hasType(integer('custom_date')).hasCustomMapper(pgIntDatetime);
-            entity.property(e => e.category).hasType(enumColumn('category', postCategoryEnum)).hasDefaultValue('tech');
+            entity.property(e => e.category).hasType(enumColumn('category', postCategoryEnum)).hasDefaultValue(`'tech'`);
 
             entity.hasOne(e => e.user, () => User)
                 .withForeignKey(p => p.userId)
@@ -108,9 +108,9 @@ export class AppDatabase extends DbContext {
 
             entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'orders_id_seq' }));
             entity.property(e => e.userId).hasType(integer('user_id')).isRequired();
-            entity.property(e => e.status).hasType(enumColumn('status', orderStatusEnum)).hasDefaultValue('pending');
+            entity.property(e => e.status).hasType(enumColumn('status', orderStatusEnum)).hasDefaultValue(`'pending'`);
             entity.property(e => e.totalAmount).hasType(decimal('total_amount', 10, 2)).isRequired();
-            entity.property(e => e.createdAt).hasType(timestamp('created_at')).hasDefaultValue('NOW()');
+            entity.property(e => e.createdAt).hasType(timestamp('created_at')).hasDefaultValue(`'NOW()'`);
             entity.property(e => e.items).hasType(jsonb('items'));
 
             entity.hasOne(e => e.user, () => User)
