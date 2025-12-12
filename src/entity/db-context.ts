@@ -1356,10 +1356,23 @@ export class DataContext<TSchema extends ContextSchema = any> {
   }
 
   /**
-   * Execute raw SQL
+   * Execute raw SQL query with optional type parameter for results
+   *
+   * @example
+   * ```typescript
+   * // Untyped query
+   * const result = await db.query('SELECT * FROM users');
+   *
+   * // Typed query - returns T[]
+   * const users = await db.query<{ id: number; name: string }>('SELECT id, name FROM users');
+   *
+   * // With parameters
+   * const user = await db.query<{ id: number }>('SELECT id FROM users WHERE name = $1', ['alice']);
+   * ```
    */
-  async query(sql: string, params?: any[]): Promise<any> {
-    return this.client.query(sql, params);
+  async query<T = any>(sql: string, params?: any[]): Promise<T[]> {
+    const result = await this.client.query(sql, params);
+    return result.rows as T[];
   }
 
   /**
