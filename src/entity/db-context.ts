@@ -553,6 +553,28 @@ export interface FluentUpsert<TEntity extends DbEntity> extends PromiseLike<void
 }
 
 /**
+ * Fluent delete operation for SelectQueryBuilder
+ * Used with db.table.where(...).delete()
+ */
+export interface FluentDelete<TSelection> extends PromiseLike<void> {
+  /** Return all columns from the deleted rows */
+  returning(): PromiseLike<TSelection[]>;
+  /** Return selected columns from the deleted rows */
+  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<TResult[]>;
+}
+
+/**
+ * Fluent update operation for SelectQueryBuilder
+ * Used with db.table.where(...).update(data)
+ */
+export interface FluentQueryUpdate<TSelection> extends PromiseLike<void> {
+  /** Return all columns from the updated rows */
+  returning(): PromiseLike<TSelection[]>;
+  /** Return selected columns from the updated rows */
+  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<TResult[]>;
+}
+
+/**
  * Insert builder for upsert operations
  */
 export class InsertBuilder<TSchema extends TableSchema> {
@@ -1667,6 +1689,18 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Count matching records
    */
   count(): Promise<number>;
+
+  /**
+   * Delete records matching the current WHERE condition
+   * Returns a fluent builder that can be awaited directly or chained with .returning()
+   */
+  delete(): FluentDelete<UnwrapDbColumns<TEntity>>;
+
+  /**
+   * Update records matching the current WHERE condition
+   * Returns a fluent builder that can be awaited directly or chained with .returning()
+   */
+  update(data: Partial<InsertData<TEntity>>): FluentQueryUpdate<UnwrapDbColumns<TEntity>>;
 }
 
 /**
@@ -1765,8 +1799,8 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   with(...ctes: import('../query/cte-builder').DbCte<any>[]): this;
 
   // Mutation methods (available after where())
-  update(data: Partial<InsertData<TEntity>>): Promise<UnwrapDbColumns<TEntity>[]>;
-  delete(): Promise<void>;
+  update(data: Partial<InsertData<TEntity>>): FluentQueryUpdate<TSelection>;
+  delete(): FluentDelete<TSelection>;
 
   toList(): Promise<ResolveCollectionResults<TSelection>[]>;
 

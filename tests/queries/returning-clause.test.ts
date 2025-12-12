@@ -611,4 +611,222 @@ describe('Returning Clause (Fluent API)', () => {
       });
     });
   });
+
+  describe('where().delete() fluent API', () => {
+    test('should return void by default', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const result = await db.users.where(u => eq(u.id, users.charlie.id)).delete();
+
+        expect(result).toBeUndefined();
+
+        // Verify the record was deleted
+        const remaining = await db.users.where(u => eq(u.id, users.charlie.id)).toList();
+        expect(remaining.length).toBe(0);
+      });
+    });
+
+    test('should return full entities with .returning()', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const deleted = await db.users.where(u => eq(u.id, users.charlie.id)).delete().returning();
+
+        expect(deleted.length).toBe(1);
+        expect(deleted[0]).toHaveProperty('id', users.charlie.id);
+        expect(deleted[0]).toHaveProperty('username', 'charlie');
+        expect(deleted[0]).toHaveProperty('email');
+      });
+    });
+
+    test('should return selected columns with .returning(selector)', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const deleted = await db.users.where(u => eq(u.id, users.charlie.id)).delete()
+          .returning(u => ({ id: u.id, username: u.username }));
+
+        expect(deleted.length).toBe(1);
+        expect(deleted[0]).toHaveProperty('id', users.charlie.id);
+        expect(deleted[0]).toHaveProperty('username', 'charlie');
+        expect(deleted[0]).not.toHaveProperty('email');
+      });
+    });
+
+    test('should delete multiple records', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Delete all inactive users
+        const deleted = await db.users.where(u => eq(u.isActive, false)).delete()
+          .returning(u => ({ id: u.id, username: u.username }));
+
+        expect(deleted.length).toBe(1);
+        expect(deleted[0].username).toBe('charlie');
+
+        // Verify only active users remain
+        const remaining = await db.users.toList();
+        expect(remaining.length).toBe(2);
+        expect(remaining.every(u => u.isActive)).toBe(true);
+      });
+    });
+  });
+
+  describe('where().update() fluent API', () => {
+    test('should return void by default', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const result = await db.users.where(u => eq(u.id, users.alice.id)).update({ age: 99 });
+
+        expect(result).toBeUndefined();
+
+        // Verify the update happened
+        const alice = await db.users.where(u => eq(u.id, users.alice.id)).toList();
+        expect(alice[0].age).toBe(99);
+      });
+    });
+
+    test('should return full entities with .returning()', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const updated = await db.users.where(u => eq(u.id, users.alice.id)).update({ age: 88 }).returning();
+
+        expect(updated.length).toBe(1);
+        expect(updated[0]).toHaveProperty('id', users.alice.id);
+        expect(updated[0]).toHaveProperty('age', 88);
+        expect(updated[0]).toHaveProperty('username', 'alice');
+      });
+    });
+
+    test('should return selected columns with .returning(selector)', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const updated = await db.users.where(u => eq(u.id, users.alice.id)).update({ age: 77 })
+          .returning(u => ({ id: u.id, age: u.age }));
+
+        expect(updated.length).toBe(1);
+        expect(updated[0]).toHaveProperty('id', users.alice.id);
+        expect(updated[0]).toHaveProperty('age', 77);
+        expect(updated[0]).not.toHaveProperty('username');
+      });
+    });
+
+    test('should update multiple records', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Update all active users
+        const updated = await db.users.where(u => eq(u.isActive, true)).update({ age: 50 })
+          .returning(u => ({ id: u.id, age: u.age }));
+
+        expect(updated.length).toBe(2); // alice and bob are active
+        expect(updated.every(r => r.age === 50)).toBe(true);
+      });
+    });
+
+    test('should update multiple columns at once', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const updated = await db.users.where(u => eq(u.id, users.alice.id))
+          .update({ age: 30, isActive: false })
+          .returning();
+
+        expect(updated.length).toBe(1);
+        expect(updated[0].age).toBe(30);
+        expect(updated[0].isActive).toBe(false);
+      });
+    });
+  });
+
+  describe('SQL generation for where().delete()', () => {
+    test('delete should not include RETURNING when no .returning() called', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const queries: string[] = [];
+        const originalQuery = (db as any).client.query.bind((db as any).client);
+        (db as any).client.query = async (sql: string, params: any[]) => {
+          queries.push(sql);
+          return originalQuery(sql, params);
+        };
+
+        await db.users.where(u => eq(u.id, users.charlie.id)).delete();
+
+        const deleteQuery = queries.find(q => q.toUpperCase().includes('DELETE'));
+        expect(deleteQuery).toBeDefined();
+        expect(deleteQuery!.toUpperCase()).not.toContain('RETURNING');
+      });
+    });
+
+    test('delete should include RETURNING with .returning()', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Insert a new user to delete
+        const newUser = await db.users.insert({
+          username: 'todelete',
+          email: 'delete@test.com',
+          isActive: false,
+        }).returning();
+
+        const queries: string[] = [];
+        const originalQuery = (db as any).client.query.bind((db as any).client);
+        (db as any).client.query = async (sql: string, params: any[]) => {
+          queries.push(sql);
+          return originalQuery(sql, params);
+        };
+
+        await db.users.where(u => eq(u.id, newUser.id)).delete().returning();
+
+        const deleteQuery = queries.find(q => q.toUpperCase().includes('DELETE'));
+        expect(deleteQuery).toBeDefined();
+        expect(deleteQuery!.toUpperCase()).toContain('RETURNING');
+      });
+    });
+  });
+
+  describe('SQL generation for where().update()', () => {
+    test('update should not include RETURNING when no .returning() called', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const queries: string[] = [];
+        const originalQuery = (db as any).client.query.bind((db as any).client);
+        (db as any).client.query = async (sql: string, params: any[]) => {
+          queries.push(sql);
+          return originalQuery(sql, params);
+        };
+
+        await db.users.where(u => eq(u.id, users.alice.id)).update({ age: 50 });
+
+        const updateQuery = queries.find(q => q.toUpperCase().includes('UPDATE'));
+        expect(updateQuery).toBeDefined();
+        expect(updateQuery!.toUpperCase()).not.toContain('RETURNING');
+      });
+    });
+
+    test('update should include RETURNING with .returning()', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const queries: string[] = [];
+        const originalQuery = (db as any).client.query.bind((db as any).client);
+        (db as any).client.query = async (sql: string, params: any[]) => {
+          queries.push(sql);
+          return originalQuery(sql, params);
+        };
+
+        await db.users.where(u => eq(u.id, users.alice.id)).update({ age: 50 }).returning();
+
+        const updateQuery = queries.find(q => q.toUpperCase().includes('UPDATE'));
+        expect(updateQuery).toBeDefined();
+        expect(updateQuery!.toUpperCase()).toContain('RETURNING');
+      });
+    });
+  });
 });
