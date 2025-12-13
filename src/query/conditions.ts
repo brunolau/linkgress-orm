@@ -694,6 +694,99 @@ export function coalesce<T1, T2>(
  */
 type PropertyType<T, K extends keyof T> = T[K];
 
+// ============================================================================
+// Flag/Bitmask Operators
+// ============================================================================
+
+/**
+ * Creates a SQL condition to check if a flag is set in a numeric column
+ * Uses bitwise AND to check if the specific bit is non-zero
+ *
+ * @param column - The numeric column containing flags
+ * @param flag - The flag value to check for
+ * @returns SqlFragment<boolean> that evaluates to true if the flag is set
+ *
+ * @example
+ * enum UserStateFlags {
+ *   Active = 1,
+ *   Verified = 2,
+ *   Admin = 4,
+ * }
+ * db.users.where(u => flagHas(u.state, UserStateFlags.Active))
+ */
+export function flagHas<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flag: T
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['(', ' & ', ') != 0'],
+    [column, flag]
+  );
+}
+
+/**
+ * Creates a SQL condition to check if ALL specified flags are set
+ * Uses bitwise AND and checks if result equals the flags value
+ *
+ * @param column - The numeric column containing flags
+ * @param flags - The combined flag values to check for (use | to combine)
+ * @returns SqlFragment<boolean> that evaluates to true if all flags are set
+ *
+ * @example
+ * db.users.where(u => flagHasAll(u.state, UserStateFlags.Active | UserStateFlags.Verified))
+ */
+export function flagHasAll<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flags: T
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['(', ' & ', ') = ', ''],
+    [column, flags, flags]
+  );
+}
+
+/**
+ * Creates a SQL condition to check if ANY of the specified flags is set
+ * Uses bitwise AND to check if any of the bits are non-zero
+ *
+ * @param column - The numeric column containing flags
+ * @param flags - The combined flag values to check for (use | to combine)
+ * @returns SqlFragment<boolean> that evaluates to true if any flag is set
+ *
+ * @example
+ * db.users.where(u => flagHasAny(u.state, UserStateFlags.Slave | UserStateFlags.Unsynced))
+ */
+export function flagHasAny<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flags: T
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['(', ' & ', ') != 0'],
+    [column, flags]
+  );
+}
+
+/**
+ * Creates a SQL condition to check if a flag is NOT set
+ * Uses bitwise AND to check if the specific bit is zero
+ *
+ * @param column - The numeric column containing flags
+ * @param flag - The flag value to check is not set
+ * @returns SqlFragment<boolean> that evaluates to true if the flag is not set
+ *
+ * @example
+ * db.users.where(u => flagHasNone(u.state, UserStateFlags.Banned))
+ */
+export function flagHasNone<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flag: T
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['(', ' & ', ') = 0'],
+    [column, flag]
+  );
+}
+
 /**
  * JSONB property selector - extracts a property from a JSONB column
  * Uses the -> operator for JSONB extraction

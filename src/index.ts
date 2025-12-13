@@ -82,6 +82,10 @@ export {
   coalesce,
   jsonbSelect,
   jsonbSelectText,
+  flagHas,
+  flagHasAll,
+  flagHasAny,
+  flagHasNone,
 } from './query/conditions';
 
 // Subquery support
