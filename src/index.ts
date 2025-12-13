@@ -79,6 +79,9 @@ export {
   or,
   not,
   sql,
+  coalesce,
+  jsonbSelect,
+  jsonbSelectText,
 } from './query/conditions';
 
 // Subquery support

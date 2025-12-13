@@ -652,6 +652,121 @@ export function not(condition: Condition): Condition {
 }
 
 // ============================================================================
+// COALESCE and JSONB operators
+// ============================================================================
+
+/**
+ * Extract the underlying value type from a FieldLike or DbColumn
+ */
+type ExtractFieldValue<T> = T extends FieldLike<infer V>
+  ? V
+  : T extends DbColumn<infer V>
+  ? V
+  : T;
+
+/**
+ * COALESCE - returns the first non-null value from the arguments
+ *
+ * @example
+ * // Use in select
+ * db.users.select(u => ({
+ *   name: coalesce(u.displayName, u.username),
+ * }))
+ *
+ * @example
+ * // With literal fallback
+ * db.users.select(u => ({
+ *   status: coalesce(u.status, 'unknown'),
+ * }))
+ */
+export function coalesce<T1, T2>(
+  value1: FieldLike<T1> | T1,
+  value2: FieldLike<T2> | T2
+): SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>> {
+  return new SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>>(
+    ['COALESCE(', ', ', ')'],
+    [value1, value2]
+  );
+}
+
+/**
+ * Type helper to extract property type from an object type
+ */
+type PropertyType<T, K extends keyof T> = T[K];
+
+/**
+ * JSONB property selector - extracts a property from a JSONB column
+ * Uses the ->> operator for text extraction with proper casting
+ *
+ * @param jsonbField - The JSONB column to extract from
+ * @param selector - A function that selects the property (used to infer the property name)
+ * @returns SqlFragment that extracts the property as text
+ *
+ * @example
+ * // Given a JSONB column 'metadata' with structure { priority: number, tags: string[] }
+ * type Metadata = { priority: number; tags: string[] };
+ * db.tasks.select(t => ({
+ *   priority: jsonbSelect<Metadata, 'priority'>(t.metadata, m => m.priority),
+ * }))
+ *
+ * @example
+ * // Use in where clause
+ * db.tasks.where(t => eq(jsonbSelect<Metadata, 'priority'>(t.metadata, m => m.priority), 'high'))
+ */
+export function jsonbSelect<TJsonb, TKey extends keyof TJsonb>(
+  jsonbField: FieldLike<any> | DbColumn<any> | undefined,
+  selector: (value: TJsonb) => TJsonb[TKey]
+): SqlFragment<TJsonb[TKey]> {
+  // Extract property name from the selector function
+  const selectorStr = selector.toString();
+  const match = selectorStr.match(/\.([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\}|\s*$|\s*;|\s*\))/);
+  if (!match) {
+    throw new Error(`Could not extract property name from selector: ${selectorStr}`);
+  }
+  const propName = match[1];
+
+  // Build the JSONB extraction SQL: (column #>> '{}')::jsonb->'propertyName'
+  // This converts JSONB to text, then back to JSONB, then extracts the property
+  return new SqlFragment<TJsonb[TKey]>(
+    ['(', ` #>> '{}')::jsonb->'${propName}'`],
+    [jsonbField]
+  ).as(propName);
+}
+
+/**
+ * JSONB text property selector - extracts a property from a JSONB column as text
+ * Uses the ->> operator for direct text extraction
+ *
+ * @param jsonbField - The JSONB column to extract from
+ * @param selector - A function that selects the property (used to infer the property name)
+ * @returns SqlFragment that extracts the property as text (string)
+ *
+ * @example
+ * type Metadata = { priority: string };
+ * db.tasks.select(t => ({
+ *   priorityText: jsonbSelectText<Metadata, 'priority'>(t.metadata, m => m.priority),
+ * }))
+ */
+export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb>(
+  jsonbField: FieldLike<any> | DbColumn<any> | undefined,
+  selector: (value: TJsonb) => TJsonb[TKey]
+): SqlFragment<string> {
+  // Extract property name from the selector function
+  const selectorStr = selector.toString();
+  const match = selectorStr.match(/\.([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\}|\s*$|\s*;|\s*\))/);
+  if (!match) {
+    throw new Error(`Could not extract property name from selector: ${selectorStr}`);
+  }
+  const propName = match[1];
+
+  // Build the JSONB text extraction SQL: column->>'propertyName'
+  return new SqlFragment<string>(
+    ['', `->>'${propName}'`],
+    [jsonbField]
+  ).as(propName);
+}
+
+// ============================================================================
 // SQL Fragment - for use in SELECT projections and WHERE conditions
 // ============================================================================
 
