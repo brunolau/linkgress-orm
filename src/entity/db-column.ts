@@ -126,6 +126,24 @@ export type ExtractDbColumns<T> = {
 };
 
 /**
+ * Type helper to extract just the keys of DbColumn properties from an entity.
+ * Returns a union of string literal types representing the column property names.
+ *
+ * @example
+ * ```typescript
+ * interface User {
+ *   id: DbColumn<number>;
+ *   username: DbColumn<string>;
+ *   posts: Post[]; // navigation property
+ * }
+ *
+ * type UserColumnKeys = ExtractDbColumnKeys<User>;
+ * // Result: 'id' | 'username'
+ * ```
+ */
+export type ExtractDbColumnKeys<T> = keyof ExtractDbColumns<T> & string;
+
+/**
  * Type for insert data - only includes DbColumn properties, unwrapped to their values
  */
 export type InsertData<TEntity> = Partial<ExtractDbColumns<TEntity>>;

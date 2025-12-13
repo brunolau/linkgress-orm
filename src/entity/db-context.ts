@@ -1,6 +1,6 @@
 import { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
-import { UnwrapDbColumns, InsertData, ExtractDbColumns } from './db-column';
+import { UnwrapDbColumns, InsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
@@ -32,10 +32,23 @@ export type CollectionStrategyType = 'cte' | 'temptable' | 'lateral';
 
 /**
  * Column information returned by getColumns()
+ *
+ * @typeParam TEntity - The entity type, used to strongly type propertyName as one of the entity's column keys
+ *
+ * @example
+ * ```typescript
+ * // With typed entity
+ * const columns: ColumnInfo<User>[] = db.users.getColumns();
+ * columns[0].propertyName; // Type: 'id' | 'username' | 'email' | ... (only column keys)
+ *
+ * // Get just the property names as a typed array
+ * const keys = db.users.getColumnKeys();
+ * // Type: Array<'id' | 'username' | 'email' | ...>
+ * ```
  */
-export interface ColumnInfo {
-  /** Property name in the entity class (TypeScript name) */
-  propertyName: string;
+export interface ColumnInfo<TEntity = any> {
+  /** Property name in the entity class (TypeScript name) - typed as keyof entity columns */
+  propertyName: ExtractDbColumnKeys<TEntity>;
   /** Column name in the database */
   columnName: string;
   /** SQL type (e.g., 'integer', 'varchar', 'timestamp') */
@@ -1913,14 +1926,14 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * // Returns: ['id', 'username', 'email', ...]
    * ```
    */
-  getColumns(): ColumnInfo[] {
+  getColumns(): ColumnInfo<TEntity>[] {
     const schema = this._getSchema();
-    const columns: ColumnInfo[] = [];
+    const columns: ColumnInfo<TEntity>[] = [];
 
     for (const [propName, colBuilder] of Object.entries(schema.columns)) {
       const config = (colBuilder as any).build();
       columns.push({
-        propertyName: propName,
+        propertyName: propName as ExtractDbColumnKeys<TEntity>,
         columnName: config.name,
         type: config.type,
         isPrimaryKey: config.primaryKey || false,
@@ -1932,6 +1945,37 @@ export class DbEntityTable<TEntity extends DbEntity> {
     }
 
     return columns;
+  }
+
+  /**
+   * Get an array of all column property names (keys) for this entity.
+   * Returns a strongly typed array where each element is a valid column key of TEntity.
+   *
+   * This is a convenience method equivalent to `getColumns().map(c => c.propertyName)`
+   * but with better type inference.
+   *
+   * @returns Array of column property names typed as ExtractDbColumnKeys<TEntity>
+   *
+   * @example
+   * ```typescript
+   * // Get all column keys
+   * const keys = db.users.getColumnKeys();
+   * // Type: ExtractDbColumnKeys<User>[] which is ('id' | 'username' | 'email' | ...)[]
+   *
+   * // Use for dynamic property access
+   * const user = await db.users.findOne(u => eq(u.id, 1));
+   * for (const key of db.users.getColumnKeys()) {
+   *   console.log(`${key}: ${user[key]}`); // TypeScript knows key is valid
+   * }
+   *
+   * // Use for building dynamic queries
+   * const columnKeys = db.users.getColumnKeys();
+   * // columnKeys[0] is typed as 'id' | 'username' | 'email' | ...
+   * ```
+   */
+  getColumnKeys(): ExtractDbColumnKeys<TEntity>[] {
+    const schema = this._getSchema();
+    return Object.keys(schema.columns) as ExtractDbColumnKeys<TEntity>[];
   }
 
   /**

@@ -151,6 +151,7 @@ export {
   isDbColumn,
   InsertData,
   ExtractDbColumns,
+  ExtractDbColumnKeys,
 } from './entity/db-column';
 
 
