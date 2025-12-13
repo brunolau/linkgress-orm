@@ -122,7 +122,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          productName: jsonbSelect<OrderItems, 'productName'>(o.items, i => i.productName),
+          productName: jsonbSelect<OrderItems>(o.items, 'productName'),
         }))
         .where(o => gt(o.id, 0))
         .toList();
@@ -148,7 +148,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          quantity: jsonbSelect<OrderItems, 'quantity'>(o.items, i => i.quantity),
+          quantity: jsonbSelect<OrderItems>(o.items, 'quantity'),
         }))
         .where(o => gt(o.id, 0))
         .toList();
@@ -160,7 +160,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          productName: jsonbSelect<OrderItems, 'productName'>(o.items, i => i.productName),
+          productName: jsonbSelect<OrderItems>(o.items, 'productName'),
         }))
         .toList();
 
@@ -185,7 +185,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          productNameText: jsonbSelectText<OrderItems, 'productName'>(o.items, i => i.productName),
+          productNameText: jsonbSelectText<OrderItems>(o.items, 'productName'),
         }))
         .where(o => gt(o.id, 0))
         .toList();
@@ -203,7 +203,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          quantityAsText: jsonbSelectText<OrderItems, 'quantity'>(o.items, i => i.quantity),
+          quantityAsText: jsonbSelectText<OrderItems>(o.items, 'quantity'),
         }))
         .where(o => gt(o.id, 0))
         .toList();
@@ -221,7 +221,7 @@ describe('Coalesce and JSONB Operators', () => {
         .select(o => ({
           id: o.id,
           displayName: coalesce(
-            jsonbSelectText<OrderItems, 'productName'>(o.items, i => i.productName),
+            jsonbSelectText<OrderItems>(o.items, 'productName'),
             'No Product'
           ),
         }))
@@ -267,7 +267,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          quantity: jsonbSelectText<OrderItems, 'quantity'>(o.items, i => i.quantity),
+          quantity: jsonbSelectText<OrderItems>(o.items, 'quantity'),
         }))
         .toList();
 
@@ -310,7 +310,7 @@ describe('Coalesce and JSONB Operators', () => {
       const results = await db.orders
         .select(o => ({
           id: o.id,
-          price: jsonbSelect<Items, 'price'>(o.items, i => i.price),
+          price: jsonbSelect<Items>(o.items, 'price'),
         }))
         .toList();
 

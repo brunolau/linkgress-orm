@@ -696,41 +696,33 @@ type PropertyType<T, K extends keyof T> = T[K];
 
 /**
  * JSONB property selector - extracts a property from a JSONB column
- * Uses the ->> operator for text extraction with proper casting
+ * Uses the -> operator for JSONB extraction
  *
  * @param jsonbField - The JSONB column to extract from
- * @param selector - A function that selects the property (used to infer the property name)
- * @returns SqlFragment that extracts the property as text
+ * @param key - The property key to extract (typed as keyof TJsonb)
+ * @returns SqlFragment that extracts the property as JSONB
  *
  * @example
  * // Given a JSONB column 'metadata' with structure { priority: number, tags: string[] }
  * type Metadata = { priority: number; tags: string[] };
  * db.tasks.select(t => ({
- *   priority: jsonbSelect<Metadata, 'priority'>(t.metadata, m => m.priority),
+ *   priority: jsonbSelect<Metadata>(t.metadata, 'priority'),
  * }))
  *
  * @example
  * // Use in where clause
- * db.tasks.where(t => eq(jsonbSelect<Metadata, 'priority'>(t.metadata, m => m.priority), 'high'))
+ * db.tasks.where(t => eq(jsonbSelect<Metadata>(t.metadata, 'priority'), 'high'))
  */
-export function jsonbSelect<TJsonb, TKey extends keyof TJsonb>(
+export function jsonbSelect<TJsonb, TKey extends keyof TJsonb & string = keyof TJsonb & string>(
   jsonbField: FieldLike<any> | DbColumn<any> | undefined,
-  selector: (value: TJsonb) => TJsonb[TKey]
+  key: TKey
 ): SqlFragment<TJsonb[TKey]> {
-  // Extract property name from the selector function
-  const selectorStr = selector.toString();
-  const match = selectorStr.match(/\.([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\}|\s*$|\s*;|\s*\))/);
-  if (!match) {
-    throw new Error(`Could not extract property name from selector: ${selectorStr}`);
-  }
-  const propName = match[1];
-
   // Build the JSONB extraction SQL: (column #>> '{}')::jsonb->'propertyName'
   // This converts JSONB to text, then back to JSONB, then extracts the property
   return new SqlFragment<TJsonb[TKey]>(
-    ['(', ` #>> '{}')::jsonb->'${propName}'`],
+    ['(', ` #>> '{}')::jsonb->'${key}'`],
     [jsonbField]
-  ).as(propName);
+  ).as(key);
 }
 
 /**
@@ -738,32 +730,24 @@ export function jsonbSelect<TJsonb, TKey extends keyof TJsonb>(
  * Uses the ->> operator for direct text extraction
  *
  * @param jsonbField - The JSONB column to extract from
- * @param selector - A function that selects the property (used to infer the property name)
+ * @param key - The property key to extract (typed as keyof TJsonb)
  * @returns SqlFragment that extracts the property as text (string)
  *
  * @example
  * type Metadata = { priority: string };
  * db.tasks.select(t => ({
- *   priorityText: jsonbSelectText<Metadata, 'priority'>(t.metadata, m => m.priority),
+ *   priorityText: jsonbSelectText<Metadata>(t.metadata, 'priority'),
  * }))
  */
-export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb>(
+export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb & string = keyof TJsonb & string>(
   jsonbField: FieldLike<any> | DbColumn<any> | undefined,
-  selector: (value: TJsonb) => TJsonb[TKey]
+  key: TKey
 ): SqlFragment<string> {
-  // Extract property name from the selector function
-  const selectorStr = selector.toString();
-  const match = selectorStr.match(/\.([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\}|\s*$|\s*;|\s*\))/);
-  if (!match) {
-    throw new Error(`Could not extract property name from selector: ${selectorStr}`);
-  }
-  const propName = match[1];
-
   // Build the JSONB text extraction SQL: column->>'propertyName'
   return new SqlFragment<string>(
-    ['', `->>'${propName}'`],
+    ['', `->>'${key}'`],
     [jsonbField]
-  ).as(propName);
+  ).as(key);
 }
 
 // ============================================================================
