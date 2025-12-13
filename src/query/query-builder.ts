@@ -1,6 +1,6 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
-import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult } from '../entity/db-context';
+import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
 import { TimeTracer } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
@@ -2053,6 +2053,261 @@ export class SelectQueryBuilder<TSelection> {
       throw new Error('No results found');
     }
     return result;
+  }
+
+  /**
+   * Delete records matching the current WHERE condition
+   * Returns a fluent builder that can be awaited directly or chained with .returning()
+   *
+   * @example
+   * ```typescript
+   * // No returning (default) - returns void
+   * await db.users.where(u => eq(u.id, 1)).delete();
+   *
+   * // With returning() - returns full entities
+   * const deleted = await db.users.where(u => eq(u.id, 1)).delete().returning();
+   *
+   * // With returning(selector) - returns selected columns
+   * const results = await db.users.where(u => eq(u.isActive, false)).delete()
+   *   .returning(u => ({ id: u.id, username: u.username }));
+   * ```
+   */
+  delete(): FluentDelete<TSelection> {
+    const queryBuilder = this;
+
+    const executeDelete = async <TResult>(
+      returning?: undefined | true | ((row: TSelection) => TResult)
+    ): Promise<any> => {
+      // Build WHERE clause
+      if (!queryBuilder.whereCond) {
+        throw new Error('Delete requires a WHERE condition. Use where() before delete().');
+      }
+
+      const condBuilder = new ConditionBuilder();
+      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, 1);
+
+      // Build RETURNING clause
+      const returningClause = queryBuilder.buildDeleteReturningClause(returning);
+
+      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
+      let sql = `DELETE FROM ${qualifiedTableName} WHERE ${whereSql}`;
+      if (returningClause) {
+        sql += ` RETURNING ${returningClause.sql}`;
+      }
+
+      const result = queryBuilder.executor
+        ? await queryBuilder.executor.query(sql, whereParams)
+        : await queryBuilder.client.query(sql, whereParams);
+
+      if (!returningClause) {
+        return undefined;
+      }
+
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning);
+    };
+
+    return {
+      then<TResult1 = void, TResult2 = never>(
+        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+      ): PromiseLike<TResult1 | TResult2> {
+        return executeDelete(undefined).then(onfulfilled, onrejected);
+      },
+      returning<TResult>(selector?: (row: TSelection) => TResult) {
+        const returningConfig = selector ?? true;
+        return {
+          then<T1 = any, T2 = never>(
+            onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
+            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
+          ): PromiseLike<T1 | T2> {
+            return executeDelete(returningConfig).then(onfulfilled, onrejected);
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * Update records matching the current WHERE condition
+   * Returns a fluent builder that can be awaited directly or chained with .returning()
+   *
+   * @param data Partial data to update
+   *
+   * @example
+   * ```typescript
+   * // No returning (default) - returns void
+   * await db.users.where(u => eq(u.id, 1)).update({ age: 30 });
+   *
+   * // With returning() - returns full entities
+   * const updated = await db.users.where(u => eq(u.id, 1)).update({ age: 30 }).returning();
+   *
+   * // With returning(selector) - returns selected columns
+   * const results = await db.users.where(u => eq(u.isActive, true)).update({ lastLogin: new Date() })
+   *   .returning(u => ({ id: u.id, lastLogin: u.lastLogin }));
+   * ```
+   */
+  update(data: Partial<Record<string, any>>): FluentQueryUpdate<TSelection> {
+    const queryBuilder = this;
+
+    const executeUpdate = async <TResult>(
+      returning?: undefined | true | ((row: TSelection) => TResult)
+    ): Promise<any> => {
+      // Build WHERE clause
+      if (!queryBuilder.whereCond) {
+        throw new Error('Update requires a WHERE condition. Use where() before update().');
+      }
+
+      // Build SET clause
+      const setClauses: string[] = [];
+      const values: any[] = [];
+      let paramIndex = 1;
+
+      for (const [key, value] of Object.entries(data)) {
+        const column = queryBuilder.schema.columns[key];
+        if (column) {
+          const config = (column as any).build();
+          setClauses.push(`"${config.name}" = $${paramIndex++}`);
+          // Apply toDriver mapper if present
+          const mappedValue = config.mapper
+            ? config.mapper.toDriver(value)
+            : value;
+          values.push(mappedValue);
+        }
+      }
+
+      if (setClauses.length === 0) {
+        throw new Error('No valid columns to update');
+      }
+
+      const condBuilder = new ConditionBuilder();
+      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, paramIndex);
+      values.push(...whereParams);
+
+      // Build RETURNING clause
+      const returningClause = queryBuilder.buildDeleteReturningClause(returning);
+
+      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
+      let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')} WHERE ${whereSql}`;
+      if (returningClause) {
+        sql += ` RETURNING ${returningClause.sql}`;
+      }
+
+      const result = queryBuilder.executor
+        ? await queryBuilder.executor.query(sql, values)
+        : await queryBuilder.client.query(sql, values);
+
+      if (!returningClause) {
+        return undefined;
+      }
+
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning);
+    };
+
+    return {
+      then<TResult1 = void, TResult2 = never>(
+        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+      ): PromiseLike<TResult1 | TResult2> {
+        return executeUpdate(undefined).then(onfulfilled, onrejected);
+      },
+      returning<TResult>(selector?: (row: TSelection) => TResult) {
+        const returningConfig = selector ?? true;
+        return {
+          then<T1 = any, T2 = never>(
+            onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
+            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
+          ): PromiseLike<T1 | T2> {
+            return executeUpdate(returningConfig).then(onfulfilled, onrejected);
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * Build RETURNING clause for delete/update operations
+   * @internal
+   */
+  private buildDeleteReturningClause<TResult>(
+    returning: undefined | true | ((row: TSelection) => TResult)
+  ): { sql: string; columns: string[] } | null {
+    if (returning === undefined) {
+      return null;
+    }
+
+    if (returning === true) {
+      // Return all columns
+      const columns = Object.values(this.schema.columns).map(col => (col as any).build().name);
+      const sql = columns.map(name => `"${name}"`).join(', ');
+      return { sql, columns };
+    }
+
+    // Selector function - extract selected columns
+    const mockRow = this.createMockRow();
+    const selectedMock = this.selector(mockRow);
+    const selection = returning(selectedMock as TSelection);
+
+    if (typeof selection === 'object' && selection !== null) {
+      const columns: string[] = [];
+      const sqlParts: string[] = [];
+
+      for (const [alias, field] of Object.entries(selection)) {
+        if (field && typeof field === 'object' && '__dbColumnName' in field) {
+          const dbName = (field as any).__dbColumnName;
+          columns.push(alias);
+          sqlParts.push(`"${dbName}" AS "${alias}"`);
+        }
+      }
+
+      return { sql: sqlParts.join(', '), columns };
+    }
+
+    return null;
+  }
+
+  /**
+   * Map row results for delete/update RETURNING clause
+   * @internal
+   */
+  private mapDeleteReturningResults<TResult>(
+    rows: any[],
+    returning: undefined | true | ((row: TSelection) => TResult)
+  ): any[] {
+    if (returning === true) {
+      // Full entity mapping - apply fromDriver mappers
+      return rows.map(row => {
+        const mapped: any = {};
+        for (const [propName, colBuilder] of Object.entries(this.schema.columns)) {
+          const config = (colBuilder as any).build();
+          const dbValue = row[config.name];
+          mapped[propName] = config.mapper ? config.mapper.fromDriver(dbValue) : dbValue;
+        }
+        return mapped;
+      });
+    }
+
+    // For selector functions, rows are already in the correct shape
+    // Just apply any type mappers needed
+    return rows.map(row => {
+      const mapped: any = {};
+      for (const [key, value] of Object.entries(row)) {
+        // Try to find column by alias or name
+        const colEntry = Object.entries(this.schema.columns).find(([propName, col]) => {
+          const config = (col as any).build();
+          return propName === key || config.name === key;
+        });
+
+        if (colEntry) {
+          const [, col] = colEntry;
+          const config = (col as any).build();
+          // Apply fromDriver mapper if present
+          mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
+        } else {
+          mapped[key] = value;
+        }
+      }
+      return mapped;
+    });
   }
 
   /**
