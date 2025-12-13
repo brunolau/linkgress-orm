@@ -31,6 +31,28 @@ import {
 export type CollectionStrategyType = 'cte' | 'temptable' | 'lateral';
 
 /**
+ * Column information returned by getColumns()
+ */
+export interface ColumnInfo {
+  /** Property name in the entity class (TypeScript name) */
+  propertyName: string;
+  /** Column name in the database */
+  columnName: string;
+  /** SQL type (e.g., 'integer', 'varchar', 'timestamp') */
+  type: string;
+  /** Whether the column is a primary key */
+  isPrimaryKey: boolean;
+  /** Whether the column is auto-incremented (identity) */
+  isAutoIncrement: boolean;
+  /** Whether the column is nullable */
+  isNullable: boolean;
+  /** Whether the column has a unique constraint */
+  isUnique: boolean;
+  /** Default value if any */
+  defaultValue?: any;
+}
+
+/**
  * Order direction for orderBy clauses
  */
 export type OrderDirection = 'ASC' | 'DESC';
@@ -1905,6 +1927,96 @@ export class DbEntityTable<TEntity extends DbEntity> {
    */
   _getCollectionStrategy(): CollectionStrategyType | undefined {
     return (this.context as any).queryOptions?.collectionStrategy;
+  }
+
+  /**
+   * Get information about all columns in this table.
+   * This method returns metadata about database columns only, excluding navigation properties.
+   *
+   * @param options - Optional configuration
+   * @param options.includeNavigation - If false (default), only returns database columns.
+   *                                    Navigation properties are never included as they are not columns.
+   *
+   * @returns Array of column information objects
+   *
+   * @example
+   * ```typescript
+   * // Get all columns
+   * const columns = db.users.getColumns();
+   * // Returns: [
+   * //   { propertyName: 'id', columnName: 'id', type: 'integer', isPrimaryKey: true, ... },
+   * //   { propertyName: 'username', columnName: 'username', type: 'varchar', ... },
+   * //   { propertyName: 'email', columnName: 'email', type: 'text', ... },
+   * // ]
+   *
+   * // Get column names only
+   * const columnNames = db.users.getColumns().map(c => c.propertyName);
+   * // Returns: ['id', 'username', 'email', ...]
+   *
+   * // Get database column names
+   * const dbColumnNames = db.users.getColumns().map(c => c.columnName);
+   * // Returns: ['id', 'username', 'email', ...]
+   * ```
+   */
+  getColumns(): ColumnInfo[] {
+    const schema = this._getSchema();
+    const columns: ColumnInfo[] = [];
+
+    for (const [propName, colBuilder] of Object.entries(schema.columns)) {
+      const config = (colBuilder as any).build();
+      columns.push({
+        propertyName: propName,
+        columnName: config.name,
+        type: config.type,
+        isPrimaryKey: config.primaryKey || false,
+        isAutoIncrement: config.autoIncrement || !!config.identity,
+        isNullable: config.nullable !== false,
+        isUnique: config.unique || false,
+        defaultValue: config.default,
+      });
+    }
+
+    return columns;
+  }
+
+  /**
+   * Get an object containing all entity properties as DbColumn references.
+   * Useful for building dynamic queries or accessing column metadata.
+   *
+   * @param options - Optional configuration
+   * @param options.excludeNavigation - If true (default), excludes navigation properties.
+   *                                    Set to false to include navigation properties.
+   *
+   * @returns Object with property names as keys and their DbColumn/navigation references as values
+   *
+   * @example
+   * ```typescript
+   * // Get all column properties (excludes navigation by default)
+   * const cols = db.users.props();
+   * // Use in select: db.users.select(u => ({ id: cols.id, name: cols.username }))
+   *
+   * // Include navigation properties
+   * const allProps = db.users.props({ excludeNavigation: false });
+   * ```
+   */
+  props(options?: { excludeNavigation?: boolean }): EntityQuery<TEntity> {
+    const schema = this._getSchema();
+    const excludeNav = options?.excludeNavigation !== false; // Default true
+
+    // Create a temporary QueryBuilder to reuse the createMockRow logic
+    const qb = new QueryBuilder(schema, this._getClient(), undefined, undefined, undefined, undefined, this._getExecutor(), undefined, undefined, this._getCollectionStrategy(), (this.context as any).schemaRegistry);
+    const mockRow = qb._createMockRow();
+
+    if (excludeNav) {
+      // Filter out navigation properties, keep only columns
+      const result: any = {};
+      for (const propName of Object.keys(schema.columns)) {
+        result[propName] = mockRow[propName];
+      }
+      return result as EntityQuery<TEntity>;
+    }
+
+    return mockRow as EntityQuery<TEntity>;
   }
 
   /**

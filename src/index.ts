@@ -183,6 +183,7 @@ export {
   OrderDirection,
   OrderByTuple,
   OrderByResult,
+  ColumnInfo,
 } from './entity/db-context';
 
 // Types

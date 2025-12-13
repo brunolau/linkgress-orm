@@ -151,7 +151,7 @@ export class DbCteBuilder {
     };
 
     // Build the CTE query and get selection metadata
-    const mockRow = (query as any).createMockRow();
+    const mockRow = (query as any)._createMockRow();
     const selectionResult = (query as any).selector(mockRow);
 
     const sql = (query as any).buildQuery(selectionResult, {
@@ -358,9 +358,9 @@ export class DbCteBuilder {
         selectionMetadata = query.getSelectionMetadata();
       }
     }
-    // Standard SelectQueryBuilder - uses createMockRow and selector
-    else if (typeof query.createMockRow === 'function' && typeof query.selector === 'function') {
-      const mockRow = query.createMockRow();
+    // Standard SelectQueryBuilder - uses _createMockRow and selector
+    else if (typeof query._createMockRow === 'function' && typeof query.selector === 'function') {
+      const mockRow = query._createMockRow();
       const selectionResult = query.selector(mockRow);
       const result = query.buildQuery(selectionResult, queryContext);
       context.paramCounter = queryContext.paramCounter;
@@ -375,7 +375,7 @@ export class DbCteBuilder {
 
   /**
    * Build inner query SQL - handles different query builder types
-   * - SelectQueryBuilder: uses createMockRow() and selector()
+   * - SelectQueryBuilder: uses _createMockRow() and selector()
    * - GroupedSelectQueryBuilder: uses buildCteQuery()
    * - GroupedJoinedQueryBuilder: uses buildCteQuery()
    *
@@ -409,9 +409,9 @@ export class DbCteBuilder {
       return result.sql;
     }
 
-    // Standard SelectQueryBuilder - uses createMockRow and selector
-    if (typeof query.createMockRow === 'function' && typeof query.selector === 'function') {
-      const mockRow = query.createMockRow();
+    // Standard SelectQueryBuilder - uses _createMockRow and selector
+    if (typeof query._createMockRow === 'function' && typeof query.selector === 'function') {
+      const mockRow = query._createMockRow();
       const selectionResult = query.selector(mockRow);
       const result = query.buildQuery(selectionResult, queryContext);
       context.paramCounter = queryContext.paramCounter;

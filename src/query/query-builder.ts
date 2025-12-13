@@ -240,7 +240,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
    * Multiple where() calls are chained with AND logic
    */
   where(condition: (row: TRow) => Condition): this {
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const newCondition = condition(mockRow);
     if (this.whereCond) {
       this.whereCond = andCondition(this.whereCond, newCondition);
@@ -274,8 +274,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
   /**
    * Create mock row for analysis
+   * @internal - Also used by DbEntityTable.props() to avoid code duplication
    */
-  private createMockRow(): any {
+  _createMockRow(): any {
     // Performance: Return cached mock if available
     if (this._cachedMockRow) {
       return this._cachedMockRow;
@@ -414,7 +415,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock rows for condition evaluation
-    const mockLeft = this.createMockRow();
+    const mockLeft = this._createMockRow();
     const mockRight = this.createMockRowForTable(rightSchema, rightAlias);
     const joinCondition = condition(mockLeft, mockRight);
 
@@ -429,7 +430,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     // Store schemas for creating fresh mocks in the selector
     const leftSchema = this.schema;
-    const createLeftMock = () => this.createMockRow();
+    const createLeftMock = () => this._createMockRow();
     const createRightMock = () => this.createMockRowForTable(rightSchema, rightAlias);
 
     // Create a selector wrapper that generates fresh mocks and calls the user's selector
@@ -499,7 +500,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock rows for condition evaluation
-    const mockLeft = this.createMockRow();
+    const mockLeft = this._createMockRow();
     const mockRight = this.createMockRowForTable(rightSchema, rightAlias);
     const joinCondition = condition(mockLeft, mockRight);
 
@@ -514,7 +515,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     // Store schemas for creating fresh mocks in the selector
     const leftSchema = this.schema;
-    const createLeftMock = () => this.createMockRow();
+    const createLeftMock = () => this._createMockRow();
     const createRightMock = () => this.createMockRowForTable(rightSchema, rightAlias);
 
     // Create a selector wrapper that generates fresh mocks and calls the user's selector
@@ -647,7 +648,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   orderBy<T>(selector: (row: TRow) => T[]): this;
   orderBy<T>(selector: (row: TRow) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (row: TRow) => OrderByResult<T>): this {
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const result = selector(mockRow);
     parseOrderBy(result, this.orderByFields);
     return this;
@@ -747,7 +748,7 @@ export class SelectQueryBuilder<TSelection> {
    * Note: The row parameter represents the selected shape (after select())
    */
   where(condition: (row: any) => Condition): this {
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     // Apply the selector to get the selected shape that the user sees in the WHERE condition
     const selectedMock = this.selector(mockRow);
     // Wrap in proxy - for WHERE, we preserve original column names
@@ -808,7 +809,7 @@ export class SelectQueryBuilder<TSelection> {
   orderBy<T>(selector: (row: TSelection) => T[]): this;
   orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const selectedMock = this.selector(mockRow);
     // Wrap selectedMock in a proxy that returns FieldRefs for property access
     const fieldRefProxy = this.createFieldRefProxy(selectedMock);
@@ -861,7 +862,7 @@ export class SelectQueryBuilder<TSelection> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock for the current selection (left side)
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const mockLeftSelection = this.selector(mockRow);
 
     // Create mock for the subquery result (right side)
@@ -959,7 +960,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create mock for the current selection (left side)
     // IMPORTANT: We call the selector with the mock row to get a result that contains FieldRef objects
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const mockLeftSelection = this.selector(mockRow);
 
     // The mockLeftSelection now contains FieldRef objects (with __fieldName, __dbColumnName, __tableAlias)
@@ -1017,7 +1018,7 @@ export class SelectQueryBuilder<TSelection> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock for the current selection (left side)
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const mockLeftSelection = this.selector(mockRow);
 
     // Create mock for the CTE columns (right side)
@@ -1077,7 +1078,7 @@ export class SelectQueryBuilder<TSelection> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock for the current selection (left side)
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const mockLeftSelection = this.selector(mockRow);
 
     // Create mock for the subquery result (right side)
@@ -1147,7 +1148,7 @@ export class SelectQueryBuilder<TSelection> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock for the current selection (left side)
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const mockLeftSelection = this.selector(mockRow);
 
     // Create mock for the right table
@@ -1424,12 +1425,12 @@ export class SelectQueryBuilder<TSelection> {
     // If selector is provided, apply it to determine the field
     let fieldToAggregate: any;
     if (selector) {
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       const mockSelection = this.selector(mockRow);
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       fieldToAggregate = this.selector(mockRow);
     }
 
@@ -1459,12 +1460,12 @@ export class SelectQueryBuilder<TSelection> {
     // If selector is provided, apply it to determine the field
     let fieldToAggregate: any;
     if (selector) {
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       const mockSelection = this.selector(mockRow);
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       fieldToAggregate = this.selector(mockRow);
     }
 
@@ -1494,12 +1495,12 @@ export class SelectQueryBuilder<TSelection> {
     // If selector is provided, apply it to determine the field
     let fieldToAggregate: any;
     if (selector) {
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       const mockSelection = this.selector(mockRow);
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       fieldToAggregate = this.selector(mockRow);
     }
 
@@ -1558,7 +1559,7 @@ export class SelectQueryBuilder<TSelection> {
     }));
 
     // Analyze the selector to extract nested queries
-    const mockRow = tracer.trace('createMockRow', () => this.createMockRow());
+    const mockRow = tracer.trace('createMockRow', () => this._createMockRow());
     const selectionResult = tracer.trace('evaluateSelector', () => this.selector(mockRow));
 
     // Check if we're using temp table strategy and have collections
@@ -1914,7 +1915,7 @@ export class SelectQueryBuilder<TSelection> {
     const collectionNames = new Set(collections.map(c => c.name));
 
     // Always ensure we have the primary key in the base selection with a known alias
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     baseSelection['__pk_id'] = mockRow.id; // Add primary key with a known alias
 
     for (const [key, value] of Object.entries(selection)) {
@@ -2243,7 +2244,7 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     // Selector function - extract selected columns
-    const mockRow = this.createMockRow();
+    const mockRow = this._createMockRow();
     const selectedMock = this.selector(mockRow);
     const selection = returning(selectedMock as TSelection);
 
@@ -2312,8 +2313,9 @@ export class SelectQueryBuilder<TSelection> {
 
   /**
    * Create mock row for analysis
+   * @internal
    */
-  private createMockRow(): any {
+  _createMockRow(): any {
     const mock: any = {};
     const tableAlias = this.schema.name;
 
@@ -3625,7 +3627,7 @@ export class SelectQueryBuilder<TSelection> {
       };
 
       // Analyze the selector to extract nested queries
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       const selectionResult = this.selector(mockRow);
 
       // Build the query
@@ -3640,7 +3642,7 @@ export class SelectQueryBuilder<TSelection> {
     // For table subqueries, preserve the selection metadata (includes SqlFragments with mappers)
     let selectionMetadata: Record<string, any> | undefined;
     if (mode === 'table') {
-      const mockRow = this.createMockRow();
+      const mockRow = this._createMockRow();
       selectionMetadata = this.selector(mockRow) as any;
     }
 
