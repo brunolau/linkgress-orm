@@ -438,6 +438,11 @@ export interface InsertConfig {
    * Use OVERRIDING SYSTEM VALUE to allow inserting into identity/serial columns
    */
   overridingSystemValue?: boolean;
+
+  /**
+   * Skip rows that would violate unique constraints (ON CONFLICT DO NOTHING)
+   */
+  onConflictDoNothing?: boolean;
 }
 
 /**
@@ -1037,7 +1042,14 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     }
 
     sql += `
-      VALUES ${valueClauses.join(', ')}
+      VALUES ${valueClauses.join(', ')}`;
+
+    // Add ON CONFLICT DO NOTHING if specified
+    if (insertConfig?.onConflictDoNothing) {
+      sql += '\n      ON CONFLICT DO NOTHING';
+    }
+
+    sql += `
       RETURNING ${returningColumns}
     `;
 
@@ -2480,8 +2492,11 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * // With returning(selector) - returns selected columns
    * const results = await db.users.insertBulk([{ username: 'alice' }]).returning(u => ({ id: u.id }));
    *
-   * // With options
+   * // With chunk size
    * await db.users.insertBulk([{ username: 'alice' }], { chunkSize: 100 });
+   *
+   * // Skip duplicates (ON CONFLICT DO NOTHING)
+   * await db.users.insertBulk([{ username: 'alice' }], { onConflictDoNothing: true });
    * ```
    */
   insertBulk(
@@ -2512,13 +2527,13 @@ export class DbEntityTable<TEntity extends DbEntity> {
         const allResults: any[] = [];
         for (let i = 0; i < dataArray.length; i += chunkSize) {
           const chunk = dataArray.slice(i, i + chunkSize);
-          const chunkResults = await table.insertBulkSingle(chunk, returning, options?.overridingSystemValue);
+          const chunkResults = await table.insertBulkSingle(chunk, returning, options?.overridingSystemValue, options?.onConflictDoNothing);
           if (chunkResults) allResults.push(...chunkResults);
         }
         return returning === undefined ? undefined : allResults;
       }
 
-      return table.insertBulkSingle(dataArray, returning, options?.overridingSystemValue);
+      return table.insertBulkSingle(dataArray, returning, options?.overridingSystemValue, options?.onConflictDoNothing);
     };
 
     return {
@@ -2549,7 +2564,8 @@ export class DbEntityTable<TEntity extends DbEntity> {
   private async insertBulkSingle<TReturning>(
     data: InsertData<TEntity>[],
     returning: TReturning,
-    overridingSystemValue?: boolean
+    overridingSystemValue?: boolean,
+    onConflictDoNothing?: boolean
   ): Promise<any[] | void> {
     const schema = this._getSchema();
     const executor = this._getExecutor();
@@ -2599,6 +2615,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
       sql += ' OVERRIDING SYSTEM VALUE';
     }
     sql += ` VALUES ${valuesClauses.join(', ')}`;
+    if (onConflictDoNothing) {
+      sql += ' ON CONFLICT DO NOTHING';
+    }
     if (returningClause) {
       sql += ` RETURNING ${returningClause.sql}`;
     }
