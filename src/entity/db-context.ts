@@ -2387,69 +2387,27 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * ```
    */
   insert(data: InsertData<TEntity>): FluentInsert<TEntity> {
-    const table = this;
-    const executeInsert = async <TResult>(
-      returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
-    ): Promise<any> => {
-      const schema = table._getSchema();
-      const executor = table._getExecutor();
-      const client = table._getClient();
-
-      // Build INSERT columns and values
-      const columns: string[] = [];
-      const values: any[] = [];
-      const placeholders: string[] = [];
-      let paramIndex = 1;
-
-      for (const [key, value] of Object.entries(data)) {
-        const column = schema.columns[key];
-        if (column) {
-          const config = (column as any).build();
-          if (!config.autoIncrement) {
-            columns.push(`"${config.name}"`);
-            const mappedValue = config.mapper ? config.mapper.toDriver(value) : value;
-            values.push(mappedValue);
-            placeholders.push(`$${paramIndex++}`);
-          }
-        }
-      }
-
-      // Build RETURNING clause
-      const returningClause = table.buildReturningClause(returning);
-      const qualifiedTableName = table._getQualifiedTableName();
-
-      let sql = `INSERT INTO ${qualifiedTableName} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
-      if (returningClause) {
-        sql += ` RETURNING ${returningClause.sql}`;
-      }
-
-      const result = executor
-        ? await executor.query(sql, values)
-        : await client.query(sql, values);
-
-      if (!returningClause) {
-        return undefined;
-      }
-
-      const mappedResults = table.mapReturningResults(result.rows, returning);
-      return mappedResults[0];
-    };
+    const bulkBuilder = this.insertBulk([data]);
 
     return {
       then<TResult1 = void, TResult2 = never>(
         onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
         onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
       ): PromiseLike<TResult1 | TResult2> {
-        return executeInsert(undefined).then(onfulfilled, onrejected);
+        return bulkBuilder.then(onfulfilled, onrejected);
       },
       returning<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
-        const returningConfig = selector ?? true;
+        const bulkReturning = selector ? bulkBuilder.returning(selector) : bulkBuilder.returning();
         return {
           then<T1 = any, T2 = never>(
             onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
             onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
           ): PromiseLike<T1 | T2> {
-            return executeInsert(returningConfig).then(onfulfilled, onrejected);
+            // Unwrap array to single item
+            return bulkReturning.then(
+              (results: any[]) => results?.[0],
+              undefined
+            ).then(onfulfilled, onrejected);
           }
         };
       }
