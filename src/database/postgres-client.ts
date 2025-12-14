@@ -142,9 +142,28 @@ export class PostgresClient extends DatabaseClient {
 
   /**
    * Begin a transaction using postgres library's built-in transaction support
+   * @deprecated Use transaction() method instead for cross-driver compatibility
    */
   async begin<T>(callback: (sql: Sql) => Promise<T>): Promise<T> {
     return await this.sql.begin(callback);
+  }
+
+  /**
+   * Execute a callback within a transaction.
+   * Uses postgres library's built-in sql.begin() for proper transaction handling.
+   */
+  async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    return await this.sql.begin(async (sql: Sql) => {
+      const queryFn = async (sqlStr: string, params?: any[]): Promise<QueryResult> => {
+        const result = await sql.unsafe(sqlStr, params || []);
+        return {
+          rows: result as any[],
+          rowCount: result.count ?? null,
+        };
+      };
+
+      return await callback(queryFn);
+    });
   }
 
   /**

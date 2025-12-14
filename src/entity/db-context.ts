@@ -1,4 +1,4 @@
-import { DatabaseClient, QueryResult } from '../database/database-client.interface';
+import { DatabaseClient, QueryResult, TransactionalClient } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
 import { UnwrapDbColumns, InsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
@@ -1330,13 +1330,26 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
   /**
    * Get table accessor by name
+   * When in a transaction, creates a fresh accessor with the transactional client
    */
   getTable<K extends keyof TSchema>(name: K): InferContextSchema<TSchema>[K] {
-    const accessor = this.tableAccessors.get(name as string);
-    if (!accessor) {
+    const cachedAccessor = this.tableAccessors.get(name as string);
+    if (!cachedAccessor) {
       throw new Error(`Table ${String(name)} not found in schema`);
     }
-    return accessor as any;
+
+    // If in a transaction, create a new accessor with the current (transactional) client
+    if (this.client.isInTransaction()) {
+      return new TableAccessor(
+        (cachedAccessor as any).tableBuilder,
+        this.client,
+        this.schemaRegistry,
+        this.executor,
+        this.queryOptions?.collectionStrategy
+      ) as any;
+    }
+
+    return cachedAccessor as any;
   }
 
   /**
@@ -1361,23 +1374,29 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
   /**
    * Execute in transaction
+   * Uses the database client's native transaction support for proper handling
+   * across different drivers (pg uses BEGIN/COMMIT, postgres uses sql.begin())
    */
   async transaction<TResult>(
     fn: (ctx: this) => Promise<TResult>
   ): Promise<TResult> {
-    const connection = await this.client.connect();
+    // Store the original client
+    const originalClient = this.client;
 
-    try {
-      await connection.query('BEGIN');
-      const result = await fn(this);
-      await connection.query('COMMIT');
-      return result;
-    } catch (error) {
-      await connection.query('ROLLBACK');
-      throw error;
-    } finally {
-      connection.release();
-    }
+    return await this.client.transaction(async (queryFn) => {
+      // Create a transactional client that routes all queries through the transaction
+      const txClient = new TransactionalClient(queryFn, originalClient);
+
+      // Temporarily swap the client to use the transactional one
+      this.client = txClient;
+
+      try {
+        return await fn(this);
+      } finally {
+        // Restore the original client
+        this.client = originalClient;
+      }
+    });
   }
 
   /**

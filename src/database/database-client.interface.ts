@@ -32,6 +32,12 @@ export interface PooledConnection {
  */
 export abstract class DatabaseClient {
   /**
+   * Whether this client is currently in a transaction
+   */
+  isInTransaction(): boolean {
+    return false;
+  }
+  /**
    * Execute a query with optional parameters and execution options
    */
   abstract query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>>;
@@ -52,6 +58,15 @@ export abstract class DatabaseClient {
   abstract getDriverName(): string;
 
   /**
+   * Execute a callback within a transaction.
+   * The transaction is automatically committed on success or rolled back on error.
+   *
+   * @param callback - Function to execute within the transaction. Receives a query function.
+   * @returns The result of the callback
+   */
+  abstract transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T>;
+
+  /**
    * Check if the driver supports executing multiple SQL statements in a single query
    * and returning multiple result sets.
    *
@@ -68,5 +83,52 @@ export abstract class DatabaseClient {
    */
   supportsBinaryProtocol(): boolean {
     return false;
+  }
+}
+
+/**
+ * A wrapper client that routes queries through a transactional connection.
+ * Used internally to ensure all operations within a transaction use the same connection.
+ */
+export class TransactionalClient extends DatabaseClient {
+  constructor(
+    private queryFn: (sql: string, params?: any[]) => Promise<QueryResult>,
+    private parentClient: DatabaseClient
+  ) {
+    super();
+  }
+
+  isInTransaction(): boolean {
+    return true;
+  }
+
+  async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    return await this.queryFn(sql, params) as QueryResult<T>;
+  }
+
+  async connect(): Promise<PooledConnection> {
+    // In a transaction, we shouldn't allow getting a new connection
+    throw new Error('Cannot get a new connection while in a transaction');
+  }
+
+  async end(): Promise<void> {
+    // No-op - the parent client manages the connection lifecycle
+  }
+
+  getDriverName(): string {
+    return this.parentClient.getDriverName();
+  }
+
+  async transaction<T>(_callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    // Nested transactions not supported - could implement savepoints in the future
+    throw new Error('Nested transactions are not supported');
+  }
+
+  supportsMultiStatementQueries(): boolean {
+    return this.parentClient.supportsMultiStatementQueries();
+  }
+
+  supportsBinaryProtocol(): boolean {
+    return this.parentClient.supportsBinaryProtocol();
   }
 }

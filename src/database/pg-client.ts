@@ -105,6 +105,35 @@ export class PgClient extends DatabaseClient {
   }
 
   /**
+   * Execute a callback within a transaction.
+   * Uses pg's connection-based transaction with BEGIN/COMMIT/ROLLBACK.
+   */
+  async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      const queryFn = async (sql: string, params?: any[]): Promise<QueryResult> => {
+        const result = await client.query(sql, params);
+        return {
+          rows: result.rows,
+          rowCount: result.rowCount,
+        };
+      };
+
+      const result = await callback(queryFn);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * pg library does NOT support retrieving ALL result sets from multi-statement queries
    * It only returns the last result, making it unsuitable for the fully optimized approach
    * Use PostgresClient (postgres library) for true single-roundtrip multi-statement support

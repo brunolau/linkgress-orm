@@ -99,10 +99,10 @@ describe('getColumns method', () => {
     const columns = db.users.getColumns();
 
     // Navigation properties should not be in the columns list
-    const postsColumn = columns.find(c => c.propertyName === 'posts');
+    const postsColumn = columns.find(c => c.propertyName === 'posts' as any);
     expect(postsColumn).toBeUndefined();
 
-    const ordersColumn = columns.find(c => c.propertyName === 'orders');
+    const ordersColumn = columns.find(c => c.propertyName === 'orders' as any);
     expect(ordersColumn).toBeUndefined();
   });
 
@@ -125,7 +125,7 @@ describe('getColumns method', () => {
     expect(userIdColumn!.type).toBe('integer');
 
     // Check that user navigation property is NOT included
-    const userColumn = columns.find(c => c.propertyName === 'user');
+    const userColumn = columns.find(c => c.propertyName === 'user' as any);
     expect(userColumn).toBeUndefined();
   });
 

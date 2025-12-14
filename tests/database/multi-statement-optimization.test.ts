@@ -35,6 +35,10 @@ class MockMultiStatementClient extends DatabaseClient {
     return true;
   }
 
+  async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    throw new Error('Not implemented');
+  }
+
   // Test helpers
   getQueryLog() {
     return this.queryLog;
@@ -89,6 +93,10 @@ class MockLegacyClient extends DatabaseClient {
 
   supportsMultiStatementQueries(): boolean {
     return false;
+  }
+
+  async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    throw new Error('Not implemented');
   }
 
   // Test helpers
