@@ -3984,7 +3984,7 @@ export class ReferenceQueryBuilder<TItem = any> {
                   relName,
                   relConfig.targetTable,
                   fk,
-                  this.targetTable,
+                  this.relationName,  // Use alias (relationName) for correlation in lateral joins
                   nestedTargetSchema,  // Pass the target schema directly
                   this.schemaRegistry  // Pass schema registry for nested resolution
                 );

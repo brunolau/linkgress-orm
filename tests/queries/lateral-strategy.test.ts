@@ -657,6 +657,60 @@ describe('LATERAL Collection Strategy', () => {
   });
 });
 
+describe('LATERAL strategy with navigation to collection', () => {
+  test('should correctly correlate collection through reference navigation', async () => {
+    // This tests the fix for: nested collections use alias (relationName)
+    // instead of table name for correlation in lateral joins
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      // Pattern: post -> user (reference) -> orders (collection)
+      // The orders collection should correlate with "user"."id" (the alias)
+      // not with "users"."id" (the table name)
+      const postsWithUserOrders = await db.posts
+        .select(p => ({
+          postTitle: p.title,
+          authorName: p.user!.username,
+          authorOrders: p.user!.orders!
+            .select(o => ({
+              status: o.status,
+              amount: o.totalAmount,
+            }))
+            .toList('authorOrders'),
+        }))
+        .toList();
+
+      expect(postsWithUserOrders.length).toBeGreaterThan(0);
+      postsWithUserOrders.forEach(post => {
+        expect(post.authorName).toBeDefined();
+        expect(Array.isArray(post.authorOrders)).toBe(true);
+      });
+    }, { collectionStrategy: 'lateral' });
+  });
+
+  test('should count collections through reference navigation', async () => {
+    // Pattern: post -> user (reference) -> posts (collection) -> count()
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const postsWithAuthorStats = await db.posts
+        .select(p => ({
+          postTitle: p.title,
+          authorName: p.user!.username,
+          authorPostCount: p.user!.posts!.count(),
+          authorOrderCount: p.user!.orders!.count(),
+        }))
+        .toList();
+
+      expect(postsWithAuthorStats.length).toBeGreaterThan(0);
+      postsWithAuthorStats.forEach(post => {
+        expect(typeof post.authorPostCount).toBe('number');
+        expect(typeof post.authorOrderCount).toBe('number');
+      });
+    }, { collectionStrategy: 'lateral' });
+  });
+});
+
 describe('LATERAL Strategy SQL Generation', () => {
   test('should use LEFT JOIN LATERAL ON true pattern', async () => {
     await withDatabase(async (db) => {
