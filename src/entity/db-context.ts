@@ -2685,7 +2685,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returning as any);
+    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
   }
 
   /**
@@ -2941,7 +2941,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returning as any);
+    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
   }
 
   /**
@@ -3064,7 +3064,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
         return undefined;
       }
 
-      return table.mapReturningResults(result.rows, returning);
+      return table.mapReturningResults(result.rows, returningClause.aliasToProperty);
     };
 
     return {
@@ -3365,7 +3365,7 @@ WHERE ${whereClause}`.trim();
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returning as any);
+    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
   }
 
   /**
@@ -3410,7 +3410,7 @@ WHERE ${whereClause}`.trim();
         : await client.query(sql, []);
 
       if (returningClause && result.rows) {
-        return table.mapReturningResults(result.rows, returningConfig);
+        return table.mapReturningResults(result.rows, returningClause.aliasToProperty);
       }
     };
 
@@ -3506,7 +3506,7 @@ WHERE ${whereClause}`.trim();
   private buildReturningClause<TResult>(
     returning: ReturningConfig<EntityQuery<TEntity>, TResult>,
     tableAlias?: string
-  ): { sql: string; columns: string[] } | null {
+  ): { sql: string; columns: string[]; aliasToProperty?: Map<string, string> } | null {
     if (returning === undefined) {
       return null; // No RETURNING
     }
@@ -3528,16 +3528,22 @@ WHERE ${whereClause}`.trim();
     if (typeof selection === 'object' && selection !== null) {
       const columns: string[] = [];
       const sqlParts: string[] = [];
+      const aliasToProperty = new Map<string, string>();
 
       for (const [alias, field] of Object.entries(selection)) {
         if (field && typeof field === 'object' && '__dbColumnName' in field) {
           const dbName = (field as any).__dbColumnName;
+          const propName = (field as any).__fieldName; // Property name on entity
           columns.push(alias);
           sqlParts.push(`${prefix}"${dbName}" AS "${alias}"`);
+          // Track alias -> property name mapping for mapper lookup
+          if (propName) {
+            aliasToProperty.set(alias, propName);
+          }
         }
       }
 
-      return { sql: sqlParts.join(', '), columns };
+      return { sql: sqlParts.join(', '), columns, aliasToProperty };
     }
 
     // Single field selection
@@ -3550,37 +3556,54 @@ WHERE ${whereClause}`.trim();
   }
 
   /**
-   * Map row results based on returning config
+   * Map row results applying custom mappers
    * @internal
+   * @param rows - Raw database rows
+   * @param aliasToProperty - Optional mapping from result aliases to entity property names.
+   *                          If undefined, assumes full entity mapping (db column names -> property names)
    */
-  private mapReturningResults<TResult>(
+  private mapReturningResults(
     rows: any[],
-    returning: ReturningConfig<EntityQuery<TEntity>, TResult>
+    aliasToProperty?: Map<string, string>
   ): any[] {
-    if (returning === true) {
-      // Full entity mapping
+    // If no alias mapping provided, use full entity mapping
+    // This handles the `returning === true` case where we want proper db column -> property name mapping
+    if (!aliasToProperty || aliasToProperty.size === 0) {
       return this.mapResultsToEntities(rows);
     }
 
-    // For selector functions, rows are already in the correct shape
-    // Just apply any type mappers needed
     const schema = this._getSchema();
+
     return rows.map(row => {
       const mapped: any = {};
       for (const [key, value] of Object.entries(row)) {
-        // Try to find column by alias or name
-        const colEntry = Object.entries(schema.columns).find(([propName, col]) => {
-          const config = (col as any).build();
-          return propName === key || config.name === key;
-        });
+        // Check if this key is an alias that maps to a property name
+        const propName = aliasToProperty.get(key);
 
-        if (colEntry) {
-          const [propName, col] = colEntry;
-          const config = (col as any).build();
-          // Apply fromDriver mapper if present
-          mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
+        if (propName) {
+          // Found via alias mapping - use the property name to look up the column
+          const colBuilder = schema.columns[propName];
+          if (colBuilder) {
+            const config = (colBuilder as any).build();
+            // Apply fromDriver mapper if present
+            mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
+          } else {
+            mapped[key] = value;
+          }
         } else {
-          mapped[key] = value;
+          // Try to find column by direct property name or db column name match
+          const colEntry = Object.entries(schema.columns).find(([pName, col]) => {
+            const config = (col as any).build();
+            return pName === key || config.name === key;
+          });
+
+          if (colEntry) {
+            const config = (colEntry[1] as any).build();
+            // Apply fromDriver mapper if present
+            mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
+          } else {
+            mapped[key] = value;
+          }
         }
       }
       return mapped;

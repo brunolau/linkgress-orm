@@ -1,6 +1,6 @@
 {
   "name": "linkgress-orm",
-  "version": "0.1.18",
+  "version": "0.1.20",
   "description": "A lightweight, type-safe ORM for PostgreSQL with LINQ-style queries and automatic type inference",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -24,8 +24,7 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:verbose": "jest --verbose",
-    "test:single": "jest --testNamePattern",
-    "prepublishOnly": "npm run build && npm test"
+    "test:single": "jest --testNamePattern"
   },
   "repository": {
     "type": "git",

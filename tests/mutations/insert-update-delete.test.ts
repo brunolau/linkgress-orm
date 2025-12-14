@@ -243,6 +243,94 @@ describe('Insert, Update, Delete Operations', () => {
       });
     });
 
+    test('should apply custom mapper in returning() with selector', async () => {
+      await withDatabase(async (db) => {
+        // First create a user since posts need userId
+        const user = await db.users.insert({
+          username: 'mapper_test_user',
+          email: 'mapper@test.com',
+        }).returning();
+
+        const testDate = new Date('2024-06-15T10:30:00Z');
+
+        // Insert post with customDate (uses pgIntDatetime mapper)
+        // The mapper stores Date as integer (seconds since custom epoch)
+        const post = await db.posts.insert({
+          title: 'Mapper Test Post',
+          userId: user.id,
+          customDate: testDate,
+        }).returning();
+
+        // Full returning() should apply mapper
+        expect(post.customDate).toBeInstanceOf(Date);
+        expect(post.customDate?.getTime()).toBe(testDate.getTime());
+      });
+    });
+
+    test('should apply custom mapper in returning() with aliased selector', async () => {
+      await withDatabase(async (db) => {
+        // First create a user since posts need userId
+        const user = await db.users.insert({
+          username: 'alias_mapper_user',
+          email: 'alias_mapper@test.com',
+        }).returning();
+
+        const testDate = new Date('2024-07-20T14:45:00Z');
+
+        // Insert with returning selector using alias
+        // This tests that mapper is applied when alias != property name
+        const result = await db.posts.insert({
+          title: 'Aliased Mapper Test',
+          userId: user.id,
+          customDate: testDate,
+        }).returning(p => ({
+          id: p.id,
+          myDate: p.customDate, // Alias 'myDate' for property 'customDate'
+          postTitle: p.title,
+        }));
+
+        expect(result.id).toBeDefined();
+        expect(result.postTitle).toBe('Aliased Mapper Test');
+        // Custom mapper should be applied to aliased column
+        expect(result.myDate).toBeInstanceOf(Date);
+        expect(result.myDate?.getTime()).toBe(testDate.getTime());
+      });
+    });
+
+    test('should apply custom mapper in insertBulk returning() with aliased selector', async () => {
+      await withDatabase(async (db) => {
+        // First create a user since posts need userId
+        const user = await db.users.insert({
+          username: 'bulk_mapper_user',
+          email: 'bulk_mapper@test.com',
+        }).returning();
+
+        const date1 = new Date('2024-08-10T09:00:00Z');
+        const date2 = new Date('2024-08-11T10:00:00Z');
+
+        // Bulk insert with returning selector using aliases
+        const results = await db.posts.insertBulk([
+          { title: 'Bulk Post 1', userId: user.id, customDate: date1 },
+          { title: 'Bulk Post 2', userId: user.id, customDate: date2 },
+        ]).returning(p => ({
+          id: p.id,
+          postDate: p.customDate, // Aliased
+          name: p.title,
+        }));
+
+        expect(results).toHaveLength(2);
+
+        // Both should have custom mapper applied
+        expect(results[0].postDate).toBeInstanceOf(Date);
+        expect(results[0].postDate?.getTime()).toBe(date1.getTime());
+        expect(results[0].name).toBe('Bulk Post 1');
+
+        expect(results[1].postDate).toBeInstanceOf(Date);
+        expect(results[1].postDate?.getTime()).toBe(date2.getTime());
+        expect(results[1].name).toBe('Bulk Post 2');
+      });
+    });
+
     test('should reject insert with duplicate unique key', async () => {
       await withDatabase(async (db) => {
         await db.users.insert({
