@@ -4,7 +4,7 @@ import { eq, and, gt } from '../../src';
 
 describe('Navigation Properties', () => {
   describe('One-to-Many relationships', () => {
-    test('should navigate from parent to collection', async () => {
+    test('should not include navigation properties in default selection', async () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);
 
@@ -13,8 +13,9 @@ describe('Navigation Properties', () => {
           .first();
 
         expect(alice).toBeDefined();
-        // Navigation properties are lazy-loaded
-        expect(alice.posts).toBeDefined();
+        // Navigation properties should NOT be present in default selection
+        // Only columns from the current table are included
+        expect((alice as any).posts).toBeUndefined();
       });
     });
 

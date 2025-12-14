@@ -2292,21 +2292,20 @@ export class DbEntityTable<TEntity extends DbEntity> {
   ): IEntityQueryable<TEntity> {
     const schema = this._getSchema();
 
-    // Create a selector that selects all columns with navigation property access
+    // Create a selector that selects all columns only (not navigation properties)
     const allColumnsSelector = (e: any) => {
       const result: any = {};
       // Copy all column properties
       for (const colName of Object.keys(schema.columns)) {
         result[colName] = e[colName];
       }
-      // Add navigation properties as enumerable getters
-      // The getter returns the actual navigation builder (CollectionQueryBuilder/ReferenceQueryBuilder)
-      // which allows chained selectors like .select(u => ({ posts: u.posts!.where(...) }))
-      // When the selection is analyzed, the builder is detected and handled appropriately
+      // Add navigation properties as non-enumerable getters
+      // This allows chained selectors like .select(u => ({ posts: u.posts!.where(...) }))
+      // but they won't be included in the default query output
       for (const relName of Object.keys(schema.relations)) {
         Object.defineProperty(result, relName, {
           get: () => e[relName],
-          enumerable: true,  // Enumerable so it's included in Object.entries
+          enumerable: false,  // Non-enumerable so it's NOT included in default selection
           configurable: true,
         });
       }
@@ -2325,21 +2324,20 @@ export class DbEntityTable<TEntity extends DbEntity> {
   with(...ctes: DbCte<any>[]): IEntityQueryable<TEntity> {
     const schema = this._getSchema();
 
-    // Create a selector that selects all columns with navigation property access
+    // Create a selector that selects all columns only (not navigation properties)
     const allColumnsSelector = (e: any) => {
       const result: any = {};
       // Copy all column properties
       for (const colName of Object.keys(schema.columns)) {
         result[colName] = e[colName];
       }
-      // Add navigation properties as enumerable getters
-      // The getter returns the actual navigation builder (CollectionQueryBuilder/ReferenceQueryBuilder)
-      // which allows chained selectors like .select(u => ({ posts: u.posts!.where(...) }))
-      // When the selection is analyzed, the builder is detected and handled appropriately
+      // Add navigation properties as non-enumerable getters
+      // This allows chained selectors like .select(u => ({ posts: u.posts!.where(...) }))
+      // but they won't be included in the default query output
       for (const relName of Object.keys(schema.relations)) {
         Object.defineProperty(result, relName, {
           get: () => e[relName],
-          enumerable: true,  // Enumerable so it's included in Object.entries
+          enumerable: false,  // Non-enumerable so it's NOT included in default selection
           configurable: true,
         });
       }
