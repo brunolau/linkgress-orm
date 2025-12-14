@@ -727,11 +727,12 @@ GROUP BY t."${foreignKey}"
     const additionalWhere = whereClause ? ` AND ${whereClause}` : '';
 
     // Build aggregation expression
+    // Use targetTable as alias to match field references in whereClause
     let aggregateExpression: string;
     switch (aggregationType) {
       case 'count':
         // Count only rows where there's an actual join match (not the temp table row)
-        aggregateExpression = `COUNT(t."${foreignKey}")`;
+        aggregateExpression = `COUNT("${targetTable}"."${foreignKey}")`;
         break;
       case 'min':
       case 'max':
@@ -739,7 +740,7 @@ GROUP BY t."${foreignKey}"
         if (!aggregateField) {
           throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
         }
-        aggregateExpression = `${aggregationType.toUpperCase()}(t."${aggregateField}")`;
+        aggregateExpression = `${aggregationType.toUpperCase()}("${targetTable}"."${aggregateField}")`;
         break;
       default:
         throw new Error(`Unknown aggregation type: ${aggregationType}`);
@@ -750,7 +751,7 @@ SELECT
   tmp.id as parent_id,
   COALESCE(${aggregateExpression}, ${config.defaultValue}) as data
 FROM ${tempTableName} tmp
-LEFT JOIN "${targetTable}" t ON t."${foreignKey}" = tmp.id${additionalWhere}
+LEFT JOIN "${targetTable}" ON "${targetTable}"."${foreignKey}" = tmp.id${additionalWhere}
 GROUP BY tmp.id
     `.trim();
 

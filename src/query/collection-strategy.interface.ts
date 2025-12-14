@@ -10,6 +10,18 @@ export interface SelectedField {
   expression?: string;  // SQL expression (for leaf fields)
   nested?: SelectedField[];  // Nested fields (for object structures)
   /**
+   * The original property name from the schema (for mapper lookup).
+   * When alias differs from the schema property name, this allows
+   * the transformation to find the correct mapper.
+   */
+  propertyName?: string;
+  /**
+   * The source table name for this field (for navigation properties).
+   * When a field comes from a navigation join (e.g., i.userEshop.birthdate),
+   * this specifies which table's schema to use for mapper lookup.
+   */
+  sourceTable?: string;
+  /**
    * When this field is a nested CTE (collection within collection),
    * this specifies how to join that CTE.
    */

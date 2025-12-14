@@ -3439,26 +3439,64 @@ export class SelectQueryBuilder<TSelection> {
     // This avoids repeated column.build() calls for each item
     const columnCache = targetSchema.columnMetadataCache;
 
-    if (!columnCache || columnCache.size === 0) {
-      // Fallback for schemas without cache (shouldn't happen, but be safe)
-      return items.map(item => {
-        const transformedItem: any = {};
-        for (const [key, value] of Object.entries(item)) {
-          const column = targetSchema.columns[key];
-          if (column) {
-            const config = column.build();
-            transformedItem[key] = config.mapper
-              ? config.mapper.fromDriver(value)
-              : value;
-          } else {
-            transformedItem[key] = value;
-          }
+    // Build alias-to-field-info mapping from selected field configs
+    // This allows us to find the correct mapper when:
+    // 1. alias differs from property name (e.g., reservationExpiry: i.expiresAt)
+    // 2. field comes from navigation (e.g., customerBirthdate: i.userEshop.birthdate)
+    const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
+    interface FieldMapperInfo {
+      propertyName: string;
+      sourceTable?: string;  // If set, look up mapper from this table's schema
+    }
+    const aliasToFieldInfo = new Map<string, FieldMapperInfo>();
+    if (selectedFieldConfigs) {
+      for (const field of selectedFieldConfigs) {
+        if (field.propertyName) {
+          aliasToFieldInfo.set(field.alias, {
+            propertyName: field.propertyName,
+            sourceTable: field.sourceTable,
+          });
         }
-        return transformedItem;
-      });
+      }
     }
 
-    // Optimized path using cached metadata and while(i--) loop
+    // Pre-build mapper cache for all fields (including navigation fields)
+    // This avoids repeated schema lookups per item
+    const mapperCache = new Map<string, any>();  // alias -> mapper
+    for (const [alias, fieldInfo] of aliasToFieldInfo) {
+      let mapper: any = null;
+      const schemaRegistry = collectionBuilder.getSchemaRegistry() || this.schemaRegistry;
+      if (fieldInfo.sourceTable && schemaRegistry) {
+        // Navigation field - look up mapper from the source table's schema
+        const navSchema = schemaRegistry.get(fieldInfo.sourceTable);
+        if (navSchema?.columnMetadataCache) {
+          const cached = navSchema.columnMetadataCache.get(fieldInfo.propertyName);
+          if (cached?.hasMapper) {
+            mapper = cached.mapper;
+          }
+        }
+      } else {
+        // Regular field from target schema
+        const cached = columnCache?.get(fieldInfo.propertyName);
+        if (cached?.hasMapper) {
+          mapper = cached.mapper;
+        }
+      }
+      if (mapper) {
+        mapperCache.set(alias, mapper);
+      }
+    }
+
+    // Also add direct property matches from target schema (when no alias mapping)
+    if (columnCache) {
+      for (const [propertyName, cached] of columnCache) {
+        if (!mapperCache.has(propertyName) && cached.hasMapper) {
+          mapperCache.set(propertyName, cached.mapper);
+        }
+      }
+    }
+
+    // Transform items using pre-built mapper cache
     const results: any[] = new Array(items.length);
     let i = items.length;
     while (i--) {
@@ -3466,9 +3504,9 @@ export class SelectQueryBuilder<TSelection> {
       const transformedItem: any = {};
       for (const key in item) {
         const value = item[key];
-        const cached = columnCache.get(key);
-        if (cached && cached.hasMapper) {
-          transformedItem[key] = cached.mapper.fromDriver(value);
+        const mapper = mapperCache.get(key);
+        if (mapper) {
+          transformedItem[key] = mapper.fromDriver(value);
         } else {
           transformedItem[key] = value;
         }
@@ -3942,6 +3980,7 @@ export class ReferenceQueryBuilder<TItem = any> {
         }
       }
 
+      const sourceTable = this.targetTable;  // Actual table name for schema lookup
       for (const [colName, dbColumnName] of columnNameMap) {
         const mapper = columnMappers[colName];
         Object.defineProperty(mock, colName, {
@@ -3951,7 +3990,8 @@ export class ReferenceQueryBuilder<TItem = any> {
               cached = fieldRefCache[colName] = {
                 __fieldName: colName,
                 __dbColumnName: dbColumnName,
-                __tableAlias: tableAlias,  // Mark which table this belongs to
+                __tableAlias: tableAlias,  // Alias for SQL generation
+                __sourceTable: sourceTable,  // Actual table name for mapper lookup
                 __mapper: mapper,  // Include mapper for toDriver transformation in conditions
               };
             }
@@ -4047,6 +4087,8 @@ export class CollectionQueryBuilder<TItem = any> {
 
   // Performance: Cache the mock item to avoid recreating it
   private _cachedMockItem?: any;
+  // Cache selected field configs for mapper lookup during transformation
+  private _selectedFieldConfigs?: SelectedField[];
 
   constructor(
     relationName: string,
@@ -4142,7 +4184,8 @@ export class CollectionQueryBuilder<TItem = any> {
       // Performance: Lazy-cache FieldRef objects
       const fieldRefCache: Record<string, any> = {};
 
-      // Add columns
+      // Add columns - include tableAlias for unambiguous column references in WHERE clauses
+      const tableAlias = this.targetTable;
       for (const [colName, dbColumnName] of columnNameMap) {
         Object.defineProperty(mock, colName, {
           get() {
@@ -4151,6 +4194,7 @@ export class CollectionQueryBuilder<TItem = any> {
               cached = fieldRefCache[colName] = {
                 __fieldName: colName,
                 __dbColumnName: dbColumnName,
+                __tableAlias: tableAlias,  // Include table alias for unambiguous references
               };
             }
             return cached;
@@ -4356,6 +4400,20 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   getTargetTableSchema(): TableSchema | undefined {
     return this.targetTableSchema;
+  }
+
+  /**
+   * Get selected field configs (for mapper lookup during transformation)
+   */
+  getSelectedFieldConfigs(): SelectedField[] | undefined {
+    return this._selectedFieldConfigs;
+  }
+
+  /**
+   * Get schema registry (for mapper lookup during transformation of navigation fields)
+   */
+  getSchemaRegistry(): Map<string, TableSchema> | undefined {
+    return this.schemaRegistry;
   }
 
   /**
@@ -4753,11 +4811,13 @@ export class CollectionQueryBuilder<TItem = any> {
         // FieldRef object - use database column name with optional table alias
         const dbColumnName = (field as any).__dbColumnName;
         const tableAlias = (field as any).__tableAlias;
+        const fieldName = (field as any).__fieldName;  // Property name for mapper lookup
+        const sourceTable = (field as any).__sourceTable;  // Actual table name for schema lookup
         // If tableAlias differs from the target table, it's a navigation property reference
         if (tableAlias && tableAlias !== this.targetTable) {
-          return { alias, expression: `"${tableAlias}"."${dbColumnName}"` };
+          return { alias, expression: `"${tableAlias}"."${dbColumnName}"`, propertyName: fieldName, sourceTable };
         }
-        return { alias, expression: `"${dbColumnName}"` };
+        return { alias, expression: `"${dbColumnName}"`, propertyName: fieldName };
       } else if (typeof field === 'string') {
         // Simple string reference (for backward compatibility)
         return { alias, expression: `"${field}"` };
@@ -4787,9 +4847,11 @@ export class CollectionQueryBuilder<TItem = any> {
         // Single field selection - use the field name as both alias and expression
         const field = selectedFields as any;
         const dbColumnName = field.__dbColumnName;
+        const fieldName = field.__fieldName;  // Property name for mapper lookup
         selectedFieldConfigs.push({
           alias: dbColumnName,
           expression: `"${dbColumnName}"`,
+          propertyName: fieldName,
         });
       } else {
         // Object selection - extract each field (with support for nested objects)
@@ -4806,6 +4868,7 @@ export class CollectionQueryBuilder<TItem = any> {
           selectedFieldConfigs.push({
             alias: colName,
             expression: `"${dbColumnName}"`,
+            propertyName: colName,  // Same as alias when selecting all fields
           });
         }
       } else {
@@ -4816,6 +4879,9 @@ export class CollectionQueryBuilder<TItem = any> {
         });
       }
     }
+
+    // Cache selected field configs for mapper lookup during transformation
+    this._selectedFieldConfigs = selectedFieldConfigs;
 
     // Step 2: Build WHERE clause SQL (without WHERE keyword)
     let whereClause: string | undefined;

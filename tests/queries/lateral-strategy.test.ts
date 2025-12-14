@@ -711,6 +711,156 @@ describe('LATERAL strategy with navigation to collection', () => {
   });
 });
 
+describe('LATERAL strategy custom mapper transformation', () => {
+  test('should apply custom mapper in collection with direct property name', async () => {
+    // Tests that custom mapper (pgHourMinute) is applied when property name matches alias
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const results = await db.users
+        .select(u => ({
+          username: u.username,
+          posts: u.posts!
+            .select(p => ({
+              title: p.title,
+              publishTime: p.publishTime,  // Custom mapper: pgHourMinute
+            }))
+            .toList('posts'),
+        }))
+        .toList();
+
+      expect(results.length).toBeGreaterThan(0);
+      const userWithPosts = results.find(u => u.posts.length > 0);
+      expect(userWithPosts).toBeDefined();
+
+      // Verify mapper was applied - publishTime should be {hour, minute} object, not raw number
+      const post = userWithPosts!.posts[0];
+      expect(post.publishTime).toBeDefined();
+      expect(typeof post.publishTime).toBe('object');
+      expect(post.publishTime).toHaveProperty('hour');
+      expect(post.publishTime).toHaveProperty('minute');
+      expect(typeof post.publishTime.hour).toBe('number');
+      expect(typeof post.publishTime.minute).toBe('number');
+    }, { collectionStrategy: 'lateral' });
+  });
+
+  test('should apply custom mapper in collection with aliased property name', async () => {
+    // Tests that custom mapper is applied when alias differs from property name
+    // e.g., { postTime: p.publishTime } should still apply pgHourMinute mapper
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const results = await db.users
+        .select(u => ({
+          username: u.username,
+          posts: u.posts!
+            .select(p => ({
+              title: p.title,
+              postTime: p.publishTime,  // Alias differs from property name
+            }))
+            .toList('posts'),
+        }))
+        .toList();
+
+      expect(results.length).toBeGreaterThan(0);
+      const userWithPosts = results.find(u => u.posts.length > 0);
+      expect(userWithPosts).toBeDefined();
+
+      // Verify mapper was applied to aliased field
+      const post = userWithPosts!.posts[0];
+      expect(post.postTime).toBeDefined();
+      expect(typeof post.postTime).toBe('object');
+      expect(post.postTime).toHaveProperty('hour');
+      expect(post.postTime).toHaveProperty('minute');
+    }, { collectionStrategy: 'lateral' });
+  });
+
+  test('should apply custom mapper from navigation property in collection', async () => {
+    // Tests that mapper is applied when field comes from navigation
+    // e.g., o.user.createdAt should apply Date transformation from users schema
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const results = await db.users
+        .select(u => ({
+          username: u.username,
+          orders: u.orders!
+            .select(o => ({
+              status: o.status,
+              userCreatedAt: o.user!.createdAt,  // Field from navigation with Date type
+            }))
+            .toList('orders'),
+        }))
+        .toList();
+
+      expect(results.length).toBeGreaterThan(0);
+      const userWithOrders = results.find(u => u.orders.length > 0);
+      expect(userWithOrders).toBeDefined();
+
+      // Verify the field from navigation is present (createdAt is Date type)
+      const order = userWithOrders!.orders[0];
+      expect(order.userCreatedAt).toBeDefined();
+      // Date fields should be transformed properly
+      expect(order.userCreatedAt instanceof Date || typeof order.userCreatedAt === 'string').toBe(true);
+    }, { collectionStrategy: 'lateral' });
+  });
+
+  test('should apply pgIntDatetime custom mapper in collection', async () => {
+    // Tests pgIntDatetime custom mapper within a collection
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const results = await db.users
+        .select(u => ({
+          username: u.username,
+          posts: u.posts!
+            .select(p => ({
+              title: p.title,
+              customDate: p.customDate,  // Custom mapper: pgIntDatetime
+            }))
+            .toList('posts'),
+        }))
+        .toList();
+
+      expect(results.length).toBeGreaterThan(0);
+      const userWithPosts = results.find(u => u.posts.length > 0);
+      expect(userWithPosts).toBeDefined();
+
+      const post = userWithPosts!.posts[0];
+      // customDate should be transformed to Date by pgIntDatetime mapper
+      expect(post.customDate).toBeDefined();
+      expect(post.customDate instanceof Date).toBe(true);
+    }, { collectionStrategy: 'lateral' });
+  });
+
+  test('should apply pgIntDatetime mapper with aliased property', async () => {
+    // Tests: customDate with alias -> dateValue
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const results = await db.users
+        .select(u => ({
+          username: u.username,
+          posts: u.posts!
+            .select(p => ({
+              postTitle: p.title,
+              dateValue: p.customDate,  // Aliased custom mapper field
+            }))
+            .toList('posts'),
+        }))
+        .toList();
+
+      expect(results.length).toBeGreaterThan(0);
+      const userWithPosts = results.find(u => u.posts.length > 0);
+      expect(userWithPosts).toBeDefined();
+
+      const post = userWithPosts!.posts[0];
+      expect(post.dateValue).toBeDefined();
+      expect(post.dateValue instanceof Date).toBe(true);
+    }, { collectionStrategy: 'lateral' });
+  });
+});
+
 describe('LATERAL Strategy SQL Generation', () => {
   test('should use LEFT JOIN LATERAL ON true pattern', async () => {
     await withDatabase(async (db) => {

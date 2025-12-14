@@ -79,6 +79,7 @@ export async function seedTestData(db: AppDatabase) {
     userId: alice.id,
     views: 100,
     customDate: baseDate,
+    publishTime: { hour: 9, minute: 30 },  // Custom mapper: pgHourMinute
   }).returning();
 
   const alicePost2 = await db.posts.insert({
@@ -87,6 +88,7 @@ export async function seedTestData(db: AppDatabase) {
     userId: alice.id,
     views: 150,
     customDate: new Date('2024-01-16T10:00:00Z'),
+    publishTime: { hour: 14, minute: 0 },  // Custom mapper: pgHourMinute
   }).returning();
 
   const bobPost = await db.posts.insert({
@@ -95,6 +97,7 @@ export async function seedTestData(db: AppDatabase) {
     userId: bob.id,
     views: 200,
     customDate: baseDate,
+    publishTime: { hour: 18, minute: 45 },  // Custom mapper: pgHourMinute
   }).returning();
 
   // Create orders
