@@ -3888,6 +3888,10 @@ export class ReferenceQueryBuilder<TItem = any> {
   private matches: string[];      // Column(s) in target table
   private isMandatory: boolean;
   private schemaRegistry?: Map<string, TableSchema>;
+  // Navigation path leading to this reference (for nested collections)
+  private navigationPath: NavigationJoin[];
+  // Source alias for this reference (the table containing the FK)
+  private sourceAlias: string;
 
   constructor(
     relationName: string,
@@ -3896,7 +3900,9 @@ export class ReferenceQueryBuilder<TItem = any> {
     matches: string[],
     isMandatory: boolean,
     targetTableSchema?: TableSchema,
-    schemaRegistry?: Map<string, TableSchema>
+    schemaRegistry?: Map<string, TableSchema>,
+    navigationPath?: NavigationJoin[],
+    sourceAlias?: string
   ) {
     this.relationName = relationName;
     this.targetTable = targetTable;
@@ -3904,6 +3910,8 @@ export class ReferenceQueryBuilder<TItem = any> {
     this.matches = matches;
     this.isMandatory = isMandatory;
     this.schemaRegistry = schemaRegistry;
+    this.navigationPath = navigationPath || [];
+    this.sourceAlias = sourceAlias || '';
 
     // Prefer registry lookup (has full relations) over passed schema
     if (this.schemaRegistry) {
@@ -4002,6 +4010,24 @@ export class ReferenceQueryBuilder<TItem = any> {
         });
       }
 
+      // Build extended navigation path for nested collections
+      // Only build navigation path if we have a sourceAlias (meaning we're inside a collection's selector)
+      // If sourceAlias is empty, we're in the main query and references are joined in the FROM clause
+      let extendedNavPath: NavigationJoin[] = [];
+      if (this.sourceAlias) {
+        // Build the current navigation step to include in path for nested collections
+        // This represents the join from sourceAlias to this.relationName (this.targetTable)
+        const currentNavStep: NavigationJoin = {
+          alias: this.relationName,
+          targetTable: this.targetTable,
+          foreignKeys: this.foreignKeys,
+          matches: this.matches.length > 0 ? this.matches : ['id'],  // Default to 'id' if not specified
+          isMandatory: this.isMandatory,
+          sourceAlias: this.sourceAlias,
+        };
+        extendedNavPath = [...this.navigationPath, currentNavStep];
+      }
+
       // Add navigation properties (both collections and references)
       if (this.targetTableSchema.relations) {
         for (const [relName, relConfig] of Object.entries(this.targetTableSchema.relations)) {
@@ -4026,7 +4052,8 @@ export class ReferenceQueryBuilder<TItem = any> {
                   fk,
                   this.relationName,  // Use alias (relationName) for correlation in lateral joins
                   nestedTargetSchema,  // Pass the target schema directly
-                  this.schemaRegistry  // Pass schema registry for nested resolution
+                  this.schemaRegistry,  // Pass schema registry for nested resolution
+                  extendedNavPath  // Pass navigation path for intermediate joins (empty if main query)
                 );
               },
               enumerable: false,
@@ -4045,7 +4072,9 @@ export class ReferenceQueryBuilder<TItem = any> {
                   relConfig.matches || [],
                   relConfig.isMandatory ?? false,
                   nestedTargetSchema,  // Pass the target schema directly
-                  this.schemaRegistry  // Pass schema registry for nested resolution
+                  this.schemaRegistry,  // Pass schema registry for nested resolution
+                  extendedNavPath,  // Pass navigation path for nested collections
+                  this.sourceAlias ? this.relationName : ''  // Only set source if tracking path
                 );
                 return refBuilder.createMockTargetRow();
               },
@@ -4084,6 +4113,8 @@ export class CollectionQueryBuilder<TItem = any> {
   private aggregationType?: 'MIN' | 'MAX' | 'SUM' | 'COUNT';
   private flattenResultType?: 'number' | 'string';
   private schemaRegistry?: Map<string, TableSchema>;
+  // Navigation path leading to this collection (for intermediate joins in lateral subqueries)
+  private navigationPath: NavigationJoin[];
 
   // Performance: Cache the mock item to avoid recreating it
   private _cachedMockItem?: any;
@@ -4096,7 +4127,8 @@ export class CollectionQueryBuilder<TItem = any> {
     foreignKey: string,
     sourceTable: string,
     targetTableSchema?: TableSchema,
-    schemaRegistry?: Map<string, TableSchema>
+    schemaRegistry?: Map<string, TableSchema>,
+    navigationPath?: NavigationJoin[]
   ) {
     this.relationName = relationName;
     this.targetTable = targetTable;
@@ -4104,6 +4136,7 @@ export class CollectionQueryBuilder<TItem = any> {
     this.foreignKey = foreignKey;
     this.sourceTable = sourceTable;
     this.schemaRegistry = schemaRegistry;
+    this.navigationPath = navigationPath || [];
 
     // Prefer registry lookup (has full relations) over passed schema
     if (this.schemaRegistry) {
@@ -4128,7 +4161,8 @@ export class CollectionQueryBuilder<TItem = any> {
       this.foreignKey,
       this.sourceTable,
       this.targetTableSchema,
-      this.schemaRegistry  // Pass schema registry for nested navigation resolution
+      this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+      this.navigationPath  // Pass navigation path for intermediate joins
     );
     newBuilder.selector = selector as any;
     newBuilder.whereCond = this.whereCond;
@@ -4221,6 +4255,7 @@ export class CollectionQueryBuilder<TItem = any> {
                   this.targetTable,
                   undefined,  // Don't pass schema, force registry lookup
                   this.schemaRegistry  // Pass schema registry for nested resolution
+                  // No navigation path needed here - direct collection access from parent
                 );
               },
               enumerable: false,
@@ -4240,7 +4275,9 @@ export class CollectionQueryBuilder<TItem = any> {
                   relConfig.matches || [],
                   relConfig.isMandatory ?? false,
                   undefined,  // Don't pass schema, force registry lookup
-                  this.schemaRegistry  // Pass schema registry for nested resolution
+                  this.schemaRegistry,  // Pass schema registry for nested resolution
+                  [],  // Empty navigation path - this is the first reference in the chain
+                  this.targetTable  // Source alias is this collection's target table
                 );
                 return refBuilder.createMockTargetRow();
               },
@@ -4956,6 +4993,13 @@ export class CollectionQueryBuilder<TItem = any> {
       this.detectNavigationJoins(selectedFields, navigationJoins, this.targetTable, this.targetTableSchema);
     }
 
+    // Step 5b: Merge navigation path joins (for intermediate tables in navigation chains)
+    // These joins are needed when accessing a collection through a chain like:
+    // oi.productPrice.product.resort.productIntegrationDefinitions
+    // The navigation path contains joins for productPrice, product, resort
+    // which must be included in the lateral subquery for correlation
+    const allNavigationJoins: NavigationJoin[] = [...this.navigationPath, ...navigationJoins];
+
     // Step 6: Build CollectionAggregationConfig object
     const config: CollectionAggregationConfig = {
       relationName: this.relationName,
@@ -4975,7 +5019,7 @@ export class CollectionQueryBuilder<TItem = any> {
       arrayField,
       defaultValue,
       counter: context.cteCounter++,
-      navigationJoins: navigationJoins.length > 0 ? navigationJoins : undefined,
+      navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
     };
 
     // Step 6: Call the strategy

@@ -709,6 +709,45 @@ describe('LATERAL strategy with navigation to collection', () => {
       });
     }, { collectionStrategy: 'lateral' });
   });
+
+  test('should join intermediate navigation tables for nested collection through chain', async () => {
+    // This tests the fix for: missing FROM-clause entry for intermediate navigation tables
+    // Pattern: users.posts (collection) -> user (reference) -> orders (collection)
+    // The intermediate 'user' navigation needs to be joined in the lateral subquery
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      // This query accesses a collection (orders) through a navigation chain (p.user)
+      // inside another collection (posts)
+      const usersWithNestedData = await db.users
+        .select(u => ({
+          username: u.username,
+          posts: u.posts!
+            .select(p => ({
+              title: p.title,
+              // This should work: accessing user.orders from inside posts collection
+              // The 'user' navigation must be joined in the lateral subquery for 'authorOrders'
+              authorOrders: p.user!.orders!
+                .select(o => ({
+                  status: o.status,
+                  amount: o.totalAmount,
+                }))
+                .toList('authorOrders'),
+            }))
+            .toList('posts'),
+        }))
+        .toList();
+
+      expect(usersWithNestedData.length).toBeGreaterThan(0);
+      const userWithPosts = usersWithNestedData.find(u => u.posts.length > 0);
+      expect(userWithPosts).toBeDefined();
+
+      // Each post should have authorOrders array (may be empty if user has no orders)
+      userWithPosts!.posts.forEach(post => {
+        expect(Array.isArray(post.authorOrders)).toBe(true);
+      });
+    }, { collectionStrategy: 'lateral' });
+  });
 });
 
 describe('LATERAL strategy custom mapper transformation', () => {
