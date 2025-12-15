@@ -258,6 +258,10 @@ export function buildConflictClause(
 
   const updateParts = updateColumns.map(col => {
     const column = schema.columns[col];
+    if (!column) {
+      // Column not in schema, use as-is (shouldn't happen normally)
+      return `"${col}" = EXCLUDED."${col}"`;
+    }
     const config = column.build();
     return `"${config.name}" = EXCLUDED."${config.name}"`;
   });

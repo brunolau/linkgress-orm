@@ -2962,7 +2962,15 @@ export class DbEntityTable<TEntity extends DbEntity> {
     } else {
       const updateSetClauses = columnsToUpdate.map(propName => {
         const col = columnConfigs.find(c => c.propName === propName);
-        const dbName = col ? col.dbName : propName;
+        let dbName: string;
+        if (col) {
+          dbName = col.dbName;
+        } else {
+          // Column not in insert values, look up from schema
+          const schemaCol = schema.columns[propName];
+          const config = schemaCol ? (schemaCol as any).build() : null;
+          dbName = config ? config.name : propName;
+        }
         return `"${dbName}" = EXCLUDED."${dbName}"`;
       });
 
