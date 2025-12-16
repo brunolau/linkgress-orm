@@ -194,7 +194,16 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     cteName: string,
     context: QueryContext
   ): string {
-    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue, isDistinct, navigationJoins } = config;
+    // Note: CTE strategy does NOT use navigationJoins for intermediate correlation.
+    // Unlike LATERAL, CTEs are computed independently and join to the main query via parent_id.
+    // The main query handles intermediate reference joins (posts -> user),
+    // and the CTE just selects from the collection table (orders) and groups by foreign key.
+    // However, we DO need navigation joins that are WITHIN the collection's selector (e.g., orderTask.task.level).
+    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue, isDistinct } = config;
+    // For CTE, we only need navigation joins that are within the collection's selector (e.g., orderTask.task.level)
+    // NOT the navigation path from outer query to this collection (e.g., post -> user -> orders)
+    // Use selectorNavigationJoins which contains only the joins detected from the selector.
+    const navigationJoins = config.selectorNavigationJoins;
 
     // Collect all leaf fields for the SELECT clause
     const leafFields = this.collectLeafFields(selectedFields);
@@ -294,10 +303,11 @@ GROUP BY "__fk_${foreignKey}"
     navJoinsSQL: string,
     nestedCteJoinsSQL: string = ''
   ): string {
-    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue, navigationJoins } = config;
+    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
 
-    // When there are navigation joins, we need to qualify unqualified field expressions
-    // with the target table name to avoid ambiguous column references
+    // CTE strategy uses selectorNavigationJoins for joins within the collection's selector.
+    // Unlike LATERAL, CTEs don't need navigation path joins for outer query correlation.
+    const navigationJoins = config.selectorNavigationJoins;
     const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
 
     // Build the innermost SELECT fields
@@ -367,7 +377,7 @@ GROUP BY "__fk_${foreignKey}"
     cteName: string,
     context: QueryContext
   ): string {
-    const { arrayField, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct, navigationJoins, selectedFields } = config;
+    const { arrayField, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct, selectedFields } = config;
 
     if (!arrayField) {
       throw new Error('arrayField is required for array aggregation');
@@ -379,7 +389,9 @@ GROUP BY "__fk_${foreignKey}"
     // Build DISTINCT clause
     const distinctClause = isDistinct ? 'DISTINCT ' : '';
 
-    // Build navigation JOINs for multi-level navigation (like toList does)
+    // CTE strategy uses selectorNavigationJoins for joins within the collection's selector.
+    // Unlike LATERAL, CTEs don't need navigation path joins for outer query correlation.
+    const navigationJoins = config.selectorNavigationJoins;
     const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
     const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
 
@@ -445,8 +457,11 @@ GROUP BY "__fk_${foreignKey}"
     distinctClause: string,
     navJoinsSQL: string
   ): string {
-    const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue, navigationJoins, selectedFields } = config;
+    const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue, selectedFields } = config;
 
+    // CTE strategy uses selectorNavigationJoins for joins within the collection's selector.
+    // Unlike LATERAL, CTEs don't need navigation path joins for outer query correlation.
+    const navigationJoins = config.selectorNavigationJoins;
     const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
 
     // Get the actual field expression from selectedFields (if available)

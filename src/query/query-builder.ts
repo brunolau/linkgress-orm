@@ -363,7 +363,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
               targetSchema,
-              this.schemaRegistry  // Pass schema registry for nested navigation resolution
+              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              [],  // Empty navigation path for first level navigation
+              this.schema.name  // Pass source table name for lateral join correlation
             );
             return refBuilder.createMockTargetRow();
           },
@@ -614,7 +616,10 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               relConfig.foreignKeys || [relConfig.foreignKey || ''],
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              [],  // Empty navigation path for first level navigation
+              schema.name  // Pass source table name for lateral join correlation
             );
             return refBuilder.createMockTargetRow();
           },
@@ -1263,7 +1268,10 @@ export class SelectQueryBuilder<TSelection> {
               relConfig.foreignKeys || [relConfig.foreignKey || ''],
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              [],  // Empty navigation path for first level navigation
+              schema.name  // Pass source table name for lateral join correlation
             );
             return refBuilder.createMockTargetRow();
           },
@@ -2609,7 +2617,9 @@ export class SelectQueryBuilder<TSelection> {
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
               targetSchema,  // Pass the target schema directly
-              this.schemaRegistry  // Pass schema registry for nested resolution
+              this.schemaRegistry,  // Pass schema registry for nested resolution
+              [],  // Empty navigation path for first level navigation
+              this.schema.name  // Pass source table name for lateral join correlation
             );
             // Return a mock object that exposes the target table's columns
             return refBuilder.createMockTargetRow();
@@ -5472,6 +5482,7 @@ export class CollectionQueryBuilder<TItem = any> {
       defaultValue,
       counter: context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
+      selectorNavigationJoins: navigationJoins.length > 0 ? navigationJoins : undefined,
     };
 
     // Step 6: Call the strategy

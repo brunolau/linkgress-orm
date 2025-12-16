@@ -227,10 +227,22 @@ export interface CollectionAggregationConfig {
   counter: number;
 
   /**
-   * Navigation joins needed for multi-level navigation in collection selectors
-   * These represent JOINs to related tables (e.g., task.level.createdBy)
+   * Navigation joins needed for multi-level navigation in collection selectors.
+   * These represent JOINs to related tables (e.g., task.level.createdBy).
+   * This includes BOTH:
+   * - Navigation path joins (for LATERAL correlation with outer query)
+   * - Selector joins (for joins within the collection's own selector)
+   * Use selectorNavigationJoins for just the selector joins (needed for CTE strategy).
    */
   navigationJoins?: NavigationJoin[];
+
+  /**
+   * Navigation joins detected from the collection's selector only.
+   * Unlike navigationJoins, this does NOT include the navigation path from outer query.
+   * CTE strategy should use this instead of navigationJoins since CTEs don't need
+   * correlation with outer query tables (they join via parent_id).
+   */
+  selectorNavigationJoins?: NavigationJoin[];
 }
 
 /**
