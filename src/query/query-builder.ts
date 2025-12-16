@@ -1641,7 +1641,7 @@ export class SelectQueryBuilder<TSelection> {
   private async executeWithTempTables(
     selectionResult: any,
     context: QueryContext,
-    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>,
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
     tracer: TimeTracer
   ): Promise<any[]> {
     // Build base selection (excludes collections, includes foreign keys)
@@ -1747,7 +1747,23 @@ export class SelectQueryBuilder<TSelection> {
         for (const collection of collections) {
           const resultMap = collectionResults.get(collection.name);
           const parentId = baseRow.__pk_id;
-          merged[collection.name] = resultMap?.get(parentId) || this.getDefaultValueForCollection(collection.builder);
+          const collectionData = resultMap?.get(parentId) || this.getDefaultValueForCollection(collection.builder);
+
+          // Handle nested paths
+          if (collection.path.length > 0) {
+            // Navigate to the nested object and set the collection there
+            let current = merged;
+            for (let i = 0; i < collection.path.length; i++) {
+              const pathPart = collection.path[i];
+              if (!(pathPart in current)) {
+                current[pathPart] = {};
+              }
+              current = current[pathPart];
+            }
+            current[collection.name] = collectionData;
+          } else {
+            merged[collection.name] = collectionData;
+          }
         }
         // Remove the internal __pk_id field before returning
         delete merged.__pk_id;
@@ -1775,7 +1791,7 @@ export class SelectQueryBuilder<TSelection> {
     baseSelection: any,
     selectionResult: any,
     context: QueryContext,
-    collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>,
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
     tracer: TimeTracer
   ): Promise<any[]> {
     tracer.startPhase('queryBuild');
@@ -1911,7 +1927,23 @@ export class SelectQueryBuilder<TSelection> {
         for (const collection of collections) {
           const resultMap = collectionResults.get(collection.name);
           const parentId = baseRow.__pk_id;
-          merged[collection.name] = resultMap?.get(parentId) || [];
+          const collectionData = resultMap?.get(parentId) || [];
+
+          // Handle nested paths
+          if (collection.path.length > 0) {
+            // Navigate to the nested object and set the collection there
+            let current = merged;
+            for (let i = 0; i < collection.path.length; i++) {
+              const pathPart = collection.path[i];
+              if (!(pathPart in current)) {
+                current[pathPart] = {};
+              }
+              current = current[pathPart];
+            }
+            current[collection.name] = collectionData;
+          } else {
+            merged[collection.name] = collectionData;
+          }
         }
         delete merged.__pk_id;
         return merged;
@@ -1929,39 +1961,104 @@ export class SelectQueryBuilder<TSelection> {
   }
 
   /**
-   * Detect collections in the selection result
+   * Detect collections in the selection result, including nested objects.
+   * Returns collections with path information for proper result reconstruction.
    */
-  private detectCollections(selection: any): Array<{ name: string; builder: CollectionQueryBuilder<any> }> {
-    const collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }> = [];
-
-    if (typeof selection === 'object' && selection !== null && !(selection instanceof SqlFragment)) {
-      for (const [key, value] of Object.entries(selection)) {
-        if (value instanceof CollectionQueryBuilder) {
-          collections.push({ name: key, builder: value });
-        } else if (value && typeof value === 'object' && '__collectionResult' in value && 'buildCTE' in value) {
-          // This is a CollectionResult which wraps a CollectionQueryBuilder
-          collections.push({ name: key, builder: value as any as CollectionQueryBuilder<any> });
-        }
-      }
-    }
-
+  private detectCollections(selection: any): Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }> {
+    const collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }> = [];
+    this.detectCollectionsRecursive(selection, [], collections);
     return collections;
   }
 
   /**
-   * Build base selection excluding collections but including necessary foreign keys
+   * Recursively detect collections in nested objects
    */
-  private buildBaseSelection(selection: any, collections: Array<{ name: string; builder: CollectionQueryBuilder<any> }>): any {
+  private detectCollectionsRecursive(
+    selection: any,
+    currentPath: string[],
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>
+  ): void {
+    if (typeof selection !== 'object' || selection === null || selection instanceof SqlFragment) {
+      return;
+    }
+
+    for (const [key, value] of Object.entries(selection)) {
+      if (value instanceof CollectionQueryBuilder) {
+        collections.push({ name: key, path: [...currentPath], builder: value });
+      } else if (value && typeof value === 'object' && '__collectionResult' in value && 'buildCTE' in value) {
+        // This is a CollectionResult which wraps a CollectionQueryBuilder
+        collections.push({ name: key, path: [...currentPath], builder: value as any as CollectionQueryBuilder<any> });
+      } else if (value && typeof value === 'object' && !Array.isArray(value) && !('__dbColumnName' in value)) {
+        // Recursively check nested objects (but not FieldRefs or arrays)
+        this.detectCollectionsRecursive(value, [...currentPath, key], collections);
+      }
+    }
+  }
+
+  /**
+   * Build base selection excluding collections but including necessary foreign keys.
+   * Handles nested collections by removing them from nested structures.
+   */
+  private buildBaseSelection(selection: any, collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>): any {
     const baseSelection: any = {};
-    const collectionNames = new Set(collections.map(c => c.name));
+
+    // Build a set of top-level collection names (for backward compatibility)
+    const topLevelCollectionNames = new Set(
+      collections.filter(c => c.path.length === 0).map(c => c.name)
+    );
 
     // Always ensure we have the primary key in the base selection with a known alias
     const mockRow = this._createMockRow();
     baseSelection['__pk_id'] = mockRow.id; // Add primary key with a known alias
 
     for (const [key, value] of Object.entries(selection)) {
-      if (!collectionNames.has(key)) {
-        baseSelection[key] = value;
+      if (!topLevelCollectionNames.has(key)) {
+        // For nested objects, recursively remove collections
+        if (value && typeof value === 'object' && !Array.isArray(value) && !('__dbColumnName' in value) && !(value instanceof SqlFragment)) {
+          const nestedCollections = collections.filter(c => c.path.length > 0 && c.path[0] === key);
+          if (nestedCollections.length > 0) {
+            // This nested object contains collections - build it recursively
+            baseSelection[key] = this.buildBaseSelectionRecursive(value, nestedCollections, 1);
+          } else {
+            baseSelection[key] = value;
+          }
+        } else {
+          baseSelection[key] = value;
+        }
+      }
+    }
+
+    return baseSelection;
+  }
+
+  /**
+   * Recursively build base selection for nested objects, excluding collections
+   */
+  private buildBaseSelectionRecursive(
+    selection: any,
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
+    depth: number
+  ): any {
+    const baseSelection: any = {};
+
+    // Build a set of collection names at this depth
+    const collectionNamesAtDepth = new Set(
+      collections.filter(c => c.path.length === depth).map(c => c.name)
+    );
+
+    for (const [key, value] of Object.entries(selection)) {
+      if (!collectionNamesAtDepth.has(key)) {
+        // For nested objects, continue recursively
+        if (value && typeof value === 'object' && !Array.isArray(value) && !('__dbColumnName' in value) && !(value instanceof SqlFragment)) {
+          const nestedCollections = collections.filter(c => c.path.length > depth && c.path[depth] === key);
+          if (nestedCollections.length > 0) {
+            baseSelection[key] = this.buildBaseSelectionRecursive(value, nestedCollections, depth + 1);
+          } else {
+            baseSelection[key] = value;
+          }
+        } else {
+          baseSelection[key] = value;
+        }
       }
     }
 
@@ -2706,6 +2803,8 @@ export class SelectQueryBuilder<TSelection> {
    * Reconstruct nested objects from flat row data with path-encoded column names.
    * Transforms { "__nested__address__street": "Main St", "__nested__address__city": "NYC" }
    * into { address: { street: "Main St", city: "NYC" } }
+   * Also handles nested collections with paths like "__nested__content__posts"
+   * Converts numeric strings to numbers for scalar aggregation results.
    */
   private reconstructNestedObjects(row: any, nestedPaths: Set<string>): any {
     if (nestedPaths.size === 0) {
@@ -2727,7 +2826,13 @@ export class SelectQueryBuilder<TSelection> {
           }
           current = current[part];
         }
-        current[pathParts[pathParts.length - 1]] = value;
+        // Convert numeric strings to numbers (for scalar aggregations like COUNT)
+        // This handles values like "2" -> 2, "3.14" -> 3.14
+        let finalValue = value;
+        if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) {
+          finalValue = +value;
+        }
+        current[pathParts[pathParts.length - 1]] = finalValue;
       } else {
         // Regular field
         result[key] = value;
@@ -2735,6 +2840,120 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     return result;
+  }
+
+  /**
+   * Check if an object contains any CollectionQueryBuilder instances (recursively)
+   */
+  private hasNestedCollections(obj: any): boolean {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return false;
+    }
+
+    for (const value of Object.values(obj)) {
+      if (value instanceof CollectionQueryBuilder) {
+        return true;
+      }
+      if (value && typeof value === 'object' && '__collectionResult' in value) {
+        return true;
+      }
+      if (value && typeof value === 'object' && !Array.isArray(value) && !('__dbColumnName' in value)) {
+        if (this.hasNestedCollections(value)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Build flat SQL SELECT parts for a nested object, excluding collections.
+   * Collections are added to collectionFields for separate handling.
+   */
+  private tryBuildFlatNestedSelectExcludingCollections(
+    obj: any,
+    context: QueryContext,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>,
+    selectParts: string[],
+    pathPrefix: string,
+    nestedPaths: Set<string>,
+    collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }>
+  ): void {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return;
+    }
+
+    // Track this path as a nested object
+    nestedPaths.add(pathPrefix);
+
+    for (const [nestedKey, nestedValue] of Object.entries(obj)) {
+      const fieldPath = `${pathPrefix}__${nestedKey}`;
+
+      // Check if this is a collection - handle it separately
+      if (nestedValue instanceof CollectionQueryBuilder || (nestedValue && typeof nestedValue === 'object' && '__collectionResult' in nestedValue)) {
+        // Build CTE for collection and add to collectionFields
+        const cteData = (nestedValue as any).buildCTE ? (nestedValue as any).buildCTE(context) : (nestedValue as CollectionQueryBuilder<any>).buildCTE(context);
+        const isCTE = cteData.isCTE !== false;
+
+        collectionFields.push({
+          name: fieldPath, // Use full path as the name
+          cteName: cteData.tableName || `cte_${context.cteCounter - 1}`,
+          isCTE,
+          joinClause: cteData.joinClause,
+          selectExpression: cteData.selectExpression,
+        });
+        continue;
+      }
+
+      if (nestedValue instanceof SqlFragment) {
+        // SQL Fragment - build the SQL expression
+        const sqlBuildContext = {
+          paramCounter: context.paramCounter,
+          params: context.allParams,
+        };
+        const fragmentSql = nestedValue.buildSql(sqlBuildContext);
+        context.paramCounter = sqlBuildContext.paramCounter;
+        selectParts.push(`${fragmentSql} as "${fieldPath}"`);
+      } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
+        // FieldRef - extract table alias and column name
+        const tableAlias = ('__tableAlias' in nestedValue && nestedValue.__tableAlias)
+          ? nestedValue.__tableAlias as string
+          : this.schema.name;
+        const columnName = nestedValue.__dbColumnName as string;
+
+        // Add JOIN if needed for navigation fields
+        if (tableAlias !== this.schema.name) {
+          const relConfig = this.schema.relations[tableAlias];
+          if (relConfig && !joins.find(j => j.alias === tableAlias)) {
+            let targetSchema: string | undefined;
+            if (relConfig.targetTableBuilder) {
+              const targetTableSchema = relConfig.targetTableBuilder.build();
+              targetSchema = targetTableSchema.schema;
+            }
+            joins.push({
+              alias: tableAlias,
+              targetTable: relConfig.targetTable,
+              targetSchema,
+              foreignKeys: relConfig.foreignKeys || [relConfig.foreignKey || ''],
+              matches: relConfig.matches || [],
+              isMandatory: relConfig.isMandatory ?? false,
+            });
+          }
+        }
+
+        selectParts.push(`"${tableAlias}"."${columnName}" as "${fieldPath}"`);
+      } else if (typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)) {
+        // Recursively handle deeper nested objects
+        this.tryBuildFlatNestedSelectExcludingCollections(nestedValue, context, joins, selectParts, fieldPath, nestedPaths, collectionFields);
+      } else if (nestedValue === undefined || nestedValue === null) {
+        selectParts.push(`NULL as "${fieldPath}"`);
+      } else {
+        // Literal value (string, number, boolean)
+        selectParts.push(`$${context.paramCounter++} as "${fieldPath}"`);
+        context.allParams.push(nestedValue);
+      }
+    }
   }
 
   private detectAndAddJoinsFromSelection(selection: any, joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>): void {
@@ -3162,6 +3381,17 @@ export class SelectQueryBuilder<TSelection> {
             if (handled) {
               continue;
             }
+
+            // Check if this is a nested object with collections inside
+            // e.g., content: { posts: u.posts!.toList() }
+            // In this case, we need to handle it specially:
+            // - Build the non-collection parts with flat select
+            // - Let collections be handled by the collection handler
+            if (this.hasNestedCollections(value)) {
+              // Build flat select for non-collection parts of the nested object
+              this.tryBuildFlatNestedSelectExcludingCollections(value, context, joins, selectParts, `__nested__${key}`, nestedPaths, collectionFields);
+              continue;
+            }
           }
           // Otherwise, treat as literal value
           selectParts.push(`$${context.paramCounter++} as "${key}"`);
@@ -3186,8 +3416,26 @@ export class SelectQueryBuilder<TSelection> {
       }
 
       // Fallback to old logic for backward compatibility
+      // Get the collection value - handle both top-level and nested paths
+      // For nested paths like "__nested__activity__postCount", we need to navigate the selection object
+      let collectionValue: any;
+      if (name.startsWith('__nested__')) {
+        // Parse the nested path and navigate to the collection
+        const pathParts = name.substring('__nested__'.length).split('__');
+        collectionValue = selection;
+        for (const part of pathParts) {
+          if (collectionValue && typeof collectionValue === 'object') {
+            collectionValue = collectionValue[part];
+          } else {
+            collectionValue = undefined;
+            break;
+          }
+        }
+      } else {
+        collectionValue = selection[name];
+      }
+
       // Check if this is an array aggregation (from toNumberList/toStringList)
-      const collectionValue = selection[name];
       const isArrayAgg = collectionValue && typeof collectionValue === 'object' && 'isArrayAggregation' in collectionValue && collectionValue.isArrayAggregation();
 
       // Check if this is a scalar aggregation (count, sum, max, min)

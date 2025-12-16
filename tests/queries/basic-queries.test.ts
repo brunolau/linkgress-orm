@@ -135,6 +135,140 @@ describe('Basic Query Operations', () => {
         });
       });
     });
+
+    test('should select with nested object containing collection', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test nested object with a collection inside
+        const users = await db.users
+          .select(u => ({
+            id: u.id,
+            info: {
+              username: u.username,
+              email: u.email,
+            },
+            content: {
+              posts: u.posts!.select(p => ({
+                postId: p.id,
+                title: p.title,
+              })).toList('posts'),
+            },
+          }))
+          .toList();
+
+        expect(users).toHaveLength(3);
+        users.forEach(u => {
+          expect(u).toHaveProperty('id');
+          expect(u).toHaveProperty('info');
+          expect(u.info).toHaveProperty('username');
+          expect(u.info).toHaveProperty('email');
+          expect(u).toHaveProperty('content');
+          expect(u.content).toHaveProperty('posts');
+          expect(Array.isArray(u.content.posts)).toBe(true);
+        });
+
+        // Verify Alice has 2 posts
+        const alice = users.find(u => u.info.username === 'alice');
+        expect(alice).toBeDefined();
+        expect(alice!.content.posts).toHaveLength(2);
+      });
+    });
+
+    test('should select with nested object alongside collection at same level', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test nested object and collection at same level
+        const users = await db.users
+          .select(u => ({
+            id: u.id,
+            profile: {
+              username: u.username,
+              active: u.isActive,
+            },
+            posts: u.posts!.select(p => ({
+              postId: p.id,
+              title: p.title,
+              views: p.views,
+            })).toList('posts'),
+          }))
+          .toList();
+
+        expect(users).toHaveLength(3);
+        users.forEach(u => {
+          expect(u).toHaveProperty('id');
+          expect(u).toHaveProperty('profile');
+          expect(u.profile).toHaveProperty('username');
+          expect(u.profile).toHaveProperty('active');
+          expect(u).toHaveProperty('posts');
+          expect(Array.isArray(u.posts)).toBe(true);
+        });
+
+        // Verify data integrity
+        const bob = users.find(u => u.profile.username === 'bob');
+        expect(bob).toBeDefined();
+        expect(bob!.posts).toHaveLength(1);
+        expect(bob!.posts[0].title).toBe('Bob Post');
+      });
+    });
+
+    test('should select with deeply nested objects and collections mixed', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test complex nested structure with collections
+        const users = await db.users
+          .select(u => ({
+            id: u.id,
+            user: {
+              info: {
+                name: u.username,
+                email: u.email,
+              },
+              status: {
+                active: u.isActive,
+                age: u.age,
+              },
+            },
+            activity: {
+              postCount: u.posts!.count(),
+              recentPosts: u.posts!
+                .orderBy(p => [[p.views, 'DESC']])
+                .limit(2)
+                .select(p => ({
+                  title: p.title,
+                  views: p.views,
+                }))
+                .toList('recentPosts'),
+            },
+          }))
+          .toList();
+
+        expect(users).toHaveLength(3);
+        users.forEach(u => {
+          expect(u).toHaveProperty('id');
+          expect(u).toHaveProperty('user');
+          expect(u.user).toHaveProperty('info');
+          expect(u.user).toHaveProperty('status');
+          expect(u.user.info).toHaveProperty('name');
+          expect(u.user.info).toHaveProperty('email');
+          expect(u.user.status).toHaveProperty('active');
+          expect(u.user.status).toHaveProperty('age');
+          expect(u).toHaveProperty('activity');
+          expect(u.activity).toHaveProperty('postCount');
+          expect(typeof u.activity.postCount).toBe('number');
+          expect(u.activity).toHaveProperty('recentPosts');
+          expect(Array.isArray(u.activity.recentPosts)).toBe(true);
+        });
+
+        // Verify Alice has 2 posts
+        const alice = users.find(u => u.user.info.name === 'alice');
+        expect(alice).toBeDefined();
+        expect(alice!.activity.postCount).toBe(2);
+        expect(alice!.activity.recentPosts).toHaveLength(2);
+      });
+    });
   });
 
   describe('WHERE conditions', () => {
