@@ -1597,7 +1597,7 @@ export class SelectQueryBuilder<TSelection> {
   private async executeSinglePhase(selectionResult: any, context: QueryContext, tracer: TimeTracer): Promise<any[]> {
     // Build the query
     tracer.startPhase('queryBuild');
-    const { sql, params } = tracer.trace('buildQuery', () => this.buildQuery(selectionResult, context));
+    const { sql, params, nestedPaths } = tracer.trace('buildQuery', () => this.buildQuery(selectionResult, context));
     tracer.endPhase();
 
     // Execute using executor if available, otherwise use client directly
@@ -1615,11 +1615,20 @@ export class SelectQueryBuilder<TSelection> {
       return result.rows;
     }
 
-    // Transform results
+    // Reconstruct nested objects from flat row data (if any)
     tracer.startPhase('resultProcessing');
+    let rows = result.rows;
+    if (nestedPaths.size > 0) {
+      rows = tracer.trace('reconstructNestedObjects', () =>
+        rows.map(row => this.reconstructNestedObjects(row, nestedPaths)),
+        { rowCount: rows.length }
+      );
+    }
+
+    // Transform results
     const transformed = tracer.trace('transformResults', () =>
-      this.transformResults(result.rows, selectionResult),
-      { rowCount: result.rows.length }
+      this.transformResults(rows, selectionResult),
+      { rowCount: rows.length }
     );
     tracer.endPhase();
 
@@ -2591,37 +2600,52 @@ export class SelectQueryBuilder<TSelection> {
    * Supports multi-level navigation like task.level.createdBy
    */
   /**
-   * Try to build SQL for a nested object containing FieldRefs
-   * Returns the json_build_object arguments string, or null if not a valid nested object
-   * e.g., { street: p.street, city: p.city } => "'street', "table"."street", 'city', "table"."city""
+   * Try to build flat SQL SELECT parts for a nested object containing FieldRefs.
+   * Uses path-encoded aliases (e.g., __nested__address__street) for JS-side reconstruction.
+   * This is more performant than json_build_object() as it avoids JSON serialization overhead.
+   *
+   * @param obj The nested object from the selector
+   * @param context Query context for parameter tracking
+   * @param joins Array to add necessary JOINs
+   * @param selectParts Array to add SELECT parts to
+   * @param pathPrefix Current path prefix for alias encoding (e.g., "__nested__address")
+   * @param nestedPaths Set to track all nested paths for reconstruction
+   * @returns true if handled as nested object, false if not a valid nested object
    */
-  private tryBuildNestedObjectSql(
+  private tryBuildFlatNestedSelect(
     obj: any,
     context: QueryContext,
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
-  ): string | null {
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>,
+    selectParts: string[],
+    pathPrefix: string,
+    nestedPaths: Set<string>
+  ): boolean {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-      return null;
+      return false;
     }
 
     const entries = Object.entries(obj);
     if (entries.length === 0) {
-      return null;
+      return false;
     }
 
     // First pass: check if this object contains any CollectionQueryBuilder instances
     // If so, this is NOT a plain nested object and needs special handling elsewhere
     for (const [, nestedValue] of entries) {
       if (nestedValue instanceof CollectionQueryBuilder) {
-        return null; // Contains collections - let the main loop handle this
+        return false; // Contains collections - let the main loop handle this
       }
       if (nestedValue && typeof nestedValue === 'object' && '__collectionResult' in nestedValue) {
-        return null; // Contains collection result marker
+        return false; // Contains collection result marker
       }
     }
 
-    const fieldParts: string[] = [];
+    // Track this path as a nested object
+    nestedPaths.add(pathPrefix);
+
     for (const [nestedKey, nestedValue] of entries) {
+      const fieldPath = `${pathPrefix}__${nestedKey}`;
+
       if (nestedValue instanceof SqlFragment) {
         // SQL Fragment - build the SQL expression
         const sqlBuildContext = {
@@ -2630,7 +2654,7 @@ export class SelectQueryBuilder<TSelection> {
         };
         const fragmentSql = nestedValue.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
-        fieldParts.push(`'${nestedKey}', ${fragmentSql}`);
+        selectParts.push(`${fragmentSql} as "${fieldPath}"`);
       } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
         // FieldRef - extract table alias and column name
         const tableAlias = ('__tableAlias' in nestedValue && nestedValue.__tableAlias)
@@ -2658,26 +2682,59 @@ export class SelectQueryBuilder<TSelection> {
           }
         }
 
-        fieldParts.push(`'${nestedKey}', "${tableAlias}"."${columnName}"`);
+        selectParts.push(`"${tableAlias}"."${columnName}" as "${fieldPath}"`);
       } else if (typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)) {
         // Recursively handle deeper nested objects
-        const nestedResult = this.tryBuildNestedObjectSql(nestedValue, context, joins);
-        if (nestedResult) {
-          fieldParts.push(`'${nestedKey}', json_build_object(${nestedResult})`);
-        } else {
-          // Not a valid nested object structure - return null to let caller handle
-          return null;
+        const handled = this.tryBuildFlatNestedSelect(nestedValue, context, joins, selectParts, fieldPath, nestedPaths);
+        if (!handled) {
+          // Not a valid nested object structure - return false to let caller handle
+          return false;
         }
       } else if (nestedValue === undefined || nestedValue === null) {
-        fieldParts.push(`'${nestedKey}', NULL`);
+        selectParts.push(`NULL as "${fieldPath}"`);
       } else {
         // Literal value (string, number, boolean)
-        fieldParts.push(`'${nestedKey}', $${context.paramCounter++}`);
+        selectParts.push(`$${context.paramCounter++} as "${fieldPath}"`);
         context.allParams.push(nestedValue);
       }
     }
 
-    return fieldParts.length > 0 ? fieldParts.join(', ') : null;
+    return true;
+  }
+
+  /**
+   * Reconstruct nested objects from flat row data with path-encoded column names.
+   * Transforms { "__nested__address__street": "Main St", "__nested__address__city": "NYC" }
+   * into { address: { street: "Main St", city: "NYC" } }
+   */
+  private reconstructNestedObjects(row: any, nestedPaths: Set<string>): any {
+    if (nestedPaths.size === 0) {
+      return row;
+    }
+
+    const result: any = {};
+    const nestedPrefix = '__nested__';
+
+    for (const [key, value] of Object.entries(row)) {
+      if (key.startsWith(nestedPrefix)) {
+        // This is a nested field - parse the path and set the value
+        const pathParts = key.substring(nestedPrefix.length).split('__');
+        let current = result;
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          const part = pathParts[i];
+          if (!(part in current)) {
+            current[part] = {};
+          }
+          current = current[part];
+        }
+        current[pathParts[pathParts.length - 1]] = value;
+      } else {
+        // Regular field
+        result[key] = value;
+      }
+    }
+
+    return result;
   }
 
   private detectAndAddJoinsFromSelection(selection: any, joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>): void {
@@ -2862,7 +2919,7 @@ export class SelectQueryBuilder<TSelection> {
   /**
    * Build SQL query
    */
-  private buildQuery(selection: any, context: QueryContext): { sql: string; params: any[] } {
+  private buildQuery(selection: any, context: QueryContext): { sql: string; params: any[]; nestedPaths: Set<string> } {
     // Handle user-defined CTEs first - their params need to come before main query params
     for (const cte of this.ctes) {
       context.allParams.push(...cte.params);
@@ -2872,6 +2929,7 @@ export class SelectQueryBuilder<TSelection> {
     const selectParts: string[] = [];
     const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }> = [];
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+    const nestedPaths: Set<string> = new Set(); // Track nested object paths for JS-side reconstruction
 
     // Scan selection for navigation property references and add JOINs
     this.detectAndAddJoinsFromSelection(selection, joins);
@@ -3099,9 +3157,9 @@ export class SelectQueryBuilder<TSelection> {
 
             // Check if this is a plain nested object containing FieldRefs
             // e.g., address: { street: p.street, city: p.city }
-            const nestedFieldParts = this.tryBuildNestedObjectSql(value, context, joins);
-            if (nestedFieldParts) {
-              selectParts.push(`json_build_object(${nestedFieldParts}) as "${key}"`);
+            // Use flat select with path-encoded aliases for better performance
+            const handled = this.tryBuildFlatNestedSelect(value, context, joins, selectParts, `__nested__${key}`, nestedPaths);
+            if (handled) {
               continue;
             }
           }
@@ -3291,6 +3349,7 @@ export class SelectQueryBuilder<TSelection> {
     return {
       sql: finalQuery,
       params: context.allParams,
+      nestedPaths,
     };
   }
 
