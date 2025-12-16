@@ -71,6 +71,70 @@ describe('Basic Query Operations', () => {
         expect(duplicates).toHaveLength(1);
       });
     });
+
+    test('should select with nested object structure', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test nested object selection - groups fields into a JSON object
+        const users = await db.users
+          .select(u => ({
+            id: u.id,
+            name: u.username,
+            contact: {
+              email: u.email,
+              active: u.isActive,
+            },
+          }))
+          .toList();
+
+        expect(users).toHaveLength(3);
+        users.forEach(u => {
+          expect(u).toHaveProperty('id');
+          expect(u).toHaveProperty('name');
+          expect(u).toHaveProperty('contact');
+          expect(u.contact).toHaveProperty('email');
+          expect(u.contact).toHaveProperty('active');
+          expect(typeof u.contact.email).toBe('string');
+          expect(typeof u.contact.active).toBe('boolean');
+        });
+      });
+    });
+
+    test('should select with deeply nested object structure', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Test deeply nested object selection
+        const users = await db.users
+          .select(u => ({
+            id: u.id,
+            profile: {
+              info: {
+                username: u.username,
+                email: u.email,
+              },
+              status: {
+                active: u.isActive,
+                age: u.age,
+              },
+            },
+          }))
+          .toList();
+
+        expect(users).toHaveLength(3);
+        users.forEach(u => {
+          expect(u).toHaveProperty('id');
+          expect(u).toHaveProperty('profile');
+          expect(u.profile).toHaveProperty('info');
+          expect(u.profile).toHaveProperty('status');
+          expect(u.profile.info).toHaveProperty('username');
+          expect(u.profile.info).toHaveProperty('email');
+          expect(u.profile.status).toHaveProperty('active');
+          expect(u.profile.status).toHaveProperty('age');
+        });
+      });
+    });
   });
 
   describe('WHERE conditions', () => {

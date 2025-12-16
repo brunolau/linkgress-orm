@@ -2590,6 +2590,96 @@ export class SelectQueryBuilder<TSelection> {
    * Detect navigation property references in selection and add necessary JOINs
    * Supports multi-level navigation like task.level.createdBy
    */
+  /**
+   * Try to build SQL for a nested object containing FieldRefs
+   * Returns the json_build_object arguments string, or null if not a valid nested object
+   * e.g., { street: p.street, city: p.city } => "'street', "table"."street", 'city', "table"."city""
+   */
+  private tryBuildNestedObjectSql(
+    obj: any,
+    context: QueryContext,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
+  ): string | null {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return null;
+    }
+
+    const entries = Object.entries(obj);
+    if (entries.length === 0) {
+      return null;
+    }
+
+    // First pass: check if this object contains any CollectionQueryBuilder instances
+    // If so, this is NOT a plain nested object and needs special handling elsewhere
+    for (const [, nestedValue] of entries) {
+      if (nestedValue instanceof CollectionQueryBuilder) {
+        return null; // Contains collections - let the main loop handle this
+      }
+      if (nestedValue && typeof nestedValue === 'object' && '__collectionResult' in nestedValue) {
+        return null; // Contains collection result marker
+      }
+    }
+
+    const fieldParts: string[] = [];
+    for (const [nestedKey, nestedValue] of entries) {
+      if (nestedValue instanceof SqlFragment) {
+        // SQL Fragment - build the SQL expression
+        const sqlBuildContext = {
+          paramCounter: context.paramCounter,
+          params: context.allParams,
+        };
+        const fragmentSql = nestedValue.buildSql(sqlBuildContext);
+        context.paramCounter = sqlBuildContext.paramCounter;
+        fieldParts.push(`'${nestedKey}', ${fragmentSql}`);
+      } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
+        // FieldRef - extract table alias and column name
+        const tableAlias = ('__tableAlias' in nestedValue && nestedValue.__tableAlias)
+          ? nestedValue.__tableAlias as string
+          : this.schema.name;
+        const columnName = nestedValue.__dbColumnName as string;
+
+        // Add JOIN if needed for navigation fields
+        if (tableAlias !== this.schema.name) {
+          const relConfig = this.schema.relations[tableAlias];
+          if (relConfig && !joins.find(j => j.alias === tableAlias)) {
+            let targetSchema: string | undefined;
+            if (relConfig.targetTableBuilder) {
+              const targetTableSchema = relConfig.targetTableBuilder.build();
+              targetSchema = targetTableSchema.schema;
+            }
+            joins.push({
+              alias: tableAlias,
+              targetTable: relConfig.targetTable,
+              targetSchema,
+              foreignKeys: relConfig.foreignKeys || [relConfig.foreignKey || ''],
+              matches: relConfig.matches || [],
+              isMandatory: relConfig.isMandatory ?? false,
+            });
+          }
+        }
+
+        fieldParts.push(`'${nestedKey}', "${tableAlias}"."${columnName}"`);
+      } else if (typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)) {
+        // Recursively handle deeper nested objects
+        const nestedResult = this.tryBuildNestedObjectSql(nestedValue, context, joins);
+        if (nestedResult) {
+          fieldParts.push(`'${nestedKey}', json_build_object(${nestedResult})`);
+        } else {
+          // Not a valid nested object structure - return null to let caller handle
+          return null;
+        }
+      } else if (nestedValue === undefined || nestedValue === null) {
+        fieldParts.push(`'${nestedKey}', NULL`);
+      } else {
+        // Literal value (string, number, boolean)
+        fieldParts.push(`'${nestedKey}', $${context.paramCounter++}`);
+        context.allParams.push(nestedValue);
+      }
+    }
+
+    return fieldParts.length > 0 ? fieldParts.join(', ') : null;
+  }
+
   private detectAndAddJoinsFromSelection(selection: any, joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>): void {
     if (!selection || typeof selection !== 'object') {
       return;
@@ -3005,6 +3095,14 @@ export class SelectQueryBuilder<TSelection> {
                 // Default: skip this navigation mock
                 continue;
               }
+            }
+
+            // Check if this is a plain nested object containing FieldRefs
+            // e.g., address: { street: p.street, city: p.city }
+            const nestedFieldParts = this.tryBuildNestedObjectSql(value, context, joins);
+            if (nestedFieldParts) {
+              selectParts.push(`json_build_object(${nestedFieldParts}) as "${key}"`);
+              continue;
             }
           }
           // Otherwise, treat as literal value
