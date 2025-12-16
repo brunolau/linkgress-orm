@@ -61,8 +61,14 @@ export class CteCollectionStrategy implements ICollectionStrategy {
 
     switch (config.aggregationType) {
       case 'jsonb':
-        cteSQL = this.buildJsonbAggregation(config, cteName, context);
-        selectExpression = `COALESCE("${cteName}".data, ${config.defaultValue})`;
+        if (config.isSingleResult) {
+          // firstOrDefault() - return single object or null, not an array
+          cteSQL = this.buildSingleJsonAggregation(config, cteName, context);
+          selectExpression = `"${cteName}".data`;  // Can be null if no match
+        } else {
+          cteSQL = this.buildJsonbAggregation(config, cteName, context);
+          selectExpression = `COALESCE("${cteName}".data, ${config.defaultValue})`;
+        }
         break;
 
       case 'array':
@@ -275,6 +281,93 @@ FROM (
   ${orderBySQL}
 ) sub
 GROUP BY "__fk_${foreignKey}"
+    `.trim();
+
+    return cteSQL;
+  }
+
+  /**
+   * Build single JSON object CTE (for firstOrDefault)
+   * Returns a single JSON object per parent, or null if no match.
+   * Uses ROW_NUMBER() to pick the first row per parent.
+   *
+   * SQL Pattern:
+   * ```sql
+   * SELECT
+   *   "__fk_user_id" as parent_id,
+   *   json_build_object('id', "id", 'title', "title") as data
+   * FROM (
+   *   SELECT *, ROW_NUMBER() OVER (PARTITION BY "__fk_user_id" ORDER BY ...) as __rn
+   *   FROM (SELECT ... FROM table) inner_sub
+   * ) sub
+   * WHERE __rn = 1
+   * ```
+   */
+  private buildSingleJsonAggregation(
+    config: CollectionAggregationConfig,
+    cteName: string,
+    context: QueryContext
+  ): string {
+    const { selectedFields, targetTable, foreignKey, whereClause, orderByClauseAlias, isDistinct } = config;
+    // Use selectorNavigationJoins for CTE (not the full navigation path)
+    const navigationJoins = config.selectorNavigationJoins;
+
+    // Collect all leaf fields for the SELECT clause
+    const leafFields = this.collectLeafFields(selectedFields);
+
+    // Build the JSONB fields for json_build_object (handles nested structures)
+    const jsonbObjectExpr = this.buildJsonbObject(selectedFields);
+
+    // Build WHERE clause
+    const whereSQL = whereClause ? `WHERE ${whereClause}` : '';
+
+    // Build DISTINCT clause
+    const distinctClause = isDistinct ? 'DISTINCT ' : '';
+
+    // Build navigation JOINs for multi-level navigation
+    const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
+
+    // Collect nested CTE joins (for collections within collections)
+    const nestedCteJoins = this.collectNestedCteJoins(selectedFields);
+    const nestedCteJoinsSQL = nestedCteJoins.length > 0 ? nestedCteJoins.join('\n  ') : '';
+
+    // When there are navigation joins, we need to qualify unqualified field expressions
+    const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
+
+    // Build the innermost SELECT fields
+    const innerSelectFields = [
+      `"${targetTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
+      ...leafFields.map(f => {
+        const isSimpleColumn = /^"[^".]+"$/.test(f.expression);
+        if (isSimpleColumn && hasNavigationJoins) {
+          const columnName = f.expression.slice(1, -1);
+          return `"${targetTable}"."${columnName}" as "${f.alias}"`;
+        }
+        if (f.expression !== `"${f.alias}"`) {
+          return `${f.expression} as "${f.alias}"`;
+        }
+        return f.expression;
+      }),
+    ];
+
+    // Build ORDER BY for ROW_NUMBER() - use the alias clause (property names) since we're referencing aliased columns from inner_sub
+    const rowNumberOrderBy = orderByClauseAlias || `"__fk_${foreignKey}"`;
+
+    const cteSQL = `
+SELECT
+  "__fk_${foreignKey}" as parent_id,
+  ${jsonbObjectExpr} as data
+FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY "__fk_${foreignKey}" ORDER BY ${rowNumberOrderBy}) as "__rn"
+  FROM (
+    SELECT ${distinctClause}${innerSelectFields.join(', ')}
+    FROM "${targetTable}"
+    ${navJoinsSQL}
+    ${nestedCteJoinsSQL}
+    ${whereSQL}
+  ) inner_sub
+) sub
+WHERE "__rn" = 1
     `.trim();
 
     return cteSQL;

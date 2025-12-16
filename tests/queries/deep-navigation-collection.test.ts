@@ -588,5 +588,103 @@ describe('Deep Navigation Collection Queries', () => {
         expect(result.length).toBeGreaterThan(0);
       });
     });
+
+    test('firstOrDefault should return single object not array (CTE)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const result = await db.orders
+          .where(o => gt(o.id, 0))
+          .select(o => ({
+            orderId: o.id,
+            // firstOrDefault should return a single object, not an array
+            firstTask: o.orderTasks!
+              .orderBy(ot => ot.sortOrder)
+              .select(ot => ({
+                taskId: ot.taskId,
+                sortOrder: ot.sortOrder,
+              }))
+              .firstOrDefault(),
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        // firstTask should be an object or null, NOT an array
+        const orderWithTask = result.find(r => r.firstTask !== null);
+        if (orderWithTask) {
+          expect(orderWithTask.firstTask).not.toBeInstanceOf(Array);
+          expect(orderWithTask.firstTask).toHaveProperty('taskId');
+          expect(orderWithTask.firstTask).toHaveProperty('sortOrder');
+        }
+      });
+    });
+
+    test('firstOrDefault should return single object not array (LATERAL)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const result = await db.orders
+          .withQueryOptions({ collectionStrategy: 'lateral' })
+          .where(o => gt(o.id, 0))
+          .select(o => ({
+            orderId: o.id,
+            // firstOrDefault should return a single object, not an array
+            firstTask: o.orderTasks!
+              .orderBy(ot => ot.sortOrder)
+              .select(ot => ({
+                taskId: ot.taskId,
+                sortOrder: ot.sortOrder,
+              }))
+              .firstOrDefault(),
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        // firstTask should be an object or null, NOT an array
+        const orderWithTask = result.find(r => r.firstTask !== null);
+        if (orderWithTask) {
+          expect(orderWithTask.firstTask).not.toBeInstanceOf(Array);
+          expect(orderWithTask.firstTask).toHaveProperty('taskId');
+          expect(orderWithTask.firstTask).toHaveProperty('sortOrder');
+        }
+      });
+    });
+
+    test('firstOrDefault with navigation should return single object (LATERAL)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // This is the exact pattern from the user's query
+        const result = await db.orders
+          .withQueryOptions({ collectionStrategy: 'lateral' })
+          .where(o => gt(o.id, 0))
+          .select(o => ({
+            orderId: o.id,
+            orderItems: o.orderTasks!.select(ot => ({
+              taskId: ot.taskId,
+              // Navigation + firstOrDefault should return single object
+              firstCard: ot.task!.level!.createdBy!.posts!
+                .where(p => gt(p.views!, 0))
+                .select(p => ({
+                  postId: p.id,
+                  title: p.title,
+                }))
+                .firstOrDefault(),
+            })).toList(),
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        // Check that firstCard is an object or null, not an array
+        for (const order of result) {
+          for (const item of order.orderItems) {
+            if (item.firstCard !== null) {
+              expect(item.firstCard).not.toBeInstanceOf(Array);
+              expect(item.firstCard).toHaveProperty('postId');
+            }
+          }
+        }
+      });
+    });
   });
 });

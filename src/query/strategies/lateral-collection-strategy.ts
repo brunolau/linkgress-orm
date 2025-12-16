@@ -79,8 +79,14 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
 
     switch (config.aggregationType) {
       case 'jsonb':
-        lateralSQL = this.buildJsonbAggregation(config, lateralAlias, context);
-        selectExpression = `COALESCE("${lateralAlias}".data, ${config.defaultValue})`;
+        if (config.isSingleResult) {
+          // firstOrDefault() - return single object or null, not an array
+          lateralSQL = this.buildSingleJsonAggregation(config, lateralAlias, context);
+          selectExpression = `"${lateralAlias}".data`;  // Already handles null via subquery
+        } else {
+          lateralSQL = this.buildJsonbAggregation(config, lateralAlias, context);
+          selectExpression = `COALESCE("${lateralAlias}".data, ${config.defaultValue})`;
+        }
         break;
 
       case 'array':
@@ -394,6 +400,109 @@ FROM (
   ${whereSQL}
   ${orderBySQL}
   ${limitOffsetClause}
+) sub
+    `.trim();
+
+    return lateralSQL;
+  }
+
+  /**
+   * Build single JSON object aggregation using LATERAL (for firstOrDefault)
+   * Returns a single JSON object or null, not an array.
+   */
+  private buildSingleJsonAggregation(
+    config: CollectionAggregationConfig,
+    lateralAlias: string,
+    context: QueryContext
+  ): string {
+    const { selectedFields, targetTable, foreignKey, sourceTable, whereClause, orderByClause, isDistinct, navigationJoins } = config;
+
+    // Helper to collect all leaf fields from a potentially nested structure
+    const collectLeafFields = (fields: SelectedField[], prefix: string = ''): Array<{ alias: string; expression: string }> => {
+      const result: Array<{ alias: string; expression: string }> = [];
+      for (const field of fields) {
+        const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
+        if (field.nested) {
+          result.push(...collectLeafFields(field.nested, fullAlias));
+        } else if (field.expression) {
+          result.push({ alias: fullAlias, expression: field.expression });
+        }
+      }
+      return result;
+    };
+
+    // Helper to build json_build_object expression (handles nested structures)
+    const buildJsonbObject = (fields: SelectedField[], prefix: string = ''): string => {
+      const parts: string[] = [];
+      for (const field of fields) {
+        if (field.nested) {
+          const nestedJsonb = buildJsonbObject(field.nested, prefix ? `${prefix}__${field.alias}` : field.alias);
+          parts.push(`'${field.alias}', ${nestedJsonb}`);
+        } else {
+          const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
+          parts.push(`'${field.alias}', "${fullAlias}"`);
+        }
+      }
+      return `json_build_object(${parts.join(', ')})`;
+    };
+
+    // Collect all leaf fields for the SELECT clause
+    const leafFields = collectLeafFields(selectedFields);
+
+    // When there are navigation joins, we need to qualify unqualified field expressions
+    // with the target table name to avoid ambiguous column references
+    const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
+
+    // Build the subquery SELECT fields (no foreign key needed since we correlate with parent)
+    const allSelectFields = leafFields.map(f => {
+      // If expression is just a quoted column name (e.g., `"id"`), qualify it with target table
+      // But if it's already qualified (e.g., `"user"."username"`), leave it as is
+      const isSimpleColumn = /^"[^".]+"$/.test(f.expression);
+      if (isSimpleColumn && hasNavigationJoins) {
+        // Extract column name and qualify with target table
+        const columnName = f.expression.slice(1, -1); // Remove quotes
+        return `"${targetTable}"."${columnName}" as "${f.alias}"`;
+      }
+      if (f.expression !== `"${f.alias}"`) {
+        return `${f.expression} as "${f.alias}"`;
+      }
+      return f.expression;
+    });
+
+    // Build the JSONB fields for json_build_object
+    const jsonbObjectExpr = buildJsonbObject(selectedFields);
+
+    // Build navigation JOINs for multi-level navigation
+    const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
+
+    // Collect nested CTE/LATERAL joins (for collections within collections)
+    const nestedCteJoins = this.collectNestedCteJoins(selectedFields);
+    const nestedCteJoinsSQL = nestedCteJoins.length > 0 ? nestedCteJoins.join('\n  ') : '';
+
+    // Build WHERE clause - LATERAL correlates with parent via foreign key
+    let whereSQL = `WHERE "${targetTable}"."${foreignKey}" = "${sourceTable}"."id"`;
+    if (whereClause) {
+      whereSQL += ` AND ${whereClause}`;
+    }
+
+    // Build ORDER BY clause
+    const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : '';
+
+    // Build DISTINCT clause
+    const distinctClause = isDistinct ? 'DISTINCT ' : '';
+
+    // For single result, use row_to_json on the first row
+    // LIMIT 1 is applied inside the subquery
+    const lateralSQL = `
+SELECT ${jsonbObjectExpr} as data
+FROM (
+  SELECT ${distinctClause}${allSelectFields.join(', ')}
+  FROM "${targetTable}"
+  ${navJoinsSQL}
+  ${nestedCteJoinsSQL}
+  ${whereSQL}
+  ${orderBySQL}
+  LIMIT 1
 ) sub
     `.trim();
 

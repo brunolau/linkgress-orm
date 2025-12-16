@@ -3802,13 +3802,16 @@ export class SelectQueryBuilder<TSelection> {
             break;
           }
           case FieldType.COLLECTION_SINGLE: {
-            // firstOrDefault() - return first item or null
-            const items = rawValue || [];
-            if (config.collectionBuilder && items.length > 0) {
-              const transformedItems = this.transformCollectionItems(items, config.collectionBuilder);
+            // firstOrDefault() - return single object or null
+            // With CTE/LATERAL single result, rawValue is already a single object (not array)
+            if (rawValue === null || rawValue === undefined) {
+              result[key] = null;
+            } else if (config.collectionBuilder) {
+              // Transform the single item using collection mapper if available
+              const transformedItems = this.transformCollectionItems([rawValue], config.collectionBuilder);
               result[key] = transformedItems[0] ?? null;
             } else {
-              result[key] = items[0] ?? null;
+              result[key] = rawValue;
             }
             break;
           }
@@ -5476,6 +5479,7 @@ export class CollectionQueryBuilder<TItem = any> {
       limitValue: this.limitValue,
       offsetValue: this.offsetValue,
       isDistinct: this.isDistinct,
+      isSingleResult: this.isSingleResult(),  // For firstOrDefault() - returns single object instead of array
       aggregationType,
       aggregateField,
       arrayField,

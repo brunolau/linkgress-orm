@@ -202,6 +202,13 @@ export interface CollectionAggregationConfig {
   isDistinct?: boolean;
 
   /**
+   * Whether this is a single result (firstOrDefault) instead of a list.
+   * When true, returns a single JSON object instead of an array.
+   * Uses row_to_json instead of json_agg.
+   */
+  isSingleResult?: boolean;
+
+  /**
    * Aggregation type
    */
   aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum';
