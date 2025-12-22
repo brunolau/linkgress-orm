@@ -392,11 +392,39 @@ export class EqComparison<V = any> extends WhereComparisonBase<V> {
   protected getOperator(): string {
     return '=';
   }
+
+  /**
+   * Override buildSql to handle null values correctly.
+   * In SQL, `column = NULL` never matches anything (returns NULL, not TRUE).
+   * We convert `eq(field, null)` to `field IS NULL` for correct semantics.
+   */
+  override buildSql(context: SqlBuildContext): string {
+    // Check if value is explicitly null (not undefined, not a Placeholder)
+    if (this.value === null) {
+      const fieldName = this.getDbColumnName(this.field);
+      return `${fieldName} IS NULL`;
+    }
+    return super.buildSql(context);
+  }
 }
 
 export class NeComparison<V = any> extends WhereComparisonBase<V> {
   protected getOperator(): string {
     return '!=';
+  }
+
+  /**
+   * Override buildSql to handle null values correctly.
+   * In SQL, `column != NULL` never matches anything (returns NULL, not TRUE).
+   * We convert `ne(field, null)` to `field IS NOT NULL` for correct semantics.
+   */
+  override buildSql(context: SqlBuildContext): string {
+    // Check if value is explicitly null (not undefined, not a Placeholder)
+    if (this.value === null) {
+      const fieldName = this.getDbColumnName(this.field);
+      return `${fieldName} IS NOT NULL`;
+    }
+    return super.buildSql(context);
   }
 }
 

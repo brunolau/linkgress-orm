@@ -3272,6 +3272,15 @@ export class SelectQueryBuilder<TSelection> {
           allTableAliases.add(tableAlias);
         }
       }
+      // Also collect intermediate navigation aliases for multi-level navigation (e.g., task.level.name)
+      // The field ref may have __navigationAliases containing all aliases in the path
+      if ('__navigationAliases' in fieldRef && Array.isArray((fieldRef as any).__navigationAliases)) {
+        for (const navAlias of (fieldRef as any).__navigationAliases) {
+          if (navAlias && navAlias !== this.schema.name) {
+            allTableAliases.add(navAlias);
+          }
+        }
+      }
     }
 
     // Resolve all joins through the schema graph
@@ -4364,6 +4373,10 @@ export class SelectQueryBuilder<TSelection> {
    * Build count query
    */
   private buildCountQuery(context: QueryContext): { sql: string; params: any[] } {
+    // Detect navigation property joins from WHERE condition
+    const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+    this.detectAndAddJoinsFromCondition(this.whereCond, joins);
+
     // Build WHERE clause
     let whereClause = '';
     if (this.whereCond) {
@@ -4378,7 +4391,8 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     // Build FROM clause with JOINs
-    let fromClause = `FROM "${this.schema.name}"`;
+    const qualifiedTableName = this.getQualifiedTableName(this.schema.name, this.schema.schema);
+    let fromClause = `FROM ${qualifiedTableName}`;
 
     // Add manual JOINs
     for (const manualJoin of this.manualJoins) {
@@ -4403,6 +4417,24 @@ export class SelectQueryBuilder<TSelection> {
       } else {
         fromClause += `\n${joinTypeStr} "${manualJoin.table}" AS "${manualJoin.alias}" ON ${condSql}`;
       }
+    }
+
+    // Add JOINs for navigation properties referenced in WHERE clause
+    for (const join of joins) {
+      const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
+      // Build ON clause for the join
+      // For multi-level navigation, use the sourceAlias (the intermediate table)
+      // For direct navigation, use the main table name
+      const sourceTable = join.sourceAlias || this.schema.name;
+      const onConditions: string[] = [];
+      for (let i = 0; i < join.foreignKeys.length; i++) {
+        const fk = join.foreignKeys[i];
+        const match = join.matches[i];
+        onConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+      }
+      // Use schema-qualified table name if schema is specified
+      const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
+      fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
     const sql = `SELECT COUNT(*) as count\n${fromClause}\n${whereClause}`.trim();
@@ -4709,6 +4741,10 @@ export class ReferenceQueryBuilder<TItem = any> {
       }
 
       const sourceTable = this.targetTable;  // Actual table name for schema lookup
+      // Collect all navigation aliases from the path leading to this reference
+      // This is needed for WHERE conditions that use multi-level navigation (e.g., task.level.name)
+      const navigationAliases = this.navigationPath.map(nav => nav.alias);
+
       for (const [colName, dbColumnName] of columnNameMap) {
         const mapper = columnMappers[colName];
         Object.defineProperty(mock, colName, {
@@ -4721,6 +4757,7 @@ export class ReferenceQueryBuilder<TItem = any> {
                 __tableAlias: tableAlias,  // Alias for SQL generation
                 __sourceTable: sourceTable,  // Actual table name for mapper lookup
                 __mapper: mapper,  // Include mapper for toDriver transformation in conditions
+                __navigationAliases: navigationAliases,  // All intermediate navigation aliases for JOIN resolution
               };
             }
             return cached;
