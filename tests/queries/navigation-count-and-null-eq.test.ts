@@ -207,4 +207,104 @@ describe('Navigation in count() and null handling in eq()', () => {
       });
     });
   });
+
+  describe('exists() method', () => {
+    test('exists() should return true when rows match', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const exists = await db.users
+          .where(u => eq(u.username, 'alice'))
+          .exists();
+
+        expect(exists).toBe(true);
+      });
+    });
+
+    test('exists() should return false when no rows match', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const exists = await db.users
+          .where(u => eq(u.username, 'nonexistent'))
+          .exists();
+
+        expect(exists).toBe(false);
+      });
+    });
+
+    test('exists() should work with navigation properties in WHERE', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Check if orders exist where user.username equals 'alice'
+        const exists = await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .exists();
+
+        expect(exists).toBe(true);
+      });
+    });
+
+    test('exists() should work with multi-level navigation in WHERE', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Check if order tasks exist where task.level.name equals 'High Priority'
+        const exists = await db.orderTasks
+          .where(ot => eq(ot.task!.level!.name, 'High Priority'))
+          .exists();
+
+        expect(exists).toBe(true);
+      });
+    });
+
+    test('exists() should return false for multi-level navigation with no matches', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const exists = await db.orderTasks
+          .where(ot => eq(ot.task!.level!.name, 'NonExistent Priority'))
+          .exists();
+
+        expect(exists).toBe(false);
+      });
+    });
+
+    test('exists() should work with null check using eq()', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Insert a user with null age
+        await db.users.insert({
+          username: 'nullage',
+          email: 'nullage@test.com',
+          age: null as any,
+          isActive: true,
+        }).returning();
+
+        // Check if user with null age exists
+        const exists = await db.users
+          .where(u => eq(u.age, null as any))
+          .exists();
+
+        expect(exists).toBe(true);
+      });
+    });
+
+    test('exists() should work with complex conditions', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const exists = await db.orders
+          .where(o => and(
+            eq(o.user!.isActive, true),
+            eq(o.status, 'completed')
+          ))
+          .exists();
+
+        expect(exists).toBe(true);
+      });
+    });
+  });
 });

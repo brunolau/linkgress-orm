@@ -1552,15 +1552,35 @@ export class SelectQueryBuilder<TSelection> {
       executor: this.executor,
     };
 
-    // Build count query
-    const { sql, params } = this.buildCountQuery(context);
+    const { sql, params } = this.buildAggregateQuery(context, 'count');
 
-    // Execute
     const result = this.executor
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
     return parseInt(result.rows[0]?.count ?? '0', 10);
+  }
+
+  /**
+   * Check if any rows match the query
+   * More efficient than count() > 0 as it can stop after finding one row
+   */
+  async exists(): Promise<boolean> {
+    const context: QueryContext = {
+      ctes: new Map(),
+      cteCounter: 0,
+      paramCounter: 1,
+      allParams: [],
+      executor: this.executor,
+    };
+
+    const { sql, params } = this.buildAggregateQuery(context, 'exists');
+
+    const result = this.executor
+      ? await this.executor.query(sql, params)
+      : await this.client.query(sql, params);
+
+    return result.rows[0]?.exists === true;
   }
 
   /**
@@ -4370,9 +4390,9 @@ export class SelectQueryBuilder<TSelection> {
   }
 
   /**
-   * Build count query
+   * Build aggregate query (count or exists)
    */
-  private buildCountQuery(context: QueryContext): { sql: string; params: any[] } {
+  private buildAggregateQuery(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
     // Detect navigation property joins from WHERE condition
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
@@ -4437,7 +4457,14 @@ export class SelectQueryBuilder<TSelection> {
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
-    const sql = `SELECT COUNT(*) as count\n${fromClause}\n${whereClause}`.trim();
+    // Build SELECT clause based on type
+    const selectClause = type === 'count'
+      ? 'SELECT COUNT(*) as count'
+      : 'SELECT EXISTS(SELECT 1';
+
+    const sql = type === 'count'
+      ? `${selectClause}\n${fromClause}\n${whereClause}`.trim()
+      : `${selectClause}\n${fromClause}\n${whereClause})`.trim();
 
     return {
       sql,

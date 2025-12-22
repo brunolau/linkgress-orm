@@ -1600,6 +1600,7 @@ export interface EntityCollectionQueryWithSelect<TEntity extends DbEntity, TSele
   max(): Promise<TSelection | null>;
   sum(): Promise<TSelection | null>;
   count(): Promise<number>;
+  exists(): Promise<boolean>;
 
   // Flattened list results (for single-column selections)
   toNumberList(asName?: string): number[];
@@ -1726,6 +1727,11 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   count(): Promise<number>;
 
   /**
+   * Check if any rows match the query
+   */
+  exists(): Promise<boolean>;
+
+  /**
    * Delete records matching the current WHERE condition
    * Returns a fluent builder that can be awaited directly or chained with .returning()
    */
@@ -1771,6 +1777,8 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   offset(count: number): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   count(): Promise<number>;
+
+  exists(): Promise<boolean>;
 
   first(): Promise<ResolveCollectionResults<TSelection>>;
 
@@ -1830,6 +1838,7 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   max<TResult = TSelection>(selector?: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TResult): Promise<TResult | null>;
   sum<TResult = TSelection>(selector?: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TResult): Promise<TResult | null>;
   count(): Promise<number>;
+  exists(): Promise<boolean>;
 
   // Subquery conversion
   asSubquery<TMode extends 'scalar' | 'array' | 'table' = 'table'>(mode?: TMode): import('../query/subquery').Subquery<
@@ -2290,6 +2299,23 @@ export class DbEntityTable<TEntity extends DbEntity> {
       : await client.query(sql, []);
 
     return parseInt(result.rows[0].count);
+  }
+
+  /**
+   * Check if any records exist
+   */
+  async exists(): Promise<boolean> {
+    const qualifiedTableName = this._getQualifiedTableName();
+    const sql = `SELECT EXISTS(SELECT 1 FROM ${qualifiedTableName})`;
+
+    const executor = this._getExecutor();
+    const client = this._getClient();
+
+    const result = executor
+      ? await executor.query(sql, [])
+      : await client.query(sql, []);
+
+    return result.rows[0].exists === true;
   }
 
   /**
