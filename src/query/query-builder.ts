@@ -2386,16 +2386,53 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Delete requires a WHERE condition. Use where() before delete().');
       }
 
+      // Detect navigation property joins from WHERE condition
+      const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, joins);
+
       const condBuilder = new ConditionBuilder();
       const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, 1);
 
+      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
+
+      // Build USING clause for navigation properties (PostgreSQL syntax for DELETE with JOINs)
+      let usingClause = '';
+      let joinConditions: string[] = [];
+      for (const join of joins) {
+        const sourceTable = join.sourceAlias || queryBuilder.schema.name;
+        const joinTableName = queryBuilder.getQualifiedTableName(join.targetTable, join.targetSchema);
+
+        if (usingClause) {
+          usingClause += `, ${joinTableName} AS "${join.alias}"`;
+        } else {
+          usingClause = `USING ${joinTableName} AS "${join.alias}"`;
+        }
+
+        // Build ON conditions as part of WHERE clause
+        for (let i = 0; i < join.foreignKeys.length; i++) {
+          const fk = join.foreignKeys[i];
+          const match = join.matches[i];
+          joinConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+        }
+      }
+
       // Build RETURNING clause (not needed for count-only)
+      // Qualify columns with table name when using USING clause to avoid ambiguity
+      const hasJoins = joins.length > 0;
       const returningClause = returning !== 'count'
-        ? queryBuilder.buildDeleteReturningClause(returning)
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins)
         : undefined;
 
-      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
-      let sql = `DELETE FROM ${qualifiedTableName} WHERE ${whereSql}`;
+      // Combine join conditions with the original WHERE clause
+      const fullWhereClause = joinConditions.length > 0
+        ? `${joinConditions.join(' AND ')} AND ${whereSql}`
+        : whereSql;
+
+      let sql = `DELETE FROM ${qualifiedTableName}`;
+      if (usingClause) {
+        sql += ` ${usingClause}`;
+      }
+      sql += ` WHERE ${fullWhereClause}`;
       if (returningClause) {
         sql += ` RETURNING ${returningClause.sql}`;
       }
@@ -2505,7 +2542,7 @@ export class SelectQueryBuilder<TSelection> {
 
       // Build RETURNING clause (not needed for count-only)
       const returningClause = returning !== 'count'
-        ? queryBuilder.buildDeleteReturningClause(returning)
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning)
         : undefined;
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
@@ -2563,19 +2600,24 @@ export class SelectQueryBuilder<TSelection> {
 
   /**
    * Build RETURNING clause for delete/update operations
+   * @param returning - The returning configuration
+   * @param qualifyWithTable - If true, qualify column names with the main table name (needed for DELETE with USING)
    * @internal
    */
-  private buildDeleteReturningClause<TResult>(
-    returning: undefined | true | ((row: TSelection) => TResult)
+  private buildUpdateDeleteReturningClause<TResult>(
+    returning: undefined | true | ((row: TSelection) => TResult),
+    qualifyWithTable: boolean = false
   ): { sql: string; columns: string[] } | null {
     if (returning === undefined) {
       return null;
     }
 
+    const tablePrefix = qualifyWithTable ? `"${this.schema.name}".` : '';
+
     if (returning === true) {
       // Return all columns
       const columns = Object.values(this.schema.columns).map(col => (col as any).build().name);
-      const sql = columns.map(name => `"${name}"`).join(', ');
+      const sql = columns.map(name => `${tablePrefix}"${name}"`).join(', ');
       return { sql, columns };
     }
 
@@ -2592,7 +2634,7 @@ export class SelectQueryBuilder<TSelection> {
         if (field && typeof field === 'object' && '__dbColumnName' in field) {
           const dbName = (field as any).__dbColumnName;
           columns.push(alias);
-          sqlParts.push(`"${dbName}" AS "${alias}"`);
+          sqlParts.push(`${tablePrefix}"${dbName}" AS "${alias}"`);
         }
       }
 

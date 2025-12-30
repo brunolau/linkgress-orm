@@ -1,6 +1,6 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, ne, gt, and } from '../../src';
+import { eq, ne, gt, and, inSubquery } from '../../src';
 
 describe('Navigation in count() and null handling in eq()', () => {
   describe('eq() with null values', () => {
@@ -304,6 +304,190 @@ describe('Navigation in count() and null handling in eq()', () => {
           .exists();
 
         expect(exists).toBe(true);
+      });
+    });
+  });
+
+  describe('delete() with navigation properties in WHERE', () => {
+    test('delete() should work with single navigation property in where', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // First verify orders exist for alice
+        const beforeCount = await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .count();
+        expect(beforeCount).toBe(1);
+
+        // Delete orders where user.username equals 'alice'
+        await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .delete();
+
+        // Verify orders were deleted
+        const afterCount = await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .count();
+        expect(afterCount).toBe(0);
+      });
+    });
+
+    test('delete() should work with navigation property and return affected count', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Delete orders where user is active
+        const affectedCount = await db.orders
+          .where(o => eq(o.user!.isActive, true))
+          .delete()
+          .affectedCount();
+
+        // Both alice and bob are active and have orders
+        expect(affectedCount).toBe(2);
+      });
+    });
+
+    test('delete() should work with navigation property and returning', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Delete orders where user.username equals 'alice' and return the deleted ids
+        const deleted = await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .delete()
+          .returning(o => ({ id: o.id }));
+
+        expect(deleted.length).toBe(1);
+        expect(deleted[0].id).toBeDefined();
+      });
+    });
+
+    test('delete() should work with multi-level navigation in where', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // First verify order tasks exist
+        const beforeCount = await db.orderTasks
+          .where(ot => eq(ot.task!.level!.name, 'High Priority'))
+          .count();
+        expect(beforeCount).toBe(1);
+
+        // Delete order tasks where task.level.name equals 'High Priority'
+        await db.orderTasks
+          .where(ot => eq(ot.task!.level!.name, 'High Priority'))
+          .delete();
+
+        // Verify order tasks were deleted
+        const afterCount = await db.orderTasks
+          .where(ot => eq(ot.task!.level!.name, 'High Priority'))
+          .count();
+        expect(afterCount).toBe(0);
+      });
+    });
+
+    test('delete() should work with complex navigation conditions', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Delete orders where user is active and status is completed
+        const affectedCount = await db.orders
+          .where(o => and(
+            eq(o.user!.isActive, true),
+            eq(o.status, 'completed')
+          ))
+          .delete()
+          .affectedCount();
+
+        // Only alice's completed order should be deleted
+        expect(affectedCount).toBe(1);
+      });
+    });
+  });
+
+  describe('delete() with subqueries in WHERE', () => {
+    test('delete() should work with inSubquery condition', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Create a subquery to get user IDs with posts
+        const usersWithPostsSubquery = db.posts
+          .select(p => p.userId)
+          .asSubquery('array');
+
+        // First verify orders exist for users with posts
+        const beforeCount = await db.orders
+          .where(o => inSubquery(o.userId, usersWithPostsSubquery))
+          .count();
+        expect(beforeCount).toBeGreaterThan(0);
+
+        // Delete orders where userId is in the subquery (users who have posts)
+        const affectedCount = await db.orders
+          .where(o => inSubquery(o.userId, usersWithPostsSubquery))
+          .delete()
+          .affectedCount();
+
+        expect(affectedCount).toBeGreaterThan(0);
+
+        // Verify orders were deleted
+        const afterCount = await db.orders
+          .where(o => inSubquery(o.userId, usersWithPostsSubquery))
+          .count();
+        expect(afterCount).toBe(0);
+      });
+    });
+
+    test('delete() should work with subquery and navigation combined', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Create a subquery to get active user IDs
+        const activeUsersSubquery = db.users
+          .where(u => eq(u.isActive, true))
+          .select(u => u.id)
+          .asSubquery('array');
+
+        // Delete orders where userId is in active users AND user.username is 'alice'
+        const deleted = await db.orders
+          .where(o => and(
+            inSubquery(o.userId, activeUsersSubquery),
+            eq(o.user!.username, 'alice')
+          ))
+          .delete()
+          .returning(o => ({ id: o.id }));
+
+        expect(deleted.length).toBe(1);
+      });
+    });
+
+    test('delete() should work with subquery returning specific columns', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Subquery selecting specific task IDs based on status
+        const completedTasksSubquery = db.tasks
+          .where(t => eq(t.status, 'completed'))
+          .select(t => t.id)
+          .asSubquery('array');
+
+        // Count before delete
+        const beforeCount = await db.orderTasks
+          .where(ot => inSubquery(ot.taskId, completedTasksSubquery))
+          .count();
+
+        // Delete order tasks where taskId is in completed tasks
+        await db.orderTasks
+          .where(ot => inSubquery(ot.taskId, completedTasksSubquery))
+          .delete();
+
+        // Verify deletion
+        const afterCount = await db.orderTasks
+          .where(ot => inSubquery(ot.taskId, completedTasksSubquery))
+          .count();
+
+        // If there were completed tasks, count should be 0 now
+        if (beforeCount > 0) {
+          expect(afterCount).toBe(0);
+        }
       });
     });
   });
