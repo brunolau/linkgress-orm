@@ -1,6 +1,6 @@
 /**
  * Configuration types for database clients
- * These are based on the actual pg and postgres libraries but defined here
+ * These are based on the actual pg, postgres, and Bun SQL libraries but defined here
  * to avoid requiring the packages at compile time.
  */
 
@@ -237,4 +237,127 @@ export interface PostgresOptions {
    * Target session attributes (default: any)
    */
   target_session_attrs?: 'any' | 'read-write' | 'read-only' | 'primary' | 'standby' | 'prefer-standby';
+}
+
+/**
+ * Connection options for Bun's built-in SQL client
+ * @see https://bun.sh/docs/api/sql
+ *
+ * Bun SQL supports PostgreSQL, MySQL, and SQLite with a unified API.
+ */
+export interface BunSqlOptions {
+  /**
+   * Connection URL (alternative to individual options)
+   * Format: postgres://user:password@host:port/database
+   *         mysql://user:password@host:port/database
+   *         sqlite://path/to/database.db or :memory:
+   */
+  url?: string;
+
+  /**
+   * Database adapter type
+   * If not specified, will be inferred from URL or defaults to postgres
+   */
+  adapter?: 'postgres' | 'mysql' | 'mysql2' | 'sqlite';
+
+  /**
+   * Database hostname (default: localhost)
+   */
+  hostname?: string;
+
+  /**
+   * Database server port
+   * PostgreSQL default: 5432
+   * MySQL default: 3306
+   */
+  port?: number;
+
+  /**
+   * Database name
+   */
+  database?: string;
+
+  /**
+   * Database username
+   */
+  username?: string;
+
+  /**
+   * Database password
+   */
+  password?: string;
+
+  /**
+   * SQLite-specific: Path to the database file
+   * Use ":memory:" for in-memory database
+   */
+  filename?: string;
+
+  /**
+   * Maximum number of connections in the pool (default: 10)
+   */
+  max?: number;
+
+  /**
+   * Idle connection timeout in seconds (default: undefined)
+   */
+  idleTimeout?: number;
+
+  /**
+   * Maximum lifetime of a connection in seconds (default: 3600)
+   */
+  maxLifetime?: number;
+
+  /**
+   * Connection timeout in seconds (default: 30)
+   */
+  connectionTimeout?: number;
+
+  /**
+   * TLS/SSL configuration
+   * For PostgreSQL: boolean or TLS options object
+   * For MySQL: 'disable' | 'require' | 'verify-ca' | 'verify-full' | 'prefer'
+   */
+  tls?: boolean | {
+    rejectUnauthorized?: boolean;
+    ca?: string;
+    key?: string;
+    cert?: string;
+  };
+
+  /**
+   * MySQL SSL mode
+   */
+  ssl?: 'disable' | 'require' | 'verify-ca' | 'verify-full' | 'prefer';
+
+  /**
+   * Whether to use prepared statements (default: true)
+   * Set to false to use unnamed prepared statements
+   */
+  prepare?: boolean;
+
+  /**
+   * Whether to return large integers as BigInt (default: false)
+   * When false, large integers are returned as strings
+   */
+  bigint?: boolean;
+
+  /**
+   * SQLite-specific options
+   */
+  readonly?: boolean;
+  create?: boolean;
+  readwrite?: boolean;
+  strict?: boolean;
+  safeIntegers?: boolean;
+
+  /**
+   * Called when a connection is established
+   */
+  onconnect?: (client: any) => void;
+
+  /**
+   * Called when a connection is closed
+   */
+  onclose?: (client: any) => void;
 }

@@ -259,7 +259,12 @@ export {
   PgClient,
 } from './database/pg-client';
 
+export {
+  BunClient,
+} from './database/bun-client';
+
 export type {
   PoolConfig,
   PostgresOptions,
+  BunSqlOptions,
 } from './database/types';
