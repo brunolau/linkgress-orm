@@ -2545,6 +2545,10 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Update requires a WHERE condition. Use where() before update().');
       }
 
+      // Detect navigation property joins from WHERE condition
+      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
+
       // Build SET clause
       const setClauses: string[] = [];
       const values: any[] = [];
@@ -2573,6 +2577,32 @@ export class SelectQueryBuilder<TSelection> {
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
 
+      // Build FROM clause for navigation properties (PostgreSQL syntax for UPDATE with JOINs)
+      let fromClause = '';
+      let joinConditions: string[] = [];
+      for (const join of whereJoins) {
+        const sourceTable = join.sourceAlias || queryBuilder.schema.name;
+        const joinTableName = queryBuilder.getQualifiedTableName(join.targetTable, join.targetSchema);
+
+        if (fromClause) {
+          fromClause += `, ${joinTableName} AS "${join.alias}"`;
+        } else {
+          fromClause = `FROM ${joinTableName} AS "${join.alias}"`;
+        }
+
+        // Build ON conditions as part of WHERE clause
+        for (let i = 0; i < join.foreignKeys.length; i++) {
+          const fk = join.foreignKeys[i];
+          const match = join.matches[i];
+          joinConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+        }
+      }
+
+      // Combine join conditions with the original WHERE clause
+      const fullWhereClause = joinConditions.length > 0
+        ? `${joinConditions.join(' AND ')} AND ${whereSql}`
+        : whereSql;
+
       // Check if RETURNING uses navigation properties
       const navigationInfo = returning && returning !== 'count' && returning !== true
         ? queryBuilder.detectNavigationInReturning(returning)
@@ -2580,7 +2610,11 @@ export class SelectQueryBuilder<TSelection> {
 
       if (navigationInfo) {
         // Use CTE-based approach for navigation properties in RETURNING
-        const updateSql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')} WHERE ${whereSql}`;
+        let updateSql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
+        if (fromClause) {
+          updateSql += ` ${fromClause}`;
+        }
+        updateSql += ` WHERE ${fullWhereClause}`;
 
         const { sql, params } = queryBuilder.buildReturningWithNavigation(
           updateSql,
@@ -2601,11 +2635,17 @@ export class SelectQueryBuilder<TSelection> {
       }
 
       // Standard RETURNING (no navigation properties)
+      // Qualify columns with table name when using FROM clause to avoid ambiguity
+      const hasJoins = whereJoins.length > 0;
       const returningClause = returning !== 'count'
-        ? queryBuilder.buildUpdateDeleteReturningClause(returning)
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins)
         : undefined;
 
-      let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')} WHERE ${whereSql}`;
+      let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
+      if (fromClause) {
+        sql += ` ${fromClause}`;
+      }
+      sql += ` WHERE ${fullWhereClause}`;
       if (returningClause) {
         sql += ` RETURNING ${returningClause.sql}`;
       }

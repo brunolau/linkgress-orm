@@ -1,6 +1,6 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, ne, gt, and, inSubquery } from '../../src';
+import { eq, ne, gt, and, inSubquery, inArray } from '../../src';
 
 describe('Navigation in count() and null handling in eq()', () => {
   describe('eq() with null values', () => {
@@ -488,6 +488,104 @@ describe('Navigation in count() and null handling in eq()', () => {
         if (beforeCount > 0) {
           expect(afterCount).toBe(0);
         }
+      });
+    });
+  });
+
+  describe('update() with navigation properties in WHERE', () => {
+    test('update() should work with navigation property in WHERE', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Update orders where user.username is 'alice'
+        const updated = await db.orders
+          .where(o => eq(o.user!.username, 'alice'))
+          .update({ status: 'processing' })
+          .returning(o => ({ id: o.id, status: o.status }));
+
+        expect(updated.length).toBe(1);
+        expect(updated[0].status).toBe('processing');
+      });
+    });
+
+    test('update() should work with multiple navigation conditions', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Update orders where user.isActive is true and user.age > 30
+        const affectedCount = await db.orders
+          .where(o => and(
+            eq(o.user!.isActive, true),
+            gt(o.user!.age, 30)
+          ))
+          .update({ status: 'completed' })
+          .affectedCount();
+
+        // Bob is active and age > 30, so his order should be updated
+        expect(affectedCount).toBeGreaterThan(0);
+      });
+    });
+
+    test('update() should work with navigation and regular conditions combined', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Update orders where user.username is 'bob' AND status is 'pending'
+        const updated = await db.orders
+          .where(o => and(
+            eq(o.user!.username, 'bob'),
+            eq(o.status, 'pending')
+          ))
+          .update({ totalAmount: 199.99 })
+          .returning(o => ({ id: o.id, totalAmount: o.totalAmount }));
+
+        expect(updated.length).toBe(1);
+        expect(Number(updated[0].totalAmount)).toBe(199.99);
+      });
+    });
+
+    test('update() should work with inArray on navigation property', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Update posts where user.username is in ['alice', 'bob']
+        const affectedCount = await db.posts
+          .where(p => inArray(p.user!.username, ['alice', 'bob']))
+          .update({ views: 999 })
+          .affectedCount();
+
+        // Alice has 2 posts, Bob has 1 = 3 total
+        expect(affectedCount).toBe(3);
+
+        // Verify the update
+        const posts = await db.posts
+          .where(p => eq(p.views, 999))
+          .toList();
+        expect(posts.length).toBe(3);
+      });
+    });
+
+    test('update() should work with subquery and navigation combined', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Create a subquery to get active user IDs
+        const activeUsersSubquery = db.users
+          .where(u => eq(u.isActive, true))
+          .select(u => u.id)
+          .asSubquery('array');
+
+        // Update orders where userId is in active users AND user.username is 'alice'
+        const updated = await db.orders
+          .where(o => and(
+            inSubquery(o.userId, activeUsersSubquery),
+            eq(o.user!.username, 'alice')
+          ))
+          .update({ status: 'refunded' })
+          .returning(o => ({ id: o.id, status: o.status }));
+
+        expect(updated.length).toBe(1);
+        expect(updated[0].status).toBe('refunded');
       });
     });
   });
