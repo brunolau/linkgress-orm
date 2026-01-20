@@ -1,6 +1,7 @@
 import { DbColumn, DbEntity } from "../../src";
 import type { User } from "./user";
 import type { HourMinute } from "../types/hour-minute";
+import type { PostComment } from "./postComment";
 
 export class Post extends DbEntity {
   id!: DbColumn<number>;
@@ -14,6 +15,7 @@ export class Post extends DbEntity {
   customDate?: DbColumn<Date>; // Integer-based custom datetime
   category!: DbColumn<'tech' | 'lifestyle' | 'business' | 'entertainment'>;
 
-  // Navigation property
+  // Navigation properties
   user?: User;
+  postComments?: PostComment[];
 }

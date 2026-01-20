@@ -1063,5 +1063,396 @@ describe('LATERAL Strategy SQL Generation', () => {
         expect(bob!.orders[0].taskCount).toBe(1);
       }, { collectionStrategy: 'lateral' });
     });
+
+    test('should isolate sibling collections with nested correlated subqueries', async () => {
+      // This test verifies that sibling collections at the same level don't interfere with each other.
+      // The bug was that when one LATERAL collection (e.g., orders with orderTasks.toNumberList)
+      // registers its table alias, it would leak into sibling collections (e.g., posts),
+      // causing SQL errors like "missing FROM-clause entry for table lateral_X_tableName"
+      //
+      // The fix involves saving and restoring the lateralTableAliasMap state after each
+      // sibling collection is built, so that each sibling starts with a clean map.
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Query with TWO sibling collections, BOTH containing nested correlated subqueries
+        // This pattern would fail before the fix because:
+        // 1. First collection (orders) registers "orders" -> "lateral_0_orders" in the map
+        // 2. After first collection completes, the map is NOT cleaned up (the bug)
+        // 3. Second collection (posts) builds and the stale "orders" entry could interfere
+        //    with any nested queries that might reference overlapping tables
+        const results = await db.users
+          .select(u => ({
+            username: u.username,
+            // First sibling collection with nested correlated subquery (toNumberList)
+            orders: u.orders!.select(o => ({
+              orderId: o.id,
+              taskIds: o.orderTasks!.select(ot => ({ id: ot.taskId })).toNumberList('taskIds'),
+            })).toList('orders'),
+            // Second sibling collection - even without nested correlated subquery,
+            // this tests that the first sibling's alias map doesn't leak
+            posts: u.posts!.select(p => ({
+              postId: p.id,
+              title: p.title,
+              views: p.views,
+            })).toList('posts'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(3);
+
+        // Verify Alice has both orders and posts
+        const alice = results.find(u => u.username === 'alice');
+        expect(alice).toBeDefined();
+        expect(alice!.orders.length).toBe(1);
+        expect(alice!.orders[0].taskIds).toBeInstanceOf(Array);
+        expect(alice!.orders[0].taskIds.length).toBe(1); // Alice's order has 1 task
+        expect(alice!.posts.length).toBe(2);
+        expect(alice!.posts[0].title).toBeDefined();
+
+        // Verify Bob has both orders and posts
+        const bob = results.find(u => u.username === 'bob');
+        expect(bob).toBeDefined();
+        expect(bob!.orders.length).toBe(1);
+        expect(bob!.orders[0].taskIds.length).toBe(1); // Bob's order has 1 task
+        expect(bob!.posts.length).toBe(1);
+
+        // Verify Charlie has no orders and no posts
+        const charlie = results.find(u => u.username === 'charlie');
+        expect(charlie).toBeDefined();
+        expect(charlie!.orders.length).toBe(0);
+        expect(charlie!.posts.length).toBe(0);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('should isolate sibling collections when same table appears in multiple siblings with nested queries', async () => {
+      // This test verifies that multiple sibling collections targeting the SAME table
+      // with nested correlated subqueries work correctly.
+      //
+      // The fix (save/restore lateralTableAliasMap) ensures that each sibling collection
+      // operates with a clean map state, preventing stale aliases from a previous sibling
+      // from affecting the current one. This is a defensive measure that prevents a class
+      // of bugs like "missing FROM-clause entry for table lateral_X_tableName".
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Query with TWO sibling collections targeting the SAME table (orders)
+        // Each sibling has a nested correlated subquery that needs to reference its parent
+        const results = await db.users
+          .select(u => ({
+            username: u.username,
+            // First sibling: completed orders with nested orderTasks
+            // This registers "orders" -> "lateral_0_orders" in the map
+            completedOrders: u.orders!
+              .where(o => eq(o.status, 'completed'))
+              .select(o => ({
+                orderId: o.id,
+                taskIds: o.orderTasks!.select(ot => ({ id: ot.taskId })).toNumberList('taskIds'),
+              })).toList('completedOrders'),
+            // Second sibling: pending orders with nested orderTasks (SAME table!)
+            // WITHOUT THE FIX: the nested orderTasks lookup finds stale "lateral_0_orders"
+            // which is out of scope for this second LATERAL join
+            pendingOrders: u.orders!
+              .where(o => eq(o.status, 'pending'))
+              .select(o => ({
+                orderId: o.id,
+                taskIds: o.orderTasks!.select(ot => ({ id: ot.taskId })).toNumberList('taskIds'),
+              })).toList('pendingOrders'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(3);
+
+        // Verify Alice has completed order but no pending orders
+        const alice = results.find(u => u.username === 'alice');
+        expect(alice).toBeDefined();
+        expect(alice!.completedOrders.length).toBe(1);
+        expect(alice!.completedOrders[0].taskIds).toBeInstanceOf(Array);
+        expect(alice!.pendingOrders.length).toBe(0);
+
+        // Verify Bob has pending order but no completed orders
+        const bob = results.find(u => u.username === 'bob');
+        expect(bob).toBeDefined();
+        expect(bob!.completedOrders.length).toBe(0);
+        expect(bob!.pendingOrders.length).toBe(1);
+        expect(bob!.pendingOrders[0].taskIds).toBeInstanceOf(Array);
+
+        // Verify Charlie has no orders
+        const charlie = results.find(u => u.username === 'charlie');
+        expect(charlie).toBeDefined();
+        expect(charlie!.completedOrders.length).toBe(0);
+        expect(charlie!.pendingOrders.length).toBe(0);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('complex ecommerce pattern: sibling collections with nested toNumberList and navigation', async () => {
+      // This test replicates the EXACT pattern from complex ecommerce that triggered the bug:
+      // "missing FROM-clause entry for table lateral_X_products"
+      //
+      // The query pattern is:
+      // db.products.select(product => ({
+      //   tagIds: product.productTags.select(pt => ({ id: pt.tag.id })).toNumberList(),  // sibling 1
+      //   seasonIds: product.productPrices.selectDistinct(p => ({ seasonId: p.seasonId })).toNumberList(), // sibling 2
+      // }))
+      //
+      // The bug pattern:
+      // 1. First sibling (productTags) builds as LATERAL, registers "product_tags" in lateralTableAliasMap
+      // 2. productTags has navigation to tag (pt.tag.id) which adds a JOIN
+      // 3. Second sibling (productPrices) builds as LATERAL
+      // 4. productPrices.toNumberList() builds a correlated subquery
+      // 5. WITHOUT THE FIX: The buildNavigationJoinsWithAlias looks up sourceAlias in the map
+      //    and may incorrectly find stale aliases from the first sibling
+      // 6. This causes: "missing FROM-clause entry for table lateral_X_tableName"
+      //
+      // WITH THE FIX: Each sibling's map entries are cleaned up after building,
+      // preventing stale aliases from leaking to sibling collections.
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Query that mirrors the complex ecommerce pattern exactly:
+        // - productTags with navigation (pt.tag!.id)
+        // - productPrices with toNumberList (sibling)
+        const results = await db.products
+          .select(product => ({
+            productId: product.id,
+            productName: product.name,
+            // Sibling 1: productTags with navigation to tag table
+            tagIds: product.productTags!.select(pt => ({
+              id: pt.tag!.id,  // Navigation: productTag -> tag
+            })).toNumberList('tagIds'),
+            // Sibling 2: productPrices with toNumberList
+            seasonIds: product.productPrices!.selectDistinct(pp => ({
+              seasonId: pp.seasonId,
+            })).toNumberList('seasonIds'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(2); // skiPass and liftTicket
+
+        // Verify skiPass has 2 tags and 2 seasons
+        const skiPass = results.find(p => p.productName === 'Ski Pass');
+        expect(skiPass).toBeDefined();
+        expect(skiPass!.tagIds).toBeInstanceOf(Array);
+        expect(skiPass!.tagIds.length).toBe(2); // winterTag, familyTag
+        expect(skiPass!.seasonIds).toBeInstanceOf(Array);
+        expect(skiPass!.seasonIds.length).toBe(2); // season 1 and 2
+
+        // Verify liftTicket has 1 tag and 1 season
+        const liftTicket = results.find(p => p.productName === 'Lift Ticket');
+        expect(liftTicket).toBeDefined();
+        expect(liftTicket!.tagIds).toBeInstanceOf(Array);
+        expect(liftTicket!.tagIds.length).toBe(1); // summerTag
+        expect(liftTicket!.seasonIds).toBeInstanceOf(Array);
+        expect(liftTicket!.seasonIds.length).toBe(1); // season 1
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('complex ecommerce pattern: deeply nested capacityGroupIds inside prices', async () => {
+      // This tests the original bug pattern that was fixed in v0.2.14:
+      // Nested collections inside LATERAL joins with correlated subqueries.
+      //
+      // The query pattern is:
+      // db.products.select(product => ({
+      //   prices: product.productPrices.select(price => ({
+      //     capacityGroupIds: price.productPriceCapacityGroups.select(cg => ({
+      //       id: cg.capacityGroupId,
+      //     })).toNumberList('capacityGroupIds'),
+      //   })).toList('prices'),
+      // }))
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Query with nested collection inside collection
+        const results = await db.products
+          .select(product => ({
+            productId: product.id,
+            productName: product.name,
+            prices: product.productPrices!.select(price => ({
+              priceId: price.id,
+              seasonId: price.seasonId,
+              priceAmount: price.price,
+              // Nested: capacityGroupIds inside prices
+              capacityGroupIds: price.productPriceCapacityGroups!.select(cg => ({
+                id: cg.capacityGroupId,
+              })).toNumberList('capacityGroupIds'),
+            })).toList('prices'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(2);
+
+        // Verify skiPass has 2 prices with capacity groups
+        const skiPass = results.find(p => p.productName === 'Ski Pass');
+        expect(skiPass).toBeDefined();
+        expect(skiPass!.prices.length).toBe(2);
+        // First price (winter) has 2 capacity groups
+        const winterPrice = skiPass!.prices.find(p => p.seasonId === 1);
+        expect(winterPrice!.capacityGroupIds.length).toBe(2);
+        // Second price (summer) has 1 capacity group
+        const summerPrice = skiPass!.prices.find(p => p.seasonId === 2);
+        expect(summerPrice!.capacityGroupIds.length).toBe(1);
+
+        // Verify liftTicket
+        const liftTicket = results.find(p => p.productName === 'Lift Ticket');
+        expect(liftTicket).toBeDefined();
+        expect(liftTicket!.prices.length).toBe(1);
+        expect(liftTicket!.prices[0].capacityGroupIds.length).toBe(1);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('complex ecommerce pattern: combined sibling collections with deeply nested queries', async () => {
+      // This is the COMPLETE pattern that triggered the regression:
+      // Multiple sibling collections at the same level, where one sibling has
+      // deeply nested collections, and another sibling has navigation.
+      //
+      // This is the pattern that would fail with:
+      // "missing FROM-clause entry for table lateral_X_products"
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const results = await db.products
+          .select(product => ({
+            productId: product.id,
+            productName: product.name,
+            // Sibling 1: tagIds with navigation (pt.tag!.id)
+            tagIds: product.productTags!.select(pt => ({
+              id: pt.tag!.id,
+            })).toNumberList('tagIds'),
+            // Sibling 2: prices with nested capacityGroupIds
+            prices: product.productPrices!.select(price => ({
+              priceId: price.id,
+              capacityGroupIds: price.productPriceCapacityGroups!.select(cg => ({
+                id: cg.capacityGroupId,
+              })).toNumberList('capacityGroupIds'),
+            })).toList('prices'),
+            // Sibling 3: seasonIds (simple toNumberList)
+            seasonIds: product.productPrices!.selectDistinct(pp => ({
+              seasonId: pp.seasonId,
+            })).toNumberList('seasonIds'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(2);
+
+        // Verify skiPass
+        const skiPass = results.find(p => p.productName === 'Ski Pass');
+        expect(skiPass).toBeDefined();
+        expect(skiPass!.tagIds.length).toBe(2);
+        expect(skiPass!.prices.length).toBe(2);
+        expect(skiPass!.seasonIds.length).toBe(2);
+
+        // Verify liftTicket
+        const liftTicket = results.find(p => p.productName === 'Lift Ticket');
+        expect(liftTicket).toBeDefined();
+        expect(liftTicket!.tagIds.length).toBe(1);
+        expect(liftTicket!.prices.length).toBe(1);
+        expect(liftTicket!.seasonIds.length).toBe(1);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('complex ecommerce pattern: sibling collections where one navigates back to parent table', async () => {
+      // This test triggers the exact bug by having a sibling collection that navigates
+      // BACK to the parent table (products) within a nested collection.
+      //
+      // The bug pattern:
+      // 1. products.productPrices.select(price => price.product.name) - NAVIGATES back to products!
+      // 2. This adds "products" to the lateralTableAliasMap
+      // 3. Sibling collection products.productTags tries to build
+      // 4. WITHOUT THE FIX: It finds stale "products" alias in the map
+      // 5. This causes: "missing FROM-clause entry for table lateral_X_products"
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const results = await db.products
+          .select(product => ({
+            productId: product.id,
+            productName: product.name,
+            // Sibling 1: productPrices with navigation BACK to product table (price.product.name)
+            // This creates a JOIN to products table inside the LATERAL, adding it to the map
+            pricesWithProductName: product.productPrices!.select(price => ({
+              priceId: price.id,
+              seasonId: price.seasonId,
+              // CRITICAL: This navigates back to the products table!
+              productNameFromPrice: price.product!.name,
+            })).toList('pricesWithProductName'),
+            // Sibling 2: tagIds - if the first sibling pollutes the map with "products" alias,
+            // this sibling's correlation might incorrectly reference it
+            tagIds: product.productTags!.select(pt => ({
+              id: pt.tag!.id,
+            })).toNumberList('tagIds'),
+          }))
+          .toList();
+
+        expect(results.length).toBe(2);
+
+        // Verify skiPass
+        const skiPass = results.find(p => p.productName === 'Ski Pass');
+        expect(skiPass).toBeDefined();
+        expect(skiPass!.pricesWithProductName.length).toBe(2);
+        expect(skiPass!.pricesWithProductName[0].productNameFromPrice).toBe('Ski Pass');
+        expect(skiPass!.tagIds.length).toBe(2);
+
+        // Verify liftTicket
+        const liftTicket = results.find(p => p.productName === 'Lift Ticket');
+        expect(liftTicket).toBeDefined();
+        expect(liftTicket!.pricesWithProductName.length).toBe(1);
+        expect(liftTicket!.tagIds.length).toBe(1);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('regression: sibling collections with nested navigation and shared table references', async () => {
+      // This test ensures sibling collection isolation works correctly.
+      //
+      // The fix (lateralTableAliasMap cleanup) prevents a class of bugs where:
+      // - One sibling collection's internal table alias could leak to another sibling
+      // - This could cause "missing FROM-clause entry for table lateral_X_tableName" errors
+      //
+      // Pattern tested:
+      // - Sibling 1: posts collection with nested navigation to orders (post.user.orders)
+      // - Sibling 2: orders collection at the same level
+      // - The fix ensures sibling 2 doesn't see stale aliases from sibling 1
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const results = await db.users
+          .withQueryOptions({ collectionStrategy: 'lateral' })
+          .select(user => ({
+            userId: user.id,
+            username: user.username,
+            // Sibling 1: posts with nested orders through navigation chain
+            postsWithNestedOrders: user.posts!.select(post => ({
+              postId: post.id,
+              title: post.title,
+              // Nested collection through navigation: post -> user -> orders
+              authorOrders: post.user!.orders!.select(o => ({ id: o.id })).toList('authorOrders'),
+            })).toList('postsWithNestedOrders'),
+            // Sibling 2: direct orders collection
+            totalOrders: user.orders!.count(),
+          }))
+          .toList();
+
+        expect(results.length).toBe(3); // alice, bob, charlie
+
+        // Verify alice
+        const alice = results.find(u => u.username === 'alice');
+        expect(alice).toBeDefined();
+        expect(alice!.postsWithNestedOrders.length).toBe(2); // Alice has 2 posts
+        expect(alice!.postsWithNestedOrders[0].authorOrders.length).toBe(1); // Alice has 1 order
+        expect(alice!.totalOrders).toBe(1);
+
+        // Verify bob
+        const bob = results.find(u => u.username === 'bob');
+        expect(bob).toBeDefined();
+        expect(bob!.postsWithNestedOrders.length).toBe(1); // Bob has 1 post
+        expect(bob!.postsWithNestedOrders[0].authorOrders.length).toBe(1); // Bob has 1 order
+        expect(bob!.totalOrders).toBe(1);
+
+        // Verify charlie (no posts, no orders)
+        const charlie = results.find(u => u.username === 'charlie');
+        expect(charlie).toBeDefined();
+        expect(charlie!.postsWithNestedOrders.length).toBe(0);
+        expect(charlie!.totalOrders).toBe(0);
+      }, { collectionStrategy: 'lateral' });
+    });
   });
 });

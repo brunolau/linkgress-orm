@@ -10,6 +10,14 @@ import { SchemaPost } from "../model/schema-post";
 import { pgHourMinute } from "../types/hour-minute";
 import { pgIntDatetime } from "../types/int-datetime";
 import { OrderTask } from "../model/orderTask";
+import { PostComment } from "../model/postComment";
+// New entities for testing sibling collection isolation (complex ecommerce pattern)
+import { Product } from "../model/product";
+import { ProductPrice } from "../model/productPrice";
+import { ProductPriceCapacityGroup } from "../model/productPriceCapacityGroup";
+import { CapacityGroup } from "../model/capacityGroup";
+import { Tag } from "../model/tag";
+import { ProductTag } from "../model/productTag";
 
 // Define PostgreSQL ENUM types
 const orderStatusEnum = pgEnum('order_status', ['pending', 'processing', 'completed', 'cancelled', 'refunded'] as const);
@@ -51,6 +59,35 @@ export class AppDatabase extends DbContext {
 
     get schemaPosts(): DbEntityTable<SchemaPost> {
         return this.table(SchemaPost);
+    }
+
+    get postComments(): DbEntityTable<PostComment> {
+        return this.table(PostComment);
+    }
+
+    // New tables for testing sibling collection isolation (complex ecommerce pattern)
+    get products(): DbEntityTable<Product> {
+        return this.table(Product);
+    }
+
+    get productPrices(): DbEntityTable<ProductPrice> {
+        return this.table(ProductPrice);
+    }
+
+    get productPriceCapacityGroups(): DbEntityTable<ProductPriceCapacityGroup> {
+        return this.table(ProductPriceCapacityGroup);
+    }
+
+    get capacityGroups(): DbEntityTable<CapacityGroup> {
+        return this.table(CapacityGroup);
+    }
+
+    get tags(): DbEntityTable<Tag> {
+        return this.table(Tag);
+    }
+
+    get productTags(): DbEntityTable<ProductTag> {
+        return this.table(ProductTag);
     }
 
     protected override setupModel(model: DbModelConfig): void {
@@ -98,8 +135,32 @@ export class AppDatabase extends DbContext {
                 .hasDbName('FK_posts_users_user_id')
                 .isRequired();
 
+            entity.hasMany(e => e.postComments, () => PostComment)
+                .withForeignKey(pc => pc.postId)
+                .withPrincipalKey(p => p.id);
+
             // Add an index on userId and publishedAt for better query performance
             entity.hasIndex('ix_posts_query', e => [e.userId, e.publishedAt]);
+        });
+
+        // Configure PostComment entity (links posts to orders for testing sibling collection isolation)
+        model.entity(PostComment, entity => {
+            entity.toTable('post_comments');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'post_comments_id_seq' }));
+            entity.property(e => e.postId).hasType(integer('post_id')).isRequired();
+            entity.property(e => e.orderId).hasType(integer('order_id')).isRequired();
+            entity.property(e => e.comment).hasType(text('comment')).isRequired();
+
+            entity.hasOne(e => e.post, () => Post)
+                .withForeignKey(pc => pc.postId)
+                .withPrincipalKey(p => p.id)
+                .onDelete('cascade');
+
+            entity.hasOne(e => e.order, () => Order)
+                .withForeignKey(pc => pc.orderId)
+                .withPrincipalKey(o => o.id)
+                .onDelete('cascade');
         });
 
         // Configure Order entity
@@ -207,6 +268,98 @@ export class AppDatabase extends DbContext {
                 .withPrincipalKey(u => u.id)
                 .onDelete('cascade')
                 .isRequired();
+        });
+
+        // ============ NEW ENTITIES FOR SIBLING COLLECTION ISOLATION TEST ============
+        // These mirror a complex ecommerce schema pattern that triggers the bug
+
+        // Configure Product entity
+        model.entity(Product, entity => {
+            entity.toTable('products');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'products_id_seq' }));
+            entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
+            entity.property(e => e.active).hasType(boolean('active')).hasDefaultValue(true);
+
+            entity.hasMany(e => e.productPrices, () => ProductPrice)
+                .withForeignKey(pp => pp.productId)
+                .withPrincipalKey(p => p.id);
+
+            entity.hasMany(e => e.productTags, () => ProductTag)
+                .withForeignKey(pt => pt.productId)
+                .withPrincipalKey(p => p.id);
+        });
+
+        // Configure ProductPrice entity
+        model.entity(ProductPrice, entity => {
+            entity.toTable('product_prices');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'product_prices_id_seq' }));
+            entity.property(e => e.productId).hasType(integer('product_id')).isRequired();
+            entity.property(e => e.seasonId).hasType(integer('season_id')).isRequired();
+            entity.property(e => e.price).hasType(decimal('price', 10, 2)).isRequired();
+
+            entity.hasOne(e => e.product, () => Product)
+                .withForeignKey(pp => pp.productId)
+                .withPrincipalKey(p => p.id)
+                .onDelete('cascade');
+
+            entity.hasMany(e => e.productPriceCapacityGroups, () => ProductPriceCapacityGroup)
+                .withForeignKey(ppcg => ppcg.productPriceId)
+                .withPrincipalKey(pp => pp.id);
+        });
+
+        // Configure ProductPriceCapacityGroup entity (join table)
+        model.entity(ProductPriceCapacityGroup, entity => {
+            entity.toTable('product_price_capacity_groups');
+
+            entity.property(e => e.productPriceId).hasType(integer('product_price_id')).isPrimaryKey();
+            entity.property(e => e.capacityGroupId).hasType(integer('capacity_group_id')).isPrimaryKey();
+
+            entity.hasOne(e => e.productPrice, () => ProductPrice)
+                .withForeignKey(ppcg => ppcg.productPriceId)
+                .withPrincipalKey(pp => pp.id)
+                .onDelete('cascade');
+
+            entity.hasOne(e => e.capacityGroup, () => CapacityGroup)
+                .withForeignKey(ppcg => ppcg.capacityGroupId)
+                .withPrincipalKey(cg => cg.id)
+                .onDelete('cascade');
+        });
+
+        // Configure CapacityGroup entity
+        model.entity(CapacityGroup, entity => {
+            entity.toTable('capacity_groups');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'capacity_groups_id_seq' }));
+            entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
+        });
+
+        // Configure Tag entity
+        model.entity(Tag, entity => {
+            entity.toTable('tags');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'tags_id_seq' }));
+            entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
+        });
+
+        // Configure ProductTag entity (join table linking products to tags)
+        model.entity(ProductTag, entity => {
+            entity.toTable('product_tags');
+
+            entity.property(e => e.productId).hasType(integer('product_id')).isPrimaryKey();
+            entity.property(e => e.tagId).hasType(integer('tag_id')).isPrimaryKey();
+            entity.property(e => e.sortOrder).hasType(integer('sort_order')).hasDefaultValue(0);
+
+            entity.hasOne(e => e.product, () => Product)
+                .withForeignKey(pt => pt.productId)
+                .withPrincipalKey(p => p.id)
+                .onDelete('cascade');
+
+            entity.hasOne(e => e.tag, () => Tag)
+                .withForeignKey(pt => pt.tagId)
+                .withPrincipalKey(t => t.id)
+                .onDelete('cascade');
         });
     }
 }

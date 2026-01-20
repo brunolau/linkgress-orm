@@ -6,6 +6,14 @@ import { Order } from '../../debug/model/order';
 import { Task } from '../../debug/model/task';
 import { TaskLevel } from '../../debug/model/taskLevel';
 import { OrderTask } from '../../debug/model/orderTask';
+import { PostComment } from '../../debug/model/postComment';
+// New imports for complex ecommerce pattern test
+import { Product } from '../../debug/model/product';
+import { ProductPrice } from '../../debug/model/productPrice';
+import { ProductPriceCapacityGroup } from '../../debug/model/productPriceCapacityGroup';
+import { CapacityGroup } from '../../debug/model/capacityGroup';
+import { Tag } from '../../debug/model/tag';
+import { ProductTag } from '../../debug/model/productTag';
 
 /**
  * Create a test database instance
@@ -152,12 +160,117 @@ export async function seedTestData(db: AppDatabase) {
     sortOrder: 1,
   }).returning();
 
+  // Create post comments (links posts to orders - used for testing sibling collection isolation)
+  // Alice's first post mentions Alice's order
+  const alicePostComment1 = await db.postComments.insert({
+    postId: alicePost1.id,
+    orderId: aliceOrder.id,
+    comment: 'Related to order',
+  }).returning();
+
+  // Alice's second post mentions Bob's order
+  const alicePostComment2 = await db.postComments.insert({
+    postId: alicePost2.id,
+    orderId: bobOrder.id,
+    comment: 'Mentions another order',
+  }).returning();
+
+  // Bob's post mentions his own order
+  const bobPostComment = await db.postComments.insert({
+    postId: bobPost.id,
+    orderId: bobOrder.id,
+    comment: 'My order update',
+  }).returning();
+
+  // ============ PRODUCT/PRICE DATA FOR COMPLEX ECOMMERCE PATTERN TEST ============
+  // This replicates the schema that triggers the sibling collection isolation bug
+
+  // Create tags
+  const summerTag = await db.tags.insert({ name: 'Summer' }).returning();
+  const winterTag = await db.tags.insert({ name: 'Winter' }).returning();
+  const familyTag = await db.tags.insert({ name: 'Family' }).returning();
+
+  // Create capacity groups
+  const adultGroup = await db.capacityGroups.insert({ name: 'Adult' }).returning();
+  const childGroup = await db.capacityGroups.insert({ name: 'Child' }).returning();
+  const seniorGroup = await db.capacityGroups.insert({ name: 'Senior' }).returning();
+
+  // Create products
+  const skiPass = await db.products.insert({ name: 'Ski Pass', active: true }).returning();
+  const liftTicket = await db.products.insert({ name: 'Lift Ticket', active: true }).returning();
+
+  // Create product prices for skiPass (multiple seasons)
+  const skiPassPrice1 = await db.productPrices.insert({
+    productId: skiPass.id,
+    seasonId: 1, // Winter season
+    price: 100.00,
+  }).returning();
+
+  const skiPassPrice2 = await db.productPrices.insert({
+    productId: skiPass.id,
+    seasonId: 2, // Summer season
+    price: 50.00,
+  }).returning();
+
+  // Create product prices for liftTicket
+  const liftTicketPrice1 = await db.productPrices.insert({
+    productId: liftTicket.id,
+    seasonId: 1,
+    price: 75.00,
+  }).returning();
+
+  // Create product price capacity groups (nested collection data)
+  await db.productPriceCapacityGroups.insert({
+    productPriceId: skiPassPrice1.id,
+    capacityGroupId: adultGroup.id,
+  }).returning();
+
+  await db.productPriceCapacityGroups.insert({
+    productPriceId: skiPassPrice1.id,
+    capacityGroupId: childGroup.id,
+  }).returning();
+
+  await db.productPriceCapacityGroups.insert({
+    productPriceId: skiPassPrice2.id,
+    capacityGroupId: adultGroup.id,
+  }).returning();
+
+  await db.productPriceCapacityGroups.insert({
+    productPriceId: liftTicketPrice1.id,
+    capacityGroupId: seniorGroup.id,
+  }).returning();
+
+  // Create product tags (sibling collection)
+  await db.productTags.insert({
+    productId: skiPass.id,
+    tagId: winterTag.id,
+    sortOrder: 1,
+  }).returning();
+
+  await db.productTags.insert({
+    productId: skiPass.id,
+    tagId: familyTag.id,
+    sortOrder: 2,
+  }).returning();
+
+  await db.productTags.insert({
+    productId: liftTicket.id,
+    tagId: summerTag.id,
+    sortOrder: 1,
+  }).returning();
+
   return {
     users: { alice, bob, charlie },
     posts: { alicePost1, alicePost2, bobPost },
     orders: { aliceOrder, bobOrder },
     taskLevels: { highPriority, lowPriority },
     tasks: { task1, task2 },
+    postComments: { alicePostComment1, alicePostComment2, bobPostComment },
+    // New data for complex ecommerce pattern
+    tags: { summerTag, winterTag, familyTag },
+    capacityGroups: { adultGroup, childGroup, seniorGroup },
+    products: { skiPass, liftTicket },
+    productPrices: { skiPassPrice1, skiPassPrice2, liftTicketPrice1 },
   };
 }
 

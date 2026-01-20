@@ -235,7 +235,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
   });
 
   /**
-   * This test reproduces the exact pattern from the gopass-eshop query:
+   * This test reproduces the exact pattern from the complex ecommerce query:
    * 1. First CTE aggregates one table
    * 2. Second CTE has navigation property in SQL expression, then groupBy, then leftJoin with first CTE
    * 3. Main query joins with second CTE
@@ -359,7 +359,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
   });
 
   /**
-   * BUG: CTE join AND collection with navigation - gopass pattern
+   * BUG: CTE join AND collection with navigation - complex ecommerce pattern
    * The collection inside the join result uses navigation which should create a JOIN
    *
    * This test combines:
@@ -368,7 +368,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
    *
    * The toNumberList() doesn't detect the navigation and generate the JOIN.
    */
-  test('should handle CTE join combined with collection navigation (gopass pattern)', async () => {
+  test('should handle CTE join combined with collection navigation (complex ecommerce pattern)', async () => {
     await withDatabase(async (db) => {
       await seedTestData(db);
 
@@ -386,7 +386,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
         'orderStats',
       );
 
-      // Helper function for collection query (like buildTagQuery in gopass)
+      // Helper function for collection query (like buildTagQuery in complex ecommerce)
       // This navigates from post -> user -> id, causing a join
       const buildPostUserIdQuery = (user: any) => user.posts?.select((p: any) => ({
         userId: p.user!.id, // BUG: Navigation to p.user.id should create JOIN
@@ -419,7 +419,7 @@ describe('CTE with Navigation and GroupBy - Ambiguous Column Bug', () => {
   });
 
   /**
-   * The exact gopass pattern - collection with navigation selecting 'id' field
+   * The exact complex ecommerce pattern - collection with navigation selecting 'id' field
    * which exists in both the main table and the joined table
    */
   /**

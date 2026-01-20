@@ -190,7 +190,7 @@ describe('Collection Null Coalesce', () => {
 
         const cteBuilder = new DbCteBuilder();
 
-        // This is the exact gopass pattern:
+        // This is the exact complex ecommerce pattern:
         // CTE with groupBy then aggregation, then leftJoin with main query
         const postPriceCte = cteBuilder.withAggregation(
           'post_price_cte',
@@ -263,7 +263,7 @@ describe('Collection Null Coalesce', () => {
         );
 
         // Second CTE: posts with navigation, groupBy, then leftJoin with first CTE
-        // This is the exact gopass productPriceCte pattern
+        // This is the exact complex ecommerce productPriceCte pattern
         const postPriceCte = cteBuilder.withAggregation(
           'post_price_cte',
           db.posts.select(p => ({

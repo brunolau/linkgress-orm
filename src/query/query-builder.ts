@@ -6571,6 +6571,8 @@ export class CollectionQueryBuilder<TItem = any> {
     // For LATERAL strategy, reserve the counter early and register the table alias
     // This allows nested collections to reference this collection's aliased table
     let reservedCounter: number | undefined;
+    let previousTableAlias: string | undefined;  // For restoring after build
+    let hadPreviousEntry = false;
     if (strategyType === 'lateral') {
       reservedCounter = context.cteCounter++;
       const lateralAlias = `lateral_${reservedCounter}`;
@@ -6580,6 +6582,10 @@ export class CollectionQueryBuilder<TItem = any> {
       if (!context.lateralTableAliasMap) {
         context.lateralTableAliasMap = new Map();
       }
+      // Save previous value (if any) so we can restore it after building
+      // This prevents sibling collections from seeing each other's aliases
+      hadPreviousEntry = context.lateralTableAliasMap.has(this.targetTable);
+      previousTableAlias = context.lateralTableAliasMap.get(this.targetTable);
       // Register this collection's table alias for nested collections to reference
       context.lateralTableAliasMap.set(this.targetTable, innerTableAlias);
     }
@@ -6895,7 +6901,19 @@ export class CollectionQueryBuilder<TItem = any> {
     // Step 6: Call the strategy
     const result = strategy.buildAggregation(config, context, client!);
 
-    // Step 7: Return the result
+    // Step 7: Restore the lateralTableAliasMap to prevent sibling collections from seeing this alias
+    // This is important because sibling collections at the same level should not affect each other
+    if (strategyType === 'lateral' && context.lateralTableAliasMap) {
+      if (hadPreviousEntry) {
+        // Restore the previous value
+        context.lateralTableAliasMap.set(this.targetTable, previousTableAlias!);
+      } else {
+        // Remove the entry we added
+        context.lateralTableAliasMap.delete(this.targetTable);
+      }
+    }
+
+    // Step 8: Return the result
     // For synchronous strategies (like JSONB), result is returned directly
     // For async strategies (like temp table), return the Promise
     // Callers need to handle both cases
