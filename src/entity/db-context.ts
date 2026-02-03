@@ -1389,29 +1389,80 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
   /**
    * Execute in transaction
-   * Uses the database client's native transaction support for proper handling
-   * across different drivers (pg uses BEGIN/COMMIT, postgres uses sql.begin())
+   * Creates a scoped transactional context to avoid race conditions with concurrent transactions.
+   * Each transaction gets its own isolated context instance with fresh table accessors.
    */
   async transaction<TResult>(
     fn: (ctx: this) => Promise<TResult>
   ): Promise<TResult> {
-    // Store the original client
-    const originalClient = this.client;
-
     return await this.client.transaction(async (queryFn) => {
       // Create a transactional client that routes all queries through the transaction
-      const txClient = new TransactionalClient(queryFn, originalClient);
+      const txClient = new TransactionalClient(queryFn, this.client);
 
-      // Temporarily swap the client to use the transactional one
-      this.client = txClient;
+      // Create an isolated transactional context instead of mutating this.client
+      const txContext = this.createTransactionalContext(txClient);
 
-      try {
-        return await fn(this);
-      } finally {
-        // Restore the original client
-        this.client = originalClient;
-      }
+      return await fn(txContext);
     });
+  }
+
+  /**
+   * Creates a scoped copy of this context with a different client.
+   * Used internally for transaction isolation to prevent race conditions
+   * when multiple transactions run concurrently.
+   */
+  protected createTransactionalContext(txClient: DatabaseClient): this {
+    // Create new instance preserving the prototype chain (including subclass methods/getters)
+    const txContext = Object.create(Object.getPrototypeOf(this)) as this;
+
+    // Set up the transactional client
+    txContext.client = txClient;
+
+    // Share read-only schema registry
+    (txContext as any).schemaRegistry = this.schemaRegistry;
+    (txContext as any).queryOptions = this.queryOptions;
+
+    // Create executor for the transactional client if logging is enabled
+    if (this.queryOptions?.logQueries || this.queryOptions?.logExecutionTime) {
+      (txContext as any).executor = new QueryExecutor(txClient, this.queryOptions);
+    }
+
+    // Create fresh table accessors bound to the transactional client
+    (txContext as any).tableAccessors = new Map();
+    for (const [key, accessor] of this.tableAccessors) {
+      const newAccessor = new TableAccessor(
+        (accessor as any).tableBuilder,
+        txClient,
+        this.schemaRegistry,
+        (txContext as any).executor,
+        this.queryOptions?.collectionStrategy
+      );
+      (txContext as any).tableAccessors.set(key, newAccessor);
+
+      // Only attach as direct property if not a getter on the prototype
+      // (DatabaseContext subclasses use getters like `get users()` that call this.table())
+      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), key);
+      if (!descriptor?.get) {
+        (txContext as any)[key] = newAccessor;
+      }
+    }
+
+    // Copy subclass-specific fields (for DatabaseContext)
+    if ('modelConfig' in this) {
+      (txContext as any).modelConfig = (this as any).modelConfig;
+    }
+    // Fresh entityTables so DbEntityTable instances are created with txContext reference
+    if ('entityTables' in this) {
+      (txContext as any).entityTables = new Map();
+    }
+    if ('sequenceRegistry' in this) {
+      (txContext as any).sequenceRegistry = (this as any).sequenceRegistry;
+    }
+    if ('sequenceInstances' in this) {
+      (txContext as any).sequenceInstances = (this as any).sequenceInstances;
+    }
+
+    return txContext;
   }
 
   /**
