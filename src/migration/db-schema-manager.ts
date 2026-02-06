@@ -12,6 +12,7 @@ import { RawSql } from '../query/conditions';
 interface DbColumnInfo {
   column_name: string;
   data_type: string;
+  udt_name: string;
   character_maximum_length: number | null;
   numeric_precision: number | null;
   numeric_scale: number | null;
@@ -711,14 +712,16 @@ export class DbSchemaManager {
 
     // Find tables to create
     for (const [tableName, schema] of this.schemaRegistry.entries()) {
-      if (!existingTables.has(tableName)) {
+      const tableKey = schema.schema && schema.schema !== 'public' ? `${schema.schema}.${tableName}` : tableName;
+      if (!existingTables.has(tableKey)) {
         operations.push({ type: 'create_table', tableName, schema });
       }
     }
 
     // Compare columns for existing tables
     for (const [tableName, schema] of this.schemaRegistry.entries()) {
-      if (existingTables.has(tableName)) {
+      const tableKey = schema.schema && schema.schema !== 'public' ? `${schema.schema}.${tableName}` : tableName;
+      if (existingTables.has(tableKey)) {
         const existingColumns = await this.getExistingColumns(tableName, schema.schema);
         const modelColumns = new Map<string, ColumnConfig>();
 
@@ -1132,8 +1135,8 @@ export class DbSchemaManager {
 
     // PostgreSQL requires separate ALTER COLUMN commands for different changes
 
-    // Change type if needed
-    const fromType = this.normalizeType(from.data_type);
+    // Change type if needed - resolve ARRAY/USER-DEFINED via udt_name before normalizing
+    const fromType = this.normalizeType(this.resolveDbType(from));
     const toType = this.normalizeType(to.type);
     if (fromType !== toType) {
       const typeDef = this.buildTypeDefinition(to);
@@ -1235,18 +1238,28 @@ export class DbSchemaManager {
   }
 
   /**
-   * Get all existing tables in the database
+   * Get all existing tables in the database across all schemas used by the model
    */
   private async getExistingTables(): Promise<Map<string, true>> {
-    const result = await this.client.query(`
-      SELECT table_name
-      FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-    `);
+    // Collect all schemas used by the model
+    const schemas = new Set<string>();
+    for (const [, schema] of this.schemaRegistry.entries()) {
+      schemas.add(schema.schema || 'public');
+    }
 
     const tables = new Map<string, true>();
-    for (const row of result.rows) {
-      tables.set(row.table_name, true);
+    for (const schemaName of schemas) {
+      const result = await this.client.query(`
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+      `, [schemaName]);
+
+      for (const row of result.rows) {
+        // Use composite key for non-public schemas to avoid collisions
+        const key = schemaName === 'public' ? row.table_name : `${schemaName}.${row.table_name}`;
+        tables.set(key, true);
+      }
     }
     return tables;
   }
@@ -1259,6 +1272,7 @@ export class DbSchemaManager {
       SELECT
         column_name,
         data_type,
+        udt_name,
         character_maximum_length,
         numeric_precision,
         numeric_scale,
@@ -1294,7 +1308,6 @@ export class DbSchemaManager {
         n.nspname = $1
         AND t.relname = $2
         AND NOT ix.indisprimary
-        AND NOT ix.indisunique
       GROUP BY i.relname
     `, [schemaName || 'public', tableName]);
 
@@ -1347,8 +1360,8 @@ export class DbSchemaManager {
    * Check if a column needs to be altered
    */
   private needsAlter(dbInfo: DbColumnInfo, modelConfig: ColumnConfig): boolean {
-    // Compare type
-    const dbType = this.normalizeType(dbInfo.data_type);
+    // Compare type - resolve ARRAY/USER-DEFINED via udt_name before normalizing
+    const dbType = this.normalizeType(this.resolveDbType(dbInfo));
     const modelType = this.normalizeType(modelConfig.type);
     if (dbType !== modelType) {
       return true;
@@ -1400,10 +1413,58 @@ export class DbSchemaManager {
   }
 
   /**
+   * Resolve the effective type from database column info.
+   * Handles ARRAY and USER-DEFINED types by using udt_name.
+   */
+  private resolveDbType(dbInfo: DbColumnInfo): string {
+    const dataType = dbInfo.data_type;
+
+    // For array types, data_type is 'ARRAY' and udt_name has underscore prefix (e.g. '_int4')
+    if (dataType === 'ARRAY' && dbInfo.udt_name) {
+      const baseType = dbInfo.udt_name.replace(/^_/, '');
+      const resolved = this.udtToSqlType(baseType);
+      return `${resolved}[]`;
+    }
+
+    // For custom/enum types, data_type is 'USER-DEFINED' and udt_name has the actual type name
+    if (dataType === 'USER-DEFINED' && dbInfo.udt_name) {
+      return dbInfo.udt_name;
+    }
+
+    return dataType;
+  }
+
+  /**
+   * Map PostgreSQL internal udt names to SQL type names
+   */
+  private udtToSqlType(udtName: string): string {
+    const map: Record<string, string> = {
+      'int4': 'integer',
+      'int2': 'smallint',
+      'int8': 'bigint',
+      'float4': 'real',
+      'float8': 'double precision',
+      'bool': 'boolean',
+      'varchar': 'varchar',
+      'text': 'text',
+      'numeric': 'decimal',
+      'timestamptz': 'timestamptz',
+      'timestamp': 'timestamp',
+    };
+    return map[udtName] || udtName;
+  }
+
+  /**
    * Normalize PostgreSQL type names for comparison
    */
   private normalizeType(type: string): string {
     const normalized = type.toLowerCase().trim();
+
+    // Handle array types - normalize the base type and preserve []
+    if (normalized.endsWith('[]')) {
+      const baseType = normalized.slice(0, -2);
+      return this.normalizeType(baseType) + '[]';
+    }
 
     // Map common variations
     const typeMap: Record<string, string> = {

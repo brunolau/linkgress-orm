@@ -43,38 +43,39 @@ export class MigrationScaffold {
 
   /**
    * Generate SQL for a migration operation (UP direction).
+   * Returns an array of statements for operations that need multiple queries.
    */
-  private generateUpSql(op: MigrationOperation): string {
+  private generateUpSql(op: MigrationOperation): string[] {
     switch (op.type) {
       case 'create_schema':
-        return `CREATE SCHEMA IF NOT EXISTS "${op.schemaName}"`;
+        return [`CREATE SCHEMA IF NOT EXISTS "${op.schemaName}"`];
 
       case 'create_enum': {
         const enumValues = op.values.map((v: string) => `'${v}'`).join(', ');
-        return `CREATE TYPE "${op.enumName}" AS ENUM (${enumValues})`;
+        return [`DO $$ BEGIN CREATE TYPE "${op.enumName}" AS ENUM (${enumValues}); EXCEPTION WHEN duplicate_object THEN NULL; END $$`];
       }
 
       case 'create_sequence':
-        return this.buildCreateSequenceSql(op.config);
+        return [this.buildCreateSequenceSql(op.config)];
 
       case 'create_table':
         return this.buildCreateTableSql(op.tableName, op.schema);
 
       case 'drop_table':
-        return `DROP TABLE IF EXISTS "${op.tableName}" CASCADE`;
+        return [`DROP TABLE IF EXISTS "${op.tableName}" CASCADE`];
 
       case 'add_column':
-        return this.buildAddColumnSql(op.tableName, op.columnName, op.config, op.schema);
+        return [this.buildAddColumnSql(op.tableName, op.columnName, op.config, op.schema)];
 
       case 'drop_column': {
         const qualifiedTable = op.schema
           ? `"${op.schema}"."${op.tableName}"`
           : `"${op.tableName}"`;
-        return `ALTER TABLE ${qualifiedTable} DROP COLUMN "${op.columnName}"`;
+        return [`ALTER TABLE ${qualifiedTable} DROP COLUMN IF EXISTS "${op.columnName}"`];
       }
 
       case 'alter_column':
-        return this.buildAlterColumnSql(op.tableName, op.columnName, op.from, op.to, op.schema);
+        return [this.buildAlterColumnSql(op.tableName, op.columnName, op.from, op.to, op.schema)];
 
       case 'create_index':
         return this.buildCreateIndexSql(
@@ -89,7 +90,7 @@ export class MigrationScaffold {
         const qualifiedIndex = op.schema
           ? `"${op.schema}"."${op.indexName}"`
           : `"${op.indexName}"`;
-        return `DROP INDEX IF EXISTS ${qualifiedIndex}`;
+        return [`DROP INDEX IF EXISTS ${qualifiedIndex}`];
       }
 
       case 'create_foreign_key':
@@ -99,77 +100,77 @@ export class MigrationScaffold {
         const fkTable = op.schema
           ? `"${op.schema}"."${op.tableName}"`
           : `"${op.tableName}"`;
-        return `ALTER TABLE ${fkTable} DROP CONSTRAINT "${op.constraintName}"`;
+        return [`ALTER TABLE ${fkTable} DROP CONSTRAINT IF EXISTS "${op.constraintName}"`];
       }
 
       default:
-        return `-- Unknown operation: ${(op as any).type}`;
+        return [`-- Unknown operation: ${(op as any).type}`];
     }
   }
 
   /**
    * Generate SQL for a migration operation (DOWN direction - reverse).
    */
-  private generateDownSql(op: MigrationOperation): string {
+  private generateDownSql(op: MigrationOperation): string[] {
     switch (op.type) {
       case 'create_schema':
-        return `DROP SCHEMA IF EXISTS "${op.schemaName}" CASCADE`;
+        return [`DROP SCHEMA IF EXISTS "${op.schemaName}" CASCADE`];
 
       case 'create_enum':
-        return `DROP TYPE IF EXISTS "${op.enumName}" CASCADE`;
+        return [`DROP TYPE IF EXISTS "${op.enumName}" CASCADE`];
 
       case 'create_sequence': {
         const seqName = op.config.schema
           ? `"${op.config.schema}"."${op.config.name}"`
           : `"${op.config.name}"`;
-        return `DROP SEQUENCE IF EXISTS ${seqName} CASCADE`;
+        return [`DROP SEQUENCE IF EXISTS ${seqName} CASCADE`];
       }
 
       case 'create_table': {
         const tableName = op.schema?.schema
           ? `"${op.schema.schema}"."${op.tableName}"`
           : `"${op.tableName}"`;
-        return `DROP TABLE IF EXISTS ${tableName} CASCADE`;
+        return [`DROP TABLE IF EXISTS ${tableName} CASCADE`];
       }
 
       case 'drop_table':
-        return `-- Cannot auto-generate: recreate table "${op.tableName}"`;
+        return [`-- Cannot auto-generate: recreate table "${op.tableName}"`];
 
       case 'add_column': {
         const addColTable = op.schema
           ? `"${op.schema}"."${op.tableName}"`
           : `"${op.tableName}"`;
-        return `ALTER TABLE ${addColTable} DROP COLUMN "${op.columnName}"`;
+        return [`ALTER TABLE ${addColTable} DROP COLUMN IF EXISTS "${op.columnName}"`];
       }
 
       case 'drop_column':
-        return `-- Cannot auto-generate: recreate column "${op.columnName}" on table "${op.tableName}"`;
+        return [`-- Cannot auto-generate: recreate column "${op.columnName}" on table "${op.tableName}"`];
 
       case 'alter_column':
-        return `-- Cannot auto-generate: revert column "${op.columnName}" changes on table "${op.tableName}"`;
+        return [`-- Cannot auto-generate: revert column "${op.columnName}" changes on table "${op.tableName}"`];
 
       case 'create_index': {
         const idxName = op.schema
           ? `"${op.schema}"."${op.indexName}"`
           : `"${op.indexName}"`;
-        return `DROP INDEX IF EXISTS ${idxName}`;
+        return [`DROP INDEX IF EXISTS ${idxName}`];
       }
 
       case 'drop_index':
-        return `-- Cannot auto-generate: recreate index "${op.indexName}"`;
+        return [`-- Cannot auto-generate: recreate index "${op.indexName}"`];
 
       case 'create_foreign_key': {
         const fkTable = op.schema
           ? `"${op.schema}"."${op.tableName}"`
           : `"${op.tableName}"`;
-        return `ALTER TABLE ${fkTable} DROP CONSTRAINT "${op.constraint.name}"`;
+        return [`ALTER TABLE ${fkTable} DROP CONSTRAINT IF EXISTS "${op.constraint.name}"`];
       }
 
       case 'drop_foreign_key':
-        return `-- Cannot auto-generate: recreate foreign key "${op.constraintName}"`;
+        return [`-- Cannot auto-generate: recreate foreign key "${op.constraintName}"`];
 
       default:
-        return `-- Unknown operation reversal: ${(op as any).type}`;
+        return [`-- Unknown operation reversal: ${(op as any).type}`];
     }
   }
 
@@ -197,14 +198,18 @@ export class MigrationScaffold {
 
   /**
    * Build CREATE TABLE SQL from schema.
+   * Returns an array: CREATE TABLE IF NOT EXISTS with PK columns only,
+   * followed by ADD COLUMN IF NOT EXISTS for each remaining column.
    */
-  private buildCreateTableSql(tableName: string, schema: TableSchema): string {
+  private buildCreateTableSql(tableName: string, schema: TableSchema): string[] {
     const qualifiedName = schema.schema
       ? `"${schema.schema}"."${tableName}"`
       : `"${tableName}"`;
 
-    const columnDefs: string[] = [];
+    const statements: string[] = [];
+    const pkColumnDefs: string[] = [];
     const primaryKeys: string[] = [];
+    const nonPkColumns: { name: string; def: string }[] = [];
 
     for (const [colKey, colBuilder] of Object.entries(schema.columns)) {
       const config = (colBuilder as any).build() as ColumnConfig;
@@ -236,15 +241,27 @@ export class MigrationScaffold {
         def += ` DEFAULT ${this.formatDefault(config.default)}`;
       }
 
-      columnDefs.push(def);
-      if (config.primaryKey) primaryKeys.push(`"${config.name}"`);
+      if (config.primaryKey) {
+        pkColumnDefs.push(def);
+        primaryKeys.push(`"${config.name}"`);
+      } else {
+        nonPkColumns.push({ name: config.name, def });
+      }
     }
 
+    // CREATE TABLE IF NOT EXISTS with PK columns only
+    const createParts = [...pkColumnDefs];
     if (primaryKeys.length > 0) {
-      columnDefs.push(`PRIMARY KEY (${primaryKeys.join(', ')})`);
+      createParts.push(`PRIMARY KEY (${primaryKeys.join(', ')})`);
+    }
+    statements.push(`CREATE TABLE IF NOT EXISTS ${qualifiedName} (\n    ${createParts.join(',\n    ')}\n  )`);
+
+    // ADD COLUMN IF NOT EXISTS for each non-PK column
+    for (const col of nonPkColumns) {
+      statements.push(`ALTER TABLE ${qualifiedName} ADD COLUMN IF NOT EXISTS ${col.def}`);
     }
 
-    return `CREATE TABLE ${qualifiedName} (\n    ${columnDefs.join(',\n    ')}\n  )`;
+    return statements;
   }
 
   /**
@@ -269,7 +286,7 @@ export class MigrationScaffold {
     if (config.unique) def += ' UNIQUE';
     if (config.default !== undefined) def += ` DEFAULT ${this.formatDefault(config.default)}`;
 
-    return `ALTER TABLE ${qualifiedTable} ADD COLUMN "${columnName}" ${def}`;
+    return `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${columnName}" ${def}`;
   }
 
   /**
@@ -288,8 +305,9 @@ export class MigrationScaffold {
 
     const statements: string[] = [];
 
-    // Type change
-    if (from.data_type !== to.type) {
+    // Type change - resolve ARRAY/USER-DEFINED via udt_name for proper comparison
+    const fromType = this.resolveDbType(from);
+    if (fromType !== to.type) {
       statements.push(
         `ALTER TABLE ${qualifiedTable} ALTER COLUMN "${columnName}" TYPE ${to.type}`
       );
@@ -313,7 +331,32 @@ export class MigrationScaffold {
   }
 
   /**
+   * Resolve the effective type from database column info.
+   * Handles ARRAY and USER-DEFINED types by using udt_name.
+   */
+  private resolveDbType(dbInfo: any): string {
+    const dataType = dbInfo.data_type;
+
+    if (dataType === 'ARRAY' && dbInfo.udt_name) {
+      const baseType = dbInfo.udt_name.replace(/^_/, '');
+      const udtMap: Record<string, string> = {
+        'int4': 'integer', 'int2': 'smallint', 'int8': 'bigint',
+        'float4': 'real', 'float8': 'double precision',
+        'bool': 'boolean', 'numeric': 'decimal',
+      };
+      return `${udtMap[baseType] || baseType}[]`;
+    }
+
+    if (dataType === 'USER-DEFINED' && dbInfo.udt_name) {
+      return dbInfo.udt_name;
+    }
+
+    return dataType;
+  }
+
+  /**
    * Build CREATE INDEX SQL.
+   * Returns [DROP IF EXISTS, CREATE] for idempotency.
    */
   private buildCreateIndexSql(
     tableName: string,
@@ -321,25 +364,33 @@ export class MigrationScaffold {
     columns: string[],
     isUnique?: boolean,
     schema?: string
-  ): string {
+  ): string[] {
     const qualifiedTable = schema
       ? `"${schema}"."${tableName}"`
       : `"${tableName}"`;
 
+    const qualifiedIndex = schema
+      ? `"${schema}"."${indexName}"`
+      : `"${indexName}"`;
+
     const uniqueStr = isUnique ? 'UNIQUE ' : '';
     const columnList = columns.map(c => `"${c}"`).join(', ');
 
-    return `CREATE ${uniqueStr}INDEX "${indexName}" ON ${qualifiedTable} (${columnList})`;
+    return [
+      `DROP INDEX IF EXISTS ${qualifiedIndex}`,
+      `CREATE ${uniqueStr}INDEX "${indexName}" ON ${qualifiedTable} (${columnList})`
+    ];
   }
 
   /**
    * Build CREATE FOREIGN KEY SQL.
+   * Returns [DROP IF EXISTS, ADD CONSTRAINT] for idempotency.
    */
   private buildCreateForeignKeySql(
     tableName: string,
     constraint: any,
     schema?: string
-  ): string {
+  ): string[] {
     const qualifiedTable = schema
       ? `"${schema}"."${tableName}"`
       : `"${tableName}"`;
@@ -347,13 +398,16 @@ export class MigrationScaffold {
     const columnList = constraint.columns.map((c: string) => `"${c}"`).join(', ');
     const refColumnList = constraint.referencedColumns.map((c: string) => `"${c}"`).join(', ');
 
-    let sql = `ALTER TABLE ${qualifiedTable} ADD CONSTRAINT "${constraint.name}" `;
-    sql += `FOREIGN KEY (${columnList}) REFERENCES "${constraint.referencedTable}" (${refColumnList})`;
+    let addSql = `ALTER TABLE ${qualifiedTable} ADD CONSTRAINT "${constraint.name}" `;
+    addSql += `FOREIGN KEY (${columnList}) REFERENCES "${constraint.referencedTable}" (${refColumnList})`;
 
-    if (constraint.onDelete) sql += ` ON DELETE ${constraint.onDelete.toUpperCase()}`;
-    if (constraint.onUpdate) sql += ` ON UPDATE ${constraint.onUpdate.toUpperCase()}`;
+    if (constraint.onDelete) addSql += ` ON DELETE ${constraint.onDelete.toUpperCase()}`;
+    if (constraint.onUpdate) addSql += ` ON UPDATE ${constraint.onUpdate.toUpperCase()}`;
 
-    return sql;
+    return [
+      `ALTER TABLE ${qualifiedTable} DROP CONSTRAINT IF EXISTS "${constraint.name}"`,
+      addSql
+    ];
   }
 
   /**
@@ -394,9 +448,9 @@ export class MigrationScaffold {
     // Generate filename
     const filename = this.loader.generateFilename();
 
-    // Build migration file content
-    const upStatements = operations.map(op => this.generateUpSql(op));
-    const downStatements = operations.map(op => this.generateDownSql(op)).reverse();
+    // Build migration file content (flatten since operations can produce multiple statements)
+    const upStatements = operations.flatMap(op => this.generateUpSql(op));
+    const downStatements = operations.map(op => this.generateDownSql(op)).reverse().flat();
 
     const content = this.generateMigrationFile(upStatements, downStatements, contextImportPath);
 
