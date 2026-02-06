@@ -316,9 +316,12 @@ export abstract class WhereComparisonBase<V = any> extends WhereConditionBase {
       // Pass the field to getRightSide so it can apply toDriver mapper if present
       const rightSide = this.getRightSide(this.value, context, this.field);
       return `${fieldName} ${operator} ${rightSide}`;
-    } else {
-      // For operators like IS NULL that don't have a value
+    } else if (operator.startsWith('IS ')) {
+      // Unary operators like IS NULL, IS NOT NULL
       return `${fieldName} ${operator}`;
+    } else {
+      // Binary operator with undefined value — would produce broken SQL like "field" >
+      throw new Error(`Cannot use ${operator} operator with undefined value on field ${fieldName}. Pass an explicit value or use eq()/ne() which treat undefined as NULL.`);
     }
   }
 }
@@ -399,8 +402,8 @@ export class EqComparison<V = any> extends WhereComparisonBase<V> {
    * We convert `eq(field, null)` to `field IS NULL` for correct semantics.
    */
   override buildSql(context: SqlBuildContext): string {
-    // Check if value is explicitly null (not undefined, not a Placeholder)
-    if (this.value === null) {
+    // Handle null/undefined: eq(field, null) and eq(field, undefined) → IS NULL
+    if (this.value === null || this.value === undefined) {
       const fieldName = this.getDbColumnName(this.field);
       return `${fieldName} IS NULL`;
     }
@@ -419,8 +422,8 @@ export class NeComparison<V = any> extends WhereComparisonBase<V> {
    * We convert `ne(field, null)` to `field IS NOT NULL` for correct semantics.
    */
   override buildSql(context: SqlBuildContext): string {
-    // Check if value is explicitly null (not undefined, not a Placeholder)
-    if (this.value === null) {
+    // Handle null/undefined: ne(field, null) and ne(field, undefined) → IS NOT NULL
+    if (this.value === null || this.value === undefined) {
       const fieldName = this.getDbColumnName(this.field);
       return `${fieldName} IS NOT NULL`;
     }
