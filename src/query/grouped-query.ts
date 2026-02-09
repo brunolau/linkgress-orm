@@ -7,6 +7,7 @@ import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
 import { CollectionQueryBuilder, ReferenceQueryBuilder, getColumnNameMapForSchema, getRelationEntriesForSchema, getTargetSchemaForRelation } from './query-builder';
 import { DbCte, isCte } from './cte-builder';
+import { formatJoinValue } from './join-utils';
 
 /**
  * Query context for tracking CTEs and parameters
@@ -959,7 +960,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       // Build join condition: source.foreignKey = target.match
       const joinConditions = navJoin.foreignKeys.map((fk, i) => {
         const targetCol = navJoin.matches[i] || 'id';
-        return `"${this.schema.name}"."${fk}" = "${navJoin.alias}"."${targetCol}"`;
+        return `${formatJoinValue(this.schema.name, fk)} = ${formatJoinValue(navJoin.alias, targetCol)}`;
       });
 
       baseFromClause += `\n${joinType} ${targetTableName} AS "${navJoin.alias}" ON ${joinConditions.join(' AND ')}`;

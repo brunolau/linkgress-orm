@@ -8,6 +8,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
+import { formatJoinValue } from '../join-utils';
 
 /**
  * LATERAL JOIN-based collection strategy
@@ -295,7 +296,7 @@ WHERE ${whereSQL})`;
       for (let i = 0; i < join.foreignKeys.length; i++) {
         const fk = join.foreignKeys[i];
         const pk = join.matches[i] || 'id';
-        onConditions.push(`"${join.sourceAlias}"."${fk}" = "${join.alias}"."${pk}"`);
+        onConditions.push(`${formatJoinValue(join.sourceAlias, fk)} = ${formatJoinValue(join.alias, pk)}`);
       }
 
       joinClauses.push(`${joinType} ${qualifiedTable} "${join.alias}" ON ${onConditions.join(' AND ')}`);
@@ -359,7 +360,7 @@ WHERE ${whereSQL})`;
           // use the parent's aliased name from the map
           sourceAlias = lateralAliasMap.get(sourceAlias)!;
         }
-        onConditions.push(`"${sourceAlias}"."${fk}" = "${join.alias}"."${pk}"`);
+        onConditions.push(`${formatJoinValue(sourceAlias, fk)} = ${formatJoinValue(join.alias, pk)}`);
       }
 
       joinClauses.push(`${joinType} ${qualifiedTable} "${join.alias}" ON ${onConditions.join(' AND ')}`);

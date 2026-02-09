@@ -12,6 +12,7 @@ import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery } from './future-query';
+import { formatJoinValue, isLiteralKeyPart } from './join-utils';
 
 /**
  * Field type categories for optimized result transformation
@@ -2619,7 +2620,7 @@ export class SelectQueryBuilder<TSelection> {
         for (let i = 0; i < join.foreignKeys.length; i++) {
           const fk = join.foreignKeys[i];
           const match = join.matches[i];
-          joinConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+          joinConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
         }
       }
 
@@ -2802,7 +2803,7 @@ export class SelectQueryBuilder<TSelection> {
         for (let i = 0; i < join.foreignKeys.length; i++) {
           const fk = join.foreignKeys[i];
           const match = join.matches[i];
-          joinConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+          joinConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
         }
       }
 
@@ -3235,6 +3236,7 @@ export class SelectQueryBuilder<TSelection> {
       // Only add FK to mainTableColumns if the join source is the main table
       if (join.sourceAlias === this.schema.name || !join.sourceAlias) {
         for (const fk of join.foreignKeys) {
+          if (isLiteralKeyPart(fk)) continue; // Skip literal values
           const fkDbCol = getFkDbColumnName(this.schema, fk);
           mainTableColumns.add(fkDbCol);
         }
@@ -3271,16 +3273,23 @@ export class SelectQueryBuilder<TSelection> {
         const fk = join.foreignKeys[i];
         const match = join.matches[i] || 'id';
 
-        if (join.sourceAlias === this.schema.name || !join.sourceAlias) {
+        if (isLiteralKeyPart(fk) || isLiteralKeyPart(match)) {
+          // Literal key parts don't need column name resolution
+          const fkSide = isLiteralKeyPart(fk)
+            ? formatJoinValue('', fk)
+            : `"${join.sourceAlias === this.schema.name || !join.sourceAlias ? '__mutation__' : join.sourceAlias}"."${getFkDbColumnName(this.schema, fk)}"`;
+          const matchSide = formatJoinValue(join.alias, match);
+          joinConditions.push(`${fkSide} = ${matchSide}`);
+        } else if (join.sourceAlias === this.schema.name || !join.sourceAlias) {
           // FK is on main table - look up db column name from main schema
           const fkDbCol = getFkDbColumnName(this.schema, fk);
-          joinConditions.push(`"__mutation__"."${fkDbCol}" = "${join.alias}"."${match}"`);
+          joinConditions.push(`"__mutation__"."${fkDbCol}" = ${formatJoinValue(join.alias, match)}`);
         } else {
           // FK is on an intermediate joined table - look up from its schema
           const sourceTableName = aliasToSourceTable.get(join.sourceAlias);
           const sourceSchema = sourceTableName && this.schemaRegistry ? this.schemaRegistry.get(sourceTableName) : undefined;
           const fkDbCol = sourceSchema ? getFkDbColumnName(sourceSchema, fk) : fk;
-          joinConditions.push(`"${join.sourceAlias}"."${fkDbCol}" = "${join.alias}"."${match}"`);
+          joinConditions.push(`"${join.sourceAlias}"."${fkDbCol}" = ${formatJoinValue(join.alias, match)}`);
         }
       }
 
@@ -4518,7 +4527,7 @@ ${joinClauses.join('\n')}`;
       for (let i = 0; i < join.foreignKeys.length; i++) {
         const fk = join.foreignKeys[i];
         const match = join.matches[i];
-        onConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+        onConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
       }
       // Use schema-qualified table name if schema is specified
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
@@ -4760,7 +4769,7 @@ ${joinClauses.join('\n')}`;
       for (let i = 0; i < join.foreignKeys.length; i++) {
         const fk = join.foreignKeys[i];
         const match = join.matches[i];
-        onConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+        onConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
       }
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
@@ -5454,7 +5463,7 @@ ${joinClauses.join('\n')}`;
       for (let i = 0; i < join.foreignKeys.length; i++) {
         const fk = join.foreignKeys[i];
         const match = join.matches[i];
-        onConditions.push(`"${sourceTable}"."${fk}" = "${join.alias}"."${match}"`);
+        onConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
       }
       // Use schema-qualified table name if schema is specified
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);

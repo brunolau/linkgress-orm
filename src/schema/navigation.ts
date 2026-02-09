@@ -54,17 +54,21 @@ export class DbNavigationCollection<
   }
 
   /**
-   * Get foreign key column names
+   * Get foreign key column names (literals prefixed with __LIT:)
    */
   get foreignKeyColumns(): string[] {
-    return this.config.foreignKeys.map(fk => fk.__dbColumnName);
+    return this.config.foreignKeys.map(fk =>
+      (fk as any).__isLiteral ? `__LIT:${fk.__dbColumnName}` : fk.__dbColumnName
+    );
   }
 
   /**
-   * Get matching column names
+   * Get matching column names (literals prefixed with __LIT:)
    */
   get matchColumns(): string[] {
-    return this.config.matches.map(m => m.__dbColumnName);
+    return this.config.matches.map(m =>
+      (m as any).__isLiteral ? `__LIT:${m.__dbColumnName}` : m.__dbColumnName
+    );
   }
 
   /**
@@ -107,8 +111,12 @@ export class DbNavigation<
       this.config = val.config;
 
       this.getTargetTable = () => this.targetTableBuilder.getName();
-      this.getForeignKeyColumns = () => this.config.foreignKeys.map(fk => fk.__dbColumnName);
-      this.getMatchColumns = () => this.config.matches.map(m => m.__dbColumnName);
+      this.getForeignKeyColumns = () => this.config.foreignKeys.map(fk =>
+        (fk as any).__isLiteral ? `__LIT:${fk.__dbColumnName}` : fk.__dbColumnName
+      );
+      this.getMatchColumns = () => this.config.matches.map(m =>
+        (m as any).__isLiteral ? `__LIT:${m.__dbColumnName}` : m.__dbColumnName
+      );
       this.getIsMandatory = () => this.config.isMandatory ?? false;
     }
   }
@@ -122,19 +130,23 @@ export class DbNavigation<
   }
 
   /**
-   * Get foreign key column names
+   * Get foreign key column names (literals prefixed with __LIT:)
    */
   getForeignKeyColumns(): string[] {
     this.ensureNavigation();
-    return this.config.foreignKeys.map(fk => fk.__dbColumnName);
+    return this.config.foreignKeys.map(fk =>
+      (fk as any).__isLiteral ? `__LIT:${fk.__dbColumnName}` : fk.__dbColumnName
+    );
   }
 
   /**
-   * Get matching column names
+   * Get matching column names (literals prefixed with __LIT:)
    */
   getMatchColumns(): string[] {
     this.ensureNavigation();
-    return this.config.matches.map(m => m.__dbColumnName);
+    return this.config.matches.map(m =>
+      (m as any).__isLiteral ? `__LIT:${m.__dbColumnName}` : m.__dbColumnName
+    );
   }
 
   /**

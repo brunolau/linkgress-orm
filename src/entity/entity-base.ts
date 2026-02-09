@@ -66,8 +66,8 @@ export interface NavigationMetadata<TTarget extends DbEntity> {
   propertyKey: keyof any;
   targetEntity: () => EntityConstructor<TTarget>;
   relationType: 'one' | 'many';
-  foreignKey: string;
-  principalKey: string;
+  foreignKeys: string[];
+  principalKeys: string[];
   isRequired?: boolean;
   onDelete?: ForeignKeyAction;
   onUpdate?: ForeignKeyAction;

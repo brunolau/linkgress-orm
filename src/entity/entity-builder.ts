@@ -121,9 +121,10 @@ abstract class BaseNavigationBuilder<TEntity extends DbEntity, TTarget extends D
   ) {}
 
   /**
-   * Extract property names from selector (supports single or multiple columns)
+   * Extract key parts from selector (supports single or multiple columns, and literal values).
+   * Returns property name strings for column references, and "__LIT:value" for constants.
    */
-  protected extractPropertyNamesFromSelector(selector: Function): string[] {
+  protected extractKeyPartsFromSelector(selector: Function): string[] {
     // Create a proxy to capture property accesses
     const propertyNames: string[] = [];
     const captureProxy = new Proxy({} as any, {
@@ -138,13 +139,40 @@ abstract class BaseNavigationBuilder<TEntity extends DbEntity, TTarget extends D
     try {
       const result = selector(captureProxy);
 
-      // If result is an array, it means multiple properties were captured
+      // If result is an array, inspect each element to distinguish columns from literals
       if (Array.isArray(result)) {
-        // Properties were already captured during the proxy access
-        return propertyNames;
+        const parts: string[] = [];
+        let propIndex = 0;
+        for (const element of result) {
+          if (element === captureProxy) {
+            // This was a property access — consume next captured name
+            parts.push(propertyNames[propIndex++]);
+          } else if (typeof element === 'number' || typeof element === 'boolean') {
+            parts.push(`__LIT:${element}`);
+          } else if (typeof element === 'string') {
+            parts.push(`__LIT:'${element}'`);
+          } else if (element instanceof SqlFragment) {
+            // SqlFragment — build it without context to get raw SQL
+            const ctx = { paramCounter: 1, params: [] };
+            parts.push(`__LIT:${element.buildSql(ctx)}`);
+          } else {
+            // Unknown — try to use as literal
+            parts.push(`__LIT:${element}`);
+          }
+        }
+        return parts;
       }
 
-      // Single property case
+      // Single SqlFragment case (e.g. e => sql`FALSE`)
+      // Only treat as literal if no proxy properties were accessed.
+      // When properties WERE accessed (e.g. sql`${e.userId}`), the user is just
+      // wrapping a field reference — use the captured property names instead.
+      if (result instanceof SqlFragment && propertyNames.length === 0) {
+        const ctx = { paramCounter: 1, params: [] };
+        return [`__LIT:${result.buildSql(ctx)}`];
+      }
+
+      // Single property case (or SqlFragment wrapping field references)
       return propertyNames;
     } catch (e) {
       // Fallback to regex parsing if proxy approach fails
@@ -157,22 +185,22 @@ abstract class BaseNavigationBuilder<TEntity extends DbEntity, TTarget extends D
     }
   }
 
-  protected setForeignKeyMetadata(foreignKeyNames: string[]): void {
+  protected setForeignKeyMetadata(foreignKeyParts: string[]): void {
     const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
     const navMetadata: NavigationMetadata<TTarget> = {
       propertyKey: this.propertyKey,
       targetEntity: this.targetEntity,
       relationType: this.relationType,
-      foreignKey: foreignKeyNames.length === 1 ? foreignKeyNames[0] : foreignKeyNames.join(','),
-      principalKey: '', // Will be set by withPrincipalKey
+      foreignKeys: foreignKeyParts,
+      principalKeys: [], // Will be set by withPrincipalKey
     };
     metadata.navigations.set(this.propertyKey, navMetadata);
   }
 
-  protected setPrincipalKeyMetadata(principalKeyNames: string[]): void {
+  protected setPrincipalKeyMetadata(principalKeyParts: string[]): void {
     const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
     const navMetadata = metadata.navigations.get(this.propertyKey)!;
-    navMetadata.principalKey = principalKeyNames.length === 1 ? principalKeyNames[0] : principalKeyNames.join(',');
+    navMetadata.principalKeys = principalKeyParts;
     metadata.navigations.set(this.propertyKey, navMetadata);
   }
 
@@ -265,8 +293,8 @@ export class HasManyNavigationBuilder<TEntity extends DbEntity, TTarget extends 
    * Supports multiple columns: p => [p.userId, p.type]
    * Supports SQL fragments: p => sql`...`
    */
-  withForeignKey(foreignKey: (entity: TTarget) => DbColumn<any> | DbColumn<any>[] | SqlFragment): this {
-    const foreignKeyNames = this.extractPropertyNamesFromSelector(foreignKey as Function);
+  withForeignKey(foreignKey: (entity: TTarget) => DbColumn<any> | (DbColumn<any> | number | string | boolean)[] | SqlFragment): this {
+    const foreignKeyNames = this.extractKeyPartsFromSelector(foreignKey as Function);
     this.setForeignKeyMetadata(foreignKeyNames);
     return this;
   }
@@ -277,8 +305,8 @@ export class HasManyNavigationBuilder<TEntity extends DbEntity, TTarget extends 
    * Supports multiple columns: u => [u.id, u.type]
    * Supports SQL fragments: u => sql`...`
    */
-  withPrincipalKey(principalKey: (entity: TEntity) => DbColumn<any> | DbColumn<any>[] | SqlFragment): this {
-    const principalKeyNames = this.extractPropertyNamesFromSelector(principalKey as Function);
+  withPrincipalKey(principalKey: (entity: TEntity) => DbColumn<any> | (DbColumn<any> | number | string | boolean)[] | SqlFragment): this {
+    const principalKeyNames = this.extractKeyPartsFromSelector(principalKey as Function);
     this.setPrincipalKeyMetadata(principalKeyNames);
     return this;
   }
@@ -296,8 +324,8 @@ export class HasOneNavigationBuilder<TEntity extends DbEntity, TTarget extends D
    * Supports multiple columns: p => [p.userId, p.type]
    * Supports SQL fragments: p => sql`...`
    */
-  withForeignKey(foreignKey: (entity: TEntity) => DbColumn<any> | DbColumn<any>[] | SqlFragment): this {
-    const foreignKeyNames = this.extractPropertyNamesFromSelector(foreignKey as Function);
+  withForeignKey(foreignKey: (entity: TEntity) => DbColumn<any> | (DbColumn<any> | number | string | boolean)[] | SqlFragment): this {
+    const foreignKeyNames = this.extractKeyPartsFromSelector(foreignKey as Function);
     this.setForeignKeyMetadata(foreignKeyNames);
     return this;
   }
@@ -308,8 +336,8 @@ export class HasOneNavigationBuilder<TEntity extends DbEntity, TTarget extends D
    * Supports multiple columns: u => [u.id, u.type]
    * Supports SQL fragments: u => sql`...`
    */
-  withPrincipalKey(principalKey: (entity: TTarget) => DbColumn<any> | DbColumn<any>[] | SqlFragment): this {
-    const principalKeyNames = this.extractPropertyNamesFromSelector(principalKey as Function);
+  withPrincipalKey(principalKey: (entity: TTarget) => DbColumn<any> | (DbColumn<any> | number | string | boolean)[] | SqlFragment): this {
+    const principalKeyNames = this.extractKeyPartsFromSelector(principalKey as Function);
     this.setPrincipalKeyMetadata(principalKeyNames);
     return this;
   }
@@ -323,7 +351,7 @@ export class EntityNavigationBuilder<TEntity extends DbEntity, TTarget extends D
   withForeignKey(foreignKey: (entity: TTarget) => any): this;
   withForeignKey(foreignKey: (entity: TEntity) => any): this;
   withForeignKey(foreignKey: Function): this {
-    const foreignKeyNames = this.extractPropertyNamesFromSelector(foreignKey);
+    const foreignKeyNames = this.extractKeyPartsFromSelector(foreignKey);
     this.setForeignKeyMetadata(foreignKeyNames);
     return this;
   }
@@ -331,7 +359,7 @@ export class EntityNavigationBuilder<TEntity extends DbEntity, TTarget extends D
   withPrincipalKey(principalKey: (entity: TEntity) => any): this;
   withPrincipalKey(principalKey: (entity: TTarget) => any): this;
   withPrincipalKey(principalKey: Function): this {
-    const principalKeyNames = this.extractPropertyNamesFromSelector(principalKey);
+    const principalKeyNames = this.extractKeyPartsFromSelector(principalKey);
     this.setPrincipalKeyMetadata(principalKeyNames);
     return this;
   }

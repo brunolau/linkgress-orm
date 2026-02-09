@@ -68,36 +68,50 @@ export class DbModelConfig {
           // Determine which table has the foreign key
           let foreignKeyTable: TableBuilder<any>;
           let principalKeyTable: TableBuilder<any>;
-          let foreignKeyProp: string;
-          let principalKeyProp: string;
+          let foreignKeyParts: string[];
+          let principalKeyParts: string[];
 
           if (navMetadata.relationType === 'many') {
             // For hasMany: FK is on target table, PK is on current table
             foreignKeyTable = targetTable;
             principalKeyTable = tableBuilder;
-            foreignKeyProp = navMetadata.foreignKey;
-            principalKeyProp = navMetadata.principalKey;
+            foreignKeyParts = navMetadata.foreignKeys;
+            principalKeyParts = navMetadata.principalKeys;
           } else {
             // For hasOne: FK is on current table, PK is on target table
             foreignKeyTable = tableBuilder;
             principalKeyTable = targetTable;
-            foreignKeyProp = navMetadata.foreignKey;
-            principalKeyProp = navMetadata.principalKey;
+            foreignKeyParts = navMetadata.foreignKeys;
+            principalKeyParts = navMetadata.principalKeys;
           }
+
+          // Resolve key parts to FieldRefs (supports composite keys and literal values)
+          const resolveKeyParts = (parts: string[], table: TableBuilder<any>) => {
+            return parts.map(part => {
+              if (part.startsWith('__LIT:')) {
+                // Literal value — create a special FieldRef
+                return { __fieldName: '__const', __dbColumnName: part.substring(6), __isLiteral: true };
+              }
+              return table.field(part as any);
+            });
+          };
+
+          const fkRefs = resolveKeyParts(foreignKeyParts, foreignKeyTable);
+          const pkRefs = resolveKeyParts(principalKeyParts, principalKeyTable);
 
           // Create navigation
           if (navMetadata.relationType === 'many') {
             navSchema[propKey as string] = new DbNavigationCollection(targetTable, {
-              foreignKeys: [foreignKeyTable.field(foreignKeyProp as any)],
-              matches: [principalKeyTable.field(principalKeyProp as any)],
+              foreignKeys: fkRefs,
+              matches: pkRefs,
               isMandatory: navMetadata.isRequired || false,
             });
           } else {
             navSchema[propKey as string] = new DbNavigation(() => ({
               targetTable: targetTable,
               config: {
-                foreignKeys: [foreignKeyTable.field(foreignKeyProp as any)],
-                matches: [principalKeyTable.field(principalKeyProp as any)],
+                foreignKeys: fkRefs,
+                matches: pkRefs,
                 isMandatory: navMetadata.isRequired || false,
               }
             }));
@@ -129,26 +143,34 @@ export class DbModelConfig {
         // Skip if this is an inverse navigation (FK is defined on the other side)
         if (navMetadata.relationType === 'one' && !navMetadata.isInverseNavigation) {
           // For hasOne: FK is on current table
-          const foreignKeyProp = navMetadata.foreignKey;
-          const principalKeyProp = navMetadata.principalKey;
+          // Filter out literal values — can't create FK constraints on constants
+          const fkColumns: string[] = [];
+          const pkColumns: string[] = [];
 
-          // Get the column name for the foreign key property
-          const fkPropMetadata = metadata.properties.get(foreignKeyProp);
-          if (!fkPropMetadata) continue;
+          for (let i = 0; i < navMetadata.foreignKeys.length; i++) {
+            const fkPart = navMetadata.foreignKeys[i];
+            const pkPart = navMetadata.principalKeys[i];
+            if (fkPart?.startsWith('__LIT:') || pkPart?.startsWith('__LIT:')) continue;
 
-          // Get the column name for the principal key property
-          const pkPropMetadata = (targetMetadata.properties as Map<any, any>).get(principalKeyProp);
-          if (!pkPropMetadata) continue;
+            const fkPropMeta = metadata.properties.get(fkPart);
+            const pkPropMeta = (targetMetadata.properties as Map<any, any>).get(pkPart);
+            if (!fkPropMeta || !pkPropMeta) continue;
+
+            fkColumns.push(fkPropMeta.columnName);
+            pkColumns.push(pkPropMeta.columnName);
+          }
+
+          if (fkColumns.length === 0) continue;
 
           // Generate or use custom constraint name
           const constraintName = navMetadata.constraintName ||
-            `FK_${metadata.tableName}_${targetMetadata.tableName}_${fkPropMetadata.columnName}`;
+            `FK_${metadata.tableName}_${targetMetadata.tableName}_${fkColumns[0]}`;
 
           fkConstraints.push({
             name: constraintName,
-            columns: [fkPropMetadata.columnName],
+            columns: fkColumns,
             referencedTable: targetMetadata.tableName,
-            referencedColumns: [pkPropMetadata.columnName],
+            referencedColumns: pkColumns,
             onDelete: navMetadata.onDelete,
             onUpdate: navMetadata.onUpdate,
           });
