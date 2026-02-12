@@ -1,4 +1,4 @@
-import { WhereConditionBase, SqlBuildContext, FieldRef } from './conditions';
+import { WhereConditionBase, SqlBuildContext, FieldRef, SqlFragment } from './conditions';
 
 /**
  * Represents a subquery that can be used in various contexts
@@ -122,10 +122,13 @@ export function isSubquery(value: any): value is Subquery {
 
 /**
  * Condition: EXISTS (subquery)
+ * Extends SqlFragment<boolean> so it works in both WHERE clauses and SELECT projections.
+ * In SELECT: produces `EXISTS (SELECT ...) as "alias"` with boolean type inference.
+ * In WHERE: works as WhereConditionBase since SqlFragment extends it.
  */
-export class ExistsCondition extends WhereConditionBase {
+export class ExistsCondition extends SqlFragment<boolean> {
   constructor(private subquery: Subquery) {
-    super();
+    super([], []);
   }
 
   /**
@@ -136,7 +139,7 @@ export class ExistsCondition extends WhereConditionBase {
     return this.subquery.getOuterFieldRefs();
   }
 
-  buildSql(context: SqlBuildContext): string {
+  override buildSql(context: SqlBuildContext): string {
     const subquerySql = this.subquery.buildSql(context);
     return `EXISTS (${subquerySql})`;
   }
@@ -144,10 +147,11 @@ export class ExistsCondition extends WhereConditionBase {
 
 /**
  * Condition: NOT EXISTS (subquery)
+ * Extends SqlFragment<boolean> so it works in both WHERE clauses and SELECT projections.
  */
-export class NotExistsCondition extends WhereConditionBase {
+export class NotExistsCondition extends SqlFragment<boolean> {
   constructor(private subquery: Subquery) {
-    super();
+    super([], []);
   }
 
   /**
@@ -158,7 +162,7 @@ export class NotExistsCondition extends WhereConditionBase {
     return this.subquery.getOuterFieldRefs();
   }
 
-  buildSql(context: SqlBuildContext): string {
+  override buildSql(context: SqlBuildContext): string {
     const subquerySql = this.subquery.buildSql(context);
     return `NOT EXISTS (${subquerySql})`;
   }

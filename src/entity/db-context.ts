@@ -1642,6 +1642,10 @@ export interface EntityCollectionQuery<TEntity extends DbEntity> {
   max<TSelection>(selector: (item: EntityQuery<TEntity>) => TSelection): SqlFragment<number | null>;
   sum<TSelection>(selector: (item: EntityQuery<TEntity>) => TSelection): SqlFragment<number | null>;
   count(): SqlFragment<number>;
+  exists(): SqlFragment<boolean>;
+
+  // Flattening
+  selectMany<TInner extends DbEntity>(selector: (item: EntityQuery<TEntity>) => EntityCollectionQuery<TInner>): EntityCollectionQuery<TInner>;
 
   // Flattened list results (for single-column selections)
   toNumberList(asName?: string): number[];

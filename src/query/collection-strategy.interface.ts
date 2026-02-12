@@ -227,7 +227,16 @@ export interface CollectionAggregationConfig {
   /**
    * Aggregation type
    */
-  aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum';
+  aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists';
+
+  /**
+   * When the foreign key column is on a different table than the target table
+   * (e.g., after selectMany flattening), this specifies which table alias
+   * to use when qualifying the FK column.
+   * Example: selectMany flattens product_price_capacity_groups through product_prices,
+   * so FK "product_id" is on "product_prices", not on the target table.
+   */
+  foreignKeyTableAlias?: string;
 
   /**
    * For scalar aggregations, the field to aggregate
