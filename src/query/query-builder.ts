@@ -4927,8 +4927,13 @@ ${joinClauses.join('\n')}`;
           } else if (cached) {
             fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
           } else {
-            // Not in schema - treat as simple value
-            fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
+            // Not in base table schema - check if FieldRef carries its own mapper (navigation property)
+            const directMapper = (value as any).__mapper;
+            if (directMapper && typeof directMapper.fromDriver === 'function') {
+              fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: directMapper });
+            } else {
+              fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
+            }
           }
         }
         continue;
