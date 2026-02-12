@@ -865,7 +865,8 @@ export class SelectQueryBuilder<TSelection> {
       this.whereCond,
       this.executor,
       this.manualJoins,
-      this.joinCounter
+      this.joinCounter,
+      this.schemaRegistry
     );
   }
 
