@@ -57,12 +57,41 @@ export class MigrationRunner {
   /**
    * Run all pending migrations in chronological order.
    *
+   * If the journal table does not exist (fresh database), the schema is
+   * created from the model definition first (diff-based), and all existing
+   * migration files are recorded as applied.
+   *
    * Each migration is executed within a transaction. If a migration fails,
    * the transaction is rolled back and execution stops.
    *
    * @returns Result containing applied, skipped, and failed migrations
    */
   async up(): Promise<MigrationRunResult> {
+    // Check if journal table exists — if not, this is a fresh database
+    const journalExists = await this.journal.tableExists();
+
+    if (!journalExists) {
+      this.log('No migration journal found — creating schema from model...');
+      await this.db.getSchemaManager().migrate();
+
+      // Create journal table and mark all existing migrations as applied
+      await this.journal.ensureTable();
+      const allMigrations = await this.loader.loadAllMigrations();
+
+      const result: MigrationRunResult = {
+        applied: [],
+        skipped: allMigrations.map(m => m.filename),
+      };
+
+      for (const migration of allMigrations) {
+        await this.journal.recordApplied(migration.filename);
+        this.log(`  Recorded as applied: ${migration.filename}`);
+      }
+
+      this.log(`Schema created. ${allMigrations.length} migration(s) recorded as applied.`);
+      return result;
+    }
+
     await this.journal.ensureTable();
 
     const allMigrations = await this.loader.loadAllMigrations();
