@@ -3928,6 +3928,14 @@ ${joinClauses.join('\n')}`;
         if (tableAlias && tableAlias !== this.schema.name) {
           allTableAliases.add(tableAlias);
         }
+        // Also collect intermediate navigation aliases for multi-level navigation
+        if ('__navigationAliases' in value && Array.isArray((value as any).__navigationAliases)) {
+          for (const navAlias of (value as any).__navigationAliases) {
+            if (navAlias && navAlias !== this.schema.name) {
+              allTableAliases.add(navAlias);
+            }
+          }
+        }
       } else if (value instanceof SqlFragment) {
         // SqlFragment may contain navigation property references
         const fieldRefs = value.getFieldRefs();
@@ -3936,6 +3944,13 @@ ${joinClauses.join('\n')}`;
             const tableAlias = fieldRef.__tableAlias as string;
             if (tableAlias && tableAlias !== this.schema.name) {
               allTableAliases.add(tableAlias);
+            }
+          }
+          if ('__navigationAliases' in fieldRef && Array.isArray((fieldRef as any).__navigationAliases)) {
+            for (const navAlias of (fieldRef as any).__navigationAliases) {
+              if (navAlias && navAlias !== this.schema.name) {
+                allTableAliases.add(navAlias);
+              }
             }
           }
         }
