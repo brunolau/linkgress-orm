@@ -97,13 +97,18 @@ export type OrderByTuple<T = unknown> = [T, OrderDirection];
 export type OrderByResult<T = unknown> = T | T[] | Array<OrderByTuple<T>>;
 
 /**
+ * Log level for logger function
+ */
+export type LogLevel = 'info' | 'warn' | 'error' | 'debug';
+
+/**
  * Query execution options
  */
 export interface QueryOptions {
   /** Enable SQL query logging */
   logQueries?: boolean;
-  /** Custom logger function (defaults to console.log) */
-  logger?: (message: string) => void;
+  /** Custom logger function (defaults to console.log). Level indicates the type of log message. */
+  logger?: (message: string, level?: LogLevel) => void;
   /** Log query execution time */
   logExecutionTime?: boolean;
   /** Log query parameters */
@@ -180,7 +185,7 @@ export class TimeTracer {
   private phaseStartTime: number = 0;
   private phases: Record<string, number> = {};
 
-  constructor(private enabled: boolean, private logger?: (message: string) => void) {
+  constructor(private enabled: boolean, private logger?: (message: string, level?: LogLevel) => void) {
     if (enabled) {
       this.startTime = performance.now();
     }
@@ -277,28 +282,28 @@ export class TimeTracer {
     const trace = this.getTrace(rowCount);
     const log = this.logger || console.log;
 
-    log('\n[Time Trace Summary]');
-    log(`  Total: ${trace.totalMs.toFixed(2)}ms`);
+    log('\n[Time Trace Summary]', 'debug');
+    log(`  Total: ${trace.totalMs.toFixed(2)}ms`, 'debug');
     if (trace.phases.queryBuild !== undefined) {
-      log(`  Query Build: ${trace.phases.queryBuild.toFixed(2)}ms`);
+      log(`  Query Build: ${trace.phases.queryBuild.toFixed(2)}ms`, 'debug');
     }
     if (trace.phases.queryExecution !== undefined) {
-      log(`  Query Execution: ${trace.phases.queryExecution.toFixed(2)}ms`);
+      log(`  Query Execution: ${trace.phases.queryExecution.toFixed(2)}ms`, 'debug');
     }
     if (trace.phases.resultProcessing !== undefined) {
-      log(`  Result Processing: ${trace.phases.resultProcessing.toFixed(2)}ms`);
+      log(`  Result Processing: ${trace.phases.resultProcessing.toFixed(2)}ms`, 'debug');
     }
     if (rowCount !== undefined) {
-      log(`  Rows: ${rowCount}`);
+      log(`  Rows: ${rowCount}`, 'debug');
     }
 
     // Log detailed entries if there are any significant operations
     const significantEntries = this.entries.filter(e => e.durationMs > 0.1);
     if (significantEntries.length > 0) {
-      log('\n[Detailed Trace]');
+      log('\n[Detailed Trace]', 'debug');
       for (const entry of significantEntries) {
         const details = entry.details ? ` (${JSON.stringify(entry.details)})` : '';
-        log(`  [${entry.phase}] ${entry.operation}: ${entry.durationMs.toFixed(2)}ms${details}`);
+        log(`  [${entry.phase}] ${entry.operation}: ${entry.durationMs.toFixed(2)}ms${details}`, 'debug');
       }
     }
   }
@@ -323,11 +328,11 @@ export class QueryExecutor {
     const startTime = this.options.logExecutionTime ? performance.now() : 0;
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query]`);
-      logger(sql.trim());
+      logger(`\n[SQL Query]`, 'debug');
+      logger(sql.trim(), 'debug');
 
       if (this.options.logParameters && params && params.length > 0) {
-        logger(`[Parameters] ${JSON.stringify(params)}`);
+        logger(`[Parameters] ${JSON.stringify(params)}`, 'debug');
       }
     }
 
@@ -341,13 +346,13 @@ export class QueryExecutor {
 
       if (this.options.logExecutionTime) {
         const duration = (performance.now() - startTime).toFixed(2);
-        logger(`[Execution Time] ${duration}ms`);
+        logger(`[Execution Time] ${duration}ms`, 'debug');
       }
 
       return result;
     } catch (error) {
       if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`);
+        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
       }
       throw error;
     }
@@ -362,8 +367,8 @@ export class QueryExecutor {
     const startTime = this.options.logExecutionTime ? performance.now() : 0;
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query - Multi-Statement]`);
-      logger(sql.trim());
+      logger(`\n[SQL Query - Multi-Statement]`, 'debug');
+      logger(sql.trim(), 'debug');
     }
 
     try {
@@ -373,7 +378,7 @@ export class QueryExecutor {
 
         if (this.options.logExecutionTime) {
           const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`);
+          logger(`[Execution Time] ${duration}ms`, 'debug');
         }
 
         return result;
@@ -383,14 +388,14 @@ export class QueryExecutor {
 
         if (this.options.logExecutionTime) {
           const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`);
+          logger(`[Execution Time] ${duration}ms`, 'debug');
         }
 
         return result;
       }
     } catch (error) {
       if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`);
+        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
       }
       throw error;
     }
@@ -405,8 +410,8 @@ export class QueryExecutor {
     const startTime = this.options.logExecutionTime ? performance.now() : 0;
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query - Fully Optimized Multi-Statement]`);
-      logger(sql.trim());
+      logger(`\n[SQL Query - Fully Optimized Multi-Statement]`, 'debug');
+      logger(sql.trim(), 'debug');
     }
 
     try {
@@ -416,7 +421,7 @@ export class QueryExecutor {
 
         if (this.options.logExecutionTime) {
           const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`);
+          logger(`[Execution Time] ${duration}ms`, 'debug');
         }
 
         return results;
@@ -425,7 +430,7 @@ export class QueryExecutor {
       }
     } catch (error) {
       if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`);
+        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
       }
       throw error;
     }
@@ -1486,7 +1491,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * Get schema manager for create/drop operations and automatic migrations
    */
   getSchemaManager(): DbSchemaManager {
-    return new DbSchemaManager(this.client, this.schemaRegistry, { logQueries: this.queryOptions?.logQueries });
+    return new DbSchemaManager(this.client, this.schemaRegistry, { logQueries: this.queryOptions?.logQueries, logger: this.queryOptions?.logger });
   }
 
   /**
@@ -4658,6 +4663,7 @@ export abstract class DatabaseContext extends DataContext {
       (this as any).schemaRegistry,
       {
         logQueries: (this as any).queryOptions?.logQueries,
+        logger: (this as any).queryOptions?.logger,
         postMigrationHook: async (client: DatabaseClient) => {
           await this.onMigrationComplete(client);
         },

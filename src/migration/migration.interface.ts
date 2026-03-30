@@ -1,4 +1,4 @@
-import { DatabaseContext } from '../entity/db-context';
+import { DatabaseContext, LogLevel } from '../entity/db-context';
 
 /**
  * Migration interface that all migration files must implement.
@@ -67,8 +67,9 @@ export interface MigrationConfig {
 
   /**
    * Custom logger function. If not provided, uses console.log.
+   * Level indicates the type of log message ('info', 'error', 'debug').
    */
-  logger?: (message: string) => void;
+  logger?: (message: string, level?: LogLevel) => void;
 }
 
 /**

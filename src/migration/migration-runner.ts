@@ -1,4 +1,4 @@
-import { DatabaseContext } from '../entity/db-context';
+import { DatabaseContext, LogLevel } from '../entity/db-context';
 import {
   MigrationConfig,
   MigrationRunResult,
@@ -36,7 +36,7 @@ export class MigrationRunner {
   private journal: MigrationJournal;
   private loader: MigrationLoader;
   private verbose: boolean;
-  private logger: (message: string) => void;
+  private logger: (message: string, level?: LogLevel) => void;
 
   constructor(
     private db: DatabaseContext,
@@ -48,9 +48,9 @@ export class MigrationRunner {
     this.logger = config.logger ?? console.log;
   }
 
-  private log(message: string): void {
+  private log(message: string, level?: LogLevel): void {
     if (this.verbose) {
-      this.logger(message);
+      this.logger(message, level);
     }
   }
 
@@ -107,11 +107,11 @@ export class MigrationRunner {
         .map(m => m.filename),
     };
 
-    this.log(`Found ${pending.length} pending migration(s)`);
+    this.log(`Found ${pending.length} pending migration(s)`, 'info');
 
     for (const migration of pending) {
       try {
-        this.log(`Applying: ${migration.filename}`);
+        this.log(`Applying: ${migration.filename}`, 'info');
 
         // Execute migration within a transaction
         await this.db.transaction(async (txDb) => {
@@ -122,21 +122,21 @@ export class MigrationRunner {
         await this.journal.recordApplied(migration.filename);
         result.applied.push(migration.filename);
 
-        this.log(`  Applied: ${migration.filename}`);
+        this.log(`  Applied: ${migration.filename}`, 'info');
       } catch (error) {
         result.failed = {
           filename: migration.filename,
           error: error as Error,
         };
-        this.logger(`  FAILED: ${migration.filename} - ${(error as Error).message}`);
+        this.logger(`  FAILED: ${migration.filename} - ${(error as Error).message}`, 'error');
         break; // Stop on first failure
       }
     }
 
     if (result.applied.length > 0) {
-      this.log(`\nCompleted: ${result.applied.length} migration(s) applied`);
+      this.log(`\nCompleted: ${result.applied.length} migration(s) applied`, 'info');
     } else if (!result.failed) {
-      this.log('No pending migrations');
+      this.log('No pending migrations', 'info');
     }
 
     return result;
@@ -164,20 +164,20 @@ export class MigrationRunner {
       skipped: [],
     };
 
-    this.log(`Reverting ${toRevert.length} migration(s)`);
+    this.log(`Reverting ${toRevert.length} migration(s)`, 'info');
 
     for (const entry of toRevert) {
       const migration = allMigrations.find(m => m.filename === entry.filename);
 
       if (!migration) {
-        this.logger(`  WARNING: Migration file not found for ${entry.filename}, removing from journal`);
+        this.logger(`  WARNING: Migration file not found for ${entry.filename}, removing from journal`, 'warn');
         await this.journal.recordReverted(entry.filename);
         result.applied.push(entry.filename);
         continue;
       }
 
       try {
-        this.log(`Reverting: ${migration.filename}`);
+        this.log(`Reverting: ${migration.filename}`, 'info');
 
         // Execute down migration within a transaction
         await this.db.transaction(async (txDb) => {
@@ -188,19 +188,19 @@ export class MigrationRunner {
         await this.journal.recordReverted(migration.filename);
         result.applied.push(migration.filename);
 
-        this.log(`  Reverted: ${migration.filename}`);
+        this.log(`  Reverted: ${migration.filename}`, 'info');
       } catch (error) {
         result.failed = {
           filename: migration.filename,
           error: error as Error,
         };
-        this.logger(`  FAILED: ${migration.filename} - ${(error as Error).message}`);
+        this.logger(`  FAILED: ${migration.filename} - ${(error as Error).message}`, 'error');
         break;
       }
     }
 
     if (result.applied.length > 0) {
-      this.log(`\nCompleted: ${result.applied.length} migration(s) reverted`);
+      this.log(`\nCompleted: ${result.applied.length} migration(s) reverted`, 'info');
     }
 
     return result;

@@ -148,6 +148,7 @@ export {
 // Internal DataContext (for library use only - users should use DbContext)
 export {
   QueryOptions,
+  LogLevel,
   LoggingOptions,
   CollectionStrategyType,
   TimeTracer,

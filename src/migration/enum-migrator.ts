@@ -1,4 +1,5 @@
 import { DatabaseClient } from '../database/database-client.interface';
+import { LogLevel } from '../entity/db-context';
 import { EnumTypeRegistry, EnumTypeDefinition } from '../types/enum-builder';
 
 /**
@@ -6,12 +7,14 @@ import { EnumTypeRegistry, EnumTypeDefinition } from '../types/enum-builder';
  */
 export class EnumMigrator {
   private logQueries: boolean;
+  private logger: (message: string, level?: LogLevel) => void;
 
   constructor(
     private client: DatabaseClient,
-    options?: { logQueries?: boolean }
+    options?: { logQueries?: boolean; logger?: (message: string, level?: LogLevel) => void }
   ) {
     this.logQueries = options?.logQueries ?? false;
+    this.logger = options?.logger ?? console.log;
   }
 
   /**
@@ -46,13 +49,13 @@ export class EnumMigrator {
     }
 
     if (this.logQueries) {
-      console.log(`  Adding value '${value}' to ENUM "${enumName}"...`);
+      this.logger(`  Adding value '${value}' to ENUM "${enumName}"...`, 'info');
     }
 
     await this.client.query(sql);
 
     if (this.logQueries) {
-      console.log(`  ✓ Value '${value}' added to ENUM "${enumName}"\n`);
+      this.logger(`  ✓ Value '${value}' added to ENUM "${enumName}"\n`, 'info');
     }
   }
 
@@ -66,13 +69,13 @@ export class EnumMigrator {
     const version = parseInt(versionResult.rows[0].server_version_num);
 
     if (version < 120000) {
-      console.warn(`  ⚠ Cannot remove enum value '${value}' - requires PostgreSQL 12+`);
-      console.warn(`  ⚠ Current version: ${version}. You need to recreate the enum type manually.`);
+      this.logger(`  ⚠ Cannot remove enum value '${value}' - requires PostgreSQL 12+`, 'warn');
+      this.logger(`  ⚠ Current version: ${version}. You need to recreate the enum type manually.`, 'warn');
       return;
     }
 
     if (this.logQueries) {
-      console.log(`  Removing value '${value}' from ENUM "${enumName}"...`);
+      this.logger(`  Removing value '${value}' from ENUM "${enumName}"...`, 'info');
     }
 
     // Note: This will fail if any rows reference this value
@@ -80,12 +83,12 @@ export class EnumMigrator {
       await this.client.query(`ALTER TYPE "${enumName}" DROP VALUE '${value}'`);
 
       if (this.logQueries) {
-        console.log(`  ✓ Value '${value}' removed from ENUM "${enumName}"\n`);
+        this.logger(`  ✓ Value '${value}' removed from ENUM "${enumName}"\n`, 'info');
       }
     } catch (error: any) {
-      console.error(`  ✗ Failed to remove value '${value}' from ENUM "${enumName}"`);
-      console.error(`  Error: ${error.message}`);
-      console.error(`  This usually means there are existing rows using this value.`);
+      this.logger(`  ✗ Failed to remove value '${value}' from ENUM "${enumName}"`, 'error');
+      this.logger(`  Error: ${error.message}`, 'error');
+      this.logger(`  This usually means there are existing rows using this value.`, 'error');
       throw error;
     }
   }
@@ -101,7 +104,7 @@ export class EnumMigrator {
     }
 
     if (this.logQueries) {
-      console.log('Migrating ENUM types...\n');
+      this.logger('Migrating ENUM types...\n', 'info');
     }
 
     for (const [enumName, enumDef] of enums.entries()) {
@@ -113,11 +116,11 @@ export class EnumMigrator {
         const createEnumSQL = `CREATE TYPE "${enumName}" AS ENUM (${values})`;
 
         if (this.logQueries) {
-          console.log(`  Creating ENUM type "${enumName}"...`);
+          this.logger(`  Creating ENUM type "${enumName}"...`, 'info');
         }
         await this.client.query(createEnumSQL);
         if (this.logQueries) {
-          console.log(`  ✓ ENUM type "${enumName}" created\n`);
+          this.logger(`  ✓ ENUM type "${enumName}" created\n`, 'info');
         }
         continue;
       }
@@ -134,7 +137,7 @@ export class EnumMigrator {
 
       if (valuesToAdd.length === 0 && valuesToRemove.length === 0) {
         if (this.logQueries) {
-          console.log(`  ENUM "${enumName}" is up to date\n`);
+          this.logger(`  ENUM "${enumName}" is up to date\n`, 'info');
         }
         continue;
       }
@@ -160,7 +163,7 @@ export class EnumMigrator {
     }
 
     if (this.logQueries) {
-      console.log('✓ ENUM types migrated successfully\n');
+      this.logger('✓ ENUM types migrated successfully\n', 'info');
     }
   }
 }
