@@ -3594,14 +3594,22 @@ ${joinClauses.join('\n')}`;
         // If the value is already a FieldRef
         if (value && typeof value === 'object' && '__fieldName' in value && '__dbColumnName' in value) {
           if (preserveOriginal) {
-            // For WHERE: preserve original column name, table alias, and mapper
+            // For WHERE: preserve original column name, table alias, mapper, and navigation aliases
             // This ensures WHERE references the actual database column with proper type conversion
-            return {
+            // and can resolve intermediate JOINs for multi-level navigation
+            const fieldRef: any = {
               __fieldName: prop as string,
               __dbColumnName: (value as any).__dbColumnName,
               __tableAlias: (value as any).__tableAlias,
               __mapper: (value as any).__mapper,  // Preserve mapper for toDriver in conditions
             };
+            if ((value as any).__navigationAliases) {
+              fieldRef.__navigationAliases = (value as any).__navigationAliases;
+            }
+            if ((value as any).__sourceTable) {
+              fieldRef.__sourceTable = (value as any).__sourceTable;
+            }
+            return fieldRef;
           } else {
             // For ORDER BY: use the alias (property name) as the column name
             // In chained selects, the alias becomes the column name in the subquery
@@ -3928,7 +3936,7 @@ ${joinClauses.join('\n')}`;
         if (tableAlias && tableAlias !== this.schema.name) {
           allTableAliases.add(tableAlias);
         }
-        // Also collect intermediate navigation aliases for multi-level navigation
+        // Also collect intermediate navigation aliases for multi-level navigation (e.g., task.level.name)
         if ('__navigationAliases' in value && Array.isArray((value as any).__navigationAliases)) {
           for (const navAlias of (value as any).__navigationAliases) {
             if (navAlias && navAlias !== this.schema.name) {
@@ -3946,6 +3954,7 @@ ${joinClauses.join('\n')}`;
               allTableAliases.add(tableAlias);
             }
           }
+          // Also collect intermediate navigation aliases for multi-level navigation
           if ('__navigationAliases' in fieldRef && Array.isArray((fieldRef as any).__navigationAliases)) {
             for (const navAlias of (fieldRef as any).__navigationAliases) {
               if (navAlias && navAlias !== this.schema.name) {
@@ -4942,10 +4951,10 @@ ${joinClauses.join('\n')}`;
           } else if (cached) {
             fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
           } else {
-            // Not in base table schema - check if FieldRef carries its own mapper (navigation property)
-            const directMapper = (value as any).__mapper;
-            if (directMapper && typeof directMapper.fromDriver === 'function') {
-              fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: directMapper });
+            // Not in root schema cache — check FieldRef's own mapper (from navigation properties)
+            const fieldMapper = (value as any).__mapper;
+            if (fieldMapper && typeof fieldMapper.fromDriver === 'function') {
+              fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: fieldMapper });
             } else {
               fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
             }
