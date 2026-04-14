@@ -22,6 +22,21 @@ export class MigrationJournal {
   }
 
   /**
+   * Check if the journal table exists in the database without creating it.
+   * Used to detect whether the schema has been previously set up.
+   */
+  async tableExists(): Promise<boolean> {
+    const result = await this.client.query(
+      `SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = $1 AND table_name = $2
+      ) as exists`,
+      [this.schemaName, this.tableName]
+    );
+    return result.rows[0]?.exists === true;
+  }
+
+  /**
    * Ensure the journal table exists in the database.
    * Creates it if it doesn't exist.
    */

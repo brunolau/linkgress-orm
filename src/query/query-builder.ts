@@ -865,7 +865,8 @@ export class SelectQueryBuilder<TSelection> {
       this.whereCond,
       this.executor,
       this.manualJoins,
-      this.joinCounter
+      this.joinCounter,
+      this.schemaRegistry
     );
   }
 
@@ -2367,7 +2368,7 @@ export class SelectQueryBuilder<TSelection> {
     const selectedFieldConfigs: Array<{ alias: string; expression: string }> = [];
 
     // Determine aggregation type
-    let aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' = 'jsonb';
+    let aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists' = 'jsonb';
     let aggregateField: string | undefined;
     let arrayField: string | undefined;
 
@@ -2417,7 +2418,7 @@ export class SelectQueryBuilder<TSelection> {
   /**
    * Get default value string for aggregation type
    */
-  private getDefaultValueString(aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum'): string {
+  private getDefaultValueString(aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists'): string {
     switch (aggregationType) {
       case 'jsonb':
         // Use JSON instead of JSONB for better aggregation performance
@@ -2426,6 +2427,8 @@ export class SelectQueryBuilder<TSelection> {
         return "'{}'";
       case 'count':
         return '0';
+      case 'exists':
+        return 'false';
       case 'min':
       case 'max':
       case 'sum':
@@ -2443,7 +2446,9 @@ export class SelectQueryBuilder<TSelection> {
 
     if (builderAny.aggregationType) {
       // Scalar aggregation
-      return builderAny.aggregationType === 'COUNT' ? 0 : null;
+      if (builderAny.aggregationType === 'COUNT') return 0;
+      if (builderAny.aggregationType === 'EXISTS') return false;
+      return null;
     } else if (builderAny.flattenResultType) {
       // Array aggregation
       return [];
@@ -4420,6 +4425,8 @@ ${joinClauses.join('\n')}`;
         const aggregationType = collectionValue.getAggregationType();
         if (aggregationType === 'COUNT') {
           selectParts.push(`COALESCE("${cteName}".data, 0) as "${name}"`);
+        } else if (aggregationType === 'EXISTS') {
+          selectParts.push(`COALESCE("${cteName}".data, false) as "${name}"`);
         } else {
           // For MAX/MIN/SUM, keep NULL as-is
           selectParts.push(`"${cteName}".data as "${name}"`);
@@ -5936,11 +5943,15 @@ export class CollectionQueryBuilder<TItem = any> {
   private asName?: string;
   private isMarkedAsList: boolean = false;
   private isDistinct: boolean = false;
-  private aggregationType?: 'MIN' | 'MAX' | 'SUM' | 'COUNT';
+  private aggregationType?: 'MIN' | 'MAX' | 'SUM' | 'COUNT' | 'EXISTS';
   private flattenResultType?: 'number' | 'string';
   private schemaRegistry?: Map<string, TableSchema>;
   // Navigation path leading to this collection (for intermediate joins in lateral subqueries)
   private navigationPath: NavigationJoin[];
+  // Navigation joins added by selectMany() - included in both CTE and LATERAL navigation joins
+  private selectManyJoins: NavigationJoin[] = [];
+  // When FK is on a different table than target (from selectMany), the table alias to qualify FK
+  private foreignKeyTableAlias?: string;
 
   // Performance: Cache the mock item to avoid recreating it
   private _cachedMockItem?: any;
@@ -5997,6 +6008,8 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.orderByFields = this.orderByFields;
     newBuilder.asName = this.asName;
     newBuilder.isDistinct = this.isDistinct;
+    newBuilder.selectManyJoins = this.selectManyJoins;
+    newBuilder.foreignKeyTableAlias = this.foreignKeyTableAlias;
     return newBuilder;
   }
 
@@ -6211,6 +6224,59 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * Check if any items exist in the collection
+   * Returns SqlFragment<boolean> for automatic type resolution in selectors
+   */
+  exists(): SqlFragment<boolean> {
+    this.aggregationType = 'EXISTS';
+    return this as unknown as SqlFragment<boolean>;
+  }
+
+  /**
+   * Flatten a nested collection through this collection.
+   * Similar to LINQ's SelectMany - projects each item to a collection and flattens.
+   *
+   * Example: product.productPrices!.selectMany(pp => pp.capacityGroups!).exists()
+   * SQL: SELECT EXISTS(SELECT 1 FROM capacity_groups JOIN product_prices ON ... WHERE ...)
+   */
+  selectMany<TInner>(selector: (item: TItem) => CollectionQueryBuilder<TInner>): CollectionQueryBuilder<TInner> {
+    const mockItem = this.createMockItem();
+    const innerCollection = selector(mockItem);
+    const innerAny = innerCollection as any;
+
+    // Build a navigation join from inner target table → this (intermediate) table
+    // e.g., product_price_capacity_groups.product_price_id → product_prices.id
+    const navJoin: NavigationJoin = {
+      alias: this.targetTable,
+      targetTable: this.targetTable,
+      foreignKeys: [innerAny.foreignKey],  // FK on inner table pointing to intermediate
+      matches: ['id'],                     // PK on intermediate table
+      isMandatory: true,                   // INNER JOIN for flattening
+      sourceAlias: innerAny.targetTable,   // Source is the inner (target) table
+    };
+
+    // Create new builder targeting the inner table but with outer's FK for parent correlation
+    const newBuilder = new CollectionQueryBuilder<TInner>(
+      this.relationName,            // Keep outer relation name for CTE naming
+      innerAny.targetTable,         // Target is the inner collection's table
+      this.foreignKey,              // FK is the outer collection's FK (e.g., product_id)
+      this.sourceTable,             // Source is the outer collection's source (e.g., products)
+      innerAny.targetTableSchema,
+      this.schemaRegistry,
+      this.navigationPath
+    );
+
+    // The FK column lives on the intermediate table, not the target table
+    newBuilder.selectManyJoins = [navJoin];
+    newBuilder.foreignKeyTableAlias = this.targetTable;
+
+    // Carry over where condition from outer collection if any
+    newBuilder.whereCond = this.whereCond;
+
+    return newBuilder;
+  }
+
+  /**
    * Flatten result to number array (for single-column selections)
    */
   toNumberList(name?: string): CollectionResult<number> {
@@ -6313,7 +6379,7 @@ export class CollectionQueryBuilder<TItem = any> {
   /**
    * Get the aggregation type
    */
-  getAggregationType(): 'MIN' | 'MAX' | 'SUM' | 'COUNT' | undefined {
+  getAggregationType(): 'MIN' | 'MAX' | 'SUM' | 'COUNT' | 'EXISTS' | undefined {
     return this.aggregationType;
   }
 
@@ -6322,6 +6388,77 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   getFlattenResultType(): 'number' | 'string' | undefined {
     return this.flattenResultType;
+  }
+
+  /**
+   * Get field references from this condition.
+   * Returns empty since EXISTS subqueries are self-contained correlated subqueries.
+   * Required for duck-typing compatibility with Condition interface when used in WHERE clauses.
+   */
+  getFieldRefs(): FieldRef[] {
+    return [];
+  }
+
+  /**
+   * Build SQL for this collection as a correlated EXISTS subquery.
+   * Produces: EXISTS (SELECT 1 FROM "table" [JOINs] WHERE correlation AND conditions)
+   * Required for duck-typing compatibility with Condition interface when used in WHERE clauses.
+   */
+  buildSql(context: SqlBuildContext): string {
+    if (this.aggregationType !== 'EXISTS') {
+      throw new Error('buildSql() on CollectionQueryBuilder is only supported for EXISTS aggregation');
+    }
+
+    const targetTable = this.targetTable;
+    const foreignKey = this.foreignKey;
+    const sourceTable = this.sourceTable;
+
+    // Build JOINs needed inside the EXISTS subquery
+    const allJoins: string[] = [];
+
+    // Navigation path joins (for reference navigation like pc.order → orders)
+    for (const nav of this.navigationPath) {
+      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
+      const fk = nav.foreignKeys[0];
+      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
+      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+    }
+
+    // SelectMany joins (for selectMany navigation through intermediate tables)
+    for (const nav of this.selectManyJoins) {
+      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
+      const fk = nav.foreignKeys[0];
+      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
+      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+    }
+
+    const navJoinsSQL = allJoins.join('\n');
+
+    // Build WHERE clause: correlation + additional conditions
+    const fkTableAlias = this.foreignKeyTableAlias || targetTable;
+    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTable}"."id"`;
+
+    if (this.whereCond) {
+      const condBuilder = new ConditionBuilder();
+      const { sql: condSql, params, placeholders, paramCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      context.paramCounter = paramCounter;
+      context.params.push(...params);
+      if (placeholders) {
+        context.placeholders = placeholders;
+      }
+
+      // Rewrite collection marker aliases to actual table names
+      const markerPattern = new RegExp(`"__collection_${targetTable}__"`, 'g');
+      const rewrittenCondSql = condSql.replace(markerPattern, `"${targetTable}"`);
+
+      whereSQL += ` AND ${rewrittenCondSql}`;
+    }
+
+    const parts = [`EXISTS (SELECT 1 FROM "${targetTable}"`];
+    if (navJoinsSQL) parts.push(navJoinsSQL);
+    parts.push(`WHERE ${whereSQL})`);
+
+    return parts.join('\n');
   }
 
   /**
@@ -6710,7 +6847,7 @@ export class CollectionQueryBuilder<TItem = any> {
         // For scalar aggregations (count, min, max, sum), don't include nestedCollectionInfo
         // because the result is a scalar value, not a structured object that needs transformation
         const aggregationType = field.getAggregationType();
-        const isScalarAggregation = aggregationType && ['COUNT', 'MIN', 'MAX', 'SUM'].includes(aggregationType);
+        const isScalarAggregation = aggregationType && ['COUNT', 'MIN', 'MAX', 'SUM', 'EXISTS'].includes(aggregationType);
 
         if (isScalarAggregation) {
           // Scalar aggregation - just return the expression, no nested transformation needed
@@ -6856,17 +6993,17 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     // Step 4: Determine aggregation type and field
-    let aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum';
+    let aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists';
     let aggregateField: string | undefined;
     let arrayField: string | undefined;
     let defaultValue: string;
 
     if (this.aggregationType) {
-      // Scalar aggregations: count, min, max, sum
-      aggregationType = this.aggregationType.toLowerCase() as 'count' | 'min' | 'max' | 'sum';
+      // Scalar aggregations: count, min, max, sum, exists
+      aggregationType = this.aggregationType.toLowerCase() as 'count' | 'min' | 'max' | 'sum' | 'exists';
 
-      // For aggregations other than COUNT, determine which field to aggregate
-      if (this.aggregationType !== 'COUNT' && this.selector) {
+      // For aggregations other than COUNT and EXISTS, determine which field to aggregate
+      if (this.aggregationType !== 'COUNT' && this.aggregationType !== 'EXISTS' && this.selector) {
         const mockItem = this.createMockItem();
         const selectedField = this.selector(mockItem);
         if (typeof selectedField === 'object' && selectedField !== null && '__dbColumnName' in selectedField) {
@@ -6875,7 +7012,13 @@ export class CollectionQueryBuilder<TItem = any> {
       }
 
       // Set default value based on aggregation type
-      defaultValue = aggregationType === 'count' ? '0' : 'null';
+      if (aggregationType === 'count') {
+        defaultValue = '0';
+      } else if (aggregationType === 'exists') {
+        defaultValue = 'false';
+      } else {
+        defaultValue = 'null';
+      }
     } else if (this.flattenResultType) {
       // Array aggregation for toNumberList/toStringList
       aggregationType = 'array';
@@ -6907,13 +7050,17 @@ export class CollectionQueryBuilder<TItem = any> {
     // oi.productPrice.product.resort.productIntegrationDefinitions
     // The navigation path contains joins for productPrice, product, resort
     // which must be included in the lateral subquery for correlation
-    const allNavigationJoins: NavigationJoin[] = [...this.navigationPath, ...navigationJoins];
+    // Include selectMany joins in both all and selector navigation joins
+    // selectMany joins are structural (from flattening) and needed by both CTE and LATERAL
+    const allNavigationJoins: NavigationJoin[] = [...this.navigationPath, ...this.selectManyJoins, ...navigationJoins];
+    const allSelectorJoins: NavigationJoin[] = [...this.selectManyJoins, ...navigationJoins];
 
     // Step 6: Build CollectionAggregationConfig object
     const config: CollectionAggregationConfig = {
       relationName: this.relationName,
       targetTable: this.targetTable,
       foreignKey: this.foreignKey,
+      foreignKeyTableAlias: this.foreignKeyTableAlias,
       sourceTable: this.sourceTable,
       parentIds,  // Pass parent IDs for temp table strategy
       selectedFields: selectedFieldConfigs,
@@ -6933,7 +7080,7 @@ export class CollectionQueryBuilder<TItem = any> {
       // Use the reserved counter for LATERAL strategy, otherwise increment as before
       counter: reservedCounter !== undefined ? reservedCounter : context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
-      selectorNavigationJoins: navigationJoins.length > 0 ? navigationJoins : undefined,
+      selectorNavigationJoins: allSelectorJoins.length > 0 ? allSelectorJoins : undefined,
     };
 
     // Step 6: Call the strategy

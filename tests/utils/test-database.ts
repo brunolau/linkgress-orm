@@ -140,9 +140,9 @@ export async function seedTestData(db: AppDatabase) {
 
   // Create users with bulk insert
   const [alice, bob, charlie] = await db.users.insertBulk([
-    { username: 'alice', email: 'alice@test.com', age: 25, isActive: true },
-    { username: 'bob', email: 'bob@test.com', age: 35, isActive: true },
-    { username: 'charlie', email: 'charlie@test.com', age: 45, isActive: false },
+    { username: 'alice', email: 'alice@test.com', age: 25, isActive: true, lastActiveAt: new Date('2025-03-15T08:00:00Z') },
+    { username: 'bob', email: 'bob@test.com', age: 35, isActive: true, lastActiveAt: new Date('2025-06-20T14:30:00Z') },
+    { username: 'charlie', email: 'charlie@test.com', age: 45, isActive: false, lastActiveAt: new Date('2025-01-10T22:00:00Z') },
   ]).returning();
 
   // Create posts with bulk insert

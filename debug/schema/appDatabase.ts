@@ -102,6 +102,7 @@ export class AppDatabase extends DbContext {
             entity.property(e => e.isActive).hasType(boolean('is_active')).hasDefaultValue(true);
             entity.property(e => e.createdAt).hasType(timestamp('created_at')).hasDefaultValue('NOW()');
             entity.property(e => e.metadata).hasType(jsonb('metadata'));
+            entity.property(e => e.lastActiveAt).hasType(integer('last_active_at')).hasCustomMapper(pgIntDatetime);
 
             entity.hasMany(e => e.posts, () => Post)
                 .withForeignKey(p => sql`${p.userId}`)

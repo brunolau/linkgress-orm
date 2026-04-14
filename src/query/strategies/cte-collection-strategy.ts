@@ -85,6 +85,11 @@ export class CteCollectionStrategy implements ICollectionStrategy {
         selectExpression = `COALESCE("${cteName}".data, ${config.defaultValue})`;
         break;
 
+      case 'exists':
+        cteSQL = this.buildExistsAggregation(config, cteName, context);
+        selectExpression = `COALESCE("${cteName}".data, ${config.defaultValue})`;
+        break;
+
       default:
         throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
     }
@@ -206,7 +211,7 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     // The main query handles intermediate reference joins (posts -> user),
     // and the CTE just selects from the collection table (orders) and groups by foreign key.
     // However, we DO need navigation joins that are WITHIN the collection's selector (e.g., orderTask.task.level).
-    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue, isDistinct } = config;
+    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue, isDistinct, foreignKeyTableAlias } = config;
     // For CTE, we only need navigation joins that are within the collection's selector (e.g., orderTask.task.level)
     // NOT the navigation path from outer query to this collection (e.g., post -> user -> orders)
     // Use selectorNavigationJoins which contains only the joins detected from the selector.
@@ -252,8 +257,10 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     // When there are navigation joins, we need to qualify unqualified field expressions
     // with the target table name to avoid ambiguous column references
     const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable)
+    const fkTable = foreignKeyTableAlias || targetTable;
     const allSelectFields = [
-      `"${targetTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
+      `"${fkTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
       ...leafFields.map(f => {
         // Rewrite collection marker in expression to actual table name
         const rewrittenExpr = rewriteCollectionMarker(f.expression) || f.expression;
@@ -320,7 +327,7 @@ GROUP BY "__fk_${foreignKey}"
     cteName: string,
     context: QueryContext
   ): string {
-    const { selectedFields, targetTable, foreignKey, whereClause, orderByClauseAlias, orderByFields, isDistinct } = config;
+    const { selectedFields, targetTable, foreignKey, whereClause, orderByClauseAlias, orderByFields, isDistinct, foreignKeyTableAlias } = config;
     // Use selectorNavigationJoins for CTE (not the full navigation path)
     const navigationJoins = config.selectorNavigationJoins;
 
@@ -357,9 +364,12 @@ GROUP BY "__fk_${foreignKey}"
     // Collect the aliases of all selected leaf fields
     const selectedAliases = new Set(leafFields.map(f => f.alias));
 
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable)
+    const fkTable = foreignKeyTableAlias || targetTable;
+
     // Build the innermost SELECT fields
     const innerSelectFields = [
-      `"${targetTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
+      `"${fkTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
       ...leafFields.map(f => {
         // Rewrite collection marker in expression to actual table name
         const rewrittenExpr = rewriteCollectionMarker(f.expression) || f.expression;
@@ -437,7 +447,7 @@ WHERE "__rn" = 1
     navJoinsSQL: string,
     nestedCteJoinsSQL: string = ''
   ): string {
-    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
+    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue, foreignKeyTableAlias } = config;
 
     // Helper to rewrite the collection marker alias to the actual table name
     const rewriteCollectionMarker = (expr: string): string => {
@@ -450,9 +460,12 @@ WHERE "__rn" = 1
     const navigationJoins = config.selectorNavigationJoins;
     const hasNavigationJoins = navigationJoins && navigationJoins.length > 0;
 
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable)
+    const fkTable = foreignKeyTableAlias || targetTable;
+
     // Build the innermost SELECT fields
     const innerSelectFields = [
-      `"${targetTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
+      `"${fkTable}"."${foreignKey}" as "__fk_${foreignKey}"`,
       ...leafFields.map(f => {
         // Rewrite collection marker in expression to actual table name
         const rewrittenExpr = rewriteCollectionMarker(f.expression);
@@ -519,7 +532,7 @@ GROUP BY "__fk_${foreignKey}"
     cteName: string,
     context: QueryContext
   ): string {
-    const { arrayField, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct, selectedFields } = config;
+    const { arrayField, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue, isDistinct, selectedFields, foreignKeyTableAlias } = config;
 
     if (!arrayField) {
       throw new Error('arrayField is required for array aggregation');
@@ -571,9 +584,10 @@ GROUP BY "__fk_${foreignKey}"
     // Build the array_agg ORDER BY clause
     const arrayAggOrderBy = orderByClause ? ` ORDER BY ${orderByClause}` : '';
 
-    // Qualify the foreign key with target table when there are navigation joins
-    const fkExpression = hasNavigationJoins
-      ? `"${targetTable}"."${foreignKey}"`
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable for nav joins, or unqualified)
+    const fkTable = foreignKeyTableAlias || targetTable;
+    const fkExpression = (foreignKeyTableAlias || hasNavigationJoins)
+      ? `"${fkTable}"."${foreignKey}"`
       : `"${foreignKey}"`;
 
     const cteSQL = `
@@ -607,7 +621,7 @@ GROUP BY "__fk_${foreignKey}"
     distinctClause: string,
     navJoinsSQL: string
   ): string {
-    const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue, selectedFields } = config;
+    const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue, selectedFields, foreignKeyTableAlias } = config;
 
     // CTE strategy uses selectorNavigationJoins for joins within the collection's selector.
     // Unlike LATERAL, CTEs don't need navigation path joins for outer query correlation.
@@ -625,9 +639,10 @@ GROUP BY "__fk_${foreignKey}"
       }
     }
 
-    // Qualify the foreign key with target table when there are navigation joins
-    const fkExpression = hasNavigationJoins
-      ? `"${targetTable}"."${foreignKey}"`
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable for nav joins, or unqualified)
+    const fkTable = foreignKeyTableAlias || targetTable;
+    const fkExpression = (foreignKeyTableAlias || hasNavigationJoins)
+      ? `"${fkTable}"."${foreignKey}"`
       : `"${foreignKey}"`;
 
     // Build ORDER BY for ROW_NUMBER() - use the order clause or default to foreign key
@@ -672,7 +687,8 @@ GROUP BY "__fk_${foreignKey}"
     cteName: string,
     context: QueryContext
   ): string {
-    const { aggregationType, aggregateField, targetTable, foreignKey, whereClause } = config;
+    const { aggregationType, aggregateField, targetTable, foreignKey, whereClause, foreignKeyTableAlias } = config;
+    const navigationJoins = config.selectorNavigationJoins;
 
     // Helper to rewrite the collection marker alias to the actual table name
     const rewriteCollectionMarker = (expr: string | undefined): string | undefined => {
@@ -684,6 +700,14 @@ GROUP BY "__fk_${foreignKey}"
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
     const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+
+    // Build navigation JOINs (needed for selectMany which joins through intermediate table)
+    const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
+
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or unqualified)
+    const fkRef = foreignKeyTableAlias
+      ? `"${foreignKeyTableAlias}"."${foreignKey}"`
+      : `"${foreignKey}"`;
 
     // Build aggregation expression
     let aggregateExpression: string;
@@ -705,11 +729,56 @@ GROUP BY "__fk_${foreignKey}"
 
     const cteSQL = `
 SELECT
-  "${foreignKey}" as parent_id,
+  ${fkRef} as parent_id,
   ${aggregateExpression} as data
 FROM "${targetTable}"
+${navJoinsSQL}
 ${whereSQL}
-GROUP BY "${foreignKey}"
+GROUP BY ${fkRef}
+    `.trim();
+
+    return cteSQL;
+  }
+
+  /**
+   * Build EXISTS aggregation CTE
+   * Returns true for each parent that has at least one child row
+   */
+  private buildExistsAggregation(
+    config: CollectionAggregationConfig,
+    cteName: string,
+    context: QueryContext
+  ): string {
+    const { targetTable, foreignKey, whereClause, foreignKeyTableAlias } = config;
+    const navigationJoins = config.selectorNavigationJoins;
+
+    // Helper to rewrite the collection marker alias to the actual table name
+    const rewriteCollectionMarker = (expr: string | undefined): string | undefined => {
+      if (!expr) return expr;
+      const markerPattern = new RegExp(`"__collection_${targetTable}__"`, 'g');
+      return expr.replace(markerPattern, `"${targetTable}"`);
+    };
+
+    // Build WHERE clause (rewrite collection markers)
+    const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
+    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+
+    // Build navigation JOINs (needed for selectMany which joins through intermediate table)
+    const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
+
+    // Qualify FK with the appropriate table (foreignKeyTableAlias for selectMany, or targetTable)
+    const fkRef = foreignKeyTableAlias
+      ? `"${foreignKeyTableAlias}"."${foreignKey}"`
+      : `"${foreignKey}"`;
+
+    const cteSQL = `
+SELECT
+  ${fkRef} as parent_id,
+  true as data
+FROM "${targetTable}"
+${navJoinsSQL}
+${whereSQL}
+GROUP BY ${fkRef}
     `.trim();
 
     return cteSQL;

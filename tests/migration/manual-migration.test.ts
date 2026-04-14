@@ -318,6 +318,10 @@ describe('Manual Migration System', () => {
         journalTable: '__runner_migrations',
         verbose: false,
       });
+
+      // Pre-create journal table so runner.up() uses the normal migration flow
+      // (fresh-DB auto-schema path is tested separately)
+      await runner.getJournal().ensureTable();
     });
 
     afterEach(async () => {
@@ -579,6 +583,10 @@ describe('Manual Migration System', () => {
         await client.query('DROP TABLE IF EXISTS "__workflow_migrations" CASCADE');
         await client.query('DROP TABLE IF EXISTS "workflow_test" CASCADE');
       } catch {}
+
+      // Pre-create journal table so runner.up() uses the normal migration flow
+      const journal = new MigrationJournal(client, { journalTable: '__workflow_migrations' });
+      await journal.ensureTable();
     });
 
     afterEach(async () => {

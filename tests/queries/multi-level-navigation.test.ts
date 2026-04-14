@@ -227,6 +227,73 @@ describe('Multi-Level Navigation', () => {
     });
   });
 
+  describe('Deep navigation without intermediate field selection', () => {
+    test('should select only from deepest navigation level (2 levels deep)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Bug: when selecting ONLY from the deepest navigation (no intermediate fields),
+        // the intermediate JOINs are missing because collectTableAliasesFromSelection
+        // only collects __tableAlias (leaf) but not __navigationAliases (intermediates).
+        const result = await db.tasks
+          .where(t => gt(t.id, 0))
+          .select(t => ({
+            creatorEmail: t.level!.createdBy!.email,
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          expect(r.creatorEmail).toBeDefined();
+          expect(r.creatorEmail).toContain('@');
+        });
+      });
+    });
+
+    test('should select only from deepest navigation level (3 levels deep)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Select ONLY the deepest level field (createdBy.username) from orderTask,
+        // without selecting any intermediate fields from task or level
+        const result = await db.orderTasks
+          .where(ot => gt(ot.orderId, 0))
+          .select(ot => ({
+            creatorUsername: ot.task!.level!.createdBy!.username,
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          expect(r.creatorUsername).toBeDefined();
+          expect(typeof r.creatorUsername).toBe('string');
+        });
+      });
+    });
+
+    test('should select from deepest level with base table field only', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // Select a base table field + deepest navigation field, skipping intermediates
+        const result = await db.orderTasks
+          .where(ot => gt(ot.orderId, 0))
+          .select(ot => ({
+            orderId: ot.orderId,
+            creatorEmail: ot.task!.level!.createdBy!.email,
+          }))
+          .toList();
+
+        expect(result.length).toBeGreaterThan(0);
+        result.forEach(r => {
+          expect(r.orderId).toBeDefined();
+          expect(r.creatorEmail).toBeDefined();
+          expect(r.creatorEmail).toContain('@');
+        });
+      });
+    });
+  });
+
   describe('Edge cases', () => {
     test('should handle null navigation at intermediate level', async () => {
       await withDatabase(async (db) => {

@@ -103,6 +103,11 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
         selectExpression = `COALESCE("${lateralAlias}".data, ${config.defaultValue})`;
         break;
 
+      case 'exists':
+        lateralSQL = this.buildScalarAggregation(config, lateralAlias, context);
+        selectExpression = `COALESCE("${lateralAlias}".data, ${config.defaultValue})`;
+        break;
+
       default:
         throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
     }
@@ -135,7 +140,8 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
                                  config.aggregationType === 'count' ||
                                  config.aggregationType === 'min' ||
                                  config.aggregationType === 'max' ||
-                                 config.aggregationType === 'sum';
+                                 config.aggregationType === 'sum' ||
+                                 config.aggregationType === 'exists';
 
     const hasNoLimitOffset = config.limitValue === undefined && config.offsetValue === undefined;
 
@@ -180,7 +186,9 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     const sourceTableAlias = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
     // Build WHERE clause with correlation to parent
-    let whereSQL = `"${innerTableAlias}"."${foreignKey}" = "${sourceTableAlias}"."id"`;
+    // For selectMany, the FK is on the intermediate table (joined via navJoins), not the target table
+    const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
+    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTableAlias}"."id"`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -218,6 +226,12 @@ FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
       }
+    } else if (aggregationType === 'exists') {
+      // EXISTS as correlated subquery: (SELECT EXISTS(SELECT 1 FROM ... WHERE ...))
+      subquerySQL = `(SELECT EXISTS(SELECT 1
+FROM "${targetTable}" "${innerTableAlias}"
+${navJoinsSQL}
+WHERE ${whereSQL}))`;
     } else {
       // Scalar aggregation (count, min, max, sum)
       let aggregateExpression: string;
@@ -464,8 +478,9 @@ WHERE ${whereSQL})`;
 
     // Build WHERE clause - LATERAL correlates with parent via foreign key
     // The correlation is: innerAlias.foreignKey = source.id
-    // Use the innerTableAlias for the collection's own table
-    let whereSQL = `WHERE "${innerTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    // For selectMany, the FK is on the intermediate table (joined via navJoins)
+    const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
+    let whereSQL = `WHERE "${fkTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
     if (whereClause) {
       // Rewrite the user's WHERE clause to use inner alias for the collection's table
       const rewrittenWhereClause = rewriteTableReference(whereClause);
@@ -595,7 +610,9 @@ FROM (
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
     // Build WHERE clause - LATERAL correlates with parent via foreign key
-    let whereSQL = `WHERE "${innerTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    // For selectMany, the FK is on the intermediate table (joined via navJoins)
+    const fkTableAlias2 = config.foreignKeyTableAlias || innerTableAlias;
+    let whereSQL = `WHERE "${fkTableAlias2}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -671,7 +688,9 @@ FROM (
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
     // Build WHERE clause with LATERAL correlation
-    let whereSQL = `WHERE "${innerTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    // For selectMany, the FK is on the intermediate table (joined via navJoins)
+    const fkTableAlias3 = config.foreignKeyTableAlias || innerTableAlias;
+    let whereSQL = `WHERE "${fkTableAlias3}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -739,7 +758,9 @@ FROM (
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
     // Build WHERE clause with LATERAL correlation
-    let whereSQL = `WHERE "${innerTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    // For selectMany, the FK is on the intermediate table (joined via navJoins)
+    const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
+    let whereSQL = `WHERE "${fkTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -759,6 +780,15 @@ FROM (
         }
         aggregateExpression = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
         break;
+      case 'exists': {
+        // EXISTS as LATERAL: SELECT EXISTS(SELECT 1 FROM ... WHERE ...)
+        const lateralSQL = `
+SELECT EXISTS(SELECT 1
+FROM "${targetTable}" "${innerTableAlias}"
+${whereSQL}) as data
+        `.trim();
+        return lateralSQL;
+      }
       default:
         throw new Error(`Unknown aggregation type: ${aggregationType}`);
     }

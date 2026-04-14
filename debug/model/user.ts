@@ -11,6 +11,7 @@ export class User extends DbEntity {
   isActive!: DbColumn<boolean>;
   createdAt!: DbColumn<Date>;
   metadata?: DbColumn<any>;
+  lastActiveAt?: DbColumn<Date>; // Integer-based custom datetime (for testing deep navigation mappers)
 
   // Navigation properties
   posts?: Post[];

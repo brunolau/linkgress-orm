@@ -181,6 +181,7 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
+  private schemaRegistry?: Map<string, TableSchema>;
 
   constructor(
     schema: TableSchema,
@@ -190,7 +191,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     whereCond?: Condition,
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
-    joinCounter?: number
+    joinCounter?: number,
+    schemaRegistry?: Map<string, TableSchema>
   ) {
     this.schema = schema;
     this.client = client;
@@ -200,6 +202,7 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     this.executor = executor;
     this.manualJoins = manualJoins || [];
     this.joinCounter = joinCounter || 0;
+    this.schemaRegistry = schemaRegistry;
   }
 
   /**
@@ -222,7 +225,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       this.orderByFields,
       this.executor,
       this.manualJoins,
-      this.joinCounter
+      this.joinCounter,
+      this.schemaRegistry
     );
   }
 
@@ -303,7 +307,13 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     const relationEntries = getRelationEntriesForSchema(this.schema);
 
     for (const [relName, relConfig] of relationEntries) {
-      const targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+      let targetSchema: TableSchema | undefined;
+      if (this.schemaRegistry) {
+        targetSchema = this.schemaRegistry.get(relConfig.targetTable);
+      }
+      if (!targetSchema) {
+        targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+      }
 
       if (relConfig.type === 'many') {
         Object.defineProperty(mock, relName, {
@@ -313,7 +323,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry
             );
           },
           enumerable: true,
@@ -328,7 +339,10 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
               relConfig.foreignKeys || [relConfig.foreignKey || ''],
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry,
+              [],
+              this.schema.name
             );
             return refBuilder.createMockTargetRow();
           },
@@ -392,6 +406,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
+  private schemaRegistry?: Map<string, TableSchema>;
 
   constructor(
     schema: TableSchema,
@@ -406,7 +421,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     orderBy?: Array<{ field: string; direction: 'ASC' | 'DESC' }>,
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
-    joinCounter?: number
+    joinCounter?: number,
+    schemaRegistry?: Map<string, TableSchema>
   ) {
     this.schema = schema;
     this.client = client;
@@ -421,6 +437,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     this.executor = executor;
     this.manualJoins = manualJoins || [];
     this.joinCounter = joinCounter || 0;
+    this.schemaRegistry = schemaRegistry;
   }
 
   /**
@@ -939,7 +956,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     );
 
     // Detect navigation property references in WHERE and add JOINs
-    const navigationJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean }> = [];
+    const navigationJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
 
     // Detect joins from the original selection (navigation properties used in select)
     this.detectAndAddJoinsFromSelection(mockOriginalSelection, navigationJoins);
@@ -958,9 +975,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         : `"${navJoin.targetTable}"`;
 
       // Build join condition: source.foreignKey = target.match
+      const sourceAlias = navJoin.sourceAlias || this.schema.name;
       const joinConditions = navJoin.foreignKeys.map((fk, i) => {
         const targetCol = navJoin.matches[i] || 'id';
-        return `${formatJoinValue(this.schema.name, fk)} = ${formatJoinValue(navJoin.alias, targetCol)}`;
+        return `${formatJoinValue(sourceAlias, fk)} = ${formatJoinValue(navJoin.alias, targetCol)}`;
       });
 
       baseFromClause += `\n${joinType} ${targetTableName} AS "${navJoin.alias}" ON ${joinConditions.join(' AND ')}`;
@@ -1363,7 +1381,13 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const relationEntries = getRelationEntriesForSchema(this.schema);
 
     for (const [relName, relConfig] of relationEntries) {
-      const targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+      let targetSchema: TableSchema | undefined;
+      if (this.schemaRegistry) {
+        targetSchema = this.schemaRegistry.get(relConfig.targetTable);
+      }
+      if (!targetSchema) {
+        targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
+      }
 
       if (relConfig.type === 'many') {
         Object.defineProperty(mock, relName, {
@@ -1373,7 +1397,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry
             );
           },
           enumerable: true,
@@ -1388,7 +1413,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
               relConfig.foreignKeys || [relConfig.foreignKey || ''],
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
-              targetSchema
+              targetSchema,
+              this.schemaRegistry,
+              [],
+              this.schema.name
             );
             return refBuilder.createMockTargetRow();
           },
@@ -1467,43 +1495,27 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    */
   private detectAndAddJoinsFromCondition(
     condition: Condition | undefined,
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean }>
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
   ): void {
     if (!condition) {
       return;
     }
 
-    // Get all field references from the condition
+    // Get all field references from the condition and collect table aliases
+    const allTableAliases = new Set<string>();
     const fieldRefs = condition.getFieldRefs();
 
     for (const fieldRef of fieldRefs) {
       if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
         const tableAlias = fieldRef.__tableAlias as string;
-        // Check if this references a related table that isn't already joined
-        if (tableAlias !== this.schema.name && !joins.some(j => j.alias === tableAlias)) {
-          // Find the relation config for this navigation
-          const relation = this.schema.relations[tableAlias];
-          if (relation && relation.type === 'one') {
-            // Get target schema from targetTableBuilder if available
-            let targetSchema: string | undefined;
-            if (relation.targetTableBuilder) {
-              const targetTableSchema = relation.targetTableBuilder.build();
-              targetSchema = targetTableSchema.schema;
-            }
-
-            // Add a JOIN for this reference
-            joins.push({
-              alias: tableAlias,
-              targetTable: relation.targetTable,
-              targetSchema,
-              foreignKeys: relation.foreignKeys || [relation.foreignKey || ''],
-              matches: relation.matches || [],
-              isMandatory: relation.isMandatory ?? false,
-            });
-          }
+        if (tableAlias && tableAlias !== this.schema.name) {
+          allTableAliases.add(tableAlias);
         }
       }
     }
+
+    // Resolve all joins through the schema graph (handles multi-level)
+    this.resolveJoinsForTableAliases(allTableAliases, joins);
   }
 
   /**
@@ -1511,61 +1523,133 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    */
   private detectAndAddJoinsFromSelection(
     selection: any,
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean }>
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
   ): void {
+    if (!selection || typeof selection !== 'object') {
+      return;
+    }
+
+    // First pass: collect all table aliases
+    const allTableAliases = new Set<string>();
+    this.collectTableAliasesFromSelection(selection, allTableAliases);
+
+    // Second pass: resolve all joins through the schema graph
+    this.resolveJoinsForTableAliases(allTableAliases, joins);
+  }
+
+  /**
+   * Collect all table aliases from a selection
+   */
+  private collectTableAliasesFromSelection(selection: any, allTableAliases: Set<string>): void {
     if (!selection || typeof selection !== 'object') {
       return;
     }
 
     for (const [, value] of Object.entries(selection)) {
       if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
-        // This is a FieldRef with a table alias - check if it's from a related table
-        this.addJoinForFieldRef(value, joins);
+        const tableAlias = value.__tableAlias as string;
+        if (tableAlias && tableAlias !== this.schema.name) {
+          allTableAliases.add(tableAlias);
+        }
+        // Also collect intermediate navigation aliases for multi-level navigation
+        if ('__navigationAliases' in value && Array.isArray((value as any).__navigationAliases)) {
+          for (const navAlias of (value as any).__navigationAliases) {
+            if (navAlias && navAlias !== this.schema.name) {
+              allTableAliases.add(navAlias);
+            }
+          }
+        }
       } else if (value instanceof SqlFragment) {
-        // SqlFragment may contain navigation property references - extract them
         const fieldRefs = value.getFieldRefs();
         for (const fieldRef of fieldRefs) {
-          this.addJoinForFieldRef(fieldRef, joins);
+          if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
+            const tableAlias = fieldRef.__tableAlias as string;
+            if (tableAlias && tableAlias !== this.schema.name) {
+              allTableAliases.add(tableAlias);
+            }
+          }
+          if ('__navigationAliases' in fieldRef && Array.isArray((fieldRef as any).__navigationAliases)) {
+            for (const navAlias of (fieldRef as any).__navigationAliases) {
+              if (navAlias && navAlias !== this.schema.name) {
+                allTableAliases.add(navAlias);
+              }
+            }
+          }
         }
-      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
-        // Recursively check nested objects
-        this.detectAndAddJoinsFromSelection(value, joins);
+      } else if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof CollectionQueryBuilder)) {
+        this.collectTableAliasesFromSelection(value, allTableAliases);
       }
     }
   }
 
   /**
-   * Add a JOIN for a FieldRef if it references a related table
+   * Resolve all navigation joins by finding the correct path through the schema graph.
+   * Handles multi-level navigation like task.level.createdBy.
    */
-  private addJoinForFieldRef(
-    fieldRef: any,
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean }>
+  private resolveJoinsForTableAliases(
+    allTableAliases: Set<string>,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
   ): void {
-    if (!fieldRef || typeof fieldRef !== 'object' || !('__tableAlias' in fieldRef) || !('__dbColumnName' in fieldRef)) {
+    if (allTableAliases.size === 0) {
       return;
     }
 
-    const tableAlias = fieldRef.__tableAlias as string;
-    if (tableAlias && tableAlias !== this.schema.name && !joins.some(j => j.alias === tableAlias)) {
-      // This references a related table - find the relation and add a JOIN
-      const relation = this.schema.relations[tableAlias];
-      if (relation && relation.type === 'one') {
-        // Get target schema from targetTableBuilder if available
-        let targetSchema: string | undefined;
-        if (relation.targetTableBuilder) {
-          const targetTableSchema = relation.targetTableBuilder.build();
-          targetSchema = targetTableSchema.schema;
+    const resolved = new Set<string>();
+    let maxIterations = allTableAliases.size * 3;
+
+    while (resolved.size < allTableAliases.size && maxIterations-- > 0) {
+      // Build a map of already joined schemas for path resolution
+      const joinedSchemas = new Map<string, TableSchema>();
+      joinedSchemas.set(this.schema.name, this.schema);
+
+      for (const join of joins) {
+        let schema: TableSchema | undefined;
+        if (this.schemaRegistry) {
+          schema = this.schemaRegistry.get(join.targetTable);
+        }
+        if (schema) {
+          joinedSchemas.set(join.alias, schema);
+        }
+      }
+
+      // Try to resolve each unresolved alias
+      for (const alias of allTableAliases) {
+        if (resolved.has(alias) || joins.some(j => j.alias === alias)) {
+          resolved.add(alias);
+          continue;
         }
 
-        // Add a JOIN for this reference
-        joins.push({
-          alias: tableAlias,
-          targetTable: relation.targetTable,
-          targetSchema,
-          foreignKeys: relation.foreignKeys || [relation.foreignKey || ''],
-          matches: relation.matches || [],
-          isMandatory: relation.isMandatory ?? false,
-        });
+        // Look for this alias in any of the already joined schemas
+        for (const [sourceAlias, schema] of joinedSchemas) {
+          if (schema.relations && schema.relations[alias]) {
+            const relation = schema.relations[alias];
+            if (relation.type === 'one') {
+              let targetSchema: TableSchema | undefined;
+              let targetSchemaName: string | undefined;
+
+              if (this.schemaRegistry) {
+                targetSchema = this.schemaRegistry.get(relation.targetTable);
+                targetSchemaName = targetSchema?.schema;
+              }
+              if (!targetSchema && relation.targetTableBuilder) {
+                targetSchema = relation.targetTableBuilder.build();
+                targetSchemaName = targetSchema?.schema;
+              }
+
+              joins.push({
+                alias,
+                targetTable: relation.targetTable,
+                targetSchema: targetSchemaName,
+                foreignKeys: relation.foreignKeys || [relation.foreignKey || ''],
+                matches: relation.matches || ['id'],
+                isMandatory: relation.isMandatory ?? false,
+                sourceAlias,
+              });
+              resolved.add(alias);
+              break;
+            }
+          }
+        }
       }
     }
   }

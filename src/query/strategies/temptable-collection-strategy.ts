@@ -335,6 +335,9 @@ ${aggregationSQL}
       case 'sum':
         return this.buildScalarAggregationSQL(config, tempTableName);
 
+      case 'exists':
+        return this.buildExistsAggregationSQL(config, tempTableName);
+
       default:
         throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
     }
@@ -379,6 +382,10 @@ ${aggregationSQL}
       case 'sum':
         // Scalar aggregations still need database aggregation
         return this.buildScalarAggregationSQL(configWithInterpolatedParams, tempTableName);
+
+      case 'exists':
+        // EXISTS aggregation needs database aggregation
+        return this.buildExistsAggregationSQL(configWithInterpolatedParams, tempTableName);
 
       default:
         throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
@@ -779,6 +786,32 @@ GROUP BY t."${foreignKey}"
 SELECT
   tmp.id as parent_id,
   COALESCE(${aggregateExpression}, ${config.defaultValue}) as data
+FROM ${tempTableName} tmp
+LEFT JOIN "${targetTable}" ON "${targetTable}"."${foreignKey}" = tmp.id${additionalWhere}
+GROUP BY tmp.id
+    `.trim();
+
+    return sql;
+  }
+
+  /**
+   * Build EXISTS aggregation using temp table
+   * Returns true for each parent that has at least one child row
+   */
+  private buildExistsAggregationSQL(
+    config: CollectionAggregationConfig,
+    tempTableName: string
+  ): string {
+    const { targetTable, foreignKey, whereClause } = config;
+
+    // Build WHERE clause (rewrite collection markers)
+    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
+    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+
+    const sql = `
+SELECT
+  tmp.id as parent_id,
+  COALESCE(bool_or(("${targetTable}"."${foreignKey}" IS NOT NULL)), false) as data
 FROM ${tempTableName} tmp
 LEFT JOIN "${targetTable}" ON "${targetTable}"."${foreignKey}" = tmp.id${additionalWhere}
 GROUP BY tmp.id

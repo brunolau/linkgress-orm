@@ -29,6 +29,7 @@ export interface FieldRef<TName extends string = string, TValueType = any> {
 export type FieldLike<V = any> =
   | FieldRef<any, V>
   | DbColumn<V>
+  | SqlFragment<V>
   | { __dbColumnName: string; __fieldName?: string };
 
 /**
@@ -912,6 +913,151 @@ export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb & string = key
     ['', `->>'${key}'`],
     [jsonbField]
   ).as(key);
+}
+
+// ============================================================================
+// JSONB array querying — jsonbArraySome
+// ============================================================================
+
+/**
+ * Recursive mapped type for navigating into a JSONB object.
+ * Each property returns a type that can be:
+ * - Used directly as a field in conditions (eq, ne, like, isNotNull, etc.)
+ * - Navigated further for nested objects (e.g. `c.config.token`)
+ *
+ * Values are compared as text (PostgreSQL ->> operator) which works naturally
+ * with string, number, and boolean comparisons via the pg driver's text protocol.
+ */
+export type JsonbElement<T> = SqlFragment<T> & {
+  readonly [K in keyof T]-?: JsonbElement<NonNullable<T[K]>>;
+};
+
+/**
+ * Creates a typed proxy that represents a JSONB array element for path navigation.
+ * Each property access builds a deeper JSONB path expression using -> and ->> operators.
+ * The result at any level is both a SqlFragment (for use in conditions) and a Proxy
+ * for further navigation.
+ *
+ * @internal
+ */
+function createJsonbElementProxy<T>(alias: string, path: string[] = []): JsonbElement<T> {
+  // Build the ->> expression for the current path
+  // Uses -> for intermediate segments, ->> for the last segment (text extraction)
+  const buildExpression = (): string => {
+    if (path.length === 0) return alias;
+    let expr = alias;
+    for (let i = 0; i < path.length - 1; i++) {
+      expr += `->'${path[i]}'`;
+    }
+    expr += `->>'${path[path.length - 1]}'`;
+    return expr;
+  };
+
+  // Create a SqlFragment for this path (pure SQL text, no interpolated values)
+  const fragment = new SqlFragment<string>([buildExpression()], []);
+
+  // Proxy it: own properties delegate to SqlFragment, unknown properties extend the JSONB path
+  return new Proxy(fragment, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'symbol' || prop in target) {
+        return Reflect.get(target, prop, receiver);
+      }
+      if (typeof prop === 'string') {
+        return createJsonbElementProxy<any>(alias, [...path, prop]);
+      }
+      return Reflect.get(target, prop, receiver);
+    }
+  }) as any;
+}
+
+/**
+ * Condition that checks if any element in a JSONB array matches a predicate.
+ * Generates: EXISTS (SELECT 1 FROM jsonb_array_elements(field) AS __elem WHERE ...)
+ *
+ * @internal
+ */
+class JsonbArraySomeCondition extends WhereConditionBase {
+  constructor(
+    private jsonbField: any,
+    private innerCondition: WhereConditionBase
+  ) {
+    super();
+  }
+
+  override getFieldRefs(): FieldRef[] {
+    const refs: FieldRef[] = [];
+    if (this.isFieldRef(this.jsonbField)) {
+      refs.push(this.jsonbField);
+    } else if (this.jsonbField instanceof SqlFragment) {
+      refs.push(...this.jsonbField.getFieldRefs());
+    }
+    return refs;
+  }
+
+  buildSql(context: SqlBuildContext): string {
+    let fieldSql: string;
+    if (this.jsonbField instanceof SqlFragment) {
+      fieldSql = this.jsonbField.buildSql(context);
+    } else if (this.isFieldRef(this.jsonbField)) {
+      if ('__tableAlias' in this.jsonbField && this.jsonbField.__tableAlias) {
+        fieldSql = `"${this.jsonbField.__tableAlias}"."${this.jsonbField.__dbColumnName}"`;
+      } else {
+        fieldSql = `"${this.jsonbField.__dbColumnName}"`;
+      }
+    } else {
+      fieldSql = `"${this.jsonbField}"`;
+    }
+
+    const whereSql = this.innerCondition.buildSql(context);
+    return `EXISTS (SELECT 1 FROM jsonb_array_elements(${fieldSql}) AS __elem WHERE ${whereSql})`;
+  }
+}
+
+/**
+ * Check if any element in a JSONB array matches a predicate.
+ * Generates an EXISTS subquery with jsonb_array_elements.
+ *
+ * The callback receives a typed proxy where each property access builds
+ * a JSONB path expression (using ->> for text extraction). Use standard
+ * condition functions (eq, ne, like, isNotNull, etc.) on the proxy properties.
+ *
+ * @example
+ * ```typescript
+ * // Check if integrationConfig array has an element with type 'VILLAPRO' and a token
+ * db.products.where(p =>
+ *   jsonbArraySome<IntegrationConfig>(p.integrationConfig, c =>
+ *     and(
+ *       eq(c.type, IntegrationType.VILLAPRO),
+ *       isNotNull(c.config.villaproSystToken)
+ *     )
+ *   )
+ * )
+ * // → WHERE EXISTS (SELECT 1 FROM jsonb_array_elements("product"."integration_config") AS __elem
+ * //     WHERE (__elem->>'type' = $1 AND __elem->'config'->>'villaproSystToken' IS NOT NULL))
+ * ```
+ */
+export function jsonbArraySome<T>(
+  jsonbField: FieldLike<T[]> | FieldLike<any> | DbColumn<T[]> | DbColumn<any> | undefined,
+  predicate: (element: JsonbElement<T>) => Condition
+): Condition {
+  const elementProxy = createJsonbElementProxy<T>('__elem');
+  const condition = predicate(elementProxy);
+  return new JsonbArraySomeCondition(jsonbField, condition as WhereConditionBase);
+}
+
+/**
+ * Converts a value to its string representation for JSONB text comparisons.
+ * The PostgreSQL ->> operator always returns text, so comparison values must be strings.
+ *
+ * @example
+ * ```typescript
+ * jsonbArraySome<IntegrationConfig>(p.integrationConfig, c =>
+ *   eq(c.type, jsonbConditionUnwrap(IntegrationType.VILLAPRO))
+ * )
+ * ```
+ */
+export function jsonbConditionUnwrap<T>(value: T): T {
+  return String(value) as any;
 }
 
 // ============================================================================
