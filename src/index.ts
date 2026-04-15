@@ -174,6 +174,7 @@ export {
   DbEntity,
   EntityConstructor,
   EntityMetadataStore,
+  IndexMethod,
 } from './entity/entity-base';
 
 export {

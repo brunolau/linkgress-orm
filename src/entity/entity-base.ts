@@ -79,6 +79,8 @@ export interface NavigationMetadata<TTarget extends DbEntity> {
   isInverseNavigation?: boolean;
 }
 
+export type IndexMethod = 'btree' | 'gin' | 'gist' | 'hash' | 'brin' | 'spgist';
+
 /**
  * Index metadata
  */
@@ -86,6 +88,8 @@ export interface IndexMetadata {
   name: string;
   columns: string[];
   isUnique?: boolean;
+  using?: IndexMethod;
+  operatorClass?: string;
 }
 
 /**

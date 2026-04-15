@@ -1,4 +1,4 @@
-import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata } from './entity-base';
+import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import { TypeMapper } from '../types/type-mapper';
 import { DbColumn } from './db-column';
@@ -488,6 +488,25 @@ export class IndexBuilder<TEntity extends DbEntity> {
    */
   isUnique(): this {
     this.indexMetadata.isUnique = true;
+    return this;
+  }
+
+  /**
+   * Set the index method (e.g., 'gin', 'gist', 'hash')
+   */
+  using(method: IndexMethod): this {
+    this.indexMetadata.using = method;
+    return this;
+  }
+
+  /**
+   * Set the operator class for index columns (e.g., 'gin_trgm_ops')
+   */
+  withOperatorClass(opClass: string): this {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(opClass)) {
+      throw new Error(`Invalid operator class name: "${opClass}". Must be a valid PostgreSQL identifier.`);
+    }
+    this.indexMetadata.operatorClass = opClass;
     return this;
   }
 }

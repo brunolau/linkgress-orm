@@ -33,10 +33,14 @@ export interface RelationConfig {
 /**
  * Index definition
  */
+export type IndexMethod = 'btree' | 'gin' | 'gist' | 'hash' | 'brin' | 'spgist';
+
 export interface IndexDefinition {
   name: string;
   columns: string[];
   isUnique?: boolean;
+  using?: IndexMethod;
+  operatorClass?: string;
 }
 
 /**
