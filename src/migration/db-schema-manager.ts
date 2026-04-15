@@ -53,7 +53,7 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; expressions?: string[]; where?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -768,7 +768,9 @@ export class DbSchemaManager {
               columns: modelIndex.columns,
               isUnique: modelIndex.isUnique,
               using: modelIndex.using,
-              operatorClass: modelIndex.operatorClass
+              operatorClass: modelIndex.operatorClass,
+              expressions: modelIndex.expressions,
+              where: modelIndex.where,
             });
           }
         }
@@ -888,7 +890,9 @@ export class DbSchemaManager {
               columns: index.columns,
               isUnique: index.isUnique,
               using: index.using,
-              operatorClass: index.operatorClass
+              operatorClass: index.operatorClass,
+              expressions: index.expressions,
+              where: index.where,
             });
           }
         }
@@ -1000,6 +1004,8 @@ export class DbSchemaManager {
           isUnique: operation.isUnique,
           using: operation.using,
           operatorClass: operation.operatorClass,
+          expressions: operation.expressions,
+          where: operation.where,
         }, operation.schema);
         break;
 
@@ -1193,7 +1199,7 @@ export class DbSchemaManager {
   private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
   private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }, schema?: string): Promise<void> {
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; expressions?: string[]; where?: string }, schema?: string): Promise<void> {
     if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
       throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
     }
@@ -1207,8 +1213,15 @@ export class DbSchemaManager {
     this.logger(`  Creating ${uniqueStr}index "${index.name}" on ${qualifiedTableName}...`);
 
     const opClassSuffix = index.operatorClass ? ` ${index.operatorClass}` : '';
-    const columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
-    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})`;
+    let columnList: string;
+    if (index.expressions && index.expressions.length > 0) {
+      // Expression-based index: use raw SQL expressions (no quoting)
+      columnList = index.expressions.map(expr => `${expr}${opClassSuffix}`).join(', ');
+    } else {
+      columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
+    }
+    const whereStr = index.where ? ` WHERE ${index.where}` : '';
+    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})${whereStr}`;
 
     await this.client.query(sql);
     this.logger(`  ✓ ${uniqueStr}Index "${index.name}" created\n`);
@@ -1597,7 +1610,11 @@ export class DbSchemaManager {
       case 'create_index':
         const uniquePrefix = operation.isUnique ? 'unique ' : '';
         const usingDesc = operation.using ? ` USING ${operation.using}` : '';
-        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${operation.columns.join(', ')})`;
+        const idxCols = operation.expressions && operation.expressions.length > 0
+          ? operation.expressions.join(', ')
+          : operation.columns.join(', ');
+        const whereDesc = operation.where ? ` WHERE ${operation.where}` : '';
+        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${whereDesc}`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':

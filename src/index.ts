@@ -176,6 +176,8 @@ export {
   EntityConstructor,
   EntityMetadataStore,
   IndexMethod,
+  ixLower,
+  ixUnaccent,
 } from './entity/entity-base';
 
 export {

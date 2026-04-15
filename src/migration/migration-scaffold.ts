@@ -83,7 +83,9 @@ export class MigrationScaffold {
           op.indexName,
           op.columns,
           op.isUnique,
-          op.schema
+          op.schema,
+          op.expressions,
+          op.where,
         );
 
       case 'drop_index': {
@@ -363,7 +365,9 @@ export class MigrationScaffold {
     indexName: string,
     columns: string[],
     isUnique?: boolean,
-    schema?: string
+    schema?: string,
+    expressions?: string[],
+    where?: string,
   ): string[] {
     const qualifiedTable = schema
       ? `"${schema}"."${tableName}"`
@@ -374,11 +378,14 @@ export class MigrationScaffold {
       : `"${indexName}"`;
 
     const uniqueStr = isUnique ? 'UNIQUE ' : '';
-    const columnList = columns.map(c => `"${c}"`).join(', ');
+    const columnList = expressions && expressions.length > 0
+      ? expressions.join(', ')
+      : columns.map(c => `"${c}"`).join(', ');
+    const whereStr = where ? ` WHERE ${where}` : '';
 
     return [
       `DROP INDEX IF EXISTS ${qualifiedIndex}`,
-      `CREATE ${uniqueStr}INDEX "${indexName}" ON ${qualifiedTable} (${columnList})`
+      `CREATE ${uniqueStr}INDEX "${indexName}" ON ${qualifiedTable} (${columnList})${whereStr}`
     ];
   }
 
