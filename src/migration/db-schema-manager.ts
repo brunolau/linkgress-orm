@@ -1,7 +1,7 @@
 import * as readline from 'readline';
 import { DatabaseClient } from '../database/database-client.interface';
 import { LogLevel } from '../entity/db-context';
-import { TableSchema } from '../schema/table-builder';
+import { TableSchema, IndexMethod } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
@@ -53,7 +53,7 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -562,7 +562,7 @@ export class DbSchemaManager {
   private async createIndexes(tableName: string, tableSchema: TableSchema): Promise<void> {
     const indexes = tableSchema.indexes || [];
     for (const index of indexes) {
-      await this.executeCreateIndex(tableName, index.name, index.columns, index.isUnique, tableSchema.schema);
+      await this.executeCreateIndex(tableName, index, tableSchema.schema);
     }
   }
 
@@ -766,7 +766,9 @@ export class DbSchemaManager {
               schema: schema.schema,
               indexName: modelIndex.name,
               columns: modelIndex.columns,
-              isUnique: modelIndex.isUnique
+              isUnique: modelIndex.isUnique,
+              using: modelIndex.using,
+              operatorClass: modelIndex.operatorClass
             });
           }
         }
@@ -884,7 +886,9 @@ export class DbSchemaManager {
 			  schema: schema.schema,
               indexName: index.name,
               columns: index.columns,
-              isUnique: index.isUnique
+              isUnique: index.isUnique,
+              using: index.using,
+              operatorClass: index.operatorClass
             });
           }
         }
@@ -990,7 +994,13 @@ export class DbSchemaManager {
         break;
 
       case 'create_index':
-        await this.executeCreateIndex(operation.tableName, operation.indexName, operation.columns, operation.isUnique, operation.schema);
+        await this.executeCreateIndex(operation.tableName, {
+          name: operation.indexName,
+          columns: operation.columns,
+          isUnique: operation.isUnique,
+          using: operation.using,
+          operatorClass: operation.operatorClass,
+        }, operation.schema);
         break;
 
       case 'drop_index':
@@ -1180,16 +1190,28 @@ export class DbSchemaManager {
   /**
    * Execute create index
    */
-  private async executeCreateIndex(tableName: string, indexName: string, columns: string[], isUnique?: boolean, schema?: string): Promise<void> {
-    const uniqueStr = isUnique ? 'UNIQUE ' : '';
-    const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
-    this.logger(`  Creating ${uniqueStr}index "${indexName}" on ${qualifiedTableName}...`);
+  private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
+  private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-    const columnList = columns.map(col => `"${col}"`).join(', ');
-    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${indexName}" ON ${qualifiedTableName} (${columnList})`;
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }, schema?: string): Promise<void> {
+    if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
+      throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
+    }
+    if (index.operatorClass && !DbSchemaManager.VALID_OPERATOR_CLASS.test(index.operatorClass)) {
+      throw new Error(`Invalid operator class: "${index.operatorClass}". Must be a valid PostgreSQL identifier.`);
+    }
+
+    const uniqueStr = index.isUnique ? 'UNIQUE ' : '';
+    const usingStr = index.using ? ` USING ${index.using}` : '';
+    const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
+    this.logger(`  Creating ${uniqueStr}index "${index.name}" on ${qualifiedTableName}...`);
+
+    const opClassSuffix = index.operatorClass ? ` ${index.operatorClass}` : '';
+    const columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
+    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})`;
 
     await this.client.query(sql);
-    this.logger(`  ✓ ${uniqueStr}Index "${indexName}" created\n`);
+    this.logger(`  ✓ ${uniqueStr}Index "${index.name}" created\n`);
   }
 
   /**
@@ -1574,7 +1596,8 @@ export class DbSchemaManager {
         return `Alter column "${operation.tableName}"."${operation.columnName}"`;
       case 'create_index':
         const uniquePrefix = operation.isUnique ? 'unique ' : '';
-        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}" (${operation.columns.join(', ')})`;
+        const usingDesc = operation.using ? ` USING ${operation.using}` : '';
+        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${operation.columns.join(', ')})`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':
