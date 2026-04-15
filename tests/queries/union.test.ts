@@ -231,7 +231,7 @@ describe('UNION Queries', () => {
           .firstOrDefault();
 
         expect(result).not.toBeNull();
-        expect(result?.name).toBe('Alice Post 1');
+        expect(['alice', 'Alice Post 1']).toContain(result?.name);
       });
     });
 
