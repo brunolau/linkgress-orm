@@ -12,6 +12,10 @@ This guide covers how to configure your database schema using Linkgress ORM's fl
   - [Many-to-One](#many-to-one-hasone)
   - [Composite Foreign Keys](#composite-foreign-keys)
 - [Indexes](#indexes)
+  - [Expression Indexes](#expression-indexes)
+  - [Partial Indexes](#partial-indexes)
+  - [GIN/GiST Indexes](#gingist-indexes)
+- [Collations](#collations)
 - [Constraints](#constraints)
 - [Sequences](#sequences)
 - [Default Values](#default-values)
@@ -454,11 +458,6 @@ model.entity(Product, entity => {
 });
 ```
 
-**Use Cases for Unique Indexes:**
-- Enforce uniqueness on multiple columns (composite unique constraint)
-- Create unique constraints without using `.isUnique()` on individual properties
-- Prevent duplicate combinations (e.g., unique product per source/type/entity)
-
 ### Multiple Indexes
 
 ```typescript
@@ -470,6 +469,132 @@ model.entity(Order, entity => {
   entity.hasIndex('ix_orders_created', e => [e.createdAt]);
 });
 ```
+
+### Expression Indexes
+
+Use `ixLower` and `ixUnaccent` helpers inside the selector to create expression-based indexes. The helpers compose naturally:
+
+```typescript
+import { ixLower, ixUnaccent } from 'linkgress-orm';
+
+model.entity(UserEshop, entity => {
+  // lower("name")
+  entity.hasIndex('ix_name_lower', e => [ixLower(e.name)]);
+
+  // lower(unaccent("name")) — composable
+  entity.hasIndex('ix_name_ci_ai', e => [ixLower(ixUnaccent(e.name))]);
+
+  // Multiple expression columns
+  entity.hasIndex('ix_multi', e => [ixLower(e.name), ixLower(e.email)]);
+
+  // Mixed: plain column + expression
+  entity.hasIndex('ix_mixed', e => [e.id, ixLower(e.name)]);
+});
+```
+
+For complex SQL that can't be expressed with helpers, use `.withExpression()` as an escape hatch:
+
+```typescript
+entity.hasIndex('ix_jsonb_key')
+  .withExpression('(data->>\'key\')::int');
+```
+
+### Partial Indexes
+
+Add `.where()` to create a partial index — the index only covers rows matching the condition:
+
+```typescript
+model.entity(User, entity => {
+  // Unique email only among active users
+  entity.hasIndex('ix_active_users_email', e => [e.email])
+    .isUnique()
+    .where('active = true');
+
+  // Expression + WHERE combined
+  entity.hasIndex('ix_active_name', e => [ixLower(e.name)])
+    .where('deleted_at IS NULL');
+});
+```
+
+### GIN/GiST Indexes
+
+Use `.using()` to set the index method and `.withOperatorClass()` for operator classes:
+
+```typescript
+model.entity(User, entity => {
+  // GIN trigram index for ILIKE substring search
+  entity.hasIndex('ix_users_gin_email', e => [e.email])
+    .using('gin')
+    .withOperatorClass('gin_trgm_ops');
+
+  // GiST index
+  entity.hasIndex('ix_users_gist_name', e => [e.name])
+    .using('gist')
+    .withOperatorClass('gist_trgm_ops');
+
+  // BRIN index (good for naturally ordered data like timestamps)
+  entity.hasIndex('ix_users_brin_created', e => [e.createdAt])
+    .using('brin');
+});
+```
+
+Supported index methods: `btree`, `gin`, `gist`, `hash`, `brin`, `spgist`.
+
+## Collations
+
+Define custom PostgreSQL collations for locale-aware or case/accent-insensitive text handling.
+
+### Defining a Collation
+
+```typescript
+import { pgCollation } from 'linkgress-orm';
+
+// Case-insensitive, accent-insensitive collation using ICU
+const ndCiAi = pgCollation({
+  name: 'nd_ci_ai',
+  provider: 'icu',
+  locale: 'und-u-ks-level1',
+  deterministic: false,
+});
+```
+
+This produces:
+```sql
+CREATE COLLATION "nd_ci_ai" (provider = 'icu', locale = 'und-u-ks-level1', deterministic = false);
+```
+
+### Using a Collation on Columns
+
+Attach a collation to a column with `.hasCollation()`:
+
+```typescript
+model.entity(UserEshop, entity => {
+  entity.toTable('user_eshop');
+
+  entity.property(e => e.name)
+    .hasType(varchar('name', 200))
+    .isRequired()
+    .hasCollation(ndCiAi);  // Case & accent insensitive
+
+  entity.property(e => e.email)
+    .hasType(varchar('email', 255))
+    .isRequired();  // Uses database default collation
+});
+```
+
+The column definition becomes:
+```sql
+"name" varchar(200) COLLATE "nd_ci_ai" NOT NULL
+```
+
+With `nd_ci_ai`, queries like `WHERE name = 'jan'` will match `'Ján'`, `'JAN'`, `'ján'`, etc.
+
+### Collation Lifecycle
+
+- **`ensureCreated()`** — creates collations before tables
+- **`analyze()`** — detects missing collations and collation mismatches on existing columns
+- **`migrate()`** — applies `CREATE COLLATION` and `ALTER COLUMN ... COLLATE` automatically
+- **`MigrationScaffold`** — generates `CREATE COLLATION IF NOT EXISTS` / `DROP COLLATION IF EXISTS`
 
 ## Constraints
 
