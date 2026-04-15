@@ -1,6 +1,7 @@
 import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import { TypeMapper } from '../types/type-mapper';
+import { CollationDefinition } from '../types/collation-builder';
 import { DbColumn } from './db-column';
 import { SqlFragment } from '../query/conditions';
 
@@ -96,6 +97,14 @@ export class EntityPropertyBuilder<TEntity extends DbEntity, TProperty> {
     // Apply mapper to column builder
     this.columnBuilder.mapWith(mapper);
 
+    return this;
+  }
+
+  /**
+   * Set the collation for this column
+   */
+  hasCollation(collation: CollationDefinition): this {
+    this.columnBuilder.hasCollation(collation);
     return this;
   }
 

@@ -50,6 +50,11 @@ export class MigrationScaffold {
       case 'create_schema':
         return [`CREATE SCHEMA IF NOT EXISTS "${op.schemaName}"`];
 
+      case 'create_collation': {
+        const det = op.collation.deterministic ? 'true' : 'false';
+        return [`CREATE COLLATION IF NOT EXISTS "${op.collation.name}" (provider = '${op.collation.provider}', locale = '${op.collation.locale}', deterministic = ${det})`];
+      }
+
       case 'create_enum': {
         const enumValues = op.values.map((v: string) => `'${v}'`).join(', ');
         return [`DO $$ BEGIN CREATE TYPE "${op.enumName}" AS ENUM (${enumValues}); EXCEPTION WHEN duplicate_object THEN NULL; END $$`];
@@ -117,6 +122,9 @@ export class MigrationScaffold {
     switch (op.type) {
       case 'create_schema':
         return [`DROP SCHEMA IF EXISTS "${op.schemaName}" CASCADE`];
+
+      case 'create_collation':
+        return [`DROP COLLATION IF EXISTS "${op.collation.name}"`];
 
       case 'create_enum':
         return [`DROP TYPE IF EXISTS "${op.enumName}" CASCADE`];
@@ -225,6 +233,10 @@ export class MigrationScaffold {
         def += `(${config.precision})`;
       }
 
+      if (config.collation) {
+        def += ` COLLATE "${config.collation}"`;
+      }
+
       if (config.identity) {
         def += ' GENERATED ALWAYS AS IDENTITY';
         const seqOptions: string[] = [];
@@ -283,6 +295,8 @@ export class MigrationScaffold {
     if (config.length) def += `(${config.length})`;
     else if (config.precision && config.scale) def += `(${config.precision}, ${config.scale})`;
     else if (config.precision) def += `(${config.precision})`;
+
+    if (config.collation) def += ` COLLATE "${config.collation}"`;
 
     if (!config.nullable) def += ' NOT NULL';
     if (config.unique) def += ' UNIQUE';

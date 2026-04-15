@@ -34,6 +34,13 @@ export {
   EnumValues,
 } from './types/enum-builder';
 
+// Collation types
+export {
+  pgCollation,
+  CollationDefinition,
+  CollationRegistry,
+} from './types/collation-builder';
+
 // Query builders
 export {
   QueryBuilder,
