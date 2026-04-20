@@ -1488,10 +1488,19 @@ export class DataContext<TSchema extends ContextSchema = any> {
   }
 
   /**
-   * Get schema manager for create/drop operations and automatic migrations
+   * Get schema manager for create/drop operations and automatic migrations.
+   *
+   * Pass `{ concurrentIndexes: true }` to force every index created during
+   * `ensureCreated()` / `migrate()` to use `CREATE INDEX CONCURRENTLY` without
+   * having to mark each index with `.concurrent()`. This must run outside a
+   * transaction — PostgreSQL disallows `CONCURRENTLY` inside a transaction.
    */
-  getSchemaManager(): DbSchemaManager {
-    return new DbSchemaManager(this.client, this.schemaRegistry, { logQueries: this.queryOptions?.logQueries, logger: this.queryOptions?.logger });
+  getSchemaManager(options?: { concurrentIndexes?: boolean }): DbSchemaManager {
+    return new DbSchemaManager(this.client, this.schemaRegistry, {
+      logQueries: this.queryOptions?.logQueries,
+      logger: this.queryOptions?.logger,
+      concurrentIndexes: options?.concurrentIndexes,
+    });
   }
 
   /**
@@ -4684,7 +4693,7 @@ export abstract class DatabaseContext extends DataContext {
   /**
    * Get schema manager for create/drop operations with post-migration hook support
    */
-  override getSchemaManager(): DbSchemaManager {
+  override getSchemaManager(options?: { concurrentIndexes?: boolean }): DbSchemaManager {
     return new DbSchemaManager(
       this.client,
       (this as any).schemaRegistry,
@@ -4694,7 +4703,8 @@ export abstract class DatabaseContext extends DataContext {
         postMigrationHook: async (client: DatabaseClient) => {
           await this.onMigrationComplete(client);
         },
-        sequenceRegistry: this.sequenceRegistry
+        sequenceRegistry: this.sequenceRegistry,
+        concurrentIndexes: options?.concurrentIndexes,
       }
     );
   }

@@ -509,6 +509,17 @@ export class IndexBuilder<TEntity extends DbEntity> {
     this.indexMetadata.operatorClass = opClass;
     return this;
   }
+
+  /**
+   * Create the index with `CREATE INDEX CONCURRENTLY`. The statement cannot run
+   * inside a transaction, so callers must ensure the migration executes in
+   * autocommit mode (e.g. through `DbSchemaManager.migrate()` / `ensureCreated()`
+   * rather than the transactional journal-based runner).
+   */
+  concurrent(): this {
+    this.indexMetadata.concurrent = true;
+    return this;
+  }
 }
 
 /**

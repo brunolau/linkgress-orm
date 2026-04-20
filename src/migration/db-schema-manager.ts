@@ -53,7 +53,7 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -66,6 +66,7 @@ export class DbSchemaManager {
   private logger: (message: string, level?: LogLevel) => void;
   private postMigrationHook?: (client: DatabaseClient) => Promise<void>;
   private sequenceRegistry: Map<string, SequenceConfig>;
+  private concurrentIndexes: boolean;
   private rl: readline.Interface | null = null;
 
   constructor(
@@ -76,12 +77,19 @@ export class DbSchemaManager {
       logger?: (message: string, level?: LogLevel) => void;
       postMigrationHook?: (client: DatabaseClient) => Promise<void>;
       sequenceRegistry?: Map<string, SequenceConfig>;
+      /**
+       * When true, every index created by this schema manager uses
+       * `CREATE INDEX CONCURRENTLY`, regardless of per-index `.concurrent()`.
+       * Must not be used inside a transaction — PostgreSQL disallows it.
+       */
+      concurrentIndexes?: boolean;
     }
   ) {
     this.logQueries = options?.logQueries ?? false;
     this.logger = options?.logger ?? console.log;
     this.postMigrationHook = options?.postMigrationHook;
     this.sequenceRegistry = options?.sequenceRegistry ?? new Map();
+    this.concurrentIndexes = options?.concurrentIndexes ?? false;
   }
 
   /**
@@ -768,7 +776,8 @@ export class DbSchemaManager {
               columns: modelIndex.columns,
               isUnique: modelIndex.isUnique,
               using: modelIndex.using,
-              operatorClass: modelIndex.operatorClass
+              operatorClass: modelIndex.operatorClass,
+              concurrent: modelIndex.concurrent
             });
           }
         }
@@ -888,7 +897,8 @@ export class DbSchemaManager {
               columns: index.columns,
               isUnique: index.isUnique,
               using: index.using,
-              operatorClass: index.operatorClass
+              operatorClass: index.operatorClass,
+              concurrent: index.concurrent
             });
           }
         }
@@ -1000,6 +1010,7 @@ export class DbSchemaManager {
           isUnique: operation.isUnique,
           using: operation.using,
           operatorClass: operation.operatorClass,
+          concurrent: operation.concurrent,
         }, operation.schema);
         break;
 
@@ -1193,7 +1204,7 @@ export class DbSchemaManager {
   private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
   private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string }, schema?: string): Promise<void> {
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean }, schema?: string): Promise<void> {
     if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
       throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
     }
@@ -1202,16 +1213,18 @@ export class DbSchemaManager {
     }
 
     const uniqueStr = index.isUnique ? 'UNIQUE ' : '';
+    const useConcurrent = index.concurrent || this.concurrentIndexes;
+    const concurrentStr = useConcurrent ? 'CONCURRENTLY ' : '';
     const usingStr = index.using ? ` USING ${index.using}` : '';
     const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
-    this.logger(`  Creating ${uniqueStr}index "${index.name}" on ${qualifiedTableName}...`);
+    this.logger(`  Creating ${uniqueStr}${concurrentStr}index "${index.name}" on ${qualifiedTableName}...`);
 
     const opClassSuffix = index.operatorClass ? ` ${index.operatorClass}` : '';
     const columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
-    const sql = `CREATE ${uniqueStr}INDEX IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})`;
+    const sql = `CREATE ${uniqueStr}INDEX ${concurrentStr}IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})`;
 
     await this.client.query(sql);
-    this.logger(`  ✓ ${uniqueStr}Index "${index.name}" created\n`);
+    this.logger(`  ✓ ${uniqueStr}${concurrentStr}Index "${index.name}" created\n`);
   }
 
   /**
@@ -1596,8 +1609,9 @@ export class DbSchemaManager {
         return `Alter column "${operation.tableName}"."${operation.columnName}"`;
       case 'create_index':
         const uniquePrefix = operation.isUnique ? 'unique ' : '';
+        const concurrentDesc = operation.concurrent ? ' CONCURRENTLY' : '';
         const usingDesc = operation.using ? ` USING ${operation.using}` : '';
-        return `Create ${uniquePrefix}index "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${operation.columns.join(', ')})`;
+        return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${operation.columns.join(', ')})`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':

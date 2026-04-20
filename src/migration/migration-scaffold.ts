@@ -83,7 +83,8 @@ export class MigrationScaffold {
           op.indexName,
           op.columns,
           op.isUnique,
-          op.schema
+          op.schema,
+          op.concurrent
         );
 
       case 'drop_index': {
@@ -357,13 +358,16 @@ export class MigrationScaffold {
   /**
    * Build CREATE INDEX SQL.
    * Returns [DROP IF EXISTS, CREATE] for idempotency.
+   * When `concurrent` is true, emits `CREATE INDEX CONCURRENTLY`; the caller
+   * must run the statement outside of a transaction block.
    */
   private buildCreateIndexSql(
     tableName: string,
     indexName: string,
     columns: string[],
     isUnique?: boolean,
-    schema?: string
+    schema?: string,
+    concurrent?: boolean
   ): string[] {
     const qualifiedTable = schema
       ? `"${schema}"."${tableName}"`
@@ -374,11 +378,12 @@ export class MigrationScaffold {
       : `"${indexName}"`;
 
     const uniqueStr = isUnique ? 'UNIQUE ' : '';
+    const concurrentStr = concurrent ? 'CONCURRENTLY ' : '';
     const columnList = columns.map(c => `"${c}"`).join(', ');
 
     return [
       `DROP INDEX IF EXISTS ${qualifiedIndex}`,
-      `CREATE ${uniqueStr}INDEX "${indexName}" ON ${qualifiedTable} (${columnList})`
+      `CREATE ${uniqueStr}INDEX ${concurrentStr}"${indexName}" ON ${qualifiedTable} (${columnList})`
     ];
   }
 
