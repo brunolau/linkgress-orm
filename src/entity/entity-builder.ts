@@ -1,6 +1,7 @@
-import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod } from './entity-base';
+import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import { TypeMapper } from '../types/type-mapper';
+import { CollationDefinition } from '../types/collation-builder';
 import { DbColumn } from './db-column';
 import { SqlFragment } from '../query/conditions';
 
@@ -96,6 +97,14 @@ export class EntityPropertyBuilder<TEntity extends DbEntity, TProperty> {
     // Apply mapper to column builder
     this.columnBuilder.mapWith(mapper);
 
+    return this;
+  }
+
+  /**
+   * Set the collation for this column
+   */
+  hasCollation(collation: CollationDefinition): this {
+    this.columnBuilder.hasCollation(collation);
     return this;
   }
 
@@ -426,36 +435,59 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
    */
   hasIndex(
     indexName: string,
-    selector: (entity: TEntity) => Array<TEntity[keyof TEntity]>
+    selector?: (entity: TEntity) => Array<TEntity[keyof TEntity]>
   ): IndexBuilder<TEntity> {
     const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
 
-    // Create a temporary entity to extract column names
-    const tempEntity = {} as TEntity;
     const columnNames: string[] = [];
+    const expressions: string[] = [];
+    let hasAnyExpression = false;
 
-    // Build a proxy to capture property accesses
-    const proxy = new Proxy(tempEntity, {
-      get: (target, prop) => {
-        if (typeof prop === 'string') {
-          // Find the column name for this property
-          const propMetadata = metadata.properties.get(prop as keyof TEntity);
-          if (propMetadata) {
-            columnNames.push(propMetadata.columnName);
+    if (selector) {
+      // Create a temporary entity to extract column names
+      const tempEntity = {} as TEntity;
+
+      // Build a proxy that returns IndexColumnRef objects for each property access.
+      // These can be used directly (plain columns) or wrapped with ixLower/ixUnaccent.
+      const proxy = new Proxy(tempEntity, {
+        get: (target, prop) => {
+          if (typeof prop === 'string') {
+            const propMetadata = metadata.properties.get(prop as keyof TEntity);
+            if (propMetadata) {
+              return { __indexColumn: true, columnName: propMetadata.columnName } as IndexColumnRef;
+            }
+          }
+          return undefined;
+        }
+      });
+
+      // Execute the selector and collect returned refs
+      const result = selector(proxy);
+
+      for (const item of result) {
+        const ref = item as unknown as IndexColumnRef;
+        if (ref && ref.__indexColumn) {
+          columnNames.push(ref.columnName);
+          if (ref.expression) {
+            hasAnyExpression = true;
+            expressions.push(ref.expression);
+          } else {
+            expressions.push(`"${ref.columnName}"`);
           }
         }
-        return proxy;
       }
-    });
-
-    // Execute the selector to capture property accesses
-    selector(proxy);
+    }
 
     // Add the index metadata
     const indexMetadata: IndexMetadata = {
       name: indexName,
-      columns: columnNames
+      columns: columnNames,
     };
+
+    if (hasAnyExpression) {
+      indexMetadata.expressions = expressions;
+    }
+
     metadata.indexes.push(indexMetadata);
 
     return new IndexBuilder<TEntity>(this.entityClass, indexMetadata);
@@ -518,6 +550,35 @@ export class IndexBuilder<TEntity extends DbEntity> {
    */
   concurrent(): this {
     this.indexMetadata.concurrent = true;
+    return this;
+  }
+
+  /**
+   * Set raw SQL expressions for expression-based index columns.
+   * When set, expressions are used instead of column names.
+   * Use with helper functions like lower() and unaccent() for composability.
+   *
+   * @example
+   * entity.hasIndex('idx_name_unaccent')
+   *   .withExpression(lower(unaccent('name')))
+   *
+   * entity.hasIndex('idx_multi')
+   *   .withExpression(lower('email'), lower(unaccent('name')))
+   */
+  withExpression(...expressions: string[]): this {
+    this.indexMetadata.expressions = expressions;
+    return this;
+  }
+
+  /**
+   * Add a WHERE clause for a partial index.
+   *
+   * @example
+   * entity.hasIndex('idx_active_users', e => [e.email])
+   *   .where('active = true')
+   */
+  where(condition: string): this {
+    this.indexMetadata.where = condition;
     return this;
   }
 }

@@ -68,7 +68,8 @@ const users = await db.users
 **Available Condition Functions:**
 - Comparison: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`
 - Logical: `and`, `or`, `not`
-- Pattern matching: `like`, `ilike`
+- Pattern matching: `like`, `ilike`, `startsWith`
+- Regex: `regexMatches`, `regexMatchesCaseInsensitive`, `regexNoMatch`, `regexNoMatchCaseInsensitive`
 - Array: `inArray`, `notInArray`
 - Null checking: `isNull`, `isNotNull`
 - JSONB: `jsonbSelect`, `jsonbSelectText`
@@ -655,6 +656,61 @@ const nonAdmins = await db.users
 - `flagHasAll(column, flags)` - Check if ALL flags are set: `(column & flags) = flags`
 - `flagHasAny(column, flags)` - Check if ANY flag is set: `(column & flags) != 0`
 - `flagHasNone(column, flag)` - Check if flag is NOT set: `(column & flag) = 0`
+
+### startsWith Operator
+
+The `startsWith` function uses PostgreSQL's `^@` operator for efficient prefix matching. Unlike `LIKE 'prefix%'`, `^@` is optimized to always use btree indexes:
+
+```typescript
+import { startsWith } from 'linkgress-orm';
+
+const users = await db.users
+  .where(u => startsWith(u.name, 'Joh'))
+  .toList();
+// → WHERE "name" ^@ $1
+```
+
+### Regex Operators
+
+PostgreSQL POSIX regular expression matching:
+
+```typescript
+import {
+  regexMatches,
+  regexMatchesCaseInsensitive,
+  regexNoMatch,
+  regexNoMatchCaseInsensitive
+} from 'linkgress-orm';
+
+// ~ operator: case-sensitive regex match
+const users = await db.users
+  .where(u => regexMatches(u.name, '^Joh'))
+  .toList();
+
+// ~* operator: case-insensitive regex match
+const gmailUsers = await db.users
+  .where(u => regexMatchesCaseInsensitive(u.email, 'gmail\\.com$'))
+  .toList();
+
+// !~ operator: does not match regex
+const noDigitStart = await db.users
+  .where(u => regexNoMatch(u.name, '^[0-9]'))
+  .toList();
+
+// !~* operator: does not match regex (case-insensitive)
+const noSecret = await db.users
+  .where(u => regexNoMatchCaseInsensitive(u.name, 'secret'))
+  .toList();
+```
+
+**Regex Operator Reference:**
+
+| Function | SQL Operator | Description |
+|----------|-------------|-------------|
+| `regexMatches` | `~` | Matches regex (respects collation) |
+| `regexMatchesCaseInsensitive` | `~*` | Matches regex (case-insensitive) |
+| `regexNoMatch` | `!~` | Does not match regex |
+| `regexNoMatchCaseInsensitive` | `!~*` | Does not match regex (case-insensitive) |
 
 ## Advanced Patterns
 

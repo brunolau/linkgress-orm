@@ -82,6 +82,35 @@ export interface NavigationMetadata<TTarget extends DbEntity> {
 export type IndexMethod = 'btree' | 'gin' | 'gist' | 'hash' | 'brin' | 'spgist';
 
 /**
+ * Index expression helpers — wrap entity property references inside hasIndex selectors.
+ * Composable: ixLower(ixUnaccent(e.name)) → lower(unaccent("name"))
+ *
+ * @example
+ * entity.hasIndex('idx_name', e => [ixLower(ixUnaccent(e.name))])
+ */
+export interface IndexColumnRef {
+  __indexColumn: true;
+  columnName: string;
+  expression?: string;
+}
+
+function wrapIndexExpression<T>(ref: T, fn: string): T {
+  const r = ref as any;
+  if (r && r.__indexColumn) {
+    return { ...r, expression: `${fn}(${r.expression || `"${r.columnName}"`})` } as T;
+  }
+  return ref;
+}
+
+export function ixLower<T>(ref: T): T {
+  return wrapIndexExpression(ref, 'lower');
+}
+
+export function ixUnaccent<T>(ref: T): T {
+  return wrapIndexExpression(ref, 'unaccent');
+}
+
+/**
  * Index metadata
  */
 export interface IndexMetadata {
@@ -96,6 +125,10 @@ export interface IndexMetadata {
    * transaction — PostgreSQL will raise an error otherwise.
    */
   concurrent?: boolean;
+  /** Raw SQL expressions for expression-based index columns (e.g., 'lower(unaccent(name))') */
+  expressions?: string[];
+  /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
+  where?: string;
 }
 
 /**

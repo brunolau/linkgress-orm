@@ -1,5 +1,6 @@
 import { ColumnType } from '../types/column-types';
 import { TypeMapper } from '../types/type-mapper';
+import { CollationDefinition } from '../types/collation-builder';
 
 /**
  * Identity column options
@@ -36,6 +37,8 @@ export interface ColumnConfig {
   identity?: IdentityOptions;
   /** PostgreSQL ENUM type name */
   enumTypeName?: string;
+  /** PostgreSQL COLLATION name */
+  collation?: string;
 }
 
 /**
@@ -169,6 +172,14 @@ export class ColumnBuilder<TType = any> {
    */
   hasTypescriptType<TNewType>(): ColumnBuilder<TNewType> {
     return this as unknown as ColumnBuilder<TNewType>;
+  }
+
+  /**
+   * Set the collation for this column
+   */
+  hasCollation(collation: CollationDefinition): this {
+    this.config.collation = collation.name;
+    return this;
   }
 
   /**

@@ -474,6 +474,36 @@ export class ILikeComparison extends WhereComparisonBase<string> {
   }
 }
 
+export class StartsWithComparison extends WhereComparisonBase<string> {
+  protected getOperator(): string {
+    return '^@';
+  }
+}
+
+export class RegexMatchesComparison extends WhereComparisonBase<string> {
+  protected getOperator(): string {
+    return '~';
+  }
+}
+
+export class RegexMatchesCaseInsensitiveComparison extends WhereComparisonBase<string> {
+  protected getOperator(): string {
+    return '~*';
+  }
+}
+
+export class RegexNoMatchComparison extends WhereComparisonBase<string> {
+  protected getOperator(): string {
+    return '!~';
+  }
+}
+
+export class RegexNoMatchCaseInsensitiveComparison extends WhereComparisonBase<string> {
+  protected getOperator(): string {
+    return '!~*';
+  }
+}
+
 export class IsNullComparison<V = any> extends WhereComparisonBase<V> {
   constructor(field: FieldLike<V> | string) {
     super(field, undefined);
@@ -675,6 +705,41 @@ export function ilike<T extends string>(
   value: FieldLike<string> | string | Placeholder<any> | undefined
 ): Condition {
   return new ILikeComparison(field!, value!);
+}
+
+export function startsWith<T extends string>(
+  field: FieldLike<string> | T | undefined,
+  value: FieldLike<string> | string | Placeholder<any> | undefined
+): Condition {
+  return new StartsWithComparison(field!, value!);
+}
+
+export function regexMatches<T extends string>(
+  field: FieldLike<string> | T | undefined,
+  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+): Condition {
+  return new RegexMatchesComparison(field!, pattern!);
+}
+
+export function regexMatchesCaseInsensitive<T extends string>(
+  field: FieldLike<string> | T | undefined,
+  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+): Condition {
+  return new RegexMatchesCaseInsensitiveComparison(field!, pattern!);
+}
+
+export function regexNoMatch<T extends string>(
+  field: FieldLike<string> | T | undefined,
+  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+): Condition {
+  return new RegexNoMatchComparison(field!, pattern!);
+}
+
+export function regexNoMatchCaseInsensitive<T extends string>(
+  field: FieldLike<string> | T | undefined,
+  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+): Condition {
+  return new RegexNoMatchCaseInsensitiveComparison(field!, pattern!);
 }
 
 export function inArray<T extends string, V>(

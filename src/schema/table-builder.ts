@@ -46,6 +46,10 @@ export interface IndexDefinition {
    * outside of a transaction block.
    */
   concurrent?: boolean;
+  /** Raw SQL expressions for expression-based index columns (e.g., 'lower(unaccent(name))') */
+  expressions?: string[];
+  /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
+  where?: string;
 }
 
 /**

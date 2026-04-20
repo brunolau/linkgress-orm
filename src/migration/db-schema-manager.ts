@@ -4,6 +4,7 @@ import { LogLevel } from '../entity/db-context';
 import { TableSchema, IndexMethod } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
+import { CollationRegistry, CollationDefinition } from '../types/collation-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
 import { RawSql } from '../query/conditions';
 
@@ -19,6 +20,7 @@ interface DbColumnInfo {
   numeric_scale: number | null;
   is_nullable: 'YES' | 'NO';
   column_default: string | null;
+  collation_name: string | null;
 }
 
 /**
@@ -46,6 +48,7 @@ interface DbForeignKeyInfo {
  */
 export type MigrationOperation =
   | { type: 'create_schema'; schemaName: string }
+  | { type: 'create_collation'; collation: CollationDefinition }
   | { type: 'create_enum'; enumName: string; values: readonly string[] }
   | { type: 'create_sequence'; config: SequenceConfig }
   | { type: 'create_table'; tableName: string; schema: TableSchema }
@@ -53,7 +56,7 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -194,6 +197,44 @@ export class DbSchemaManager {
   }
 
   /**
+   * Create all COLLATION types used in the schema
+   */
+  private async createCollations(): Promise<void> {
+    const collations = CollationRegistry.getAll();
+
+    if (collations.size === 0) return;
+
+    if (this.logQueries) {
+      this.logger('Creating collations...\n');
+    }
+
+    for (const [collationName, collationDef] of collations.entries()) {
+      const checkSQL = `
+        SELECT EXISTS (
+          SELECT 1 FROM pg_collation WHERE collname = $1
+        ) as exists
+      `;
+      const result = await this.client.query(checkSQL, [collationName]);
+      const exists = result.rows[0]?.exists;
+
+      if (!exists) {
+        const deterministic = collationDef.deterministic ? 'true' : 'false';
+        const createSQL = `CREATE COLLATION "${collationName}" (provider = '${collationDef.provider}', locale = '${collationDef.locale}', deterministic = ${deterministic})`;
+
+        if (this.logQueries) {
+          this.logger(`  Creating collation "${collationName}"...`);
+        }
+        await this.client.query(createSQL);
+        if (this.logQueries) {
+          this.logger(`  ✓ Collation "${collationName}" created\n`);
+        }
+      } else if (this.logQueries) {
+        this.logger(`  Collation "${collationName}" already exists, skipping\n`);
+      }
+    }
+  }
+
+  /**
    * Create all sequences registered in the schema
    */
   private async createSequences(): Promise<void> {
@@ -290,6 +331,10 @@ export class DbSchemaManager {
         def += `(${config.precision}, ${config.scale})`;
       } else if (config.precision) {
         def += `(${config.precision})`;
+      }
+
+      if (config.collation) {
+        def += ` COLLATE "${config.collation}"`;
       }
 
       // Handle GENERATED ALWAYS AS IDENTITY
@@ -531,6 +576,9 @@ export class DbSchemaManager {
     // Create schemas first
     await this.createSchemas();
 
+    // Create collations
+    await this.createCollations();
+
     // Create enum types
     await this.createEnumTypes();
 
@@ -684,6 +732,20 @@ export class DbSchemaManager {
       }
     }
 
+    // Check collations
+    const modelCollations = CollationRegistry.getAll();
+    for (const [collationName, collationDef] of modelCollations.entries()) {
+      const result = await this.client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_collation WHERE collname = $1
+        ) as exists
+      `, [collationName]);
+
+      if (!result.rows[0]?.exists) {
+        operations.push({ type: 'create_collation', collation: collationDef });
+      }
+    }
+
     // Check enums
     const modelEnums = EnumTypeRegistry.getAll();
     for (const [enumName, enumDef] of modelEnums.entries()) {
@@ -777,7 +839,9 @@ export class DbSchemaManager {
               isUnique: modelIndex.isUnique,
               using: modelIndex.using,
               operatorClass: modelIndex.operatorClass,
-              concurrent: modelIndex.concurrent
+              concurrent: modelIndex.concurrent,
+              expressions: modelIndex.expressions,
+              where: modelIndex.where,
             });
           }
         }
@@ -834,7 +898,7 @@ export class DbSchemaManager {
       const tablesToCreate = new Set<string>();
 
       for (const op of operations) {
-        if (op.type === 'create_schema' || op.type === 'create_enum' || op.type === 'create_sequence') {
+        if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'create_sequence') {
           phase1Ops.push(op);
         } else if (op.type === 'create_table') {
           phase1Ops.push(op);
@@ -898,7 +962,9 @@ export class DbSchemaManager {
               isUnique: index.isUnique,
               using: index.using,
               operatorClass: index.operatorClass,
-              concurrent: index.concurrent
+              concurrent: index.concurrent,
+              expressions: index.expressions,
+              where: index.where,
             });
           }
         }
@@ -967,6 +1033,10 @@ export class DbSchemaManager {
         await this.executeCreateSchema(operation.schemaName);
         break;
 
+      case 'create_collation':
+        await this.executeCreateCollation(operation.collation);
+        break;
+
       case 'create_enum':
         await this.executeCreateEnum(operation.enumName, operation.values);
         break;
@@ -1011,6 +1081,8 @@ export class DbSchemaManager {
           using: operation.using,
           operatorClass: operation.operatorClass,
           concurrent: operation.concurrent,
+          expressions: operation.expressions,
+          where: operation.where,
         }, operation.schema);
         break;
 
@@ -1048,6 +1120,13 @@ export class DbSchemaManager {
   /**
    * Execute create enum
    */
+  private async executeCreateCollation(collation: CollationDefinition): Promise<void> {
+    this.logger(`  Creating collation "${collation.name}"...`);
+    const deterministic = collation.deterministic ? 'true' : 'false';
+    await this.client.query(`CREATE COLLATION IF NOT EXISTS "${collation.name}" (provider = '${collation.provider}', locale = '${collation.locale}', deterministic = ${deterministic})`);
+    this.logger(`  ✓ Collation "${collation.name}" created\n`);
+  }
+
   private async executeCreateEnum(enumName: string, values: readonly string[]): Promise<void> {
     this.logger(`  Creating ENUM type "${enumName}"...`);
     const valueList = values.map(v => `'${v}'`).join(', ');
@@ -1122,6 +1201,10 @@ export class DbSchemaManager {
       def += `(${config.precision})`;
     }
 
+    if (config.collation) {
+      def += ` COLLATE "${config.collation}"`;
+    }
+
     if (!config.nullable) {
       def += ' NOT NULL';
     }
@@ -1182,6 +1265,15 @@ export class DbSchemaManager {
       }
     }
 
+    // Change collation if needed
+    const fromCollation = from.collation_name;
+    const toCollation = to.collation || null;
+    if (toCollation && fromCollation !== toCollation) {
+      const typeDef = this.buildTypeDefinition(to);
+      await this.client.query(`ALTER TABLE ${qualifiedTableName} ALTER COLUMN "${columnName}" TYPE ${typeDef} COLLATE "${toCollation}"`);
+      this.logger(`    ✓ Collation changed to "${toCollation}"`);
+    }
+
     // Change default if needed
     const fromDefault = from.column_default;
     const toDefault = to.default !== undefined ? this.formatDefaultValue(to.default) : null;
@@ -1204,7 +1296,7 @@ export class DbSchemaManager {
   private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
   private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean }, schema?: string): Promise<void> {
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string }, schema?: string): Promise<void> {
     if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
       throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
     }
@@ -1220,8 +1312,15 @@ export class DbSchemaManager {
     this.logger(`  Creating ${uniqueStr}${concurrentStr}index "${index.name}" on ${qualifiedTableName}...`);
 
     const opClassSuffix = index.operatorClass ? ` ${index.operatorClass}` : '';
-    const columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
-    const sql = `CREATE ${uniqueStr}INDEX ${concurrentStr}IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})`;
+    let columnList: string;
+    if (index.expressions && index.expressions.length > 0) {
+      // Expression-based index: use raw SQL expressions (no quoting)
+      columnList = index.expressions.map(expr => `${expr}${opClassSuffix}`).join(', ');
+    } else {
+      columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
+    }
+    const whereStr = index.where ? ` WHERE ${index.where}` : '';
+    const sql = `CREATE ${uniqueStr}INDEX ${concurrentStr}IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})${whereStr}`;
 
     await this.client.query(sql);
     this.logger(`  ✓ ${uniqueStr}${concurrentStr}Index "${index.name}" created\n`);
@@ -1316,7 +1415,8 @@ export class DbSchemaManager {
         numeric_precision,
         numeric_scale,
         is_nullable,
-        column_default
+        column_default,
+        collation_name
       FROM information_schema.columns
       WHERE table_schema = $1 AND table_name = $2
       ORDER BY ordinal_position
@@ -1411,6 +1511,13 @@ export class DbSchemaManager {
     const modelNullable = modelConfig.nullable;
     if (dbNullable !== modelNullable) {
       return true;
+    }
+
+    // Compare collation (only when model specifies one)
+    if (modelConfig.collation) {
+      if (dbInfo.collation_name !== modelConfig.collation) {
+        return true;
+      }
     }
 
     // Compare default (normalize for comparison)
@@ -1590,6 +1697,8 @@ export class DbSchemaManager {
     switch (operation.type) {
       case 'create_schema':
         return `Create schema "${operation.schemaName}"`;
+      case 'create_collation':
+        return `Create collation "${operation.collation.name}" (provider=${operation.collation.provider}, locale=${operation.collation.locale}, deterministic=${operation.collation.deterministic})`;
       case 'create_enum':
         return `Create ENUM type "${operation.enumName}" (${operation.values.join(', ')})`;
       case 'create_sequence':
@@ -1611,7 +1720,11 @@ export class DbSchemaManager {
         const uniquePrefix = operation.isUnique ? 'unique ' : '';
         const concurrentDesc = operation.concurrent ? ' CONCURRENTLY' : '';
         const usingDesc = operation.using ? ` USING ${operation.using}` : '';
-        return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${operation.columns.join(', ')})`;
+        const idxCols = operation.expressions && operation.expressions.length > 0
+          ? operation.expressions.join(', ')
+          : operation.columns.join(', ');
+        const whereDesc = operation.where ? ` WHERE ${operation.where}` : '';
+        return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${whereDesc}`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':

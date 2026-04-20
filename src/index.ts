@@ -34,6 +34,13 @@ export {
   EnumValues,
 } from './types/enum-builder';
 
+// Collation types
+export {
+  pgCollation,
+  CollationDefinition,
+  CollationRegistry,
+} from './types/collation-builder';
+
 // Query builders
 export {
   QueryBuilder,
@@ -97,6 +104,11 @@ export {
   lte,
   like,
   ilike,
+  startsWith,
+  regexMatches,
+  regexMatchesCaseInsensitive,
+  regexNoMatch,
+  regexNoMatchCaseInsensitive,
   inArray,
   notInArray,
   isNull,
@@ -176,6 +188,8 @@ export {
   EntityConstructor,
   EntityMetadataStore,
   IndexMethod,
+  ixLower,
+  ixUnaccent,
 } from './entity/entity-base';
 
 export {
