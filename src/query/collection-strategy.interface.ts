@@ -38,6 +38,7 @@ export interface SelectedField {
     targetTable: string;
     selectedFieldConfigs?: SelectedField[];
     isSingleResult?: boolean;  // true for firstOrDefault()
+    flattenResultType?: 'number' | 'string';  // set for toNumberList() / toStringList()
   };
 }
 
@@ -275,6 +276,16 @@ export interface CollectionAggregationConfig {
    * correlation with outer query tables (they join via parent_id).
    */
   selectorNavigationJoins?: NavigationJoin[];
+
+  /**
+   * The navigation path of this CollectionQueryBuilder itself — the intermediate joins
+   * traversed to reach this collection from the context where it was accessed.
+   * Set when the collection is accessed through a reference chain, e.g.
+   * cdc.discountCode!.discountProducts! (navigationPath = [discountCode step]).
+   * Used by LATERAL to correlate a nested correlated subquery back to the outer row
+   * via the correct FK column instead of the default "id".
+   */
+  collectionNavigationPath?: NavigationJoin[];
 }
 
 /**

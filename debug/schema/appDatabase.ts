@@ -18,6 +18,12 @@ import { ProductPriceCapacityGroup } from "../model/productPriceCapacityGroup";
 import { CapacityGroup } from "../model/capacityGroup";
 import { Tag } from "../model/tag";
 import { ProductTag } from "../model/productTag";
+import { Cart } from "../model/cart";
+import { CartItem } from "../model/cartItem";
+import { CartDiscountCode } from "../model/cartDiscountCode";
+import { DiscountCode } from "../model/discountCode";
+import { Discount } from "../model/discount";
+import { DiscountProduct } from "../model/discountProduct";
 
 // Define PostgreSQL ENUM types
 const orderStatusEnum = pgEnum('order_status', ['pending', 'processing', 'completed', 'cancelled', 'refunded'] as const);
@@ -88,6 +94,31 @@ export class AppDatabase extends DbContext {
 
     get productTags(): DbEntityTable<ProductTag> {
         return this.table(ProductTag);
+    }
+
+    // Cart / discount schema (impl.md reproduction)
+    get carts(): DbEntityTable<Cart> {
+        return this.table(Cart);
+    }
+
+    get cartItems(): DbEntityTable<CartItem> {
+        return this.table(CartItem);
+    }
+
+    get cartDiscountCodes(): DbEntityTable<CartDiscountCode> {
+        return this.table(CartDiscountCode);
+    }
+
+    get discountCodes(): DbEntityTable<DiscountCode> {
+        return this.table(DiscountCode);
+    }
+
+    get discounts(): DbEntityTable<Discount> {
+        return this.table(Discount);
+    }
+
+    get discountProducts(): DbEntityTable<DiscountProduct> {
+        return this.table(DiscountProduct);
     }
 
     protected override setupModel(model: DbModelConfig): void {
@@ -360,6 +391,88 @@ export class AppDatabase extends DbContext {
             entity.hasOne(e => e.tag, () => Tag)
                 .withForeignKey(pt => pt.tagId)
                 .withPrincipalKey(t => t.id)
+                .onDelete('cascade');
+        });
+
+        // ============ CART / DISCOUNT SCHEMA (impl.md reproduction) ============
+
+        model.entity(Cart, entity => {
+            entity.toTable('carts');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'carts_id_seq' }));
+            entity.property(e => e.uuid).hasType(varchar('uuid', 36)).isRequired().isUnique();
+
+            entity.hasMany(e => e.cartItems, () => CartItem)
+                .withForeignKey(ci => ci.cartId)
+                .withPrincipalKey(c => c.id);
+
+            entity.hasMany(e => e.cartDiscountCodes, () => CartDiscountCode)
+                .withForeignKey(cdc => cdc.cartId)
+                .withPrincipalKey(c => c.id);
+        });
+
+        model.entity(CartItem, entity => {
+            entity.toTable('cart_items');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'cart_items_id_seq' }));
+            entity.property(e => e.cartId).hasType(integer('cart_id')).isRequired();
+            entity.property(e => e.productId).hasType(integer('product_id')).isRequired();
+
+            entity.hasOne(e => e.cart, () => Cart)
+                .withForeignKey(ci => ci.cartId)
+                .withPrincipalKey(c => c.id)
+                .onDelete('cascade');
+        });
+
+        model.entity(CartDiscountCode, entity => {
+            entity.toTable('cart_discount_codes');
+
+            entity.property(e => e.cartId).hasType(integer('cart_id')).isPrimaryKey();
+            entity.property(e => e.discountCodeId).hasType(integer('discount_code_id')).isPrimaryKey();
+
+            entity.hasOne(e => e.cart, () => Cart)
+                .withForeignKey(cdc => cdc.cartId)
+                .withPrincipalKey(c => c.id)
+                .onDelete('cascade');
+
+            entity.hasOne(e => e.discountCode, () => DiscountCode)
+                .withForeignKey(cdc => cdc.discountCodeId)
+                .withPrincipalKey(dc => dc.id)
+                .onDelete('cascade');
+        });
+
+        model.entity(DiscountCode, entity => {
+            entity.toTable('discount_codes');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'discount_codes_id_seq' }));
+            entity.property(e => e.discountId).hasType(integer('discount_id')).isRequired();
+
+            entity.hasOne(e => e.discount, () => Discount)
+                .withForeignKey(dc => dc.discountId)
+                .withPrincipalKey(d => d.id)
+                .onDelete('cascade');
+        });
+
+        model.entity(Discount, entity => {
+            entity.toTable('discounts');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'discounts_id_seq' }));
+            entity.property(e => e.code).hasType(varchar('code', 50)).isRequired();
+
+            entity.hasMany(e => e.discountProducts, () => DiscountProduct)
+                .withForeignKey(dp => dp.discountId)
+                .withPrincipalKey(d => d.id);
+        });
+
+        model.entity(DiscountProduct, entity => {
+            entity.toTable('discount_products');
+
+            entity.property(e => e.discountId).hasType(integer('discount_id')).isPrimaryKey();
+            entity.property(e => e.productId).hasType(integer('product_id')).isPrimaryKey();
+
+            entity.hasOne(e => e.discount, () => Discount)
+                .withForeignKey(dp => dp.discountId)
+                .withPrincipalKey(d => d.id)
                 .onDelete('cascade');
         });
     }

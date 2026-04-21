@@ -181,14 +181,49 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     // Build navigation JOINs for multi-level navigation (selector joins only)
     const navJoinsSQL = this.buildNavigationJoinsWithAlias(selectorNavigationJoins, innerTableAlias, targetTable, context);
 
-    // Check if the source table has been aliased by a parent LATERAL (for nested collections)
-    // If so, use that alias instead of the raw table name
-    const sourceTableAlias = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
+    // Build WHERE clause with correlation to parent.
+    // For selectMany, the FK is on the intermediate table (joined via navJoins), not the target table.
+    //
+    // When the collection was accessed through an intermediate navigation reference
+    // (e.g. cdc.discountCode!.discountProducts!), the collectionNavigationPath carries the
+    // first hop's source alias and FK column. We use those to correlate back to the outer
+    // lateral alias rather than falling back to the generic "sourceTable"."id" pattern.
+    const collectionNavPath = config.collectionNavigationPath;
+    let sourceRef: string;
+    if (collectionNavPath && collectionNavPath.length > 0) {
+      const firstStep = collectionNavPath[0];
+      const outerTableAlias = context.lateralTableAliasMap?.get(firstStep.sourceAlias) || firstStep.sourceAlias;
+      const outerFKColumn = firstStep.foreignKeys[0];
 
-    // Build WHERE clause with correlation to parent
-    // For selectMany, the FK is on the intermediate table (joined via navJoins), not the target table
+      if (collectionNavPath.length === 1) {
+        sourceRef = `"${outerTableAlias}"."${outerFKColumn}"`;
+      } else {
+        // Multi-hop: use a scalar subquery to traverse the navigation chain.
+        // e.g. cdc.discountCode!.discount!.discountProducts! with navPath.length=2:
+        // (SELECT "discountCode"."discount_id"
+        //  FROM "discount_codes" "discountCode"
+        //  WHERE "discountCode"."id" = outerAlias."discount_code_id")
+        const lastStep = collectionNavPath[collectionNavPath.length - 1];
+        const returnAlias = lastStep.sourceAlias;
+        const returnColumn = lastStep.foreignKeys[0];
+
+        const fromClause = `"${firstStep.targetTable}" "${firstStep.alias}"`;
+        const joinClauses: string[] = [];
+        for (let i = 1; i < collectionNavPath.length - 1; i++) {
+          const step = collectionNavPath[i];
+          joinClauses.push(`LEFT JOIN "${step.targetTable}" "${step.alias}" ON "${step.alias}"."${step.matches[0] || 'id'}" = "${step.sourceAlias}"."${step.foreignKeys[0]}"`);
+        }
+        const subWhere = `"${firstStep.alias}"."${firstStep.matches[0] || 'id'}" = "${outerTableAlias}"."${outerFKColumn}"`;
+        const subParts = [`SELECT "${returnAlias}"."${returnColumn}"`, `FROM ${fromClause}`, ...joinClauses, `WHERE ${subWhere}`];
+        sourceRef = `(${subParts.join(' ')})`;
+      }
+    } else {
+      const sourceTableAlias = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
+      sourceRef = `"${sourceTableAlias}"."id"`;
+    }
+
     const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTableAlias}"."id"`;
+    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = ${sourceRef}`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;

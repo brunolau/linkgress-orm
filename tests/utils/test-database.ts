@@ -101,6 +101,12 @@ async function truncateAllTables(db: AppDatabase): Promise<void> {
   // RESTART IDENTITY resets auto-increment sequences
   await db.query(`
     TRUNCATE TABLE
+      cart_discount_codes,
+      cart_items,
+      carts,
+      discount_products,
+      discounts,
+      discount_codes,
       product_tags,
       product_price_capacity_groups,
       product_prices,
@@ -248,6 +254,50 @@ export async function seedTestData(db: AppDatabase) {
     { productId: liftTicket.id, tagId: summerTag.id, sortOrder: 1 },
   ]);
 
+  // ============ CART / DISCOUNT DATA (impl.md reproduction) ============
+  // Schema: Cart → CartItems + CartDiscountCodes
+  //                              └─ DiscountCode → Discount → DiscountProducts
+  //                                                                 └─ productId ← toNumberList() target
+
+  // Discounts (intermediate entity in the 3-hop chain)
+  const [discountA, discountB] = await db.discounts.insertBulk([
+    { code: 'SUMMER10' },
+    { code: 'WINTER20' },
+  ]).returning();
+
+  // Discount codes referencing discounts via discountId FK
+  const [codeA, codeB] = await db.discountCodes.insertBulk([
+    { discountId: discountA.id },
+    { discountId: discountB.id },
+  ]).returning();
+
+  // Scoped products per discount (productId references existing Product IDs)
+  await db.discountProducts.insertBulk([
+    { discountId: discountA.id, productId: skiPass.id },
+    { discountId: discountA.id, productId: liftTicket.id },
+    { discountId: discountB.id, productId: skiPass.id },
+  ]);
+
+  // Carts with items and applied discount codes
+  const [cartA, cartB] = await db.carts.insertBulk([
+    { uuid: 'cart-uuid-a' },
+    { uuid: 'cart-uuid-b' },
+  ]).returning();
+
+  // Cart items (sibling list #1)
+  const [cartItemA1, cartItemA2, cartItemB1] = await db.cartItems.insertBulk([
+    { cartId: cartA.id, productId: skiPass.id },
+    { cartId: cartA.id, productId: liftTicket.id },
+    { cartId: cartB.id, productId: skiPass.id },
+  ]).returning();
+
+  // Applied discount codes (sibling list #2, the one that contains the deep toNumberList)
+  await db.cartDiscountCodes.insertBulk([
+    { cartId: cartA.id, discountCodeId: codeA.id },
+    { cartId: cartA.id, discountCodeId: codeB.id },
+    { cartId: cartB.id, discountCodeId: codeB.id },
+  ]);
+
   return {
     users: { alice, bob, charlie },
     posts: { alicePost1, alicePost2, bobPost },
@@ -259,6 +309,10 @@ export async function seedTestData(db: AppDatabase) {
     capacityGroups: { adultGroup, childGroup, seniorGroup },
     products: { skiPass, liftTicket },
     productPrices: { skiPassPrice1, skiPassPrice2, liftTicketPrice1 },
+    discounts: { discountA, discountB },
+    discountCodes: { codeA, codeB },
+    carts: { cartA, cartB },
+    cartItems: { cartItemA1, cartItemA2, cartItemB1 },
   };
 }
 

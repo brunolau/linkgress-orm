@@ -5284,9 +5284,14 @@ ${joinClauses.join('\n')}`;
    */
   private transformNestedCollectionValue(
     value: any,
-    nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean },
+    nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' },
     schemaRegistry: Map<string, TableSchema>
   ): any {
+    // toNumberList()/toStringList() produce arrays of primitives — no object mapping needed
+    if (nestedInfo.flattenResultType) {
+      return value;
+    }
+
     const nestedSchema = schemaRegistry.get(nestedInfo.targetTable);
     if (!nestedSchema?.columnMetadataCache) {
       return value;  // No schema info, return as-is
@@ -6469,6 +6474,13 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * Get the navigation path for this collection (intermediate joins to reach the source table)
+   */
+  getNavigationPath(): NavigationJoin[] {
+    return this.navigationPath;
+  }
+
+  /**
    * Get field references from this condition.
    * Returns empty since EXISTS subqueries are self-contained correlated subqueries.
    * Required for duck-typing compatibility with Condition interface when used in WHERE clauses.
@@ -6897,9 +6909,37 @@ export class CollectionQueryBuilder<TItem = any> {
           let nestedJoinClause: string;
 
           if (nestedResult.isCTE) {
-            // CTE strategy: join by parent_id
-            // The join should be: this.targetTable.id = nestedCte.parent_id
-            nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+            // CTE strategy: join by parent_id.
+            // When the nested collection is reached through an intermediate navigation
+            // (e.g. cdc.discountCode!.discountProducts!), use the navigation path to
+            // correlate the outer table with the inner CTE's parent_id.
+            const navPath = field.getNavigationPath();
+            if (navPath.length === 0) {
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+            } else if (navPath.length === 1) {
+              const outerJoinColumn = navPath[0].foreignKeys[0];
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."${outerJoinColumn}" = "${nestedResult.tableName}".parent_id`;
+            } else {
+              // Multi-hop: use a scalar subquery to traverse the navigation chain.
+              // e.g. cdc.discountCode!.discount!.discountProducts! with navPath.length=2:
+              // (SELECT "discountCode"."discount_id"
+              //  FROM "discount_codes" "discountCode"
+              //  WHERE "discountCode"."id" = "cart_discount_codes"."discount_code_id")
+              const lastStep = navPath[navPath.length - 1];
+              const returnAlias = lastStep.sourceAlias;
+              const returnColumn = lastStep.foreignKeys[0];
+
+              const fromClause = `"${navPath[0].targetTable}" "${navPath[0].alias}"`;
+              const joinClauses: string[] = [];
+              for (let i = 1; i < navPath.length - 1; i++) {
+                const step = navPath[i];
+                joinClauses.push(`LEFT JOIN "${step.targetTable}" "${step.alias}" ON "${step.alias}"."${step.matches[0] || 'id'}" = "${step.sourceAlias}"."${step.foreignKeys[0]}"`);
+              }
+              const subWhere = `"${navPath[0].alias}"."${navPath[0].matches[0] || 'id'}" = "${this.targetTable}"."${navPath[0].foreignKeys[0]}"`;
+              const subParts = [`SELECT "${returnAlias}"."${returnColumn}"`, `FROM ${fromClause}`, ...joinClauses, `WHERE ${subWhere}`];
+              const scalarSubquery = `(${subParts.join(' ')})`;
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON ${scalarSubquery} = "${nestedResult.tableName}".parent_id`;
+            }
           } else {
             // LATERAL strategy: use the provided join clause (contains full LATERAL subquery)
             nestedJoinClause = nestedResult.joinClause!;
@@ -6917,6 +6957,7 @@ export class CollectionQueryBuilder<TItem = any> {
               targetTable: field.getTargetTable(),
               selectedFieldConfigs: field.getSelectedFieldConfigs(),
               isSingleResult: field.isSingleResult(),
+              flattenResultType: field.getFlattenResultType(),
             },
           };
         }
@@ -6943,6 +6984,7 @@ export class CollectionQueryBuilder<TItem = any> {
             targetTable: field.getTargetTable(),
             selectedFieldConfigs: field.getSelectedFieldConfigs(),
             isSingleResult: field.isSingleResult(),
+            flattenResultType: field.getFlattenResultType(),
           },
         };
       } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
@@ -7159,6 +7201,7 @@ export class CollectionQueryBuilder<TItem = any> {
       counter: reservedCounter !== undefined ? reservedCounter : context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
       selectorNavigationJoins: allSelectorJoins.length > 0 ? allSelectorJoins : undefined,
+      collectionNavigationPath: this.navigationPath.length > 0 ? this.navigationPath : undefined,
     };
 
     // Step 6: Call the strategy
