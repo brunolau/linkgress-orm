@@ -162,7 +162,7 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     lateralAlias: string,
     context: QueryContext
   ): CollectionAggregationResult {
-    const { arrayField, targetTable, foreignKey, sourceTable, whereClause, isDistinct, selectedFields, aggregationType, aggregateField, defaultValue, relationName, selectorNavigationJoins } = config;
+    const { arrayField, targetTable, foreignKey, sourceTable, whereClause, isDistinct, selectedFields, aggregationType, aggregateField, aggregateExpression, defaultValue, relationName, selectorNavigationJoins } = config;
 
     // Use a unique table alias to avoid conflicts with outer query tables
     const innerTableAlias = `${lateralAlias}_${relationName}`;
@@ -234,25 +234,29 @@ ${navJoinsSQL}
 WHERE ${whereSQL}))`;
     } else {
       // Scalar aggregation (count, min, max, sum)
-      let aggregateExpression: string;
+      let aggregateSql: string;
       switch (aggregationType) {
         case 'count':
-          aggregateExpression = 'COUNT(*)';
+          aggregateSql = 'COUNT(*)';
           break;
         case 'min':
         case 'max':
         case 'sum':
-          if (!aggregateField) {
+          if (aggregateExpression) {
+            // Nested scalar-subquery summand (e.g. sum(row => other.count()))
+            aggregateSql = `${aggregationType.toUpperCase()}(${aggregateExpression})`;
+          } else if (aggregateField) {
+            aggregateSql = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
+          } else {
             throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
           }
-          aggregateExpression = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
           break;
         default:
           throw new Error(`Unknown aggregation type: ${aggregationType}`);
       }
 
       // Build correlated subquery for scalar aggregation
-      subquerySQL = `(SELECT COALESCE(${aggregateExpression}, ${defaultValue})
+      subquerySQL = `(SELECT COALESCE(${aggregateSql}, ${defaultValue})
 FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
@@ -742,7 +746,7 @@ FROM (
     lateralAlias: string,
     context: QueryContext
   ): string {
-    const { aggregationType, aggregateField, targetTable, foreignKey, sourceTable, whereClause, relationName } = config;
+    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, sourceTable, whereClause, relationName } = config;
 
     // Use a unique table alias to avoid conflicts with outer query tables
     const innerTableAlias = `${lateralAlias}_${relationName}`;
@@ -775,10 +779,14 @@ FROM (
       case 'min':
       case 'max':
       case 'sum':
-        if (!aggregateField) {
+        if (aggregateExprFromConfig) {
+          // Nested scalar-subquery summand (e.g. sum(row => other.count()))
+          aggregateExpression = `${aggregationType.toUpperCase()}(${aggregateExprFromConfig})`;
+        } else if (aggregateField) {
+          aggregateExpression = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
+        } else {
           throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
         }
-        aggregateExpression = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
         break;
       case 'exists': {
         // EXISTS as LATERAL: SELECT EXISTS(SELECT 1 FROM ... WHERE ...)

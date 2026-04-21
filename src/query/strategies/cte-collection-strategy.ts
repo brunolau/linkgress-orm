@@ -687,7 +687,7 @@ GROUP BY "__fk_${foreignKey}"
     cteName: string,
     context: QueryContext
   ): string {
-    const { aggregationType, aggregateField, targetTable, foreignKey, whereClause, foreignKeyTableAlias } = config;
+    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, whereClause, foreignKeyTableAlias } = config;
     const navigationJoins = config.selectorNavigationJoins;
 
     // Helper to rewrite the collection marker alias to the actual table name
@@ -718,10 +718,14 @@ GROUP BY "__fk_${foreignKey}"
       case 'min':
       case 'max':
       case 'sum':
-        if (!aggregateField) {
+        if (aggregateExprFromConfig) {
+          // Nested scalar-subquery summand (e.g. sum(row => other.count()))
+          aggregateExpression = `${aggregationType.toUpperCase()}(${aggregateExprFromConfig})`;
+        } else if (aggregateField) {
+          aggregateExpression = `${aggregationType.toUpperCase()}("${aggregateField}")`;
+        } else {
           throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
         }
-        aggregateExpression = `${aggregationType.toUpperCase()}("${aggregateField}")`;
         break;
       default:
         throw new Error(`Unknown aggregation type: ${aggregationType}`);

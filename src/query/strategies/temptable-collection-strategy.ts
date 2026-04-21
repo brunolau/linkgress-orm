@@ -756,7 +756,7 @@ GROUP BY t."${foreignKey}"
     config: CollectionAggregationConfig,
     tempTableName: string
   ): string {
-    const { aggregationType, aggregateField, targetTable, foreignKey, whereClause } = config;
+    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, whereClause } = config;
 
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
@@ -773,10 +773,14 @@ GROUP BY t."${foreignKey}"
       case 'min':
       case 'max':
       case 'sum':
-        if (!aggregateField) {
+        if (aggregateExprFromConfig) {
+          // Nested scalar-subquery summand (e.g. sum(row => other.count()))
+          aggregateExpression = `${aggregationType.toUpperCase()}(${aggregateExprFromConfig})`;
+        } else if (aggregateField) {
+          aggregateExpression = `${aggregationType.toUpperCase()}("${targetTable}"."${aggregateField}")`;
+        } else {
           throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
         }
-        aggregateExpression = `${aggregationType.toUpperCase()}("${targetTable}"."${aggregateField}")`;
         break;
       default:
         throw new Error(`Unknown aggregation type: ${aggregationType}`);
