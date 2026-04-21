@@ -119,6 +119,12 @@ export interface IndexMetadata {
   isUnique?: boolean;
   using?: IndexMethod;
   operatorClass?: string;
+  /**
+   * If true, the index is created with `CREATE INDEX CONCURRENTLY`, which avoids
+   * holding a long write lock on the table. The statement must run outside of a
+   * transaction — PostgreSQL will raise an error otherwise.
+   */
+  concurrent?: boolean;
   /** Raw SQL expressions for expression-based index columns (e.g., 'lower(unaccent(name))') */
   expressions?: string[];
   /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */

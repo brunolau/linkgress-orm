@@ -543,6 +543,17 @@ export class IndexBuilder<TEntity extends DbEntity> {
   }
 
   /**
+   * Create the index with `CREATE INDEX CONCURRENTLY`. The statement cannot run
+   * inside a transaction, so callers must ensure the migration executes in
+   * autocommit mode (e.g. through `DbSchemaManager.migrate()` / `ensureCreated()`
+   * rather than the transactional journal-based runner).
+   */
+  concurrent(): this {
+    this.indexMetadata.concurrent = true;
+    return this;
+  }
+
+  /**
    * Set raw SQL expressions for expression-based index columns.
    * When set, expressions are used instead of column names.
    * Use with helper functions like lower() and unaccent() for composability.

@@ -41,6 +41,11 @@ export interface IndexDefinition {
   isUnique?: boolean;
   using?: IndexMethod;
   operatorClass?: string;
+  /**
+   * If true, the index is created with `CREATE INDEX CONCURRENTLY`. Must run
+   * outside of a transaction block.
+   */
+  concurrent?: boolean;
   /** Raw SQL expressions for expression-based index columns (e.g., 'lower(unaccent(name))') */
   expressions?: string[];
   /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
