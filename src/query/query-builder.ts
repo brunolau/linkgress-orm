@@ -6977,10 +6977,15 @@ export class CollectionQueryBuilder<TItem = any> {
       }
     };
 
+    // Evaluate the user's selector exactly once per buildCTE call. Downstream steps
+    // (field collection, aggregate-expression discovery, navigation-join detection) all
+    // need to walk the same selection, and re-invoking the selector is expensive
+    // (rebuilds proxy mocks and any nested CollectionQueryBuilder instances).
+    const selectorResult = this.selector ? this.selector(this.createMockItem()) : undefined;
+
     // Step 1: Build field selection configuration
     if (this.selector) {
-      const mockItem = this.createMockItem();
-      const selectedFields = this.selector(mockItem);
+      const selectedFields = selectorResult;
 
       // Check if the selector returns a FieldRef directly (single field selection like p => p.title)
       if (typeof selectedFields === 'object' && selectedFields !== null && '__dbColumnName' in selectedFields) {
@@ -6993,6 +6998,9 @@ export class CollectionQueryBuilder<TItem = any> {
           expression: `"${dbColumnName}"`,
           propertyName: fieldName,
         });
+      } else if (selectedFields instanceof CollectionQueryBuilder || selectedFields instanceof SqlFragment) {
+        // Selector returns a scalar subquery (e.g. .sum(row => other.count())) or a raw fragment.
+        // No per-column fields to collect — the aggregate argument lives on aggregateExpression.
       } else {
         // Object selection - extract each field (with support for nested objects)
         for (const [alias, field] of Object.entries(selectedFields)) {
@@ -7073,6 +7081,7 @@ export class CollectionQueryBuilder<TItem = any> {
     // Step 4: Determine aggregation type and field
     let aggregationType: 'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists';
     let aggregateField: string | undefined;
+    let aggregateExpression: string | undefined;
     let arrayField: string | undefined;
     let defaultValue: string;
 
@@ -7082,10 +7091,21 @@ export class CollectionQueryBuilder<TItem = any> {
 
       // For aggregations other than COUNT and EXISTS, determine which field to aggregate
       if (this.aggregationType !== 'COUNT' && this.aggregationType !== 'EXISTS' && this.selector) {
-        const mockItem = this.createMockItem();
-        const selectedField = this.selector(mockItem);
+        const selectedField = selectorResult;
         if (typeof selectedField === 'object' && selectedField !== null && '__dbColumnName' in selectedField) {
           aggregateField = (selectedField as any).__dbColumnName;
+        } else if (selectedField instanceof CollectionQueryBuilder) {
+          // Selector returns a nested collection (e.g., sum(row => other.where(...).count())).
+          // We need a *scalar* SQL expression to feed into the aggregate — so force the nested
+          // build to emit a correlated subquery (lateral's scalar form) rather than a CTE/temp
+          // table that can't be composed inside SUM(...). Outer strategies (CTE, temp table,
+          // lateral) then wrap this expression with the aggregate function via
+          // config.aggregateExpression.
+          const nestedCtx: QueryContext = { ...context, collectionStrategy: 'lateral' };
+          const nestedResult = selectedField.buildCTE(nestedCtx, client);
+          context.cteCounter = nestedCtx.cteCounter;
+          context.paramCounter = nestedCtx.paramCounter;
+          aggregateExpression = nestedResult.selectExpression || nestedResult.sql;
         }
       }
 
@@ -7117,10 +7137,13 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Step 5: Detect navigation joins from the selected fields
     const navigationJoins: NavigationJoin[] = [];
-    if (this.selector && this.targetTableSchema) {
-      const mockItem = this.createMockItem();
-      const selectedFields = this.selector(mockItem);
-      this.detectNavigationJoins(selectedFields, navigationJoins, this.targetTable, this.targetTableSchema);
+    if (this.selector && this.targetTableSchema && selectorResult !== undefined) {
+      // A CollectionQueryBuilder summand already had its navigation joins built via the
+      // recursive buildCTE above; detectNavigationJoins would iterate its own properties
+      // as if they were fields and produce nothing useful. Skip the walk in that case.
+      if (!(selectorResult instanceof CollectionQueryBuilder)) {
+        this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema);
+      }
     }
 
     // Step 5b: Merge navigation path joins (for intermediate tables in navigation chains)
@@ -7153,6 +7176,7 @@ export class CollectionQueryBuilder<TItem = any> {
       isSingleResult: this.isSingleResult(),  // For firstOrDefault() - returns single object instead of array
       aggregationType,
       aggregateField,
+      aggregateExpression,
       arrayField,
       defaultValue,
       // Use the reserved counter for LATERAL strategy, otherwise increment as before

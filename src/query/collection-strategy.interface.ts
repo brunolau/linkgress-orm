@@ -244,6 +244,15 @@ export interface CollectionAggregationConfig {
   aggregateField?: string;
 
   /**
+   * Pre-built SQL expression used as the aggregate argument instead of a column.
+   * Set when the user's .sum/.min/.max selector returns a nested collection
+   * (e.g. `.sum(row => other.where(...).count())`) — the strategy wraps this
+   * expression with the aggregate function (`SUM(<expr>)`) rather than
+   * referencing a simple column.
+   */
+  aggregateExpression?: string;
+
+  /**
    * For array aggregations, the field to collect
    */
   arrayField?: string;
