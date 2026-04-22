@@ -5240,7 +5240,7 @@ ${joinClauses.join('\n')}`;
 
     // Build cache of nested collection info (fields that are themselves nested collections)
     // This is used for recursive transformation of nested collection results
-    const nestedCollectionCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean }>();
+    const nestedCollectionCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' }>();
     if (selectedFieldConfigs) {
       for (const field of selectedFieldConfigs) {
         if (field.nestedCollectionInfo) {
@@ -5284,9 +5284,17 @@ ${joinClauses.join('\n')}`;
    */
   private transformNestedCollectionValue(
     value: any,
-    nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean },
+    nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' },
     schemaRegistry: Map<string, TableSchema>
   ): any {
+    // Flattened lists (toNumberList/toStringList) return a primitive array directly
+    // from the driver — no per-element object transformation applies. Iterating with
+    // `for (const key in item)` on a number/string would yield an empty object, so
+    // short-circuit here before touching any elements.
+    if (nestedInfo.flattenResultType) {
+      return value;
+    }
+
     const nestedSchema = schemaRegistry.get(nestedInfo.targetTable);
     if (!nestedSchema?.columnMetadataCache) {
       return value;  // No schema info, return as-is
@@ -5334,7 +5342,7 @@ ${joinClauses.join('\n')}`;
     }
 
     // Build cache for any deeply nested collections
-    const deeplyNestedCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean }>();
+    const deeplyNestedCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' }>();
     if (selectedFieldConfigs) {
       for (const field of selectedFieldConfigs) {
         if (field.nestedCollectionInfo) {
@@ -6434,6 +6442,17 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * Get the navigation path leading to this collection.
+   * Non-empty when this collection was reached through a reference chain
+   * (e.g. `cdc.discountCode!.discount!.discountProducts`). The outer collection
+   * builder needs these joins emitted in its own FROM so the nested aggregation's
+   * correlation key (e.g. `discount.id`) resolves.
+   */
+  getNavigationPath(): NavigationJoin[] {
+    return this.navigationPath;
+  }
+
+  /**
    * Check if this collection uses array aggregation (for flattened results)
    */
   isArrayAggregation(): boolean {
@@ -6579,7 +6598,19 @@ export class CollectionQueryBuilder<TItem = any> {
           for (const fieldRef of fieldRefs) {
             this.addNavigationJoinForFieldRef(fieldRef, joins, currentSourceAlias, currentSchema, allTableAliases);
           }
-        } else if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof CollectionQueryBuilder)) {
+        } else if (value instanceof CollectionQueryBuilder) {
+          // A nested collection that was reached via a reference chain (e.g.
+          // `cdc.discountCode!.discount!.discountProducts`) carries the chain as its
+          // navigationPath. The nested aggregation will correlate on the last alias's
+          // PK (e.g. `discount.id`), so the outer collection must emit those joins
+          // in its own FROM for the correlation to resolve.
+          const nestedPath = value.getNavigationPath();
+          for (const step of nestedPath) {
+            if (!joins.some(j => j.alias === step.alias)) {
+              joins.push(step);
+            }
+          }
+        } else if (value && typeof value === 'object' && !Array.isArray(value)) {
           // Recursively check nested objects
           collectFromSelection(value);
         }
@@ -6897,9 +6928,21 @@ export class CollectionQueryBuilder<TItem = any> {
           let nestedJoinClause: string;
 
           if (nestedResult.isCTE) {
-            // CTE strategy: join by parent_id
-            // The join should be: this.targetTable.id = nestedCte.parent_id
-            nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+            // CTE strategy: join by parent_id. When the nested collection was reached
+            // through a reference chain (e.g. `cdc.discountCode!.discount!.discountProducts`),
+            // the CTE aggregates on the chain's terminal PK (here `discount.id`), not on
+            // the outer collection's own PK — and the outer's target table may not even
+            // have an `id` column (junction tables like `cart_discount_codes`). The
+            // intermediate joins are emitted into the outer's FROM via detectNavigationJoins
+            // picking up the nested path.
+            const nestedPath = field.getNavigationPath();
+            if (nestedPath.length > 0) {
+              const lastStep = nestedPath[nestedPath.length - 1];
+              const pk = lastStep.matches?.[0] || 'id';
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${lastStep.alias}"."${pk}" = "${nestedResult.tableName}".parent_id`;
+            } else {
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+            }
           } else {
             // LATERAL strategy: use the provided join clause (contains full LATERAL subquery)
             nestedJoinClause = nestedResult.joinClause!;
@@ -6917,6 +6960,7 @@ export class CollectionQueryBuilder<TItem = any> {
               targetTable: field.getTargetTable(),
               selectedFieldConfigs: field.getSelectedFieldConfigs(),
               isSingleResult: field.isSingleResult(),
+              flattenResultType: field.getFlattenResultType(),
             },
           };
         }
@@ -6943,6 +6987,7 @@ export class CollectionQueryBuilder<TItem = any> {
             targetTable: field.getTargetTable(),
             selectedFieldConfigs: field.getSelectedFieldConfigs(),
             isSingleResult: field.isSingleResult(),
+            flattenResultType: field.getFlattenResultType(),
           },
         };
       } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {

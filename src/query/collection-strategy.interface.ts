@@ -38,6 +38,7 @@ export interface SelectedField {
     targetTable: string;
     selectedFieldConfigs?: SelectedField[];
     isSingleResult?: boolean;  // true for firstOrDefault()
+    flattenResultType?: 'number' | 'string';  // set for toNumberList()/toStringList() — array elements are primitives, not objects
   };
 }
 
