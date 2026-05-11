@@ -442,7 +442,10 @@ export class MigrationScaffold {
   private formatDefault(value: any): string {
     if (value === null) return 'NULL';
     if (value instanceof RawSql) return value.value;
-    if (typeof value === 'string') return value;
+    if (typeof value === 'string') {
+      if (value === '') return "''";
+      return value;
+    }
     if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
     if (value instanceof Date) return `'${value.toISOString()}'`;
     return String(value);

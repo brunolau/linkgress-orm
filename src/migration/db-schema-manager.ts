@@ -1769,6 +1769,7 @@ export class DbSchemaManager {
     // RawSql passes through without any formatting
     if (value instanceof RawSql) return value.value;
     if (typeof value === 'string') {
+      if (value === '') return "''";
       return value;
     }
     if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
