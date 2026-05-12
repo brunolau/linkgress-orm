@@ -2821,7 +2821,7 @@ export class SelectQueryBuilder<TSelection> {
    *   .returning(u => ({ id: u.id, lastLogin: u.lastLogin }));
    * ```
    */
-  update(data: Partial<Record<string, any>>): FluentQueryUpdate<TSelection> {
+  update(data: Partial<Record<string, any>> | ((row: TSelection) => Partial<Record<string, any>>)): FluentQueryUpdate<TSelection> {
     const queryBuilder = this;
 
     const executeUpdate = async <TResult>(
@@ -2836,15 +2836,38 @@ export class SelectQueryBuilder<TSelection> {
       const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
       queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
 
+      // Resolve the data object - if a function, invoke it with the column proxy so that
+      // expressions like `update(p => ({ col: sql`... ${p.col} ...` }))` resolve the
+      // SqlFragment column references against the actual table.
+      const resolvedData = typeof data === 'function'
+        ? (data as (row: TSelection) => Partial<Record<string, any>>)(queryBuilder._createMockRow() as TSelection)
+        : data;
+
       // Build SET clause
       const setClauses: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
 
-      for (const [key, value] of Object.entries(data)) {
+      for (const [key, value] of Object.entries(resolvedData)) {
         const column = queryBuilder.schema.columns[key];
         if (column) {
           const config = (column as any).build();
+
+          // If the value is a SqlFragment, inline it as a SQL expression
+          // (with its own params merged into our values array). This allows
+          // expressions like `update({ jsonbCol: sql\`COALESCE(...) || ${patch}::jsonb\` })`
+          // to execute as SQL instead of being JSON-serialised as a literal.
+          if (value instanceof SqlFragment) {
+            const sqlBuildContext: SqlBuildContext = {
+              paramCounter: paramIndex,
+              params: values,
+            };
+            const fragmentSql = value.buildSql(sqlBuildContext);
+            paramIndex = sqlBuildContext.paramCounter;
+            setClauses.push(`"${config.name}" = ${fragmentSql}`);
+            continue;
+          }
+
           setClauses.push(`"${config.name}" = $${paramIndex++}`);
           // Apply toDriver mapper if present
           const mappedValue = config.mapper

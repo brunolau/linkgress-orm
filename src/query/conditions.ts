@@ -802,7 +802,8 @@ type ExtractFieldValue<T> = T extends FieldLike<infer V>
   : T;
 
 /**
- * COALESCE - returns the first non-null value from the arguments
+ * COALESCE - returns the first non-null value from the arguments.
+ * Accepts two or more arguments; each may be a column, SqlFragment or literal.
  *
  * @example
  * // Use in select
@@ -815,14 +816,64 @@ type ExtractFieldValue<T> = T extends FieldLike<infer V>
  * db.users.select(u => ({
  *   status: coalesce(u.status, 'unknown'),
  * }))
+ *
+ * @example
+ * // Use in update with a SqlFragment fallback for JSONB
+ * db.orderItems.where(p => eq(p.id, id)).update({
+ *   integrationInfo: sql`${coalesce(p.integrationInfo, sql`'{}'::jsonb`)} || ${patch}::jsonb`,
+ * })
  */
 export function coalesce<T1, T2>(
   value1: FieldLike<T1> | T1,
   value2: FieldLike<T2> | T2
-): SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>> {
-  return new SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>>(
-    ['COALESCE(', ', ', ')'],
-    [value1, value2]
+): SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>>;
+export function coalesce<T1, T2, TRest extends any[]>(
+  value1: FieldLike<T1> | T1,
+  value2: FieldLike<T2> | T2,
+  ...rest: TRest
+): SqlFragment<NonNullable<ExtractFieldValue<T1>> | ExtractFieldValue<T2>>;
+export function coalesce(
+  value1: any,
+  value2: any,
+  ...rest: any[]
+): SqlFragment<any> {
+  const all = [value1, value2, ...rest];
+  // Build parts: 'COALESCE(', ', ', ', ', ..., ')'
+  const parts: string[] = ['COALESCE('];
+  for (let i = 1; i < all.length; i++) {
+    parts.push(', ');
+  }
+  parts.push(')');
+
+  return new SqlFragment<any>(parts, all);
+}
+
+/**
+ * JSONB merge helper - emits `COALESCE(target, '{}'::jsonb) || $patch::jsonb`.
+ *
+ * Convenience wrapper for the common pattern of merging a JSONB patch onto a
+ * column that may be null. Safe under concurrent writes because the `||`
+ * operator is evaluated atomically by PostgreSQL per row.
+ *
+ * @param target - The JSONB column (or SqlFragment) to merge onto. May be null.
+ *                 Accept the column proxy directly (e.g. `p.integrationInfo`) — at
+ *                 runtime it is a FieldRef even though TypeScript sees the value type.
+ * @param patch  - The JSONB object literal (or SqlFragment) to merge in.
+ *
+ * @example
+ * // Atomic JSONB merge in update (note: must use the function form so `p` is
+ * // the column proxy — bare `update({...})` lacks the proxy).
+ * db.orderItems.where(p => eq(p.id, id)).update(p => ({
+ *   integrationInfo: jsonbMerge(p.integrationInfo, patch),
+ * }))
+ */
+export function jsonbMerge<T extends object = any>(
+  target: FieldLike<T | null | undefined> | SqlFragment<T | null | undefined> | T | null | undefined,
+  patch: FieldLike<T> | SqlFragment<T> | T
+): SqlFragment<T> {
+  return new SqlFragment<T>(
+    ['COALESCE(', `, '{}'::jsonb) || `, '::jsonb'],
+    [target, patch]
   );
 }
 

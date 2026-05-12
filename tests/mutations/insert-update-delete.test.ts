@@ -1,6 +1,6 @@
 import { describe, test, expect } from '@jest/globals';
 import { withDatabase, seedTestData, createTestDatabase, setupDatabase, cleanupDatabase } from '../utils/test-database';
-import { eq, sql } from '../../src';
+import { eq, sql, coalesce, jsonbMerge } from '../../src';
 
 describe('Insert, Update, Delete Operations', () => {
   describe('INSERT operations', () => {
@@ -447,6 +447,97 @@ describe('Insert, Update, Delete Operations', () => {
           .affectedCount();
 
         expect(count).toBe(totalUsers);
+      });
+    });
+
+    test('should inline a SqlFragment passed as update value (not JSON-serialise it)', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Update age via a SQL expression instead of a literal value
+        const updated = await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update({ age: sql`age + 10` })
+          .returning();
+
+        expect(updated).toHaveLength(1);
+        expect(updated[0].age).toBe(35); // 25 + 10 — proves the SQL ran
+      });
+    });
+
+    test('should support SqlFragment with bound parameters in update', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        const updated = await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update({ age: sql`age + ${5}` })
+          .returning();
+
+        expect(updated[0].age).toBe(30); // 25 + 5
+      });
+    });
+
+    test('should atomically merge JSONB via jsonbMerge helper in update', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Seed initial metadata
+        await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update({ metadata: { foo: 'bar' } });
+
+        // Merge a patch via jsonbMerge - second update should preserve `foo`
+        await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update(p => ({ metadata: jsonbMerge(p.metadata, { baz: 'qux' }) }));
+
+        const row = await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .select(u => ({ metadata: u.metadata }))
+          .firstOrDefault();
+
+        expect(row?.metadata).toEqual({ foo: 'bar', baz: 'qux' });
+      });
+    });
+
+    test('jsonbMerge should produce {} when target column is NULL', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Ensure metadata is NULL
+        await db.users.where(u => eq(u.id, users.bob.id)).update({ metadata: null });
+
+        await db.users
+          .where(u => eq(u.id, users.bob.id))
+          .update(p => ({ metadata: jsonbMerge(p.metadata, { hello: 'world' }) }));
+
+        const row = await db.users
+          .where(u => eq(u.id, users.bob.id))
+          .select(u => ({ metadata: u.metadata }))
+          .firstOrDefault();
+
+        expect(row?.metadata).toEqual({ hello: 'world' });
+      });
+    });
+
+    test('coalesce helper should support 3+ args', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Charlie has age=45, set to null then back via coalesce(null, null, 99)
+        await db.users.where(u => eq(u.id, users.charlie.id)).update({ age: null });
+
+        const row = await db.users
+          .where(u => eq(u.id, users.charlie.id))
+          .select(u => ({
+            age: u.age,
+            fallback: coalesce(u.age, null, 99),
+          }))
+          .firstOrDefault();
+
+        expect(row?.age).toBeNull();
+        expect(row?.fallback).toBe(99);
       });
     });
   });

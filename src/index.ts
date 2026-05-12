@@ -119,6 +119,7 @@ export {
   not,
   sql,
   coalesce,
+  jsonbMerge,
   jsonbSelect,
   jsonbSelectText,
   jsonbArraySome,
@@ -197,6 +198,7 @@ export {
   UnwrapDbColumns,
   isDbColumn,
   InsertData,
+  UpdateData,
   ExtractDbColumns,
   ExtractDbColumnKeys,
 } from './entity/db-column';

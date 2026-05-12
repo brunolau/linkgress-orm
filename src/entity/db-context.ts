@@ -1,10 +1,10 @@
 import { DatabaseClient, QueryResult, TransactionalClient } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
-import { UnwrapDbColumns, InsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
+import { UnwrapDbColumns, InsertData, UpdateData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
-import { Condition, ConditionBuilder, SqlFragment, UnwrapSelection, FieldRef } from '../query/conditions';
+import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, UnwrapSelection, FieldRef } from '../query/conditions';
 import { ResolveCollectionResults, CollectionQueryBuilder, ReferenceQueryBuilder, SelectQueryBuilder, QueryBuilder, QueryContext } from '../query/query-builder';
 import { PreparedQuery } from '../query/prepared-query';
 import { InferRowType } from '../schema/row-type';
@@ -1834,8 +1834,17 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   /**
    * Update records matching the current WHERE condition
    * Returns a fluent builder that can be awaited directly or chained with .returning()
+   *
+   * Accepts either a partial data object, or a function that receives the entity's
+   * column proxy (so SqlFragment values can reference table columns). For example:
+   * ```ts
+   * .update(p => ({ integrationInfo: jsonbMerge(p.integrationInfo, patch) }))
+   * ```
    */
-  update(data: Partial<InsertData<TEntity>>): FluentQueryUpdate<UnwrapDbColumns<TEntity>>;
+  update(
+    data: UpdateData<TEntity>
+      | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>>;
 
   /**
    * Create a prepared query for efficient reusable parameterized execution
@@ -2008,7 +2017,16 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   buildUnionSql(context: import('../query/conditions').SqlBuildContext): string;
 
   // Mutation methods (available after where())
-  update(data: Partial<InsertData<TEntity>>): FluentQueryUpdate<TSelection>;
+  /**
+   * Update records matching the current WHERE condition.
+   *
+   * Accepts either a partial data object, or a function that receives the entity's
+   * column proxy (so SqlFragment values can reference table columns).
+   */
+  update(
+    data: UpdateData<TEntity>
+      | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
+  ): FluentQueryUpdate<TSelection>;
   delete(): FluentDelete<TSelection>;
 
   toList(): Promise<ResolveCollectionResults<TSelection>[]>;
@@ -3490,7 +3508,10 @@ export class DbEntityTable<TEntity extends DbEntity> {
    *   await db.users.where(u => eq(u.id, 1)).update({ age: 30 }) // Update with condition
    *   const updated = await db.users.where(u => eq(u.id, 1)).update({ age: 30 }).returning()
    */
-  update(data: Partial<InsertData<TEntity>>): FluentQueryUpdate<UnwrapDbColumns<TEntity>> {
+  update(
+    data: UpdateData<TEntity>
+      | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>> {
     const table = this;
 
     const executeUpdate = async <TResult>(
@@ -3500,15 +3521,38 @@ export class DbEntityTable<TEntity extends DbEntity> {
       const executor = table._getExecutor();
       const client = table._getClient();
 
+      // Resolve the data object - if a function, invoke it with the column proxy so that
+      // expressions like `update(p => ({ col: sql`... ${p.col} ...` }))` resolve the
+      // SqlFragment column references against the actual table.
+      const resolvedData = typeof data === 'function'
+        ? (data as (row: any) => UpdateData<TEntity>)(table.props())
+        : data;
+
       // Build SET clause
       const setClauses: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
 
-      for (const [key, value] of Object.entries(data)) {
+      for (const [key, value] of Object.entries(resolvedData as Record<string, any>)) {
         const column = schema.columns[key];
         if (column) {
           const config = (column as any).build();
+
+          // If the value is a SqlFragment, inline it as a SQL expression (with its own
+          // params merged into our values array). This allows expressions like
+          // `update({ jsonbCol: sql\`COALESCE(...) || ${patch}::jsonb\` })` to execute
+          // as SQL instead of being JSON-serialised as a literal.
+          if (value instanceof SqlFragment) {
+            const sqlBuildContext: SqlBuildContext = {
+              paramCounter: paramIndex,
+              params: values,
+            };
+            const fragmentSql = value.buildSql(sqlBuildContext);
+            paramIndex = sqlBuildContext.paramCounter;
+            setClauses.push(`"${config.name}" = ${fragmentSql}`);
+            continue;
+          }
+
           setClauses.push(`"${config.name}" = $${paramIndex++}`);
           values.push(value);
         }

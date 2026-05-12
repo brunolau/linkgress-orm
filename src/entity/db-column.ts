@@ -149,6 +149,26 @@ export type ExtractDbColumnKeys<T> = keyof ExtractDbColumns<T> & string;
 export type InsertData<TEntity> = Partial<ExtractDbColumns<TEntity>>;
 
 /**
+ * Forward-declared SqlFragment marker (the actual class lives in `query/conditions`).
+ * Used by `UpdateData` so an UPDATE can accept SqlFragment values for SQL expressions
+ * (e.g. `jsonbMerge(...)` or raw `sql\`...\`` templates).
+ */
+interface _SqlFragmentMarker<T> {
+  buildSql: (...args: any[]) => string;
+  readonly __valueType?: T;
+}
+
+/**
+ * Type for update data - like InsertData but each value may also be a SqlFragment<T>,
+ * allowing in-place SQL expressions (e.g. `jsonbMerge(p.col, patch)` or `sql\`col + 1\``).
+ */
+export type UpdateData<TEntity> = {
+  [K in keyof ExtractDbColumns<TEntity>]?:
+    | ExtractDbColumns<TEntity>[K]
+    | _SqlFragmentMarker<ExtractDbColumns<TEntity>[K]>;
+};
+
+/**
  * Marker to indicate DbEntity type (imported to avoid circular dependency)
  */
 interface DbEntity {
