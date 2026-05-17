@@ -5498,6 +5498,10 @@ ${joinClauses.join('\n')}`;
       throw new Error('Aggregation selector must return a field reference');
     }
 
+    // Detect navigation property joins from WHERE condition (same as buildAggregateQuery)
+    const navJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+    this.detectAndAddJoinsFromCondition(this.whereCond, navJoins);
+
     // Build WHERE clause
     let whereClause = '';
     if (this.whereCond) {
@@ -5537,6 +5541,20 @@ ${joinClauses.join('\n')}`;
       } else {
         fromClause += `\n${joinTypeStr} "${manualJoin.table}" AS "${manualJoin.alias}" ON ${condSql}`;
       }
+    }
+
+    // Add JOINs for navigation properties referenced in WHERE clause
+    for (const join of navJoins) {
+      const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
+      const sourceTable = join.sourceAlias || this.schema.name;
+      const onConditions: string[] = [];
+      for (let i = 0; i < join.foreignKeys.length; i++) {
+        const fk = join.foreignKeys[i];
+        const match = join.matches[i];
+        onConditions.push(`${formatJoinValue(sourceTable, fk)} = ${formatJoinValue(join.alias, match)}`);
+      }
+      const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
+      fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
     const sql = `SELECT ${aggregation}("${tableAlias}"."${fieldName}") as result\n${fromClause}\n${whereClause}`.trim();
