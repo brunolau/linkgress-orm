@@ -3,6 +3,7 @@ import type { QueryExecutor, OrderDirection } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
+import { Subquery } from './subquery';
 
 /**
  * Union type: UNION removes duplicates, UNION ALL keeps all rows
@@ -228,11 +229,24 @@ export class UnionQueryBuilder<TSelection> {
    * Build the SQL for this union query
    * @internal
    */
-  buildSql(): { sql: string; params: any[] } {
-    const context: SqlBuildContext = {
-      paramCounter: 1,
-      params: [],
-    };
+  buildSql(): { sql: string; params: any[] };
+  /**
+   * Build the SQL for this union query inside an outer context (e.g. when
+   * this union is used as a subquery via {@link asSubquery}). Reuses the
+   * outer context's `paramCounter` and `params` array so parameter indices
+   * chain correctly across the whole composite statement.
+   *
+   * @internal
+   */
+  buildSql(outerContext: SqlBuildContext): string;
+  buildSql(outerContext?: SqlBuildContext): { sql: string; params: any[] } | string {
+    const isNested = outerContext !== undefined;
+    const context: SqlBuildContext = isNested
+      ? outerContext
+      : {
+          paramCounter: 1,
+          params: [],
+        };
 
     const sqlParts: string[] = [];
 
@@ -266,7 +280,55 @@ export class UnionQueryBuilder<TSelection> {
       sql += `\nOFFSET ${this.offsetValue}`;
     }
 
+    if (isNested) {
+      return sql;
+    }
+
     return { sql, params: context.params };
+  }
+
+  /**
+   * Convert this union query to a subquery usable in WHERE, SELECT, JOIN, or
+   * FROM clauses of an outer query. Mirrors {@link SelectQueryBuilder.asSubquery}
+   * but composes a UNION ALL / UNION across multiple SELECT legs into a single
+   * subquery expression.
+   *
+   * @template TMode - 'scalar' for a single value, 'array' for column list (use
+   *   with `inSubquery(...)`), 'table' for full rows
+   * @returns Subquery that can be passed to `inSubquery`, `exists`, etc.
+   *
+   * @example
+   * ```typescript
+   * // Filter outer query by the union of two id selections
+   * const friendIds = db.userRelations
+   *   .where(r => eq(r.parentId, userId))
+   *   .select(r => r.slaveId)
+   *   .unionAll(
+   *     db.userRelations
+   *       .where(r => eq(r.slaveId, userId))
+   *       .select(r => r.parentId)
+   *   )
+   *   .asSubquery('array');
+   *
+   * const rows = await db.usersEshop
+   *   .where(u => inSubquery(u.id, friendIds))
+   *   .select(u => ({ id: u.id, name: u.name }))
+   *   .toList();
+   * ```
+   */
+  asSubquery<TMode extends 'scalar' | 'array' | 'table' = 'table'>(
+    mode: TMode = 'table' as TMode
+  ): Subquery<
+    TMode extends 'scalar' ? TSelection : TMode extends 'array' ? TSelection[] : TSelection[],
+    TMode
+  > {
+    const sqlBuilder = (outerContext: SqlBuildContext & { tableAlias?: string }): string => {
+      // Reuse the outer context so $1, $2, ... numbering and the params array
+      // chain across the whole composite statement.
+      return this.buildSql(outerContext);
+    };
+
+    return new Subquery(sqlBuilder, mode) as any;
   }
 
   /**
