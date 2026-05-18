@@ -3997,7 +3997,10 @@ WHERE ${whereClause}`.trim();
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               schema.name,
               targetSchema,
-              schemaRegistry  // Pass schema registry for nested navigation
+              schemaRegistry,  // Pass schema registry for nested navigation
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: true,

@@ -156,9 +156,35 @@ export interface CollectionAggregationConfig {
   targetTable: string;
 
   /**
-   * Foreign key column in target table
+   * Foreign key column in target table.
+   * @deprecated Use `foreignKeys` for full composite-/literal-predicate support.
+   *             Retained for backward compatibility; equals `foreignKeys[0]`.
    */
   foreignKey: string;
+
+  /**
+   * Full FK column list on the target (child) side of the navigation. May
+   * contain literal markers (`__LIT:<value>`) for constant FK predicates such
+   * as `withForeignKey: [col, isCurrent], withPrincipalKey: [id, true]` — the
+   * literal pair becomes an AND-predicate (e.g. `target.is_current = TRUE`).
+   *
+   * When present, all collection strategies must build the parent-correlation
+   * WHERE clause by iterating `foreignKeys` × `matches` (using `formatJoinValue`),
+   * NOT by emitting a single `foreignKey = sourceTable.id` clause. The latter
+   * silently drops every constant pair past index 0.
+   *
+   * Optional for backward compatibility. When undefined, strategies fall back
+   * to the legacy single-column behavior (`foreignKey = sourceTable.id`).
+   */
+  foreignKeys?: string[];
+
+  /**
+   * Full match-key column list on the source (parent) side of the navigation.
+   * Paired index-for-index with `foreignKeys`. May contain `__LIT:<value>`
+   * markers for literal principal-key constants. Defaults to `['id']` when
+   * undefined.
+   */
+  matches?: string[];
 
   /**
    * Source table (parent)

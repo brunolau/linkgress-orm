@@ -324,7 +324,10 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
               targetSchema,
-              this.schemaRegistry
+              this.schemaRegistry,
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: true,
@@ -1398,7 +1401,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
               targetSchema,
-              this.schemaRegistry
+              this.schemaRegistry,
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: true,

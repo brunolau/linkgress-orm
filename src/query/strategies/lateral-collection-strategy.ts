@@ -8,7 +8,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { formatJoinValue } from '../join-utils';
+import { formatJoinValue, buildCollectionCorrelationWhere } from '../join-utils';
 
 /**
  * LATERAL JOIN-based collection strategy
@@ -57,6 +57,32 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
   requiresParentIds(): boolean {
     // LATERAL doesn't need parent IDs upfront - it correlates with each parent row
     return false;
+  }
+
+  /**
+   * Build the parent-correlation WHERE predicate for a collection LATERAL/correlated
+   * subquery. Supports composite keys and constant FK predicates (literal markers
+   * like `__LIT:true`). Falls back to the legacy single-column form when the
+   * navigation metadata doesn't carry the array form.
+   *
+   * This is the load-bearing helper for the QA_GO-429 Bug D fix: navigation
+   * properties may declare additional literal predicates beyond the column
+   * equality (e.g. `withForeignKey: [col, isCurrent], withPrincipalKey: [id, true]`)
+   * that must fire on every projection. Without this helper, the strategy
+   * emitted a single hard-coded `fk = sourceTable.id` clause and silently
+   * dropped the literal predicate, leaking SCD2-closed rows.
+   */
+  private buildParentCorrelation(
+    config: CollectionAggregationConfig,
+    fkTableAlias: string,
+    sourceAlias: string,
+    foreignKey: string,
+  ): string {
+    if (config.foreignKeys && config.foreignKeys.length > 0) {
+      const matches = config.matches && config.matches.length > 0 ? config.matches : ['id'];
+      return buildCollectionCorrelationWhere(fkTableAlias, sourceAlias, config.foreignKeys, matches);
+    }
+    return `"${fkTableAlias}"."${foreignKey}" = "${sourceAlias}"."id"`;
   }
 
   buildAggregation(
@@ -188,7 +214,7 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     // Build WHERE clause with correlation to parent
     // For selectMany, the FK is on the intermediate table (joined via navJoins), not the target table
     const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTableAlias}"."id"`;
+    let whereSQL = this.buildParentCorrelation(config, fkTableAlias, sourceTableAlias, foreignKey);
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -481,10 +507,11 @@ WHERE ${whereSQL})`;
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
     // Build WHERE clause - LATERAL correlates with parent via foreign key
-    // The correlation is: innerAlias.foreignKey = source.id
+    // The correlation is: innerAlias.foreignKey = source.id (plus any literal
+    // predicates carried by `config.foreignKeys`/`matches`).
     // For selectMany, the FK is on the intermediate table (joined via navJoins)
     const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `WHERE "${fkTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    let whereSQL = `WHERE ${this.buildParentCorrelation(config, fkTableAlias, effectiveSourceTable, foreignKey)}`;
     if (whereClause) {
       // Rewrite the user's WHERE clause to use inner alias for the collection's table
       const rewrittenWhereClause = rewriteTableReference(whereClause);
@@ -616,7 +643,7 @@ FROM (
     // Build WHERE clause - LATERAL correlates with parent via foreign key
     // For selectMany, the FK is on the intermediate table (joined via navJoins)
     const fkTableAlias2 = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `WHERE "${fkTableAlias2}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    let whereSQL = `WHERE ${this.buildParentCorrelation(config, fkTableAlias2, effectiveSourceTable, foreignKey)}`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -694,7 +721,7 @@ FROM (
     // Build WHERE clause with LATERAL correlation
     // For selectMany, the FK is on the intermediate table (joined via navJoins)
     const fkTableAlias3 = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `WHERE "${fkTableAlias3}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    let whereSQL = `WHERE ${this.buildParentCorrelation(config, fkTableAlias3, effectiveSourceTable, foreignKey)}`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;
@@ -764,7 +791,7 @@ FROM (
     // Build WHERE clause with LATERAL correlation
     // For selectMany, the FK is on the intermediate table (joined via navJoins)
     const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
-    let whereSQL = `WHERE "${fkTableAlias}"."${foreignKey}" = "${effectiveSourceTable}"."id"`;
+    let whereSQL = `WHERE ${this.buildParentCorrelation(config, fkTableAlias, effectiveSourceTable, foreignKey)}`;
     if (whereClause) {
       const rewrittenWhereClause = rewriteTableReference(whereClause);
       whereSQL += ` AND ${rewrittenWhereClause}`;

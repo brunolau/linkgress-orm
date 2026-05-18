@@ -7,6 +7,7 @@ import {
   SelectedField,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
+import { buildLiteralOnlyPredicates } from '../join-utils';
 
 /**
  * Temp table-based collection strategy
@@ -56,6 +57,30 @@ export class TempTableCollectionStrategy implements ICollectionStrategy {
     if (!expr) return expr;
     const markerPattern = new RegExp(`"__collection_${targetTable}__"`, 'g');
     return expr.replace(markerPattern, `"${targetTable}"`);
+  }
+
+  /**
+   * Compose the trailing AND-clauses appended after the temp-table IN filter.
+   * Combines the user's where clause (already rewritten for collection markers)
+   * with any literal FK predicates declared on the navigation (e.g. SCD2
+   * `is_current = TRUE`). Returns "" or " AND <preds...>". Without this, the
+   * temptable strategy leaks SCD2-closed target rows into the projection — the
+   * exact QA_GO-429 Bug D symptom.
+   */
+  private buildAdditionalWhere(
+    config: CollectionAggregationConfig,
+    targetTable: string,
+    rewrittenWhereClause: string | undefined,
+  ): string {
+    const literalPreds = buildLiteralOnlyPredicates(targetTable, config.foreignKeys, config.matches);
+    const parts: string[] = [];
+    if (literalPreds.length > 0) {
+      parts.push(...literalPreds);
+    }
+    if (rewrittenWhereClause) {
+      parts.push(rewrittenWhereClause);
+    }
+    return parts.length > 0 ? ` AND ${parts.join(' AND ')}` : '';
   }
 
   requiresParentIds(): boolean {
@@ -431,7 +456,7 @@ ${aggregationSQL}
 
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
 
     // Build ORDER BY clause
     const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
@@ -586,7 +611,7 @@ ${orderBySQL.replace(/ORDER BY/i, 'ORDER BY')}
 
     // Build WHERE clause (combine temp table join with additional filters, rewrite markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
 
     // Build ORDER BY clause (use primary key DESC as default for consistent ordering matching JSONB)
     const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
@@ -679,7 +704,7 @@ GROUP BY t."${foreignKey}"
 
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
 
     // Build ORDER BY clause (use primary key DESC as default for consistent ordering matching JSONB)
     const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
@@ -760,7 +785,7 @@ GROUP BY t."${foreignKey}"
 
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
 
     // Build aggregation expression
     // Use targetTable as alias to match field references in whereClause
@@ -810,7 +835,7 @@ GROUP BY tmp.id
 
     // Build WHERE clause (rewrite collection markers)
     const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = rewrittenWhereClause ? ` AND ${rewrittenWhereClause}` : '';
+    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
 
     const sql = `
 SELECT

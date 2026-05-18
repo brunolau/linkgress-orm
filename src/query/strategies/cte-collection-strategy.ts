@@ -8,7 +8,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { formatJoinValue } from '../join-utils';
+import { formatJoinValue, buildLiteralOnlyPredicates } from '../join-utils';
 
 /**
  * CTE-based collection strategy
@@ -49,6 +49,36 @@ export class CteCollectionStrategy implements ICollectionStrategy {
   requiresParentIds(): boolean {
     // JSONB strategy doesn't need parent IDs upfront - it aggregates for all parents
     return false;
+  }
+
+  /**
+   * Compose a final WHERE clause for a CTE inner SELECT by AND-ing the user's
+   * existing where clause with any literal FK predicates declared on the
+   * navigation (e.g. SCD2 `is_current = TRUE` from a
+   * `withForeignKey: [col, isCurrent] / withPrincipalKey: [id, true]` shape).
+   *
+   * Without this, the CTE strategy groups every target row by FK column with no
+   * filtering, leaking historical / closed SCD2 rows into the projected
+   * collection — the exact QA_GO-429 Bug D symptom.
+   *
+   * @param config              The aggregation config (carries `foreignKeys`/`matches`).
+   * @param targetTable         Alias of the target table inside the CTE's inner SELECT.
+   * @param rewrittenWhereClause User's whereClause already rewritten for collection markers.
+   */
+  private composeInnerWhere(
+    config: CollectionAggregationConfig,
+    targetTable: string,
+    rewrittenWhereClause: string | undefined,
+  ): string {
+    const literalPreds = buildLiteralOnlyPredicates(targetTable, config.foreignKeys, config.matches);
+    const parts: string[] = [];
+    if (literalPreds.length > 0) {
+      parts.push(...literalPreds);
+    }
+    if (rewrittenWhereClause) {
+      parts.push(rewrittenWhereClause);
+    }
+    return parts.length > 0 ? `WHERE ${parts.join(' AND ')}` : '';
   }
 
   buildAggregation(
@@ -231,9 +261,10 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     // Build the JSONB fields for json_build_object (handles nested structures)
     const jsonbObjectExpr = this.buildJsonbObject(selectedFields);
 
-    // Build WHERE clause (rewrite collection markers)
+    // Build WHERE clause (rewrite collection markers; AND with any literal
+    // FK predicates declared on the navigation — e.g. SCD2 `is_current = TRUE`).
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
-    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+    const whereSQL = this.composeInnerWhere(config, targetTable, rewrittenWhereClause);
 
     // Build DISTINCT clause
     const distinctClause = isDistinct ? 'DISTINCT ' : '';
@@ -344,9 +375,10 @@ GROUP BY "__fk_${foreignKey}"
     // Build the JSONB fields for json_build_object (handles nested structures)
     const jsonbObjectExpr = this.buildJsonbObject(selectedFields);
 
-    // Build WHERE clause (rewrite collection markers)
+    // Build WHERE clause (rewrite collection markers; AND with any literal
+    // FK predicates declared on the navigation — e.g. SCD2 `is_current = TRUE`).
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
-    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+    const whereSQL = this.composeInnerWhere(config, targetTable, rewrittenWhereClause);
 
     // Build DISTINCT clause
     const distinctClause = isDistinct ? 'DISTINCT ' : '';
@@ -545,9 +577,10 @@ GROUP BY "__fk_${foreignKey}"
       return expr.replace(markerPattern, `"${targetTable}"`);
     };
 
-    // Build WHERE clause (rewrite collection markers)
+    // Build WHERE clause (rewrite collection markers; AND with any literal
+    // FK predicates declared on the navigation — e.g. SCD2 `is_current = TRUE`).
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
-    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+    const whereSQL = this.composeInnerWhere(config, targetTable, rewrittenWhereClause);
 
     // Build DISTINCT clause
     const distinctClause = isDistinct ? 'DISTINCT ' : '';
@@ -697,9 +730,10 @@ GROUP BY "__fk_${foreignKey}"
       return expr.replace(markerPattern, `"${targetTable}"`);
     };
 
-    // Build WHERE clause (rewrite collection markers)
+    // Build WHERE clause (rewrite collection markers; AND with any literal
+    // FK predicates declared on the navigation — e.g. SCD2 `is_current = TRUE`).
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
-    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+    const whereSQL = this.composeInnerWhere(config, targetTable, rewrittenWhereClause);
 
     // Build navigation JOINs (needed for selectMany which joins through intermediate table)
     const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);
@@ -763,9 +797,10 @@ GROUP BY ${fkRef}
       return expr.replace(markerPattern, `"${targetTable}"`);
     };
 
-    // Build WHERE clause (rewrite collection markers)
+    // Build WHERE clause (rewrite collection markers; AND with any literal
+    // FK predicates declared on the navigation — e.g. SCD2 `is_current = TRUE`).
     const rewrittenWhereClause = rewriteCollectionMarker(whereClause);
-    const whereSQL = rewrittenWhereClause ? `WHERE ${rewrittenWhereClause}` : '';
+    const whereSQL = this.composeInnerWhere(config, targetTable, rewrittenWhereClause);
 
     // Build navigation JOINs (needed for selectMany which joins through intermediate table)
     const navJoinsSQL = this.buildNavigationJoins(navigationJoins, targetTable);

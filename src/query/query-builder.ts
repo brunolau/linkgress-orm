@@ -12,7 +12,7 @@ import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery } from './future-query';
-import { formatJoinValue, isLiteralKeyPart } from './join-utils';
+import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere } from './join-utils';
 
 /**
  * Field type categories for optimized result transformation
@@ -356,7 +356,10 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
               targetSchema,
-              this.schemaRegistry  // Pass schema registry for nested navigation resolution
+              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: false,
@@ -611,7 +614,11 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               schema.name,
-              targetSchema
+              targetSchema,
+              undefined,
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: false,
@@ -1265,7 +1272,11 @@ export class SelectQueryBuilder<TSelection> {
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               schema.name,
-              targetSchema
+              targetSchema,
+              undefined,
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: false,
@@ -3629,7 +3640,10 @@ ${joinClauses.join('\n')}`;
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
               this.schema.name,
               targetSchema,  // Pass the target schema directly
-              this.schemaRegistry  // Pass schema registry for nested resolution
+              this.schemaRegistry,  // Pass schema registry for nested resolution
+              undefined,
+              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+              relConfig.matches
             );
           },
           enumerable: false,
@@ -6013,7 +6027,9 @@ export class ReferenceQueryBuilder<TItem = any> {
                   this.relationName,  // Use alias (relationName) for correlation in lateral joins
                   nestedTargetSchema,  // Pass the target schema directly
                   this.schemaRegistry,  // Pass schema registry for nested resolution
-                  extendedNavPath  // Pass navigation path for intermediate joins (empty if main query)
+                  extendedNavPath,  // Pass navigation path for intermediate joins (empty if main query)
+                  relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+                  relConfig.matches
                 );
               },
               enumerable: false,
@@ -6061,6 +6077,16 @@ export class CollectionQueryBuilder<TItem = any> {
   private targetTable: string;
   private targetTableSchema?: TableSchema;  // Optional schema for type-safe operations
   private foreignKey: string;
+  // Full composite FK column list on the target (child) side. May contain
+  // `__LIT:<value>` markers for constant FK predicates (e.g. SCD2 `is_current = TRUE`).
+  // When present (length > 0), all strategies must build the parent-correlation
+  // WHERE by iterating this in lock-step with `matches`, not via the legacy
+  // single-column `foreignKey = sourceTable.id` form. The latter silently drops
+  // every literal predicate past index 0.
+  private foreignKeys: string[];
+  // Match-key columns on the source (parent) side. Paired index-for-index with
+  // `foreignKeys`. May also contain `__LIT:<value>` markers. Defaults to `['id']`.
+  private matches: string[];
   private sourceTable: string;
   private selector?: (item: any) => any;
   private whereCond?: Condition;
@@ -6092,12 +6118,20 @@ export class CollectionQueryBuilder<TItem = any> {
     sourceTable: string,
     targetTableSchema?: TableSchema,
     schemaRegistry?: Map<string, TableSchema>,
-    navigationPath?: NavigationJoin[]
+    navigationPath?: NavigationJoin[],
+    foreignKeys?: string[],
+    matches?: string[]
   ) {
     this.relationName = relationName;
     this.targetTable = targetTable;
     this.targetTableSchema = targetTableSchema;
     this.foreignKey = foreignKey;
+    // Default `foreignKeys` to the single-column form so every strategy can
+    // iterate uniformly. Constant FK predicates ([col, literal] + [id, true])
+    // arrive via the explicit `foreignKeys`/`matches` arrays passed from the
+    // navigation metadata.
+    this.foreignKeys = (foreignKeys && foreignKeys.length > 0) ? foreignKeys : (foreignKey ? [foreignKey] : []);
+    this.matches = (matches && matches.length > 0) ? matches : ['id'];
     this.sourceTable = sourceTable;
     this.schemaRegistry = schemaRegistry;
     this.navigationPath = navigationPath || [];
@@ -6126,7 +6160,9 @@ export class CollectionQueryBuilder<TItem = any> {
       this.sourceTable,
       this.targetTableSchema,
       this.schemaRegistry,  // Pass schema registry for nested navigation resolution
-      this.navigationPath  // Pass navigation path for intermediate joins
+      this.navigationPath,  // Pass navigation path for intermediate joins
+      this.foreignKeys,      // Propagate composite/literal FK metadata
+      this.matches
     );
     newBuilder.selector = selector as any;
     newBuilder.whereCond = this.whereCond;
@@ -6223,8 +6259,11 @@ export class CollectionQueryBuilder<TItem = any> {
                   fk,
                   this.targetTable,
                   undefined,  // Don't pass schema, force registry lookup
-                  this.schemaRegistry  // Pass schema registry for nested resolution
+                  this.schemaRegistry,  // Pass schema registry for nested resolution
                   // No navigation path needed here - direct collection access from parent
+                  undefined,
+                  relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+                  relConfig.matches
                 );
               },
               enumerable: false,
@@ -6573,8 +6612,16 @@ export class CollectionQueryBuilder<TItem = any> {
     const navJoinsSQL = allJoins.join('\n');
 
     // Build WHERE clause: correlation + additional conditions
+    // Use full composite-FK / literal-predicate form when navigation declared
+    // multiple key pairs (e.g. SCD2 `[productId, isCurrent] / [id, true]`).
     const fkTableAlias = this.foreignKeyTableAlias || targetTable;
-    let whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTable}"."id"`;
+    let whereSQL: string;
+    if (this.foreignKeys && this.foreignKeys.length > 0) {
+      const matches = this.matches && this.matches.length > 0 ? this.matches : ['id'];
+      whereSQL = buildCollectionCorrelationWhere(fkTableAlias, sourceTable, this.foreignKeys, matches);
+    } else {
+      whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTable}"."id"`;
+    }
 
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
@@ -7247,6 +7294,11 @@ export class CollectionQueryBuilder<TItem = any> {
       relationName: this.relationName,
       targetTable: this.targetTable,
       foreignKey: this.foreignKey,
+      // Composite FK metadata: enables strategies to emit constant FK predicates
+      // (e.g. SCD2 `is_current = TRUE` from `withForeignKey: [col, isCurrent] /
+      // withPrincipalKey: [id, true]`) in the projection WHERE clause.
+      foreignKeys: this.foreignKeys,
+      matches: this.matches,
       foreignKeyTableAlias: this.foreignKeyTableAlias,
       sourceTable: this.sourceTable,
       parentIds,  // Pass parent IDs for temp table strategy
