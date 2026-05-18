@@ -11,6 +11,21 @@ import { Subquery } from './subquery';
 export type UnionType = 'UNION' | 'UNION ALL';
 
 /**
+ * Minimal contract a union component must satisfy. SelectQueryBuilder provides
+ * the optional `_consumeUnionMetadata` and `_applyUnionPostProcessing` hooks
+ * so the union can reconstruct nested-object projections and apply collection
+ * mappers; non-SelectQueryBuilder components (rare; e.g. ad-hoc objects used
+ * in tests) skip those steps.
+ */
+export interface UnionLegBuilder {
+  buildUnionSql: (context: SqlBuildContext) => string;
+  /** @internal */
+  _consumeUnionMetadata?(): { nestedPaths: Set<string>; selectionResult: any } | undefined;
+  /** @internal */
+  _applyUnionPostProcessing?(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): any[];
+}
+
+/**
  * Represents a query component in a union chain
  */
 interface UnionComponent {
@@ -18,6 +33,8 @@ interface UnionComponent {
   buildSql: (context: SqlBuildContext) => string;
   /** The union type to use before this query (not used for the first query) */
   unionType?: UnionType;
+  /** Owner reference so post-fetch processing can call back into the builder. */
+  ownerBuilder?: UnionLegBuilder;
 }
 
 /**
@@ -64,7 +81,7 @@ export class UnionQueryBuilder<TSelection> {
    * Internal constructor - use SelectQueryBuilder.union() or unionAll() to create instances
    */
   constructor(
-    firstQuery: { buildUnionSql: (context: SqlBuildContext) => string },
+    firstQuery: UnionLegBuilder,
     client: DatabaseClient,
     executor?: QueryExecutor
   ) {
@@ -72,6 +89,7 @@ export class UnionQueryBuilder<TSelection> {
     this.executor = executor;
     this.components.push({
       buildSql: (ctx) => firstQuery.buildUnionSql(ctx),
+      ownerBuilder: firstQuery,
     });
   }
 
@@ -89,11 +107,12 @@ export class UnionQueryBuilder<TSelection> {
    *   .toList();
    * ```
    */
-  union(query: { buildUnionSql: (context: SqlBuildContext) => string }): UnionQueryBuilder<TSelection> {
+  union(query: UnionLegBuilder): UnionQueryBuilder<TSelection> {
     const newBuilder = this.clone();
     newBuilder.components.push({
       buildSql: (ctx) => query.buildUnionSql(ctx),
       unionType: 'UNION',
+      ownerBuilder: query,
     });
     return newBuilder;
   }
@@ -114,11 +133,12 @@ export class UnionQueryBuilder<TSelection> {
    *   .toList();
    * ```
    */
-  unionAll(query: { buildUnionSql: (context: SqlBuildContext) => string }): UnionQueryBuilder<TSelection> {
+  unionAll(query: UnionLegBuilder): UnionQueryBuilder<TSelection> {
     const newBuilder = this.clone();
     newBuilder.components.push({
       buildSql: (ctx) => query.buildUnionSql(ctx),
       unionType: 'UNION ALL',
+      ownerBuilder: query,
     });
     return newBuilder;
   }
@@ -184,11 +204,47 @@ export class UnionQueryBuilder<TSelection> {
    * @returns Promise resolving to array of results
    */
   async toList(): Promise<TSelection[]> {
+    // buildSql() walks every component which, for SelectQueryBuilder legs,
+    // stashes nestedPaths + selectionResult on the builder via
+    // _consumeUnionMetadata. We read it back AFTER buildSql finishes (and
+    // before query execution — order doesn't actually matter, just consume
+    // before another buildSql wipes it).
     const { sql, params } = this.buildSql();
+
+    // First-leg metadata is canonical for post-processing because UNION
+    // requires every leg to project the same column shape. If the first leg
+    // has nestedPaths or a transformable selection (collections / mappers /
+    // FieldRefs), apply the same reconstruction that SelectQueryBuilder.toList
+    // would normally apply.
+    let firstLegMeta: { nestedPaths: Set<string>; selectionResult: any } | undefined;
+    let firstLegOwner: UnionLegBuilder | undefined;
+    for (let i = 0; i < this.components.length; i++) {
+      const c = this.components[i];
+      if (c.ownerBuilder?._consumeUnionMetadata) {
+        const meta = c.ownerBuilder._consumeUnionMetadata();
+        if (i === 0) {
+          firstLegMeta = meta;
+          firstLegOwner = c.ownerBuilder;
+        }
+        // Non-first legs: just drain to avoid stale state on the builder.
+      }
+    }
 
     const result = this.executor
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
+
+    // Apply post-processing through the FIRST leg's builder. This is correct
+    // because:
+    //   - Postgres's UNION semantics enforce column-shape equality across all
+    //     legs (otherwise we'd get a SQL error before reaching here),
+    //   - the result mapper only cares about the column SHAPE (names, types,
+    //     nested-path encoding), which is identical across legs,
+    //   - first-leg ownership is the natural pick (the union is initiated
+    //     from `firstLeg.unionAll(...)`).
+    if (firstLegOwner?._applyUnionPostProcessing && firstLegMeta) {
+      return firstLegOwner._applyUnionPostProcessing(result.rows, firstLegMeta) as TSelection[];
+    }
 
     return result.rows as TSelection[];
   }

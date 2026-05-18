@@ -1730,12 +1730,61 @@ export class SelectQueryBuilder<TSelection> {
     const selectionResult = this.selector(mockRow);
 
     // Build query without ORDER BY, LIMIT, OFFSET for union component
-    const { sql } = this.buildQueryCore(selectionResult, queryContext, false);
+    const { sql, nestedPaths } = this.buildQueryCore(selectionResult, queryContext, false);
 
     // Update context's param counter
     context.paramCounter = queryContext.paramCounter;
 
+    // Stash the rich metadata (nestedPaths + selection) so UnionQueryBuilder
+    // can post-process the result rows (reconstructNestedObjects +
+    // transformResults for collection projections). buildUnionSql is always
+    // called by UnionQueryBuilder synchronously immediately before the union
+    // SQL is executed, so this is safe — no concurrency. The fields are
+    // refreshed on every call; `_lastUnionMetadata` is the contract.
+    this._lastUnionMetadata = {
+      nestedPaths,
+      selectionResult,
+    };
+
     return sql;
+  }
+
+  /**
+   * Metadata captured by the most recent `buildUnionSql` invocation. Used by
+   * `UnionQueryBuilder.toList()` to drive `reconstructNestedObjects` and
+   * `transformResults` on the union result. Cleared after each consume.
+   * @internal
+   */
+  private _lastUnionMetadata?: {
+    nestedPaths: Set<string>;
+    selectionResult: any;
+  };
+
+  /**
+   * Read (and consume) the metadata captured by the most recent
+   * `buildUnionSql` call. Internal contract with `UnionQueryBuilder`.
+   * @internal
+   */
+  _consumeUnionMetadata(): { nestedPaths: Set<string>; selectionResult: any } | undefined {
+    const meta = this._lastUnionMetadata;
+    this._lastUnionMetadata = undefined;
+    return meta;
+  }
+
+  /**
+   * Apply the standard post-fetch result transformation to the raw rows
+   * returned by a UNION execution. Combines `reconstructNestedObjects` (for
+   * `__nested__<path>` columns produced by nested-object projections) with
+   * `transformResults` (for collection projections, scalar mappers, FieldRef
+   * mappers, etc.). Used exclusively by `UnionQueryBuilder.toList()`.
+   * @internal
+   */
+  _applyUnionPostProcessing(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): TSelection[] {
+    let processed = rows;
+    if (meta.nestedPaths.size > 0) {
+      processed = rows.map(row => this.reconstructNestedObjects(row, meta.nestedPaths));
+    }
+    return this.transformResults(processed, meta.selectionResult);
   }
 
   /**
@@ -4741,11 +4790,35 @@ ${joinClauses.join('\n')}`;
       throw new Error('Cannot use CollectionQueryBuilder directly as selection');
     } else {
       // Process selection object properties
+      //
+      // Parity with buildQuery (the non-UNION path): UNION legs must support
+      // nested-object projections (`{ address: { street, city } }`) AND
+      // collection projections (`{ cards: u.cards.toList(...) }`) so that the
+      // same selector shape can be reused across UNION legs and stand-alone
+      // queries. The legacy buildQueryCore silently dropped both:
+      //   - nested objects fell through to the literal-param branch and
+      //     arrived as a stringified blob,
+      //   - collections hit an explicit `continue` and were never emitted.
+      // Both regressions are now covered by union-nested-select.test.ts and
+      // union-collection-nav.test.ts.
       for (const [key, value] of Object.entries(selection)) {
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
-          // Collection fields are not supported in UNION queries for simplicity
-          // Skip them - they would need complex handling
-          continue;
+          // Collection projection inside a UNION leg — delegate to the
+          // collection strategy (LATERAL by default) and emit per-row
+          // correlated subquery. Same flow as buildQuery (line ~4266):
+          //   buildCTE() registers the CTE / produces the joinClause +
+          //   selectExpression. We push the selectExpression as the SELECT
+          //   slot for this leg and add the joinClause to FROM later.
+          const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
+          const isCTE = cteData.isCTE !== false;
+
+          collectionFields.push({
+            name: key,
+            cteName: cteData.tableName || `cte_${context.cteCounter - 1}`,
+            isCTE,
+            joinClause: cteData.joinClause,
+            selectExpression: cteData.selectExpression,
+          });
         } else if (value instanceof Subquery || (value && typeof value === 'object' && 'buildSql' in value && typeof (value as any).buildSql === 'function' && '__mode' in value)) {
           const sqlBuildContext = {
             paramCounter: context.paramCounter,
@@ -4805,6 +4878,26 @@ ${joinClauses.join('\n')}`;
             } else if (value instanceof ReferenceQueryBuilder) {
               continue; // Skip ReferenceQueryBuilder in union queries
             }
+
+            // Plain nested object containing FieldRefs / SqlFragments /
+            // primitives (e.g. `address: { street: p.street, city: p.city }`).
+            // Same flat-flattening pass as buildQuery: produces flat
+            // `__nested__<path>__<leaf>` columns with deterministic ordering
+            // across UNION legs. The UnionQueryBuilder reconstructs them
+            // post-fetch via reconstructNestedObjects().
+            const handled = this.tryBuildFlatNestedSelect(value, context, joins, selectParts, `__nested__${key}`, nestedPaths);
+            if (handled) {
+              continue;
+            }
+
+            // Nested object that ALSO contains a collection inside it
+            // (e.g. `content: { posts: u.posts.toList() }`). Build the
+            // non-collection leaves flat, register the collection in
+            // collectionFields so it gets the LATERAL / CTE treatment.
+            if (this.hasNestedCollections(value)) {
+              this.tryBuildFlatNestedSelectExcludingCollections(value, context, joins, selectParts, `__nested__${key}`, nestedPaths, collectionFields);
+              continue;
+            }
           }
           selectParts.push(`$${context.paramCounter++} as "${key}"`);
           context.allParams.push(value);
@@ -4813,6 +4906,55 @@ ${joinClauses.join('\n')}`;
         } else {
           selectParts.push(`$${context.paramCounter++} as "${key}"`);
           context.allParams.push(value);
+        }
+      }
+
+      // Add collection fields as JSON / array aggregations joined from CTEs or
+      // LATERAL joins. Mirrors the buildQuery flow at line ~4498 — collections
+      // must contribute a SELECT slot (or every UNION leg's column count
+      // diverges) and a FROM-side join clause.
+      for (const { name, cteName, selectExpression } of collectionFields) {
+        if (selectExpression) {
+          selectParts.push(`${selectExpression} as "${name}"`);
+          continue;
+        }
+
+        // Fallback path mirrors buildQuery for the CTE strategy (when no
+        // pre-built selectExpression was produced by buildCTE).
+        let collectionValue: any;
+        if (name.startsWith('__nested__')) {
+          const pathParts = name.substring('__nested__'.length).split('__');
+          collectionValue = selection;
+          for (const part of pathParts) {
+            if (collectionValue && typeof collectionValue === 'object') {
+              collectionValue = collectionValue[part];
+            } else {
+              collectionValue = undefined;
+              break;
+            }
+          }
+        } else {
+          collectionValue = (selection as any)[name];
+        }
+
+        const isArrayAgg = collectionValue && typeof collectionValue === 'object' && 'isArrayAggregation' in collectionValue && collectionValue.isArrayAggregation();
+        const isScalarAgg = collectionValue instanceof CollectionQueryBuilder && collectionValue.isScalarAggregation();
+
+        if (isScalarAgg) {
+          const aggregationType = collectionValue.getAggregationType();
+          if (aggregationType === 'COUNT') {
+            selectParts.push(`COALESCE("${cteName}".data, 0) as "${name}"`);
+          } else if (aggregationType === 'EXISTS') {
+            selectParts.push(`COALESCE("${cteName}".data, false) as "${name}"`);
+          } else {
+            selectParts.push(`"${cteName}".data as "${name}"`);
+          }
+        } else if (isArrayAgg) {
+          const flattenType = (collectionValue as any).getFlattenResultType?.() || 'string';
+          const arrayType = flattenType === 'number' ? 'integer[]' : 'text[]';
+          selectParts.push(`COALESCE("${cteName}".data, ARRAY[]::${arrayType}) as "${name}"`);
+        } else {
+          selectParts.push(`COALESCE("${cteName}".data, '[]'::json) as "${name}"`);
         }
       }
     }
@@ -4919,6 +5061,17 @@ ${joinClauses.join('\n')}`;
       }
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
+    }
+
+    // Join CTEs / LATERAL subqueries for collection projections inside the UNION
+    // leg. Mirror the buildQuery flow at line ~4678. CTE legs join by parent_id;
+    // LATERAL legs splice in the pre-built `LEFT JOIN LATERAL (...)` clause.
+    for (const { cteName, isCTE, joinClause } of collectionFields) {
+      if (isCTE) {
+        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${qualifiedTableName}.id`;
+      } else if (joinClause) {
+        fromClause += `\n${joinClause}`;
+      }
     }
 
     // Add DISTINCT if needed
