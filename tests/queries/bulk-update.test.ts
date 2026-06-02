@@ -428,4 +428,62 @@ describe('Bulk Update', () => {
       });
     });
   });
+
+  describe('Custom type mappers (toDriver)', () => {
+    // Regression: bulkUpdate must run each column's toDriver mapper before binding the
+    // value — the same way insert and where().update() do. The `publishTime` column is
+    // an { hour, minute } object stored in a smallint via a custom mapper. Without the
+    // mapper the raw object reaches the pg driver and the smallint bind fails with
+    // 'invalid input syntax for type smallint: "{"hour":...}"'.
+    test('should apply the toDriver mapper to a mapped column', async () => {
+      await withDatabase(async (db) => {
+        const { posts } = await seedTestData(db);
+
+        const updated = await db.posts.bulkUpdate([
+          { id: posts.alicePost1.id, publishTime: { hour: 7, minute: 5 } },
+          { id: posts.bobPost.id, publishTime: { hour: 23, minute: 59 } },
+        ]).returning();
+
+        expect(updated.length).toBe(2);
+
+        // Mapped value survives the bulkUpdate round-trip (toDriver on write, fromDriver on read).
+        const fresh1 = await db.posts.where(p => eq(p.id, posts.alicePost1.id)).toList();
+        const fresh2 = await db.posts.where(p => eq(p.id, posts.bobPost.id)).toList();
+
+        expect(fresh1[0].publishTime).toEqual({ hour: 7, minute: 5 });
+        expect(fresh2[0].publishTime).toEqual({ hour: 23, minute: 59 });
+      });
+    });
+
+    test('should apply the mapper alongside plain columns in the same batch', async () => {
+      await withDatabase(async (db) => {
+        const { posts } = await seedTestData(db);
+
+        await db.posts.bulkUpdate([
+          { id: posts.alicePost1.id, publishTime: { hour: 6, minute: 0 }, views: 321 },
+        ]);
+
+        const fresh = await db.posts.where(p => eq(p.id, posts.alicePost1.id)).toList();
+
+        expect(fresh[0].publishTime).toEqual({ hour: 6, minute: 0 });
+        expect(fresh[0].views).toBe(321);
+      });
+    });
+
+    test('should leave rows outside the batch untouched', async () => {
+      await withDatabase(async (db) => {
+        const { posts } = await seedTestData(db);
+
+        const before = (await db.posts.where(p => eq(p.id, posts.alicePost2.id)).toList())[0].publishTime;
+
+        await db.posts.bulkUpdate([
+          { id: posts.alicePost1.id, publishTime: { hour: 1, minute: 1 } },
+        ]);
+
+        const after = (await db.posts.where(p => eq(p.id, posts.alicePost2.id)).toList())[0].publishTime;
+
+        expect(after).toEqual(before);
+      });
+    });
+  });
 });
