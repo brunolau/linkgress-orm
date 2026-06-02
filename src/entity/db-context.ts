@@ -3812,7 +3812,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
     }
 
     // Build column info - access config once per column
-    const columnInfoList: Array<{ propName: string; dbName: string; pgType: string; isPK: boolean }> = [];
+    const columnInfoList: Array<{ propName: string; dbName: string; pgType: string; isPK: boolean; mapper?: any }> = [];
     const valueColumnParts: string[] = [];
     const setClauses: string[] = [];
     const whereClauseParts: string[] = [];
@@ -3823,7 +3823,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       const pgType = DbEntityTable.PG_TYPE_MAP[colConfig.type] || colConfig.type;
       const isPK = primaryKeySet.has(propName);
 
-      const info = { propName, dbName, pgType, isPK };
+      const info = { propName, dbName, pgType, isPK, mapper: colConfig.mapper };
       columnInfoList.push(info);
 
       // Build VALUES column list
@@ -3850,7 +3850,13 @@ export class DbEntityTable<TEntity extends DbEntity> {
       const rowValues: string[] = [];
       for (const col of columnInfoList) {
         const hasKey = col.propName in record;
-        const value = record[col.propName];
+        const rawValue = record[col.propName];
+        // Apply the column's toDriver mapper (e.g. Temporal -> driver string) so bulk
+        // updates serialize values the same way insert and `where().update()` do.
+        // Without this, class instances such as Temporal.PlainDateTime reach the pg
+        // driver raw and throw "argument must be of type string ... Received an
+        // instance of PlainDateTime".
+        const value = col.mapper ? col.mapper.toDriver(rawValue) : rawValue;
 
         // Add the value (always cast to correct type for NULL to work in CASE expressions)
         if (value === undefined || value === null) {
