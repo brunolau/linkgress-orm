@@ -442,13 +442,15 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
     const columnNames: string[] = [];
     const expressions: string[] = [];
     let hasAnyExpression = false;
+    let requiresSearchNormalize = false;
+    let wantsGin = false;
 
     if (selector) {
       // Create a temporary entity to extract column names
       const tempEntity = {} as TEntity;
 
       // Build a proxy that returns IndexColumnRef objects for each property access.
-      // These can be used directly (plain columns) or wrapped with ixLower/ixUnaccent.
+      // These can be used directly (plain columns) or wrapped with ixLower/ixUnaccent/ixNormalized.
       const proxy = new Proxy(tempEntity, {
         get: (target, prop) => {
           if (typeof prop === 'string') {
@@ -474,6 +476,15 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
           } else {
             expressions.push(`"${ref.columnName}"`);
           }
+          if (ref.__requiresSearchNormalize) {
+            requiresSearchNormalize = true;
+            // Leave a transferable flag on the column so normalized query
+            // helpers know an accent/case-insensitive index is available.
+            this.markColumnNormalized(metadata, ref.columnName);
+          }
+          if (ref.__gin) {
+            wantsGin = true;
+          }
         }
       }
     }
@@ -488,9 +499,35 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
       indexMetadata.expressions = expressions;
     }
 
+    if (requiresSearchNormalize) {
+      indexMetadata.requiresSearchNormalize = true;
+    }
+
+    // `ixNormalized(col, { gin: true })` opts into a trigram GIN index. Set
+    // sensible defaults here; explicit `.using()` / `.withOperatorClass()` calls
+    // on the returned builder still override them.
+    if (wantsGin) {
+      indexMetadata.using = 'gin';
+      indexMetadata.operatorClass = 'gin_trgm_ops';
+    }
+
     metadata.indexes.push(indexMetadata);
 
     return new IndexBuilder<TEntity>(this.entityClass, indexMetadata);
+  }
+
+  /**
+   * Mark a column (by DB column name) as participating in an ixNormalized index.
+   * Sets the flag on both the property metadata and the column config.
+   */
+  private markColumnNormalized(metadata: { properties: Map<any, PropertyMetadata> }, columnName: string): void {
+    for (const propMeta of metadata.properties.values()) {
+      if (propMeta.columnName === columnName) {
+        propMeta.hasNormalizedIndex = true;
+        (propMeta.columnBuilder as any).markNormalizedIndex?.();
+        break;
+      }
+    }
   }
 
   /**

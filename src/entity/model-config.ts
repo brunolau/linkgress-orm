@@ -7,6 +7,8 @@ import { DbNavigation, DbNavigationCollection } from '../schema/navigation';
  * Model builder for configuring entities
  */
 export class DbModelConfig {
+  private _searchNormalizeRequired = false;
+
   /**
    * Configure an entity
    */
@@ -16,6 +18,30 @@ export class DbModelConfig {
   ): void {
     const builder = new EntityConfigBuilder(entityClass);
     configure(builder);
+  }
+
+  /**
+   * Opt into the `search_normalize` support objects (the `unaccent` extension
+   * and the `public.search_normalize(text)` function) even when no
+   * `ixNormalized` index is declared.
+   *
+   * Call this in `setupModel` when you use the normalized query helpers
+   * (`normalizedEq` / `normalizedLike` / `normalizedStartsWith` / `searchNormalize`)
+   * without a dedicated index, so the function exists in the database. When an
+   * `ixNormalized` index exists, the support objects are created automatically
+   * and this call is not required.
+   */
+  useSearchNormalize(): this {
+    this._searchNormalizeRequired = true;
+    return this;
+  }
+
+  /**
+   * Whether `useSearchNormalize()` was called.
+   * @internal
+   */
+  isSearchNormalizeRequired(): boolean {
+    return this._searchNormalizeRequired;
   }
 
   /**

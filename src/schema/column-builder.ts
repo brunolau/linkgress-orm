@@ -39,6 +39,12 @@ export interface ColumnConfig {
   enumTypeName?: string;
   /** PostgreSQL COLLATION name */
   collation?: string;
+  /**
+   * Set when the column participates in an `ixNormalized` index. A transferable
+   * hint (mirrored from the entity metadata) that the column has an
+   * accent/case-insensitive `search_normalize()` index available.
+   */
+  hasNormalizedIndex?: boolean;
 }
 
 /**
@@ -179,6 +185,16 @@ export class ColumnBuilder<TType = any> {
    */
   hasCollation(collation: CollationDefinition): this {
     this.config.collation = collation.name;
+    return this;
+  }
+
+  /**
+   * Mark that this column has an `ixNormalized` (search_normalize) index.
+   * Called internally when an index referencing this column is declared.
+   * @internal
+   */
+  markNormalizedIndex(): this {
+    this.config.hasNormalizedIndex = true;
     return this;
   }
 

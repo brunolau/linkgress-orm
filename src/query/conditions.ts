@@ -742,6 +742,89 @@ export function regexNoMatchCaseInsensitive<T extends string>(
   return new RegexNoMatchCaseInsensitiveComparison(field!, pattern!);
 }
 
+// ============================================================================
+// Normalized (accent/case-insensitive) text search helpers
+//
+// All of these wrap their operands in `public.search_normalize(...)`, the
+// IMMUTABLE function created by the migration system (see `ixNormalized` /
+// `model.useSearchNormalize()`). They pair with `ixNormalized` expression
+// indexes so the database can use the index for the comparison.
+// ============================================================================
+
+/**
+ * Wrap a field or value in `public.search_normalize(...)`. Usable both inside a
+ * `sql\`\`` template and as a building block for the normalized helpers below.
+ *
+ * @example
+ * db.users.where(u => sql<boolean>`
+ *   ${searchNormalize(u.username)} LIKE ${searchNormalize(containsSearch(query))}
+ * `)
+ */
+export function searchNormalize<V = string>(
+  value: FieldLike<V> | string | Placeholder<any>
+): SqlFragment<string> {
+  return new SqlFragment<string>(['public.search_normalize(', ')'], [value]);
+}
+
+/** Build a `%value%` (contains) LIKE pattern. */
+export function containsSearch(value: string): string {
+  return `%${value}%`;
+}
+
+/** Build a `value%` (starts-with) LIKE pattern. */
+export function startsWithSearch(value: string): string {
+  return `${value}%`;
+}
+
+/** Build a `%value` (ends-with) LIKE pattern. */
+export function endsWithSearch(value: string): string {
+  return `%${value}`;
+}
+
+/**
+ * Accent/case-insensitive equality:
+ * `search_normalize(field) = search_normalize(value)`.
+ */
+export function normalizedEq<T extends string>(
+  field: FieldLike<string> | T,
+  value: FieldLike<string> | string | Placeholder<any>
+): Condition {
+  return new SqlFragment<boolean>(
+    ['', ' = ', ''],
+    [searchNormalize(field as any), searchNormalize(value)]
+  );
+}
+
+/**
+ * Accent/case-insensitive `LIKE`. The `pattern` is normalized too, so pass the
+ * wildcards yourself (or build them with `containsSearch` / `startsWithSearch`):
+ * `search_normalize(field) LIKE search_normalize(pattern)`.
+ */
+export function normalizedLike<T extends string>(
+  field: FieldLike<string> | T,
+  pattern: FieldLike<string> | string | Placeholder<any>
+): Condition {
+  return new SqlFragment<boolean>(
+    ['', ' LIKE ', ''],
+    [searchNormalize(field as any), searchNormalize(pattern)]
+  );
+}
+
+/**
+ * Accent/case-insensitive prefix match. The wildcard is appended after
+ * normalization, so callers pass a plain prefix:
+ * `search_normalize(field) LIKE search_normalize(value) || '%'`.
+ */
+export function normalizedStartsWith<T extends string>(
+  field: FieldLike<string> | T,
+  value: FieldLike<string> | string | Placeholder<any>
+): Condition {
+  return new SqlFragment<boolean>(
+    ['', ' LIKE ', " || '%'"],
+    [searchNormalize(field as any), searchNormalize(value)]
+  );
+}
+
 export function inArray<T extends string, V>(
   field: FieldLike<V> | T | undefined,
   values: V[]

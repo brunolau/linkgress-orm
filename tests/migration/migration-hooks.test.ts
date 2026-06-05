@@ -171,3 +171,101 @@ describe('Migration Hooks', () => {
     await simpleDb.dispose();
   });
 });
+
+// Database context that records when the pre-migration hook fires
+class TestDatabaseWithStartHook extends DbContext {
+  events: string[] = [];
+  tableExistedAtStart: boolean | null = null;
+
+  get users(): DbEntityTable<CustomScriptUser> {
+    return this.table(CustomScriptUser);
+  }
+
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(CustomScriptUser, entity => {
+      entity.toTable('pre_hook_users');
+
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'pre_hook_users_id_seq' }));
+      entity.property(e => e.username).hasType(varchar('username', 100)).isRequired();
+      entity.property(e => e.email).hasType(text('email')).isRequired();
+    });
+  }
+
+  protected override async onMigrationStart(client: DatabaseClient): Promise<void> {
+    // Capture whether the target table exists at the moment the hook runs.
+    // On a fresh create it must NOT exist yet — proving the hook runs first.
+    const res = await client.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'pre_hook_users'
+      ) as exists
+    `);
+    this.tableExistedAtStart = res.rows[0].exists;
+    this.events.push('start');
+  }
+
+  protected override async onMigrationComplete(client: DatabaseClient): Promise<void> {
+    this.events.push('complete');
+  }
+}
+
+describe('Migration Start Hook (onMigrationStart)', () => {
+  let client: PgClient;
+  let db: TestDatabaseWithStartHook;
+
+  beforeAll(async () => {
+    client = new PgClient({
+      host: process.env.DB_HOST || 'localhost',
+      port: parseInt(process.env.DB_PORT || '5432'),
+      user: process.env.DB_USER || 'postgres',
+      password: process.env.DB_PASSWORD || 'postgres',
+      database: process.env.DB_NAME || 'linkgress_test',
+    });
+
+    // Ensure a clean slate so the pre-hook observes a missing table
+    await client.query('DROP TABLE IF EXISTS pre_hook_users CASCADE');
+
+    db = new TestDatabaseWithStartHook(client);
+  });
+
+  afterAll(async () => {
+    try {
+      await client.query('DROP TABLE IF EXISTS pre_hook_users CASCADE');
+    } catch (error) {
+      // Ignore cleanup errors
+    }
+    await db.dispose();
+  });
+
+  test('runs onMigrationStart before schema creation and before onMigrationComplete', async () => {
+    await db.getSchemaManager().ensureCreated();
+
+    // Hook fired, and fired first (before the complete hook)
+    expect(db.events).toEqual(['start', 'complete']);
+
+    // Table did not exist when the pre-hook ran
+    expect(db.tableExistedAtStart).toBe(false);
+
+    // ...but it does now
+    const res = await client.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'pre_hook_users'
+      ) as exists
+    `);
+    expect(res.rows[0].exists).toBe(true);
+  });
+
+  test('runs onMigrationStart on auto-migrate (migrate) even when schema is in sync', async () => {
+    // Schema already created by the previous test — migrate() finds no ops,
+    // but the pre-migration hook must still fire.
+    db.events.length = 0;
+    db.tableExistedAtStart = null;
+
+    await db.getSchemaManager().migrate();
+
+    expect(db.events).toContain('start');
+    // Table already existed on this run
+    expect(db.tableExistedAtStart).toBe(true);
+  });
+});

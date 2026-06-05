@@ -50,6 +50,12 @@ export interface IndexDefinition {
   expressions?: string[];
   /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
   where?: string;
+  /**
+   * Set when the index contains an `ixNormalized` expression. Tells the schema
+   * manager to create the `unaccent` extension + `search_normalize` function
+   * (and `pg_trgm` when `using === 'gin'`) before building the index.
+   */
+  requiresSearchNormalize?: boolean;
 }
 
 /**

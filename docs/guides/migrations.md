@@ -265,6 +265,50 @@ teardownDatabase().catch(console.error);
 - Development reset (start fresh)
 - CI/CD pipeline cleanup
 
+## Pre-Migration Hooks
+
+You can execute custom SQL **before** any schema changes are applied by overriding the `onMigrationStart` method in your `DbContext`. This is the symmetric counterpart to `onMigrationComplete` and is useful for things that must exist *before* tables are created or altered:
+
+- Installing required extensions (`CREATE EXTENSION IF NOT EXISTS ...`)
+- Setting session/database GUCs needed during migration
+- Seeding prerequisite schemas, roles, or lookup data
+- Any one-off script that must run first
+
+### Example: Ensure an extension exists before migrating
+
+```typescript
+import { DbContext, DbEntityTable, DbModelConfig, DatabaseClient } from 'linkgress-orm';
+
+export class AppDatabase extends DbContext {
+  protected override setupModel(model: DbModelConfig): void {
+    // ... your entity configurations
+  }
+
+  /**
+   * Called before the ORM analyzes or changes the schema, and before any
+   * file-based migration runs. On a fresh database (where MigrationRunner
+   * triggers auto-migration) this still runs first.
+   */
+  protected override async onMigrationStart(client: DatabaseClient): Promise<void> {
+    await client.query(`CREATE EXTENSION IF NOT EXISTS "pg_trgm"`);
+    await client.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+  }
+}
+```
+
+**When it fires:**
+- At the start of `getSchemaManager().migrate()` (auto-migration) — even when the schema is already in sync.
+- At the start of `getSchemaManager().ensureCreated()`.
+- Via `MigrationRunner.up()`: on a fresh database the runner calls auto-migration (so the hook runs first); on an existing database the runner fires the hook before applying any pending migration files.
+
+**Important Notes:**
+- Make the script idempotent (`IF NOT EXISTS`, `CREATE OR REPLACE`) — it may run on every migration.
+- The hook receives a `DatabaseClient` for executing raw SQL.
+- It runs **outside** the per-file migration transaction, so statements that cannot run inside a transaction (e.g. `CREATE INDEX CONCURRENTLY`) are allowed.
+- Errors thrown in the hook abort the migration before any schema change is made.
+
+> **Note:** Naming a migration file to "sort first" does **not** guarantee it runs first on a fresh database. On a fresh DB the runner builds the schema from the model via auto-migration and records all existing migration files as already applied **without executing them**. Use `onMigrationStart` for "run this before everything" logic.
+
 ## Post-Migration Hooks
 
 You can execute custom SQL after migrations complete by overriding the `onMigrationComplete` method in your `DbContext`. This is useful for:

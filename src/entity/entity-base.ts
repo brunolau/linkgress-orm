@@ -52,6 +52,12 @@ export interface PropertyMetadata {
   isRequired?: boolean;
   isUnique?: boolean;
   defaultValue?: any;
+  /**
+   * Set when the column participates in an {@link ixNormalized} index. A
+   * transferable hint that the column has an accent/case-insensitive index, so
+   * normalized query helpers can be applied against it efficiently.
+   */
+  hasNormalizedIndex?: boolean;
 }
 
 /**
@@ -92,6 +98,18 @@ export interface IndexColumnRef {
   __indexColumn: true;
   columnName: string;
   expression?: string;
+  /**
+   * Set by {@link ixNormalized}. Signals that this index entry uses
+   * `public.search_normalize()`, so the migration must create the `unaccent`
+   * extension and the `search_normalize` function before building the index.
+   */
+  __requiresSearchNormalize?: boolean;
+  /**
+   * Set by `ixNormalized(ref, { gin: true })`. Signals that the index should be
+   * a trigram GIN index (`USING gin (... gin_trgm_ops)`), which also requires
+   * the `pg_trgm` extension.
+   */
+  __gin?: boolean;
 }
 
 function wrapIndexExpression<T>(ref: T, fn: string): T {
@@ -108,6 +126,37 @@ export function ixLower<T>(ref: T): T {
 
 export function ixUnaccent<T>(ref: T): T {
   return wrapIndexExpression(ref, 'unaccent');
+}
+
+/**
+ * Index expression helper that wraps a column in `public.search_normalize()`,
+ * producing an accent- and case-insensitive expression index. Composable with
+ * the other `ix*` helpers.
+ *
+ * Pass `{ gin: true }` to build a trigram GIN index (best for substring /
+ * `normalizedLike('%x%')` searches); omit it for a plain btree expression index
+ * (best for `normalizedEq` / `normalizedStartsWith` and unique constraints).
+ *
+ * Declaring any `ixNormalized` index automatically makes the migration create
+ * the `unaccent` extension + `search_normalize` function (and `pg_trgm` when
+ * `gin` is used) before the index is built.
+ *
+ * @example
+ * // unique normalized lookup (btree)
+ * entity.hasIndex('user_admin_query', e => [ixNormalized(e.email), e.hash]).isUnique();
+ *
+ * // fuzzy substring search (trigram GIN)
+ * entity.hasIndex('user_name_search', e => [ixNormalized(e.username, { gin: true })]);
+ */
+export function ixNormalized<T>(ref: T, options?: { gin?: boolean }): T {
+  const wrapped = wrapIndexExpression(ref, 'public.search_normalize') as any;
+  if (wrapped && wrapped.__indexColumn) {
+    wrapped.__requiresSearchNormalize = true;
+    if (options?.gin) {
+      wrapped.__gin = true;
+    }
+  }
+  return wrapped as T;
 }
 
 /**
@@ -129,6 +178,12 @@ export interface IndexMetadata {
   expressions?: string[];
   /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
   where?: string;
+  /**
+   * Set when the index contains an {@link ixNormalized} expression. The schema
+   * manager uses this to create the `unaccent` extension + `search_normalize`
+   * function (and `pg_trgm` when `using === 'gin'`) before building the index.
+   */
+  requiresSearchNormalize?: boolean;
 }
 
 /**

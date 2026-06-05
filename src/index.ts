@@ -105,6 +105,13 @@ export {
   like,
   ilike,
   startsWith,
+  searchNormalize,
+  containsSearch,
+  startsWithSearch,
+  endsWithSearch,
+  normalizedEq,
+  normalizedLike,
+  normalizedStartsWith,
   regexMatches,
   regexMatchesCaseInsensitive,
   regexNoMatch,
@@ -191,6 +198,7 @@ export {
   IndexMethod,
   ixLower,
   ixUnaccent,
+  ixNormalized,
 } from './entity/entity-base';
 
 export {

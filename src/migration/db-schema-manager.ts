@@ -67,9 +67,11 @@ export type MigrationOperation =
 export class DbSchemaManager {
   private logQueries: boolean;
   private logger: (message: string, level?: LogLevel) => void;
+  private preMigrationHook?: (client: DatabaseClient) => Promise<void>;
   private postMigrationHook?: (client: DatabaseClient) => Promise<void>;
   private sequenceRegistry: Map<string, SequenceConfig>;
   private concurrentIndexes: boolean;
+  private searchNormalizeRequired: boolean;
   private rl: readline.Interface | null = null;
 
   constructor(
@@ -78,8 +80,16 @@ export class DbSchemaManager {
     options?: {
       logQueries?: boolean;
       logger?: (message: string, level?: LogLevel) => void;
+      preMigrationHook?: (client: DatabaseClient) => Promise<void>;
       postMigrationHook?: (client: DatabaseClient) => Promise<void>;
       sequenceRegistry?: Map<string, SequenceConfig>;
+      /**
+       * When true, the `search_normalize` support objects (the `unaccent`
+       * extension and `public.search_normalize(text)` function) are created
+       * even if no `ixNormalized` index is present. Set via
+       * `model.useSearchNormalize()` for query-only usage.
+       */
+      searchNormalizeRequired?: boolean;
       /**
        * When true, every index created by this schema manager uses
        * `CREATE INDEX CONCURRENTLY`, regardless of per-index `.concurrent()`.
@@ -90,9 +100,11 @@ export class DbSchemaManager {
   ) {
     this.logQueries = options?.logQueries ?? false;
     this.logger = options?.logger ?? console.log;
+    this.preMigrationHook = options?.preMigrationHook;
     this.postMigrationHook = options?.postMigrationHook;
     this.sequenceRegistry = options?.sequenceRegistry ?? new Map();
     this.concurrentIndexes = options?.concurrentIndexes ?? false;
+    this.searchNormalizeRequired = options?.searchNormalizeRequired ?? false;
   }
 
   /**
@@ -566,9 +578,107 @@ export class DbSchemaManager {
   }
 
   /**
+   * Execute the pre-migration hook, if one is configured.
+   *
+   * Runs BEFORE any schema analysis or changes. Exposed publicly so the
+   * MigrationRunner can fire it ahead of file-based migrations on an
+   * existing database (where `migrate()` is not invoked). Safe to call when
+   * no hook is configured — it is a no-op in that case.
+   */
+  async runPreMigrationHook(): Promise<void> {
+    if (!this.preMigrationHook) return;
+
+    if (this.logQueries) {
+      this.logger('Executing pre-migration scripts...\n');
+    }
+    await this.preMigrationHook(this.client);
+    if (this.logQueries) {
+      this.logger('✓ Pre-migration scripts completed\n');
+    }
+  }
+
+  /**
+   * SQL body for the `public.search_normalize(text)` function. Uses the 2-arg
+   * form of `unaccent` (explicit dictionary) so the function is IMMUTABLE and
+   * therefore usable in expression indexes.
+   *
+   * The dictionary is schema-qualified (`'public.unaccent'`) on purpose:
+   * PostgreSQL evaluates functional-index expressions with a restricted
+   * `search_path`, so an unqualified `'unaccent'::regdictionary` would fail with
+   * "text search dictionary unaccent does not exist" when the index is built.
+   */
+  private static readonly SEARCH_NORMALIZE_FUNCTION_SQL = `
+CREATE OR REPLACE FUNCTION public.search_normalize(value text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+RETURNS NULL ON NULL INPUT
+AS $$
+  SELECT lower(public.unaccent('public.unaccent', value))
+$$`;
+
+  /**
+   * Whether any registered index uses an `ixNormalized` expression.
+   */
+  private hasNormalizedIndex(): boolean {
+    for (const tableSchema of this.schemaRegistry.values()) {
+      for (const index of tableSchema.indexes || []) {
+        if (index.requiresSearchNormalize) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether any registered `ixNormalized` index is a trigram GIN index, which
+   * additionally needs the `pg_trgm` extension.
+   */
+  private needsPgTrgmForNormalized(): boolean {
+    for (const tableSchema of this.schemaRegistry.values()) {
+      for (const index of tableSchema.indexes || []) {
+        if (index.requiresSearchNormalize && index.using === 'gin') return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Create the `search_normalize` support objects (the `unaccent` extension and
+   * the `public.search_normalize(text)` function — plus `pg_trgm` when a
+   * trigram GIN normalized index is present) when the model needs them.
+   *
+   * Runs before tables/indexes so that `ixNormalized` expression indexes can be
+   * built. Idempotent — safe to run on every migration.
+   */
+  async ensureSearchNormalizeSupport(): Promise<void> {
+    const needed = this.searchNormalizeRequired || this.hasNormalizedIndex();
+    if (!needed) return;
+
+    if (this.logQueries) {
+      this.logger('Creating search_normalize support (unaccent extension + function)...\n');
+    }
+
+    await this.client.query(`CREATE EXTENSION IF NOT EXISTS unaccent`);
+
+    if (this.needsPgTrgmForNormalized()) {
+      await this.client.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+    }
+
+    await this.client.query(DbSchemaManager.SEARCH_NORMALIZE_FUNCTION_SQL);
+
+    if (this.logQueries) {
+      this.logger('✓ search_normalize support created\n');
+    }
+  }
+
+  /**
    * Create all tables in the database
    */
   async ensureCreated(): Promise<void> {
+    // Run pre-migration hook before any schema work
+    await this.runPreMigrationHook();
+
     if (this.logQueries) {
       this.logger('Creating database schema...\n');
     }
@@ -584,6 +694,9 @@ export class DbSchemaManager {
 
     // Create sequences
     await this.createSequences();
+
+    // Create search_normalize support before tables/indexes that may use it
+    await this.ensureSearchNormalizeSupport();
 
     // Create tables in dependency order
     const sortedTables = this.sortTablesByDependency();
@@ -879,6 +992,13 @@ export class DbSchemaManager {
    */
   async migrate(): Promise<void> {
     try {
+      // Run pre-migration hook before any analysis or schema changes
+      await this.runPreMigrationHook();
+
+      // Ensure search_normalize support exists before any ixNormalized indexes
+      // are (re)built in phase 3. Idempotent, so safe to run every migration.
+      await this.ensureSearchNormalizeSupport();
+
       const operations = await this.analyze();
 
       if (operations.length === 0) {
@@ -1302,6 +1422,9 @@ export class DbSchemaManager {
     }
     if (index.operatorClass && !DbSchemaManager.VALID_OPERATOR_CLASS.test(index.operatorClass)) {
       throw new Error(`Invalid operator class: "${index.operatorClass}". Must be a valid PostgreSQL identifier.`);
+    }
+    if (index.isUnique && index.using === 'gin') {
+      throw new Error(`Index "${index.name}" cannot be both UNIQUE and a GIN index. GIN does not support unique constraints — drop .isUnique() or remove the GIN option (e.g. \`ixNormalized(col, { gin: true })\`).`);
     }
 
     const uniqueStr = index.isUnique ? 'UNIQUE ' : '';

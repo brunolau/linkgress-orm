@@ -13,6 +13,7 @@ This guide covers how to configure your database schema using Linkgress ORM's fl
   - [Composite Foreign Keys](#composite-foreign-keys)
 - [Indexes](#indexes)
   - [Expression Indexes](#expression-indexes)
+  - [Normalized (accent/case-insensitive) Indexes](#normalized-accentcase-insensitive-indexes)
   - [Partial Indexes](#partial-indexes)
   - [GIN/GiST Indexes](#gingist-indexes)
 - [Collations](#collations)
@@ -498,6 +499,35 @@ For complex SQL that can't be expressed with helpers, use `.withExpression()` as
 entity.hasIndex('ix_jsonb_key')
   .withExpression('(data->>\'key\')::int');
 ```
+
+### Normalized (accent/case-insensitive) Indexes
+
+`ixNormalized` wraps a column in `public.search_normalize()` — an accent- and
+case-insensitive normalization function the ORM creates for you (along with the
+`unaccent` extension) during migration. It pairs with the
+[normalized query helpers](./querying.md#normalized-accentcase-insensitive-search).
+
+```typescript
+import { ixNormalized } from 'linkgress-orm';
+
+model.entity(User, entity => {
+  // Unique normalized lookup — btree expression index
+  entity.hasIndex('user_admin_query', e => [ixNormalized(e.email), e.hash]).isUnique();
+  // → CREATE UNIQUE INDEX ... (public.search_normalize(email), hash)
+
+  // Fuzzy substring search — trigram GIN index (installs pg_trgm, defaults gin_trgm_ops)
+  entity.hasIndex('user_name_search', e => [ixNormalized(e.username, { gin: true })]);
+  // → CREATE INDEX ... USING gin (public.search_normalize(username) gin_trgm_ops)
+});
+```
+
+- Declaring any `ixNormalized` index auto-creates the `unaccent` extension and
+  the `search_normalize` function before the index is built — no manual SQL.
+- `{ gin: true }` opts into a trigram GIN index (best for `normalizedLike('%x%')`);
+  omit it for a btree index (best for `normalizedEq` / `normalizedStartsWith` and
+  unique constraints). A **UNIQUE** GIN index is rejected — GIN can't be unique.
+- If you use the normalized query helpers **without** an `ixNormalized` index,
+  call `model.useSearchNormalize()` in `setupModel` so the function is created.
 
 ### Partial Indexes
 

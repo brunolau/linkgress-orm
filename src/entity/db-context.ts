@@ -4629,6 +4629,7 @@ export abstract class DatabaseContext extends DataContext {
   private entityTables = new Map<EntityConstructor<any>, DbEntityTable<any>>();
   private sequenceRegistry = new Map<string, SequenceConfig>();
   private sequenceInstances = new Map<string, DbSequence>();
+  private searchNormalizeRequired = false;
 
   constructor(client: DatabaseClient, queryOptions?: QueryOptions) {
     // Initialize model config
@@ -4651,6 +4652,7 @@ export abstract class DatabaseContext extends DataContext {
     super(client, schema, queryOptions);
 
     this.modelConfig = modelConfig;
+    this.searchNormalizeRequired = modelConfig.isSearchNormalizeRequired();
 
     // Setup sequences after construction (call setupSequences if it exists)
     if (derivedPrototype.setupSequences) {
@@ -4677,6 +4679,32 @@ export abstract class DatabaseContext extends DataContext {
    * ```
    */
   protected setupSequences?(): void;
+
+  /**
+   * Hook called before any database migrations/schema changes are applied.
+   * Override this method to execute custom SQL scripts that must run first —
+   * before the ORM analyzes or modifies the schema, and before any file-based
+   * migrations run.
+   *
+   * Fires at the start of `getSchemaManager().migrate()` / `ensureCreated()`,
+   * and (via `MigrationRunner.up()`) before file migrations on an existing
+   * database. On a fresh database, the runner triggers auto-migration, so this
+   * still runs first there too.
+   *
+   * @example
+   * ```typescript
+   * protected async onMigrationStart(client: DatabaseClient): Promise<void> {
+   *   // Ensure a required extension exists before any tables are created
+   *   await client.query(`CREATE EXTENSION IF NOT EXISTS "pg_trgm"`);
+   * }
+   * ```
+   *
+   * @param client - Database client for executing custom SQL
+   */
+  protected async onMigrationStart(client: DatabaseClient): Promise<void> {
+    // Default implementation does nothing
+    // Override in derived class to execute custom scripts before migrations run
+  }
 
   /**
    * Hook called after database migrations/schema creation are complete.
@@ -4753,10 +4781,14 @@ export abstract class DatabaseContext extends DataContext {
       {
         logQueries: (this as any).queryOptions?.logQueries,
         logger: (this as any).queryOptions?.logger,
+        preMigrationHook: async (client: DatabaseClient) => {
+          await this.onMigrationStart(client);
+        },
         postMigrationHook: async (client: DatabaseClient) => {
           await this.onMigrationComplete(client);
         },
         sequenceRegistry: this.sequenceRegistry,
+        searchNormalizeRequired: this.searchNormalizeRequired,
         concurrentIndexes: options?.concurrentIndexes,
       }
     );

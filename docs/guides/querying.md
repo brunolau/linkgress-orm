@@ -712,6 +712,44 @@ const noSecret = await db.users
 | `regexNoMatch` | `!~` | Does not match regex |
 | `regexNoMatchCaseInsensitive` | `!~*` | Does not match regex (case-insensitive) |
 
+### Normalized (accent/case-insensitive) search
+
+These helpers wrap both operands in `public.search_normalize()` — a `lower(unaccent(...))`
+function the ORM creates during migration — so `"José"`, `"jose"` and `"JOSÉ"` all match.
+For best performance, back the column with an [`ixNormalized` index](./schema-configuration.md#normalized-accentcase-insensitive-indexes);
+if you query without one, call `model.useSearchNormalize()` in `setupModel` so the function exists.
+
+```typescript
+import { normalizedEq, normalizedLike, normalizedStartsWith, searchNormalize, containsSearch } from 'linkgress-orm';
+
+// equality, ignoring accents and case
+await db.users.where(u => normalizedEq(u.email, 'José')).toList();
+// → WHERE public.search_normalize("email") = public.search_normalize($1)
+
+// prefix match (the wildcard is appended after normalization)
+await db.users.where(u => normalizedStartsWith(u.name, 'jo')).toList();
+// → WHERE public.search_normalize("name") LIKE public.search_normalize($1) || '%'
+
+// substring search — build the pattern with containsSearch / startsWithSearch / endsWithSearch
+await db.users.where(u => normalizedLike(u.name, containsSearch(query))).toList();
+// → WHERE public.search_normalize("name") LIKE public.search_normalize($1)   -- $1 = '%query%'
+
+// low-level building blocks inside a sql`` template
+await db.users
+  .where(u => sql<boolean>`
+    ${searchNormalize(u.name)} LIKE ${searchNormalize(containsSearch(query))}
+  `)
+  .toList();
+```
+
+| Function | Description |
+|----------|-------------|
+| `normalizedEq(field, value)` | `search_normalize(field) = search_normalize(value)` |
+| `normalizedLike(field, pattern)` | `search_normalize(field) LIKE search_normalize(pattern)` (pass your own wildcards) |
+| `normalizedStartsWith(field, value)` | prefix match; `'%'` appended after normalization |
+| `searchNormalize(fieldOrValue)` | `public.search_normalize(...)` as a composable `SqlFragment` |
+| `containsSearch` / `startsWithSearch` / `endsWithSearch` | build `%x%` / `x%` / `%x` LIKE patterns |
+
 ## Advanced Patterns
 
 ### Conditional Queries

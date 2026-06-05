@@ -92,6 +92,11 @@ export class MigrationRunner {
       return result;
     }
 
+    // Existing database: the fresh-DB path above runs the pre-migration hook
+    // via getSchemaManager().migrate(), but that is not invoked here. Fire it
+    // explicitly so it still runs before any file-based migration is applied.
+    await this.db.getSchemaManager().runPreMigrationHook();
+
     await this.journal.ensureTable();
 
     const allMigrations = await this.loader.loadAllMigrations();
