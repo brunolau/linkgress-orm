@@ -523,9 +523,12 @@ model.entity(User, entity => {
 
 - Declaring any `ixNormalized` index auto-creates the `unaccent` extension and
   the `search_normalize` function before the index is built — no manual SQL.
-- `{ gin: true }` opts into a trigram GIN index (best for `normalizedLike('%x%')`);
-  omit it for a btree index (best for `normalizedEq` / `normalizedStartsWith` and
-  unique constraints). A **UNIQUE** GIN index is rejected — GIN can't be unique.
+- The btree form uses `text_pattern_ops`, so a single index serves both
+  `normalizedEq` (`=`) and `normalizedStartsWith` (`LIKE 'prefix%'`) as index
+  scans even on non-`C`-locale databases — and still enforces accent/case-insensitive
+  uniqueness. `{ gin: true }` opts into a trigram GIN index for substring search
+  (`normalizedLike('%x%')`). A **UNIQUE** GIN index is rejected — GIN can't be unique.
+- Keep `ixNormalized` the outermost helper (don't wrap it with `ixLower` etc.).
 - If you use the normalized query helpers **without** an `ixNormalized` index,
   call `model.useSearchNormalize()` in `setupModel` so the function is created.
 

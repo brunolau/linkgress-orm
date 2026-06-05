@@ -154,6 +154,13 @@ export function ixNormalized<T>(ref: T, options?: { gin?: boolean }): T {
     wrapped.__requiresSearchNormalize = true;
     if (options?.gin) {
       wrapped.__gin = true;
+    } else {
+      // btree expression index: `text_pattern_ops` makes anchored LIKE
+      // ('prefix%', i.e. normalizedStartsWith) index-usable on non-C-locale
+      // databases, while still serving normalizedEq (=) and UNIQUE constraints.
+      // Baked into the expression so it applies per-column in composite indexes.
+      // (Keep ixNormalized the OUTERMOST helper — don't wrap it with ixLower etc.)
+      wrapped.expression = `${wrapped.expression} text_pattern_ops`;
     }
   }
   return wrapped as T;

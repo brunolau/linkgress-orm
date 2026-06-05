@@ -101,6 +101,39 @@ describe('ixNormalized / search_normalize support', () => {
       expect(def).toContain('UNIQUE');
       expect(def).toContain('search_normalize');
       expect(def).not.toContain('USING gin');
+      // text_pattern_ops makes normalizedStartsWith (LIKE 'prefix%') index-usable
+      // on non-C collations while still serving normalizedEq and UNIQUE.
+      expect(def).toContain('text_pattern_ops');
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS users_norm_btree CASCADE`);
+      await db.dispose();
+    }
+  });
+
+  test('normalizedStartsWith is index-usable on the btree (text_pattern_ops) index', async () => {
+    const client = createFreshClient();
+    const db = new BtreeNormDb(client);
+
+    try {
+      await client.query(`DROP TABLE IF EXISTS users_norm_btree CASCADE`);
+      await db.getSchemaManager().ensureCreated();
+
+      await client.query(`
+        INSERT INTO users_norm_btree (email, hash, username)
+        SELECT 'José' || lpad(g::text, 6, '0') || '@x.com', md5(g::text), 'u' || g
+        FROM generate_series(1, 5000) g
+      `);
+      await client.query('ANALYZE users_norm_btree');
+
+      // Mirrors the SQL produced by normalizedStartsWith(email, 'JOSÉ000123')
+      const plan = await client.query(
+        `EXPLAIN (COSTS OFF) SELECT * FROM users_norm_btree
+         WHERE public.search_normalize(email) LIKE public.search_normalize($1) || '%'`,
+        ['JOSÉ000123']
+      );
+      const text = plan.rows.map((r: any) => r['QUERY PLAN']).join('\n');
+      expect(text).toContain('user_admin_query'); // the index is used
+      expect(text).not.toContain('Seq Scan');
     } finally {
       await client.query(`DROP TABLE IF EXISTS users_norm_btree CASCADE`);
       await db.dispose();
