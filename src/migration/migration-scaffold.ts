@@ -4,6 +4,7 @@ import { DatabaseContext } from '../entity/db-context';
 import { MigrationConfig } from './migration.interface';
 import { MigrationLoader } from './migration-loader';
 import { MigrationOperation } from './db-schema-manager';
+import { buildCreateIndexStatement, buildDropIndexStatement } from './index-sql';
 import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
@@ -83,16 +84,10 @@ export class MigrationScaffold {
         return [this.buildAlterColumnSql(op.tableName, op.columnName, op.from, op.to, op.schema)];
 
       case 'create_index':
-        return this.buildCreateIndexSql(
-          op.tableName,
-          op.indexName,
-          op.columns,
-          op.isUnique,
-          op.schema,
-          op.concurrent,
-          op.expressions,
-          op.where,
-        );
+      case 'recreate_index':
+        // Both drop-if-exists then create, so the statement is idempotent and a
+        // changed-signature recreate replaces the old index in place.
+        return this.buildIndexUpSql(op);
 
       case 'drop_index': {
         const qualifiedIndex = op.schema
@@ -165,6 +160,19 @@ export class MigrationScaffold {
           ? `"${op.schema}"."${op.indexName}"`
           : `"${op.indexName}"`;
         return [`DROP INDEX IF EXISTS ${idxName}`];
+      }
+
+      case 'recreate_index': {
+        // Reverse a signature change by restoring the index's previous
+        // definition, captured from the live database at scaffold time.
+        const idxName = op.schema
+          ? `"${op.schema}"."${op.indexName}"`
+          : `"${op.indexName}"`;
+        const down = [`DROP INDEX IF EXISTS ${idxName}`];
+        down.push(op.previousDef
+          ? op.previousDef
+          : `-- Cannot auto-generate: recreate previous definition of index "${op.indexName}"`);
+        return down;
       }
 
       case 'drop_index':
@@ -372,39 +380,35 @@ export class MigrationScaffold {
   }
 
   /**
-   * Build CREATE INDEX SQL.
-   * Returns [DROP IF EXISTS, CREATE] for idempotency.
-   * When `concurrent` is true, emits `CREATE INDEX CONCURRENTLY`; the caller
-   * must run the statement outside of a transaction block.
+   * Build the UP SQL for a create_index / recreate_index operation.
+   * Returns [DROP IF EXISTS, CREATE] for idempotency, so a recreate replaces a
+   * changed-signature index in place. Uses the shared builders so the generated
+   * SQL is identical to the live auto-migrate path — including `USING <method>`
+   * and per-column operator classes (which the previous scaffold omitted).
    */
-  private buildCreateIndexSql(
-    tableName: string,
-    indexName: string,
-    columns: string[],
-    isUnique?: boolean,
-    schema?: string,
-    concurrent?: boolean,
-    expressions?: string[],
-    where?: string,
+  private buildIndexUpSql(
+    op: Extract<MigrationOperation, { type: 'create_index' | 'recreate_index' }>
   ): string[] {
-    const qualifiedTable = schema
-      ? `"${schema}"."${tableName}"`
-      : `"${tableName}"`;
+    const qualifiedTable = op.schema
+      ? `"${op.schema}"."${op.tableName}"`
+      : `"${op.tableName}"`;
+    const qualifiedIndex = op.schema
+      ? `"${op.schema}"."${op.indexName}"`
+      : `"${op.indexName}"`;
 
-    const qualifiedIndex = schema
-      ? `"${schema}"."${indexName}"`
-      : `"${indexName}"`;
-
-    const uniqueStr = isUnique ? 'UNIQUE ' : '';
-    const columnList = expressions && expressions.length > 0
-      ? expressions.join(', ')
-      : columns.map(c => `"${c}"`).join(', ');
-	const concurrentStr = concurrent ? 'CONCURRENTLY ' : '';
-    const whereStr = where ? ` WHERE ${where}` : '';
+    const spec = {
+      name: op.indexName,
+      columns: op.columns,
+      isUnique: op.isUnique,
+      using: op.using,
+      operatorClass: op.operatorClass,
+      expressions: op.expressions,
+      where: op.where,
+    };
 
     return [
-      `DROP INDEX IF EXISTS ${qualifiedIndex}`,
-      `CREATE ${uniqueStr}INDEX ${concurrentStr}"${indexName}" ON ${qualifiedTable} (${columnList})${whereStr}`
+      buildDropIndexStatement(qualifiedIndex, { concurrent: op.concurrent, ifExists: true }),
+      buildCreateIndexStatement(spec, qualifiedTable, { concurrent: op.concurrent }),
     ];
   }
 

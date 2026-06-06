@@ -1,12 +1,18 @@
 import * as readline from 'readline';
 import { DatabaseClient } from '../database/database-client.interface';
 import { LogLevel } from '../entity/db-context';
-import { TableSchema, IndexMethod } from '../schema/table-builder';
+import { TableSchema, IndexMethod, IndexDefinition } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
 import { CollationRegistry, CollationDefinition } from '../types/collation-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
 import { RawSql } from '../query/conditions';
+import {
+  buildCreateIndexStatement,
+  buildDropIndexStatement,
+  compareIndexDefinition,
+  canonicalDefsEquivalent,
+} from './index-sql';
 
 /**
  * Database column information from pg
@@ -29,6 +35,8 @@ interface DbColumnInfo {
 interface DbIndexInfo {
   index_name: string;
   column_names: string[];
+  /** Canonical `pg_get_indexdef(oid, 0, true)` output, for signature comparison. */
+  canonical_def: string;
 }
 
 /**
@@ -57,6 +65,7 @@ export type MigrationOperation =
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
   | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string }
+  | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -71,7 +80,10 @@ export class DbSchemaManager {
   private postMigrationHook?: (client: DatabaseClient) => Promise<void>;
   private sequenceRegistry: Map<string, SequenceConfig>;
   private concurrentIndexes: boolean;
+  private recreateChangedIndexes: boolean;
   private searchNormalizeRequired: boolean;
+  /** Monotonic counter for unique temp object names during index confirmation. */
+  private indexCheckSeq = 0;
   private rl: readline.Interface | null = null;
 
   constructor(
@@ -96,6 +108,18 @@ export class DbSchemaManager {
        * Must not be used inside a transaction — PostgreSQL disallows it.
        */
       concurrentIndexes?: boolean;
+      /**
+       * When true (the default), automatic migration compares each model index
+       * against the matching index already in the database and, when their
+       * definitions differ (operator class, expressions, method, uniqueness,
+       * columns, partial predicate) while the name is unchanged, drops and
+       * recreates it. Set to false to keep the legacy name-only behavior, where
+       * a same-named index is never touched.
+       *
+       * The recreate is non-blocking (`DROP/CREATE INDEX CONCURRENTLY`) when the
+       * index is marked `.concurrent()` or `concurrentIndexes: true` is set.
+       */
+      recreateChangedIndexes?: boolean;
     }
   ) {
     this.logQueries = options?.logQueries ?? false;
@@ -104,6 +128,7 @@ export class DbSchemaManager {
     this.postMigrationHook = options?.postMigrationHook;
     this.sequenceRegistry = options?.sequenceRegistry ?? new Map();
     this.concurrentIndexes = options?.concurrentIndexes ?? false;
+    this.recreateChangedIndexes = options?.recreateChangedIndexes ?? true;
     this.searchNormalizeRequired = options?.searchNormalizeRequired ?? false;
   }
 
@@ -937,12 +962,13 @@ $$`;
         const existingIndexes = await this.getExistingIndexes(tableName, schema.schema);
         const modelIndexes = schema.indexes || [];
 
-        // Find indexes to create
+        // Find indexes to create, and collect same-named indexes whose
+        // definition LOOKS changed (fast string comparison) as candidates for an
+        // authoritative confirmation pass below.
+        const recreateCandidates: Array<{ modelIndex: IndexDefinition; dbDef: string; reason?: string }> = [];
         for (const modelIndex of modelIndexes) {
-          const exists = existingIndexes.some(dbIndex =>
-            dbIndex.index_name === modelIndex.name
-          );
-          if (!exists) {
+          const dbIndex = existingIndexes.find(d => d.index_name === modelIndex.name);
+          if (!dbIndex) {
             operations.push({
               type: 'create_index',
               tableName,
@@ -955,6 +981,38 @@ $$`;
               concurrent: modelIndex.concurrent,
               expressions: modelIndex.expressions,
               where: modelIndex.where,
+            });
+          } else if (this.recreateChangedIndexes) {
+            const comparison = compareIndexDefinition(dbIndex.canonical_def, modelIndex);
+            if (comparison.changed) {
+              recreateCandidates.push({ modelIndex, dbDef: dbIndex.canonical_def, reason: comparison.reason });
+            }
+          }
+        }
+
+        // Authoritative confirmation: rebuild each candidate on an empty mirror
+        // table and compare PostgreSQL's own canonical definitions, so an index
+        // is recreated ONLY when its definition genuinely differs — never merely
+        // because the model's SQL is spelled differently than PostgreSQL stores
+        // it. Anything uncertain is left untouched (no needless rebuild).
+        if (recreateCandidates.length > 0) {
+          const qualifiedTable = this.getQualifiedTableName(tableName, schema.schema);
+          const confirmed = await this.confirmIndexChanges(qualifiedTable, recreateCandidates);
+          for (const cand of confirmed) {
+            operations.push({
+              type: 'recreate_index',
+              tableName,
+              schema: schema.schema,
+              indexName: cand.modelIndex.name,
+              columns: cand.modelIndex.columns,
+              isUnique: cand.modelIndex.isUnique,
+              using: cand.modelIndex.using,
+              operatorClass: cand.modelIndex.operatorClass,
+              concurrent: cand.modelIndex.concurrent,
+              expressions: cand.modelIndex.expressions,
+              where: cand.modelIndex.where,
+              reason: cand.reason,
+              previousDef: cand.dbDef,
             });
           }
         }
@@ -1206,6 +1264,10 @@ $$`;
         }, operation.schema);
         break;
 
+      case 'recreate_index':
+        await this.executeRecreateIndex(operation);
+        break;
+
       case 'drop_index':
         if (await this.confirm(`Drop index "${operation.indexName}"?`)) {
           await this.executeDropIndex(operation.indexName, operation.schema);
@@ -1430,23 +1492,54 @@ $$`;
     const uniqueStr = index.isUnique ? 'UNIQUE ' : '';
     const useConcurrent = index.concurrent || this.concurrentIndexes;
     const concurrentStr = useConcurrent ? 'CONCURRENTLY ' : '';
-    const usingStr = index.using ? ` USING ${index.using}` : '';
     const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
     this.logger(`  Creating ${uniqueStr}${concurrentStr}index "${index.name}" on ${qualifiedTableName}...`);
 
-    const opClassSuffix = index.operatorClass ? ` ${index.operatorClass}` : '';
-    let columnList: string;
-    if (index.expressions && index.expressions.length > 0) {
-      // Expression-based index: use raw SQL expressions (no quoting)
-      columnList = index.expressions.map(expr => `${expr}${opClassSuffix}`).join(', ');
-    } else {
-      columnList = index.columns.map(col => `"${col}"${opClassSuffix}`).join(', ');
-    }
-    const whereStr = index.where ? ` WHERE ${index.where}` : '';
-    const sql = `CREATE ${uniqueStr}INDEX ${concurrentStr}IF NOT EXISTS "${index.name}" ON ${qualifiedTableName}${usingStr} (${columnList})${whereStr}`;
+    const sql = buildCreateIndexStatement(index, qualifiedTableName, {
+      concurrent: useConcurrent,
+      ifNotExists: true,
+    });
 
     await this.client.query(sql);
     this.logger(`  ✓ ${uniqueStr}${concurrentStr}Index "${index.name}" created\n`);
+  }
+
+  /**
+   * Recreate an index whose definition changed while its name stayed the same:
+   * drop the existing index, then create it from the model definition.
+   *
+   * The drop and create both use `CONCURRENTLY` when the index opted into it
+   * (`.concurrent()` or the schema manager's `concurrentIndexes` option), making
+   * the change non-blocking; otherwise it is a plain (briefly locking) recreate.
+   * Either way this must run outside a transaction when concurrent.
+   */
+  private async executeRecreateIndex(operation: Extract<MigrationOperation, { type: 'recreate_index' }>): Promise<void> {
+    const useConcurrent = operation.concurrent || this.concurrentIndexes;
+    const qualifiedIndexName = operation.schema
+      ? `"${operation.schema}"."${operation.indexName}"`
+      : `"${operation.indexName}"`;
+
+    this.logger(`  Recreating index "${operation.indexName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}...\n`);
+    if (!useConcurrent) {
+      this.logger(`    (blocking recreate — enable concurrentIndexes or .concurrent() for non-blocking)\n`, 'warn');
+    }
+
+    await this.client.query(buildDropIndexStatement(qualifiedIndexName, {
+      concurrent: useConcurrent,
+      ifExists: true,
+    }));
+
+    // Reuse executeCreateIndex for validation + concurrent + IF NOT EXISTS.
+    await this.executeCreateIndex(operation.tableName, {
+      name: operation.indexName,
+      columns: operation.columns,
+      isUnique: operation.isUnique,
+      using: operation.using,
+      operatorClass: operation.operatorClass,
+      concurrent: operation.concurrent,
+      expressions: operation.expressions,
+      where: operation.where,
+    }, operation.schema);
   }
 
   /**
@@ -1556,27 +1649,112 @@ $$`;
    * Get all indexes for a table
    */
   private async getExistingIndexes(tableName: string, schemaName?: string): Promise<DbIndexInfo[]> {
+    // `pg_get_indexdef(oid, 0, true)` yields the canonical, pretty-printed
+    // CREATE INDEX statement (no CONCURRENTLY / IF NOT EXISTS, redundant parens
+    // stripped), which the signature comparison parses to detect changes.
     const result = await this.client.query(`
       SELECT
         i.relname as index_name,
-        array_agg(a.attname ORDER BY k.ordinality) as column_names
+        pg_get_indexdef(i.oid, 0, true) as canonical_def,
+        ARRAY(
+          SELECT a.attname
+          FROM unnest(ix.indkey) WITH ORDINALITY k(attnum, ord)
+          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+          ORDER BY k.ord
+        ) as column_names
       FROM pg_index ix
       JOIN pg_class t ON t.oid = ix.indrelid
       JOIN pg_class i ON i.oid = ix.indexrelid
       JOIN pg_namespace n ON n.oid = t.relnamespace
-      CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY k(attnum, ordinality)
-      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
       WHERE
         n.nspname = $1
         AND t.relname = $2
         AND NOT ix.indisprimary
-      GROUP BY i.relname
     `, [schemaName || 'public', tableName]);
 
     return result.rows.map(row => ({
       index_name: row.index_name,
-      column_names: row.column_names
+      column_names: row.column_names,
+      canonical_def: row.canonical_def,
     }));
+  }
+
+  /**
+   * Authoritatively confirm which candidate indexes have genuinely changed by
+   * asking PostgreSQL to canonicalize the model's intended definition the exact
+   * same way it canonicalized the stored one — then comparing the two canonical
+   * forms.
+   *
+   * Each candidate's index is rebuilt on a throwaway **empty** mirror table
+   * (`CREATE TEMP TABLE ... (LIKE realTable)`), which makes the build instant
+   * regardless of how much data the real table holds. PostgreSQL's
+   * `pg_get_indexdef()` of that rebuild is the canonical form of the *model*; the
+   * stored index already gives the canonical form of the *database*. If they are
+   * equal, the index is unchanged — no matter how differently the model's SQL was
+   * spelled (timestamp-literal expansion, re-parenthesization, `IN`→`ANY`, casts,
+   * …). This is what makes a needless recreate impossible.
+   *
+   * Defensive by construction: if the mirror table or any rebuild can't be made
+   * (e.g. a read-only session, missing `search_normalize` support, lacking TEMP
+   * privilege), that candidate is treated as **unchanged** and left alone, so the
+   * worst case is a missed change — never a churning rebuild.
+   */
+  private async confirmIndexChanges(
+    qualifiedTable: string,
+    candidates: Array<{ modelIndex: IndexDefinition; dbDef: string; reason?: string }>
+  ): Promise<Array<{ modelIndex: IndexDefinition; dbDef: string; reason?: string }>> {
+    const confirmed: Array<{ modelIndex: IndexDefinition; dbDef: string; reason?: string }> = [];
+    const seq = ++this.indexCheckSeq;
+    const tmpTable = `_lkg_idxchk_${process.pid}_${seq}`;
+    let tableCreated = false;
+
+    try {
+      await this.client.query(`CREATE TEMP TABLE "${tmpTable}" (LIKE ${qualifiedTable})`);
+      tableCreated = true;
+
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        const tmpIndexName = `${tmpTable}_ix${i}`;
+        try {
+          const createSql = buildCreateIndexStatement(
+            { ...cand.modelIndex, name: tmpIndexName },
+            `"${tmpTable}"`,
+            { concurrent: false, ifNotExists: false }
+          );
+          await this.client.query(createSql);
+
+          const defResult = await this.client.query(
+            `SELECT pg_get_indexdef(to_regclass($1)::oid, 0, true) AS d`,
+            [tmpIndexName]
+          );
+          const modelCanonical: string | undefined = defResult.rows[0]?.d;
+          await this.client.query(`DROP INDEX IF EXISTS "${tmpIndexName}"`);
+
+          if (!modelCanonical) {
+            this.logger(`  ⓘ Could not verify index "${cand.modelIndex.name}"; leaving unchanged.\n`, 'warn');
+            continue;
+          }
+          if (!canonicalDefsEquivalent(modelCanonical, cand.dbDef)) {
+            confirmed.push(cand); // PostgreSQL confirms the definitions differ.
+          }
+          // Equivalent canonical forms → the difference was only cosmetic; skip.
+        } catch (err: any) {
+          // Could not rebuild this one (e.g. missing function) — leave it alone.
+          this.logger(`  ⓘ Could not verify index "${cand.modelIndex.name}" (${err?.message ?? err}); leaving unchanged to avoid a needless rebuild.\n`, 'warn');
+        }
+      }
+    } catch (err: any) {
+      // Could not create the mirror table — conservatively leave every candidate
+      // untouched rather than risk recreating an unchanged index.
+      this.logger(`  ⓘ Could not verify index changes on ${qualifiedTable} (${err?.message ?? err}); leaving indexes unchanged.\n`, 'warn');
+      return [];
+    } finally {
+      if (tableCreated) {
+        try { await this.client.query(`DROP TABLE IF EXISTS "${tmpTable}"`); } catch { /* best effort */ }
+      }
+    }
+
+    return confirmed;
   }
 
   /**
@@ -1848,6 +2026,8 @@ $$`;
           : operation.columns.join(', ');
         const whereDesc = operation.where ? ` WHERE ${operation.where}` : '';
         return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${whereDesc}`;
+      case 'recreate_index':
+        return `Recreate index "${operation.indexName}" on "${operation.tableName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_foreign_key':

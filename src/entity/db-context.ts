@@ -1494,12 +1494,18 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * `ensureCreated()` / `migrate()` to use `CREATE INDEX CONCURRENTLY` without
    * having to mark each index with `.concurrent()`. This must run outside a
    * transaction — PostgreSQL disallows `CONCURRENTLY` inside a transaction.
+   *
+   * `recreateChangedIndexes` (default `true`) makes `migrate()` drop + recreate
+   * a same-named index whose definition no longer matches the model (operator
+   * class, expressions, method, uniqueness, columns, partial predicate). Set it
+   * to `false` for the legacy name-only behavior.
    */
-  getSchemaManager(options?: { concurrentIndexes?: boolean }): DbSchemaManager {
+  getSchemaManager(options?: { concurrentIndexes?: boolean; recreateChangedIndexes?: boolean }): DbSchemaManager {
     return new DbSchemaManager(this.client, this.schemaRegistry, {
       logQueries: this.queryOptions?.logQueries,
       logger: this.queryOptions?.logger,
       concurrentIndexes: options?.concurrentIndexes,
+      recreateChangedIndexes: options?.recreateChangedIndexes,
     });
   }
 
@@ -4774,7 +4780,7 @@ export abstract class DatabaseContext extends DataContext {
   /**
    * Get schema manager for create/drop operations with post-migration hook support
    */
-  override getSchemaManager(options?: { concurrentIndexes?: boolean }): DbSchemaManager {
+  override getSchemaManager(options?: { concurrentIndexes?: boolean; recreateChangedIndexes?: boolean }): DbSchemaManager {
     return new DbSchemaManager(
       this.client,
       (this as any).schemaRegistry,
@@ -4790,6 +4796,7 @@ export abstract class DatabaseContext extends DataContext {
         sequenceRegistry: this.sequenceRegistry,
         searchNormalizeRequired: this.searchNormalizeRequired,
         concurrentIndexes: options?.concurrentIndexes,
+        recreateChangedIndexes: options?.recreateChangedIndexes,
       }
     );
   }

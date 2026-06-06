@@ -573,6 +573,60 @@ model.entity(User, entity => {
 
 Supported index methods: `btree`, `gin`, `gist`, `hash`, `brin`, `spgist`.
 
+### Changing an Index (same name, different definition)
+
+Automatic migration (`migrate()`) compares the **full definition** of each index
+against what PostgreSQL actually stores. If you change *how* a column is indexed
+— operator class, expression, method (`btree`→`gin`), uniqueness, columns, or the
+partial `where` predicate — while keeping the **same index name**, the migrator
+drops and recreates it so the change takes effect:
+
+```typescript
+// before: entity.hasIndex('ix_users_email', e => [e.email]);
+// after — same name, now accent/case-insensitive + prefix-searchable:
+entity.hasIndex('ix_users_email', e => [ixNormalized(e.email)]);
+
+await db.getSchemaManager().migrate();
+// → Recreate index "ix_users_email" on "users" (changed: columns (...) -> (...))
+```
+
+This is **on by default**. The recreate is **non-blocking**
+(`DROP/CREATE INDEX CONCURRENTLY`) when the index opts into concurrency — either
+per-index with `.concurrent()` or globally:
+
+```typescript
+// non-blocking recreate of any changed index
+await db.getSchemaManager({ concurrentIndexes: true }).migrate();
+
+// opt out entirely — legacy behavior, a same-named index is never touched
+await db.getSchemaManager({ recreateChangedIndexes: false }).migrate();
+```
+
+This works for `.where()` **partial indexes** too, including predicates
+PostgreSQL rewrites at parse time (`active = true`, `deleted_at IS NULL`,
+`status IN ('a','b')`, `age BETWEEN 1 AND 10`, `created_at > '2020-01-01'`, …).
+
+**An index is recreated only when PostgreSQL itself confirms the definition
+changed.** A fast string comparison flags *candidates*; before any rebuild, the
+model's index is re-created on an empty mirror table and PostgreSQL's own
+`pg_get_indexdef` of both sides is compared. Because both forms come from
+PostgreSQL's deparser, a definition that merely *looks* different — an expanded
+timestamp literal, re-parenthesized arithmetic, a hidden default operator class —
+is recognized as identical and **left untouched**.
+
+Notes:
+
+- An **unchanged** index is never rebuilt, even when the model's SQL is spelled
+  differently from what PostgreSQL stores (e.g. the `::text` cast it injects for
+  `ixNormalized` indexes on `varchar` columns).
+- If the confirmation step can't run (a read-only session, or `search_normalize`
+  support not yet created outside `migrate()`), it fails *closed* — the index is
+  left as-is rather than rebuilt.
+- `INCLUDE`/`COLLATE`/storage-parameter clauses the model can't express are left
+  alone (so a change to one of those isn't auto-detected).
+- The recreate has a brief window with no index while it rebuilds; prefer the
+  `concurrent` form on large production tables.
+
 ## Collations
 
 Define custom PostgreSQL collations for locale-aware or case/accent-insensitive text handling.
