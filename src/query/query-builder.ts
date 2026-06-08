@@ -3788,6 +3788,24 @@ ${joinClauses.join('\n')}`;
           };
         }
 
+        // Navigation builders (hasMany -> CollectionQueryBuilder, hasOne ->
+        // ReferenceQueryBuilder, and nested QueryBuilders surfaced via
+        // mock-row getters) must pass through untouched, so callers like
+        // `exists(p.children.where(...))` can still reach .where(), .exists(),
+        // .select() etc. on the second .where() call (where the row has been
+        // wrapped in this proxy via DbEntityTable.where()'s all-columns
+        // selector). Wrapping them in another get-trap proxy turned their
+        // methods into FieldRef objects and produced
+        // "TypeError: p.<navProp>.where is not a function".
+        if (
+          value instanceof CollectionQueryBuilder
+          || value instanceof ReferenceQueryBuilder
+          || value instanceof QueryBuilder
+          || value instanceof SelectQueryBuilder
+        ) {
+          return value;
+        }
+
         // If the value is an object (nested selection), recursively wrap it
         if (value && typeof value === 'object' && !Array.isArray(value)) {
           return this.createFieldRefProxy(value, preserveOriginal);
