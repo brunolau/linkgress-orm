@@ -19,6 +19,13 @@ export interface IndexSqlSpec {
   operatorClass?: string;
   expressions?: string[];
   where?: string;
+  /**
+   * Opt-in `NULLS NOT DISTINCT` for a UNIQUE index (PostgreSQL 15+): treat NULLs
+   * as equal so at most one row may have NULL in the indexed column(s). Only
+   * meaningful on unique indexes — PostgreSQL rejects it on non-unique ones, so
+   * the SQL builder emits the clause only when `isUnique` is also set.
+   */
+  nullsNotDistinct?: boolean;
 }
 
 /**
@@ -48,9 +55,14 @@ export function buildCreateIndexStatement(
   const concurrentStr = opts?.concurrent ? 'CONCURRENTLY ' : '';
   const ifNotExistsStr = opts?.ifNotExists ? 'IF NOT EXISTS ' : '';
   const usingStr = spec.using ? ` USING ${spec.using}` : '';
+  // PostgreSQL grammar: `(cols) [INCLUDE ...] [NULLS NOT DISTINCT] [WITH ...] [WHERE ...]`.
+  // Emit only on UNIQUE indexes — PostgreSQL rejects `NULLS NOT DISTINCT` on a
+  // non-unique index, so the `isUnique` guard keeps the statement valid even if a
+  // model sets the flag without `.isUnique()`.
+  const nullsNotDistinctStr = spec.isUnique && spec.nullsNotDistinct ? ' NULLS NOT DISTINCT' : '';
   const whereStr = spec.where ? ` WHERE ${spec.where}` : '';
   const columnList = buildIndexColumnList(spec);
-  return `CREATE ${uniqueStr}INDEX ${concurrentStr}${ifNotExistsStr}"${spec.name}" ON ${qualifiedTable}${usingStr} (${columnList})${whereStr}`;
+  return `CREATE ${uniqueStr}INDEX ${concurrentStr}${ifNotExistsStr}"${spec.name}" ON ${qualifiedTable}${usingStr} (${columnList})${nullsNotDistinctStr}${whereStr}`;
 }
 
 /**
@@ -79,6 +91,11 @@ export interface IndexSignature {
   columns: string;
   /** Normalized partial-index predicate (empty string when none). */
   where: string;
+  /**
+   * Whether the (unique) index treats NULLs as equal (`NULLS NOT DISTINCT`).
+   * Always `false` for a non-unique index, mirroring what PostgreSQL can store.
+   */
+  nullsNotDistinct: boolean;
 }
 
 /**
@@ -185,6 +202,9 @@ export function modelIndexSignature(spec: IndexSqlSpec): IndexSignature {
     method: (spec.using || 'btree').toLowerCase(),
     columns: normalizeIndexFragment(buildIndexColumnList(spec)),
     where: normalizeIndexPredicate(spec.where),
+    // Mirror the SQL builder's `isUnique` guard: the clause is only emitted (and
+    // only valid) on a unique index, so a non-unique spec normalizes to `false`.
+    nullsNotDistinct: !!(spec.isUnique && spec.nullsNotDistinct),
   };
 }
 
@@ -219,7 +239,18 @@ export function parseDbIndexSignature(canonicalDef: string): IndexSignature | nu
   if (closeParenIdx === -1) return null;
 
   const columns = canonicalDef.slice(openParenIdx + 1, closeParenIdx);
-  const rest = canonicalDef.slice(closeParenIdx + 1).trim();
+  let rest = canonicalDef.slice(closeParenIdx + 1).trim();
+
+  // PostgreSQL deparses `(cols) [INCLUDE ...] [NULLS NOT DISTINCT] [WITH ...] [WHERE ...]`.
+  // Strip a leading `NULLS NOT DISTINCT` (PG15+, unique indexes) before the WHERE
+  // check so a NND index no longer collapses to `null`; what remains is then
+  // either empty or a `WHERE …` predicate, exactly as before.
+  let nullsNotDistinct = false;
+  const nndMatch = /^NULLS\s+NOT\s+DISTINCT\b/i.exec(rest);
+  if (nndMatch) {
+    nullsNotDistinct = true;
+    rest = rest.slice(nndMatch[0].length).trim();
+  }
 
   let where = '';
   if (rest) {
@@ -238,6 +269,7 @@ export function parseDbIndexSignature(canonicalDef: string): IndexSignature | nu
     method,
     columns: normalizeIndexFragment(columns),
     where: normalizeIndexPredicate(where),
+    nullsNotDistinct,
   };
 }
 
@@ -278,6 +310,9 @@ export function compareIndexDefinition(
   }
   if (modelSignature.where !== dbSignature.where) {
     diffs.push(`where (${dbSignature.where || 'none'}) -> (${modelSignature.where || 'none'})`);
+  }
+  if (modelSignature.nullsNotDistinct !== dbSignature.nullsNotDistinct) {
+    diffs.push(`nulls not distinct ${dbSignature.nullsNotDistinct} -> ${modelSignature.nullsNotDistinct}`);
   }
 
   return {

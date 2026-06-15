@@ -618,6 +618,24 @@ export class IndexBuilder<TEntity extends DbEntity> {
     this.indexMetadata.where = condition;
     return this;
   }
+
+  /**
+   * Opt into `NULLS NOT DISTINCT` (PostgreSQL 15+) so the unique index treats
+   * NULLs as equal — at most one row may hold NULL in the indexed column(s),
+   * instead of PostgreSQL's default of allowing unlimited NULL rows.
+   *
+   * Only meaningful together with {@link isUnique}: PostgreSQL rejects the clause
+   * on a non-unique index, so it is emitted only when the index is also unique.
+   *
+   * @example
+   * entity.hasIndex('uq_user_external_ref', e => [e.externalRef])
+   *   .isUnique()
+   *   .nullsNotDistinct()
+   */
+  nullsNotDistinct(): this {
+    this.indexMetadata.nullsNotDistinct = true;
+    return this;
+  }
 }
 
 /**

@@ -186,6 +186,12 @@ export interface IndexMetadata {
   /** Raw SQL WHERE clause for partial indexes (e.g., 'active = true') */
   where?: string;
   /**
+   * Opt-in `NULLS NOT DISTINCT` (PostgreSQL 15+) for a UNIQUE index: treat NULLs
+   * as equal so at most one row may hold NULL in the indexed column(s). Only
+   * meaningful on unique indexes; ignored when the index is not unique.
+   */
+  nullsNotDistinct?: boolean;
+  /**
    * Set when the index contains an {@link ixNormalized} expression. The schema
    * manager uses this to create the `unaccent` extension + `search_normalize`
    * function (and `pg_trgm` when `using === 'gin'`) before building the index.

@@ -404,6 +404,7 @@ export class MigrationScaffold {
       operatorClass: op.operatorClass,
       expressions: op.expressions,
       where: op.where,
+      nullsNotDistinct: op.nullsNotDistinct,
     };
 
     return [

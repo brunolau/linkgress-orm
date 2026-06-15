@@ -64,8 +64,8 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string }
-  | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; reason?: string; previousDef?: string }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean }
+  | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -981,6 +981,7 @@ $$`;
               concurrent: modelIndex.concurrent,
               expressions: modelIndex.expressions,
               where: modelIndex.where,
+              nullsNotDistinct: modelIndex.nullsNotDistinct,
             });
           } else if (this.recreateChangedIndexes) {
             const comparison = compareIndexDefinition(dbIndex.canonical_def, modelIndex);
@@ -1011,6 +1012,7 @@ $$`;
               concurrent: cand.modelIndex.concurrent,
               expressions: cand.modelIndex.expressions,
               where: cand.modelIndex.where,
+              nullsNotDistinct: cand.modelIndex.nullsNotDistinct,
               reason: cand.reason,
               previousDef: cand.dbDef,
             });
@@ -1143,6 +1145,7 @@ $$`;
               concurrent: index.concurrent,
               expressions: index.expressions,
               where: index.where,
+              nullsNotDistinct: index.nullsNotDistinct,
             });
           }
         }
@@ -1261,6 +1264,7 @@ $$`;
           concurrent: operation.concurrent,
           expressions: operation.expressions,
           where: operation.where,
+          nullsNotDistinct: operation.nullsNotDistinct,
         }, operation.schema);
         break;
 
@@ -1478,7 +1482,7 @@ $$`;
   private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
   private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string }, schema?: string): Promise<void> {
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean }, schema?: string): Promise<void> {
     if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
       throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
     }
@@ -1539,6 +1543,7 @@ $$`;
       concurrent: operation.concurrent,
       expressions: operation.expressions,
       where: operation.where,
+      nullsNotDistinct: operation.nullsNotDistinct,
     }, operation.schema);
   }
 

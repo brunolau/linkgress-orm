@@ -255,3 +255,116 @@ describe('index-sql: canonicalDefsEquivalent (Tier-2 authoritative comparison)',
     expect(sig.body.startsWith('USING btree (email)')).toBe(true);
   });
 });
+
+describe('index-sql: NULLS NOT DISTINCT (opt-in, PG15+ unique indexes)', () => {
+  // (a) SQL-gen: a UNIQUE index with the flag emits the clause in PostgreSQL's
+  // grammar slot — after the column list, before WHERE.
+  it('emits " NULLS NOT DISTINCT" after the column list on a UNIQUE index', () => {
+    const sql = buildCreateIndexStatement(
+      { name: 'uq_ref', columns: ['external_ref'], isUnique: true, nullsNotDistinct: true },
+      '"public"."t"'
+    );
+    expect(sql).toBe('CREATE UNIQUE INDEX "uq_ref" ON "public"."t" ("external_ref") NULLS NOT DISTINCT');
+  });
+
+  it('places NULLS NOT DISTINCT between the column list and WHERE', () => {
+    const sql = buildCreateIndexStatement(
+      { name: 'uq_ref', columns: ['a', 'b'], isUnique: true, nullsNotDistinct: true, where: 'deleted_at IS NULL' },
+      '"t"'
+    );
+    expect(sql).toBe('CREATE UNIQUE INDEX "uq_ref" ON "t" ("a", "b") NULLS NOT DISTINCT WHERE deleted_at IS NULL');
+    // Ordering guard: the clause sits after the closing ')' and before 'WHERE'.
+    const nndAt = sql.indexOf('NULLS NOT DISTINCT');
+    expect(nndAt).toBeGreaterThan(sql.indexOf(')'));
+    expect(nndAt).toBeLessThan(sql.indexOf('WHERE'));
+  });
+
+  // (b) Guarded no-op on a NON-unique index (PostgreSQL rejects it there), so the
+  // emitted SQL is byte-identical to the same index without the flag.
+  it('does NOT emit NULLS NOT DISTINCT on a non-unique index (guarded no-op)', () => {
+    const withFlag = buildCreateIndexStatement(
+      { name: 'ix_ref', columns: ['external_ref'], nullsNotDistinct: true },
+      '"t"'
+    );
+    const withoutFlag = buildCreateIndexStatement(
+      { name: 'ix_ref', columns: ['external_ref'] },
+      '"t"'
+    );
+    expect(withFlag).not.toContain('NULLS NOT DISTINCT');
+    expect(withFlag).toBe(withoutFlag);
+    expect(withFlag).toBe('CREATE INDEX "ix_ref" ON "t" ("external_ref")');
+  });
+
+  // Existing (flag-unset) UNIQUE indexes still emit byte-identically to before.
+  it('a UNIQUE index WITHOUT the flag is unchanged — no clause leaks in', () => {
+    expect(
+      buildCreateIndexStatement({ name: 'uq', columns: ['email'], isUnique: true }, '"t"')
+    ).toBe('CREATE UNIQUE INDEX "uq" ON "t" ("email")');
+  });
+
+  // parseDbIndexSignature: a live NND index now parses instead of collapsing to
+  // null (the prior bug treated it as "unparseable -> unchanged").
+  it('parseDbIndexSignature reads NULLS NOT DISTINCT (previously returned null)', () => {
+    const sig = parseDbIndexSignature(
+      'CREATE UNIQUE INDEX uq ON public.t USING btree (external_ref) NULLS NOT DISTINCT'
+    );
+    expect(sig).not.toBeNull();
+    expect(sig!.isUnique).toBe(true);
+    expect(sig!.nullsNotDistinct).toBe(true);
+    expect(sig!.where).toBe('');
+  });
+
+  it('parseDbIndexSignature reads NULLS NOT DISTINCT together with a WHERE predicate', () => {
+    const sig = parseDbIndexSignature(
+      'CREATE UNIQUE INDEX uq ON public.t USING btree (a) NULLS NOT DISTINCT WHERE active = true'
+    );
+    expect(sig).not.toBeNull();
+    expect(sig!.nullsNotDistinct).toBe(true);
+    expect(sig!.where).toBe('active = true');
+  });
+
+  // (c) Reconcile: declared NND vs live NND => UNCHANGED (no churn). The
+  // non-null + nullsNotDistinct assertions prove the live def actually parsed.
+  it('declared NULLS NOT DISTINCT vs live NULLS NOT DISTINCT => no change', () => {
+    const liveDef = 'CREATE UNIQUE INDEX uq ON probe.t USING btree (external_ref) NULLS NOT DISTINCT';
+    const model: IndexSqlSpec = { name: 'uq', columns: ['external_ref'], isUnique: true, nullsNotDistinct: true };
+    const result = compareIndexDefinition(liveDef, model);
+    expect(result.dbSignature).not.toBeNull();
+    expect(result.dbSignature!.nullsNotDistinct).toBe(true);
+    expect(result.modelSignature.nullsNotDistinct).toBe(true);
+    expect(result.changed).toBe(false);
+  });
+
+  // (d) Reconcile: declared NND vs live DISTINCT => CHANGED (recreate).
+  it('declared NULLS NOT DISTINCT vs live DISTINCT => change (recreate)', () => {
+    const liveDistinct = 'CREATE UNIQUE INDEX uq ON probe.t USING btree (external_ref)';
+    const model: IndexSqlSpec = { name: 'uq', columns: ['external_ref'], isUnique: true, nullsNotDistinct: true };
+    const result = compareIndexDefinition(liveDistinct, model);
+    expect(result.dbSignature!.nullsNotDistinct).toBe(false);
+    expect(result.changed).toBe(true);
+    expect(result.reason).toMatch(/nulls not distinct/i);
+  });
+
+  // (d, reverse) declared DISTINCT vs live NND => CHANGED. This specifically
+  // exercises the parse fix: the live NND def previously collapsed to null and
+  // the real difference was silently invisible (changed=false).
+  it('declared DISTINCT vs live NULLS NOT DISTINCT => change (fixes prior null-return bug)', () => {
+    const liveNND = 'CREATE UNIQUE INDEX uq ON probe.t USING btree (external_ref) NULLS NOT DISTINCT';
+    const model: IndexSqlSpec = { name: 'uq', columns: ['external_ref'], isUnique: true };
+    const result = compareIndexDefinition(liveNND, model);
+    expect(result.dbSignature).not.toBeNull();
+    expect(result.modelSignature.nullsNotDistinct).toBe(false);
+    expect(result.changed).toBe(true);
+    expect(result.reason).toMatch(/nulls not distinct/i);
+  });
+
+  // The flag normalizes to false on a non-unique spec, mirroring the SQL guard,
+  // so a non-unique index that erroneously sets it never falsely churns.
+  it('a non-unique spec with the flag set normalizes to nullsNotDistinct=false (no false churn)', () => {
+    const liveDef = 'CREATE INDEX ix ON probe.t USING btree (external_ref)';
+    const model: IndexSqlSpec = { name: 'ix', columns: ['external_ref'], nullsNotDistinct: true };
+    const result = compareIndexDefinition(liveDef, model);
+    expect(result.modelSignature.nullsNotDistinct).toBe(false);
+    expect(result.changed).toBe(false);
+  });
+});
