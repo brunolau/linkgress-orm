@@ -97,9 +97,38 @@ export type OrderByTuple<T = unknown> = [T, OrderDirection];
 export type OrderByResult<T = unknown> = T | T[] | Array<OrderByTuple<T>>;
 
 /**
- * Log level for logger function
+ * The section a log message belongs to — *what* is being logged — so a custom
+ * logger can route or filter by category (e.g. drop `'sql'`, keep `'error'`).
+ *
+ * - `'sql'`     — the SQL query text
+ * - `'params'`  — query parameters
+ * - `'timing'`  — execution time / time-trace output
+ * - `'slow'`    — a slow-query notice (see `onQueryTakingTooLong`)
+ * - `'info'`    — general informational messages (migrations, etc.)
+ * - `'warn'`    — warnings
+ * - `'error'`   — errors
  */
-export type LogLevel = 'info' | 'warn' | 'error' | 'debug';
+export type LogSection = 'sql' | 'params' | 'timing' | 'slow' | 'info' | 'warn' | 'error';
+
+/**
+ * @deprecated Renamed to {@link LogSection}. The logger's second argument is now
+ * the log *section* (what is being logged), not a severity level. Kept as an alias.
+ */
+export type LogLevel = LogSection;
+
+/**
+ * Default logger used when no custom `logger` is provided. Routes by section to
+ * the appropriate console method.
+ */
+export function defaultLogger(message: string, section?: LogSection): void {
+  if (section === 'error') {
+    console.error(message);
+  } else if (section === 'warn') {
+    console.warn(message);
+  } else {
+    console.log(message);
+  }
+}
 
 /**
  * Query execution options
@@ -107,8 +136,12 @@ export type LogLevel = 'info' | 'warn' | 'error' | 'debug';
 export interface QueryOptions {
   /** Enable SQL query logging */
   logQueries?: boolean;
-  /** Custom logger function (defaults to console.log). Level indicates the type of log message. */
-  logger?: (message: string, level?: LogLevel) => void;
+  /**
+   * Custom logger function (defaults to {@link defaultLogger}). The second
+   * argument is the {@link LogSection} — what is being logged ('sql', 'params',
+   * 'timing', 'error', ...) — so the logger can filter or route by category.
+   */
+  logger?: (message: string, section?: LogSection) => void;
   /** Log query execution time */
   logExecutionTime?: boolean;
   /** Log query parameters */
@@ -147,6 +180,148 @@ export interface QueryOptions {
    * Default: false
    */
   traceTime?: boolean;
+  /**
+   * Callback invoked when a query's execution time exceeds its expected
+   * threshold (the default {@link longRunningQueryThreshold}, or a per-query
+   * `.expectedExecutionTime(ms)` override). Providing this callback enables
+   * slow-query detection — which captures a call stack per query, so leave it
+   * unset when you don't need it.
+   *
+   * The query still runs to completion (this is a diagnostic notice, not a
+   * cancellation — use `.withTimeout()` to actually cancel). The callback
+   * receives the SQL, params, duration, threshold, and the **user** call stack
+   * that initiated the query (internal linkgress frames removed), so the top
+   * frame is the code that called `.toList()` / `.firstOrDefault()` / etc.
+   *
+   * Errors thrown by the callback are swallowed so they cannot affect the query.
+   */
+  onQueryTakingTooLong?: (info: SlowQueryInfo) => void;
+  /**
+   * Threshold in milliseconds above which a query is considered "too long" and
+   * {@link onQueryTakingTooLong} fires. Overridable per query with
+   * `.expectedExecutionTime(ms)`. Default: 10000 (10s).
+   */
+  longRunningQueryThreshold?: number;
+}
+
+/**
+ * Details passed to the {@link QueryOptions.onQueryTakingTooLong} callback when a
+ * query runs longer than its expected execution time.
+ */
+export interface SlowQueryInfo {
+  /** The SQL text that was executed. */
+  sql: string;
+  /** The query parameters, if any. */
+  params?: any[];
+  /** Actual execution time in milliseconds. */
+  durationMs: number;
+  /** The threshold that was exceeded, in milliseconds. */
+  thresholdMs: number;
+  /**
+   * Call stack of the user code that initiated the query, with linkgress
+   * internal frames removed — the top frame is the call site of the terminal
+   * method (`.toList()`, `.firstOrDefault()`, `.count()`, ...). Empty string if
+   * no user frames could be resolved.
+   */
+  stack: string;
+}
+
+/**
+ * Basenames (without extension) of the linkgress source files that can appear in
+ * a query's call stack between the public terminal method (`.toList()` etc.) and
+ * the user's code. Internal frames are stripped from {@link SlowQueryInfo.stack}
+ * by matching these file IDENTITIES — not an install path — so it works wherever
+ * the package lives (node_modules, a monorepo, ts-node/ts-jest, a global link).
+ */
+const LINKGRESS_INTERNAL_FILES = new Set([
+  'db-context',
+  'query-builder',
+  'grouped-query',
+  'union-builder',
+  'join-builder',
+  'future-query',
+  'prepared-query',
+]);
+
+/** Extract the source-file basename (without extension) from a V8 stack frame line. */
+function stackFrameFile(line: string): string | undefined {
+  // Matches the "<file>:<line>:<col>" tail, e.g.
+  //   "    at SelectQueryBuilder.toList (C:\repo\src\query\query-builder.ts:2019:17)"
+  //   "    at /repo/dist/entity/db-context.js:574:22"
+  const match = line.match(/([^()\s]+):\d+:\d+\)?\s*$/);
+  if (!match) return undefined;
+  const base = match[1].split(/[\\/]/).pop();
+  return base ? base.replace(/\.[cm]?[jt]s$/, '') : undefined;
+}
+
+/**
+ * Capture a stack-trace holder cheaply — the `.stack` string is only formatted
+ * on access, so this is paid for fully only when the query turns out slow. Call
+ * it from within the user's synchronous call chain (before awaiting), so the
+ * user's frames are present. Temporarily raises the capture depth so deep user
+ * frames survive the internal frames sitting above them.
+ */
+function captureStackHolder(): { stack?: string } {
+  const holder: { stack?: string } = {};
+  const previousLimit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 50;
+  if (typeof Error.captureStackTrace === 'function') {
+    Error.captureStackTrace(holder, captureStackHolder);
+  } else {
+    holder.stack = new Error().stack;
+  }
+  Error.stackTraceLimit = previousLimit;
+  return holder;
+}
+
+/**
+ * Turn a captured stack into the user-facing call stack: drop the leading run of
+ * linkgress-internal frames (identified by source-file basename, so it is robust
+ * to wherever the package is installed and catches anonymous internal closures
+ * too), leaving the user's terminal-method call site as the first frame. Falls
+ * back to all frames if filtering would leave nothing.
+ */
+function extractUserStack(holder?: { stack?: string }): string {
+  const raw = holder?.stack;
+  if (!raw) return '';
+  const frames = raw.split('\n').filter(line => line.trim().startsWith('at '));
+  let i = 0;
+  while (i < frames.length) {
+    const file = stackFrameFile(frames[i]);
+    if (file && LINKGRESS_INTERNAL_FILES.has(file)) {
+      i++;
+    } else {
+      break;
+    }
+  }
+  const userFrames = frames.slice(i);
+  return (userFrames.length > 0 ? userFrames : frames).join('\n');
+}
+
+/**
+ * Invoke the slow-query callback defensively: resolve the user stack lazily and
+ * swallow any error from the callback so a diagnostic notice can never break the
+ * query that triggered it.
+ */
+function fireSlowQueryCallback(
+  callback: (info: SlowQueryInfo) => void,
+  sql: string,
+  params: any[] | undefined,
+  durationMs: number,
+  thresholdMs: number,
+  stackHolder?: { stack?: string }
+): void {
+  let stack = '';
+  try {
+    stack = extractUserStack(stackHolder);
+  } catch {
+    /* ignore stack-extraction failures */
+  }
+  try {
+    callback({ sql, params, durationMs, thresholdMs, stack });
+  } catch {
+    /* swallow — the slow-query notice must never affect the query */
+  }
 }
 
 /**
@@ -185,7 +360,7 @@ export class TimeTracer {
   private phaseStartTime: number = 0;
   private phases: Record<string, number> = {};
 
-  constructor(private enabled: boolean, private logger?: (message: string, level?: LogLevel) => void) {
+  constructor(private enabled: boolean, private logger?: (message: string, section?: LogSection) => void) {
     if (enabled) {
       this.startTime = performance.now();
     }
@@ -280,30 +455,30 @@ export class TimeTracer {
     if (!this.enabled) return;
 
     const trace = this.getTrace(rowCount);
-    const log = this.logger || console.log;
+    const log = this.logger || defaultLogger;
 
-    log('\n[Time Trace Summary]', 'debug');
-    log(`  Total: ${trace.totalMs.toFixed(2)}ms`, 'debug');
+    log('\n[Time Trace Summary]', 'timing');
+    log(`  Total: ${trace.totalMs.toFixed(2)}ms`, 'timing');
     if (trace.phases.queryBuild !== undefined) {
-      log(`  Query Build: ${trace.phases.queryBuild.toFixed(2)}ms`, 'debug');
+      log(`  Query Build: ${trace.phases.queryBuild.toFixed(2)}ms`, 'timing');
     }
     if (trace.phases.queryExecution !== undefined) {
-      log(`  Query Execution: ${trace.phases.queryExecution.toFixed(2)}ms`, 'debug');
+      log(`  Query Execution: ${trace.phases.queryExecution.toFixed(2)}ms`, 'timing');
     }
     if (trace.phases.resultProcessing !== undefined) {
-      log(`  Result Processing: ${trace.phases.resultProcessing.toFixed(2)}ms`, 'debug');
+      log(`  Result Processing: ${trace.phases.resultProcessing.toFixed(2)}ms`, 'timing');
     }
     if (rowCount !== undefined) {
-      log(`  Rows: ${rowCount}`, 'debug');
+      log(`  Rows: ${rowCount}`, 'timing');
     }
 
     // Log detailed entries if there are any significant operations
     const significantEntries = this.entries.filter(e => e.durationMs > 0.1);
     if (significantEntries.length > 0) {
-      log('\n[Detailed Trace]', 'debug');
+      log('\n[Detailed Trace]', 'timing');
       for (const entry of significantEntries) {
         const details = entry.details ? ` (${JSON.stringify(entry.details)})` : '';
-        log(`  [${entry.phase}] ${entry.operation}: ${entry.durationMs.toFixed(2)}ms${details}`, 'debug');
+        log(`  [${entry.phase}] ${entry.operation}: ${entry.durationMs.toFixed(2)}ms${details}`, 'timing');
       }
     }
   }
@@ -326,7 +501,13 @@ export class QueryExecutor {
      * the driver as `QueryExecutionOptions.timeoutMs`. `undefined` means no
      * override (the connection-level default, if any, applies).
      */
-    private overrideTimeoutMs?: number
+    private overrideTimeoutMs?: number,
+    /**
+     * Per-query "expected execution time" override (ms) set via
+     * `.expectedExecutionTime()`. If the query runs longer than this,
+     * `onQueryTakingTooLong` fires. `undefined` means use the context default.
+     */
+    private overrideExpectedMs?: number
   ) {}
 
   /**
@@ -349,33 +530,79 @@ export class QueryExecutor {
    * the derived executor. Used by `.withTimeout()` on the query builders.
    */
   withTimeout(timeoutMs: number): QueryExecutor {
-    return new QueryExecutor(this.client, this.options, timeoutMs);
+    return new QueryExecutor(this.client, this.options, timeoutMs, this.overrideExpectedMs);
+  }
+
+  /**
+   * Return a new executor that flags this query as expected to finish within
+   * `expectedMs` — if it runs longer, `onQueryTakingTooLong` fires. Used by
+   * `.expectedExecutionTime()` on the query builders.
+   */
+  withExpectedExecutionTime(expectedMs: number): QueryExecutor {
+    return new QueryExecutor(this.client, this.options, this.overrideTimeoutMs, expectedMs);
+  }
+
+  /** Whether slow-query detection is active (a callback is configured). */
+  private get slowQueryEnabled(): boolean {
+    return typeof this.options.onQueryTakingTooLong === 'function';
+  }
+
+  /** Effective "too long" threshold for the current query (ms). */
+  private get expectedExecutionMs(): number {
+    return this.overrideExpectedMs ?? this.options.longRunningQueryThreshold ?? 10000;
+  }
+
+  /**
+   * Begin timing/stack capture for a query. Returns `undefined` when neither
+   * execution-time logging nor slow-query detection is active (zero overhead).
+   * The stack is captured here — synchronously, inside the caller's call chain —
+   * so the slow-query callback can report the user's code, not an async frame.
+   */
+  private beginTiming(): { startTime: number; stackHolder?: { stack?: string } } | undefined {
+    if (!this.options.logExecutionTime && !this.slowQueryEnabled) {
+      return undefined;
+    }
+    const stackHolder = this.slowQueryEnabled ? captureStackHolder() : undefined;
+    return { startTime: performance.now(), stackHolder };
+  }
+
+  /**
+   * Finish timing: log execution time (if enabled) and fire the slow-query
+   * callback (if enabled and the expected threshold was exceeded).
+   */
+  private finishTiming(
+    timing: { startTime: number; stackHolder?: { stack?: string } } | undefined,
+    logger: (message: string, section?: LogSection) => void,
+    sql: string,
+    params?: any[]
+  ): void {
+    if (!timing) return;
+    const duration = performance.now() - timing.startTime;
+    if (this.options.logExecutionTime) {
+      logger(`[Execution Time] ${duration.toFixed(2)}ms`, 'timing');
+    }
+    const callback = this.options.onQueryTakingTooLong;
+    if (callback && duration > this.expectedExecutionMs) {
+      fireSlowQueryCallback(callback, sql, params, duration, this.expectedExecutionMs, timing.stackHolder);
+    }
   }
 
   async query(sql: string, params?: any[]): Promise<QueryResult> {
-    const logger = this.options.logger || console.log;
-    const startTime = this.options.logExecutionTime ? performance.now() : 0;
+    const logger = this.options.logger || defaultLogger;
+    const timing = this.beginTiming();
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query]`, 'debug');
-      logger(sql.trim(), 'debug');
+      logger(`\n[SQL Query]`, 'sql');
+      logger(sql.trim(), 'sql');
 
       if (this.options.logParameters && params && params.length > 0) {
-        logger(`[Parameters] ${JSON.stringify(params)}`, 'debug');
+        logger(`[Parameters] ${JSON.stringify(params)}`, 'params');
       }
     }
 
     try {
-      // Pass binary-protocol and/or per-query timeout options when set
-      const queryOptions = this.buildExecutionOptions();
-
-      const result = await this.client.query(sql, params, queryOptions);
-
-      if (this.options.logExecutionTime) {
-        const duration = (performance.now() - startTime).toFixed(2);
-        logger(`[Execution Time] ${duration}ms`, 'debug');
-      }
-
+      const result = await this.client.query(sql, params, this.buildExecutionOptions());
+      this.finishTiming(timing, logger, sql, params);
       return result;
     } catch (error) {
       if (this.options.logQueries) {
@@ -390,36 +617,24 @@ export class QueryExecutor {
    * Only available for clients that support it (e.g., PostgresClient)
    */
   async querySimple(sql: string): Promise<QueryResult> {
-    const logger = this.options.logger || console.log;
-    const startTime = this.options.logExecutionTime ? performance.now() : 0;
+    const logger = this.options.logger || defaultLogger;
+    const timing = this.beginTiming();
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query - Multi-Statement]`, 'debug');
-      logger(sql.trim(), 'debug');
+      logger(`\n[SQL Query - Multi-Statement]`, 'sql');
+      logger(sql.trim(), 'sql');
     }
 
     try {
-      // Check if client has querySimple method
+      let result: QueryResult;
       if ('querySimple' in this.client && typeof (this.client as any).querySimple === 'function') {
-        const result = await (this.client as any).querySimple(sql);
-
-        if (this.options.logExecutionTime) {
-          const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`, 'debug');
-        }
-
-        return result;
+        result = await (this.client as any).querySimple(sql);
       } else {
         // Fallback to regular query
-        const result = await this.client.query(sql, []);
-
-        if (this.options.logExecutionTime) {
-          const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`, 'debug');
-        }
-
-        return result;
+        result = await this.client.query(sql, []);
       }
+      this.finishTiming(timing, logger, sql);
+      return result;
     } catch (error) {
       if (this.options.logQueries) {
         logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
@@ -433,24 +648,19 @@ export class QueryExecutor {
    * Only available for PostgresClient
    */
   async querySimpleMulti(sql: string): Promise<QueryResult[]> {
-    const logger = this.options.logger || console.log;
-    const startTime = this.options.logExecutionTime ? performance.now() : 0;
+    const logger = this.options.logger || defaultLogger;
+    const timing = this.beginTiming();
 
     if (this.options.logQueries) {
-      logger(`\n[SQL Query - Fully Optimized Multi-Statement]`, 'debug');
-      logger(sql.trim(), 'debug');
+      logger(`\n[SQL Query - Fully Optimized Multi-Statement]`, 'sql');
+      logger(sql.trim(), 'sql');
     }
 
     try {
       // Check if client has querySimpleMulti method
       if ('querySimpleMulti' in this.client && typeof (this.client as any).querySimpleMulti === 'function') {
         const results = await (this.client as any).querySimpleMulti(sql);
-
-        if (this.options.logExecutionTime) {
-          const duration = (performance.now() - startTime).toFixed(2);
-          logger(`[Execution Time] ${duration}ms`, 'debug');
-        }
-
+        this.finishTiming(timing, logger, sql);
         return results;
       } else {
         throw new Error('querySimpleMulti not supported by this client');
@@ -901,7 +1111,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
 
     // Create new executor if logging options are provided
     let newExecutor = this.executor;
-    if (options.logQueries || options.logExecutionTime) {
+    if (options.logQueries || options.logExecutionTime || options.onQueryTakingTooLong) {
       newExecutor = new QueryExecutor(this.client, {
         ...options,
         collectionStrategy: mergedStrategy,
@@ -931,6 +1141,25 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     const newExecutor = this.executor
       ? this.executor.withTimeout(timeoutMs)
       : new QueryExecutor(this.client, undefined, timeoutMs);
+    return new TableAccessor(
+      this.tableBuilder,
+      this.client,
+      this.schemaRegistry,
+      newExecutor,
+      this.collectionStrategy
+    );
+  }
+
+  /**
+   * Mark queries started from the returned accessor as expected to finish within
+   * `expectedMs` (ms). If a query runs longer, the context's
+   * `onQueryTakingTooLong` callback fires — the query is NOT cancelled (use
+   * `.withTimeout()` for that). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): TableAccessor<TBuilder> {
+    const newExecutor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
     return new TableAccessor(
       this.tableBuilder,
       this.client,
@@ -1370,7 +1599,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     this.queryOptions = queryOptions;
 
     // Create executor if logging is enabled
-    if (queryOptions?.logQueries || queryOptions?.logExecutionTime) {
+    if (queryOptions?.logQueries || queryOptions?.logExecutionTime || queryOptions?.onQueryTakingTooLong) {
       this.executor = new QueryExecutor(client, queryOptions);
     }
 
@@ -1494,7 +1723,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     (txContext as any).queryOptions = this.queryOptions;
 
     // Create executor for the transactional client if logging is enabled
-    if (this.queryOptions?.logQueries || this.queryOptions?.logExecutionTime) {
+    if (this.queryOptions?.logQueries || this.queryOptions?.logExecutionTime || this.queryOptions?.onQueryTakingTooLong) {
       (txContext as any).executor = new QueryExecutor(txClient, this.queryOptions);
     }
 
@@ -1781,6 +2010,13 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   withTimeout(timeoutMs: number): IEntityQueryable<TEntity>;
 
   /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires (the query is
+   * NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): IEntityQueryable<TEntity>;
+
+  /**
    * Add a WHERE condition. Multiple where() calls are chained with AND logic.
    */
   where(condition: (entity: EntityQuery<TEntity>) => Condition): IEntityQueryable<TEntity>;
@@ -1946,6 +2182,13 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
    * to disable. On timeout a `QueryTimeoutError` is thrown.
    */
   withTimeout(timeoutMs: number): EntitySelectQueryBuilder<TEntity, TSelection>;
+
+  /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires (the query is
+   * NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   select<TNewSelection>(
     selector: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TNewSelection
@@ -2468,7 +2711,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
 
     // Create new executor if logging options are provided
     let newExecutor = (originalContext as any).executor;
-    if (mergedOptions.logQueries || mergedOptions.logExecutionTime) {
+    if (mergedOptions.logQueries || mergedOptions.logExecutionTime || mergedOptions.onQueryTakingTooLong) {
       newExecutor = new QueryExecutor(
         (originalContext as any).client,
         mergedOptions
@@ -2528,13 +2771,39 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * await db.users.withTimeout(5000).where(u => gt(u.id, 0)).toList();
    */
   withTimeout(timeoutMs: number): DbEntityTable<TEntity> {
+    return this._deriveWithExecutor((current, client) =>
+      current ? current.withTimeout(timeoutMs) : new QueryExecutor(client, undefined, timeoutMs)
+    );
+  }
+
+  /**
+   * Mark queries started from the returned table as expected to finish within
+   * `expectedMs` (ms). If a query runs longer, the context's
+   * `onQueryTakingTooLong` callback fires — the query is NOT cancelled (use
+   * `.withTimeout()` for that). Overrides the context's `longRunningQueryThreshold`.
+   *
+   * @example
+   * await db.users.expectedExecutionTime(2000).where(u => gt(u.id, 0)).toList();
+   */
+  expectedExecutionTime(expectedMs: number): DbEntityTable<TEntity> {
+    return this._deriveWithExecutor((current, client) =>
+      current ? current.withExpectedExecutionTime(expectedMs) : new QueryExecutor(client, undefined, undefined, expectedMs)
+    );
+  }
+
+  /**
+   * Build a derived table whose context surfaces a transformed executor (via a
+   * proxy context, threaded into this table's accessor). Shared by
+   * `.withTimeout()` and `.expectedExecutionTime()`.
+   * @internal
+   */
+  private _deriveWithExecutor(
+    makeExecutor: (current: QueryExecutor | undefined, client: DatabaseClient) => QueryExecutor
+  ): DbEntityTable<TEntity> {
     const originalContext = this.context;
     const tableName = this.tableName;
-    const client = (originalContext as any).client;
-    const currentExecutor = (originalContext as any).executor as QueryExecutor | undefined;
-    const newExecutor = currentExecutor
-      ? currentExecutor.withTimeout(timeoutMs)
-      : new QueryExecutor(client, undefined, timeoutMs);
+    const client = (originalContext as any).client as DatabaseClient;
+    const newExecutor = makeExecutor((originalContext as any).executor as QueryExecutor | undefined, client);
     const collectionStrategy = (originalContext as any).queryOptions?.collectionStrategy;
 
     const proxyContext = new Proxy(originalContext, {

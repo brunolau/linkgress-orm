@@ -107,6 +107,18 @@ export class UnionQueryBuilder<TSelection> {
   }
 
   /**
+   * Mark this union query as expected to finish within `expectedMs` (ms). If it
+   * runs longer, the context's `onQueryTakingTooLong` callback fires (the query
+   * is NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
+    return this;
+  }
+
+  /**
    * Add a query with UNION (removes duplicate rows)
    *
    * @param query The query to union with the current result

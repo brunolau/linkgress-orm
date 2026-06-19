@@ -170,6 +170,9 @@ export {
 export {
   QueryOptions,
   LogLevel,
+  LogSection,
+  SlowQueryInfo,
+  defaultLogger,
   LoggingOptions,
   CollectionStrategyType,
   TimeTracer,

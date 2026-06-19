@@ -77,6 +77,18 @@ export class JoinQueryBuilder<TLeft, TRight> {
   }
 
   /**
+   * Mark this join query as expected to finish within `expectedMs` (ms). If it
+   * runs longer, the context's `onQueryTakingTooLong` callback fires (the query
+   * is NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
+    return this;
+  }
+
+  /**
    * Add another left join
    */
   leftJoin<TThird>(

@@ -219,6 +219,18 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   }
 
   /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires (the query is
+   * NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
+    return this;
+  }
+
+  /**
    * Select from grouped results
    * The selector receives a GroupedItem with key and aggregate functions
    */
@@ -465,6 +477,18 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     this.executor = this.executor
       ? this.executor.withTimeout(timeoutMs)
       : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
+  }
+
+  /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires (the query is
+   * NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
     return this;
   }
 
@@ -1844,6 +1868,18 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     this.executor = this.executor
       ? this.executor.withTimeout(timeoutMs)
       : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
+  }
+
+  /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires (the query is
+   * NOT cancelled). Overrides the context's `longRunningQueryThreshold`.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
     return this;
   }
 

@@ -235,6 +235,19 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   }
 
   /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires — the query is
+   * NOT cancelled (use `.withTimeout()` for that). Overrides the context's
+   * `longRunningQueryThreshold` for this query.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
+    return this;
+  }
+
+  /**
    * Get qualified table name with schema prefix if specified
    */
   private getQualifiedTableName(tableName: string, schema?: string): string {
@@ -770,6 +783,19 @@ export class SelectQueryBuilder<TSelection> {
     this.executor = this.executor
       ? this.executor.withTimeout(timeoutMs)
       : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
+  }
+
+  /**
+   * Mark this query as expected to finish within `expectedMs` (ms). If it runs
+   * longer, the context's `onQueryTakingTooLong` callback fires — the query is
+   * NOT cancelled (use `.withTimeout()` for that). Overrides the context's
+   * `longRunningQueryThreshold` for this query.
+   */
+  expectedExecutionTime(expectedMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withExpectedExecutionTime(expectedMs)
+      : new QueryExecutor(this.client, undefined, undefined, expectedMs);
     return this;
   }
 
