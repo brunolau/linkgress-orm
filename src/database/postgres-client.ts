@@ -1,8 +1,11 @@
-import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions } from './database-client.interface';
+import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, QueryTimeoutError } from './database-client.interface';
 import type { PostgresOptions } from './types';
 
 // Use dynamic import to make postgres optional
 type Sql = any;
+
+/** PostgreSQL error code raised when a statement is cancelled due to a timeout. */
+const STATEMENT_TIMEOUT_CODE = '57014';
 
 /**
  * Check if a value is a postgres.Sql instance
@@ -11,21 +14,74 @@ function isPostgresSqlInstance(value: any): boolean {
   return value && typeof value === 'function' && typeof value.unsafe === 'function' && typeof value.end === 'function';
 }
 
+/** Clamp a timeout to a safe non-negative integer for inlining into SET LOCAL. */
+function normalizeTimeoutMs(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? Math.max(0, Math.floor(timeoutMs)) : 0;
+}
+
+/**
+ * Translate a statement-timeout cancellation (PostgreSQL `57014`) into a typed
+ * {@link QueryTimeoutError}. Any other error is returned unchanged.
+ */
+function asTimeoutError(error: any, timeoutMs: number | undefined, sql: string): any {
+  if (error && error.code === STATEMENT_TIMEOUT_CODE) {
+    return new QueryTimeoutError(timeoutMs ?? 0, sql, error);
+  }
+  return error;
+}
+
+/**
+ * Execute a single statement against a `postgres` (porsager) sql instance,
+ * honoring an optional per-query timeout override.
+ *
+ * - No override (`timeoutMs === undefined`): run the query directly. Any
+ *   connection-level `statement_timeout` default still applies (server-enforced,
+ *   no wrapping).
+ * - Override present: run the query inside a short transaction that issues
+ *   `SET LOCAL statement_timeout` first. `SET LOCAL` is scoped to the
+ *   transaction and auto-resets at COMMIT, so it never leaks to other queries on
+ *   the pooled connection. `timeoutMs === 0` disables the timeout for this query.
+ *
+ * A statement-timeout cancellation is surfaced as a {@link QueryTimeoutError}.
+ */
+async function runStatement(
+  sqlInstance: Sql,
+  sql: string,
+  params: any[] | undefined,
+  timeoutMs: number | undefined,
+  defaultTimeoutMs: number | undefined
+): Promise<QueryResult> {
+  if (timeoutMs === undefined) {
+    try {
+      const result = await sqlInstance.unsafe(sql, params || []);
+      return { rows: result, rowCount: result.count ?? null };
+    } catch (error) {
+      throw asTimeoutError(error, defaultTimeoutMs, sql);
+    }
+  }
+
+  // Per-query override: wrap only this query so SET LOCAL auto-resets at COMMIT.
+  try {
+    return await sqlInstance.begin(async (tx: Sql) => {
+      await tx.unsafe(`SET LOCAL statement_timeout = ${normalizeTimeoutMs(timeoutMs)}`);
+      const result = await tx.unsafe(sql, params || []);
+      return { rows: result, rowCount: result.count ?? null };
+    });
+  } catch (error) {
+    throw asTimeoutError(error, timeoutMs, sql);
+  }
+}
+
 /**
  * Wrapper for the pooled connection from postgres library
  */
 class PostgresPooledConnection implements PooledConnection {
-  constructor(private sql: Sql) {}
+  constructor(private sql: Sql, private defaultStatementTimeout?: number) {}
 
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // postgres library doesn't have explicit binary protocol toggle
-    // It automatically uses the most efficient protocol based on data types
-    const result = await this.sql.unsafe(sql, params || []);
-
-    return {
-      rows: result as T[],
-      rowCount: result.count ?? null,
-    };
+    // It automatically uses the most efficient protocol based on data types.
+    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout) as QueryResult<T>;
   }
 
   release(): void {
@@ -44,6 +100,8 @@ class PostgresPooledConnection implements PooledConnection {
 export class PostgresClient extends DatabaseClient {
   private sql: Sql;
   private ownsConnection: boolean;
+  /** Default statement_timeout (ms) configured at construction, if any. */
+  private defaultStatementTimeout?: number;
 
   /**
    * Create a PostgresClient
@@ -60,7 +118,7 @@ export class PostgresClient extends DatabaseClient {
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const postgres = require('postgres');
-        this.sql = postgres(config as any);
+        this.sql = postgres(this.normalizeConfig(config));
         this.ownsConnection = true;
       } catch (error) {
         throw new Error(
@@ -71,22 +129,50 @@ export class PostgresClient extends DatabaseClient {
     }
   }
 
+  /**
+   * Move a top-level `statement_timeout` (ms) option onto the porsager
+   * `connection` parameters so PostgreSQL applies it as a native, connection-level
+   * default (server-enforced, no per-query wrapping). Other config is untouched.
+   *
+   * String/URL configs are passed through unchanged — for those, set the default
+   * via the connection string or use a config object.
+   */
+  private normalizeConfig(config: string | PostgresOptions | Sql): any {
+    if (typeof config !== 'object' || config === null) {
+      return config;
+    }
+
+    const options = config as PostgresOptions;
+    const statementTimeout = options.statement_timeout;
+    if (statementTimeout === undefined) {
+      return config;
+    }
+
+    this.defaultStatementTimeout = statementTimeout;
+
+    // Clone, drop the top-level alias, and push it into the connection params
+    // (porsager sends `connection.*` as PostgreSQL connection parameters).
+    const { statement_timeout: _omit, connection, ...rest } = options as any;
+    return {
+      ...rest,
+      connection: {
+        ...(connection || {}),
+        statement_timeout: normalizeTimeoutMs(statementTimeout),
+      },
+    };
+  }
+
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // postgres library doesn't have explicit binary protocol toggle
-    // It automatically uses the most efficient protocol based on data types
-    const result = await this.sql.unsafe(sql, params || []);
-
-    return {
-      rows: result as T[],
-      rowCount: result.count ?? null,
-    };
+    // It automatically uses the most efficient protocol based on data types.
+    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout) as QueryResult<T>;
   }
 
   async connect(): Promise<PooledConnection> {
     // postgres library doesn't expose individual connections in the same way
     // We'll return a wrapper that uses the same sql instance
     // For transactions, the library handles it through sql.begin()
-    return new PostgresPooledConnection(this.sql);
+    return new PostgresPooledConnection(this.sql, this.defaultStatementTimeout);
   }
 
   async end(): Promise<void> {

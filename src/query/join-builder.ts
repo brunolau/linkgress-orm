@@ -1,7 +1,8 @@
 import { Condition, ConditionBuilder, and as andCondition } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
-import type { QueryExecutor, OrderDirection } from '../entity/db-context';
+import type { OrderDirection } from '../entity/db-context';
+import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy, getTableAlias } from './query-utils';
 import { createNestedFieldRefProxy, getColumnNameMapForSchema } from './query-builder';
 
@@ -61,6 +62,18 @@ export class JoinQueryBuilder<TLeft, TRight> {
       schema: rightSchema,
       condition: joinCondition,
     });
+  }
+
+  /**
+   * Override the timeout for this join query (ms). Only this query is wrapped
+   * (`SET LOCAL statement_timeout`). Overrides the connection-level default; pass
+   * `0` to disable. On timeout a `QueryTimeoutError` is thrown.
+   */
+  withTimeout(timeoutMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withTimeout(timeoutMs)
+      : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
   }
 
   /**

@@ -172,6 +172,19 @@ export interface PostgresOptions {
   timeout?: number;
 
   /**
+   * Default PostgreSQL `statement_timeout` in **milliseconds**, applied to every
+   * query on this client (default: undefined — no timeout).
+   *
+   * This is set as a native connection-level parameter, so it is enforced by the
+   * server with zero per-query overhead and no query wrapping. When a query
+   * exceeds it the server cancels it and the driver throws a `QueryTimeoutError`.
+   *
+   * Override (or disable) it for an individual query with `.withTimeout(ms)`
+   * (`.withTimeout(0)` disables the timeout for that one query).
+   */
+  statement_timeout?: number;
+
+  /**
    * SSL configuration (default: false)
    */
   ssl?: boolean | 'require' | 'allow' | 'prefer' | 'verify-full' | {

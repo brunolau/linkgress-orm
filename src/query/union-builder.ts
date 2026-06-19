@@ -1,5 +1,6 @@
 import { ConditionBuilder, SqlBuildContext, FieldRef, UnwrapSelection } from './conditions';
-import type { QueryExecutor, OrderDirection } from '../entity/db-context';
+import type { OrderDirection } from '../entity/db-context';
+import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
@@ -91,6 +92,18 @@ export class UnionQueryBuilder<TSelection> {
       buildSql: (ctx) => firstQuery.buildUnionSql(ctx),
       ownerBuilder: firstQuery,
     });
+  }
+
+  /**
+   * Override the timeout for this union query (ms). Only this query is wrapped
+   * (`SET LOCAL statement_timeout`). Overrides the connection-level default; pass
+   * `0` to disable. On timeout a `QueryTimeoutError` is thrown.
+   */
+  withTimeout(timeoutMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withTimeout(timeoutMs)
+      : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
   }
 
   /**

@@ -1,4 +1,4 @@
-import { DatabaseClient, QueryResult, TransactionalClient } from '../database/database-client.interface';
+import { DatabaseClient, QueryResult, TransactionalClient, QueryExecutionOptions } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
 import { UnwrapDbColumns, InsertData, UpdateData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
@@ -320,8 +320,37 @@ export type LoggingOptions = QueryOptions;
 export class QueryExecutor {
   constructor(
     private client: DatabaseClient,
-    private options: QueryOptions = {}
+    private options: QueryOptions = {},
+    /**
+     * Per-query timeout override (ms) set via `.withTimeout()`. Threaded down to
+     * the driver as `QueryExecutionOptions.timeoutMs`. `undefined` means no
+     * override (the connection-level default, if any, applies).
+     */
+    private overrideTimeoutMs?: number
   ) {}
+
+  /**
+   * Build the per-query execution options (binary protocol + timeout override),
+   * or `undefined` when neither is set so the driver takes its fast path.
+   */
+  private buildExecutionOptions(): QueryExecutionOptions | undefined {
+    if (!this.options.useBinaryProtocol && this.overrideTimeoutMs === undefined) {
+      return undefined;
+    }
+    return {
+      useBinaryProtocol: this.options.useBinaryProtocol,
+      timeoutMs: this.overrideTimeoutMs,
+    };
+  }
+
+  /**
+   * Return a new executor sharing this one's client and options but applying the
+   * given per-query timeout override (ms). Pass `0` to disable the timeout for
+   * the derived executor. Used by `.withTimeout()` on the query builders.
+   */
+  withTimeout(timeoutMs: number): QueryExecutor {
+    return new QueryExecutor(this.client, this.options, timeoutMs);
+  }
 
   async query(sql: string, params?: any[]): Promise<QueryResult> {
     const logger = this.options.logger || console.log;
@@ -337,10 +366,8 @@ export class QueryExecutor {
     }
 
     try {
-      // Pass binary protocol option if enabled
-      const queryOptions = this.options.useBinaryProtocol
-        ? { useBinaryProtocol: true }
-        : undefined;
+      // Pass binary-protocol and/or per-query timeout options when set
+      const queryOptions = this.buildExecutionOptions();
 
       const result = await this.client.query(sql, params, queryOptions);
 
@@ -888,6 +915,28 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       this.schemaRegistry,
       newExecutor,
       mergedStrategy
+    );
+  }
+
+  /**
+   * Set a per-query timeout (ms) applied to every query and CRUD operation
+   * started from the returned accessor. Each such query is wrapped individually
+   * (`SET LOCAL statement_timeout`); pass `0` to disable. Overrides the
+   * connection-level default. On timeout a `QueryTimeoutError` is thrown.
+   *
+   * @example
+   * await db.users.withTimeout(5000).where(u => gt(u.id, 0)).toList();
+   */
+  withTimeout(timeoutMs: number): TableAccessor<TBuilder> {
+    const newExecutor = this.executor
+      ? this.executor.withTimeout(timeoutMs)
+      : new QueryExecutor(this.client, undefined, timeoutMs);
+    return new TableAccessor(
+      this.tableBuilder,
+      this.client,
+      this.schemaRegistry,
+      newExecutor,
+      this.collectionStrategy
     );
   }
 
@@ -1725,6 +1774,13 @@ export interface EntityCollectionQueryWithSelect<TEntity extends DbEntity, TSele
  */
 export interface IEntityQueryable<TEntity extends DbEntity> {
   /**
+   * Set a per-query timeout (ms) for this query, overriding the connection-level
+   * default. Only this query is wrapped (`SET LOCAL statement_timeout`); pass `0`
+   * to disable. On timeout a `QueryTimeoutError` is thrown.
+   */
+  withTimeout(timeoutMs: number): IEntityQueryable<TEntity>;
+
+  /**
    * Add a WHERE condition. Multiple where() calls are chained with AND logic.
    */
   where(condition: (entity: EntityQuery<TEntity>) => Condition): IEntityQueryable<TEntity>;
@@ -1884,6 +1940,13 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
  * Results automatically unwrap DbColumn<T> to T and SqlFragment<T> to T
  */
 export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> {
+  /**
+   * Set a per-query timeout (ms) for this query, overriding the connection-level
+   * default. Only this query is wrapped (`SET LOCAL statement_timeout`); pass `0`
+   * to disable. On timeout a `QueryTimeoutError` is thrown.
+   */
+  withTimeout(timeoutMs: number): EntitySelectQueryBuilder<TEntity, TSelection>;
+
   select<TNewSelection>(
     selector: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TNewSelection
   ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
@@ -2452,6 +2515,57 @@ export class DbEntityTable<TEntity extends DbEntity> {
     });
 
     // Return new instance with proxy context
+    return new DbEntityTable(proxyContext as any, this.tableName, this.tableBuilder);
+  }
+
+  /**
+   * Set a per-query timeout (ms) applied to every query and CRUD operation
+   * started from the returned table. Each such query is wrapped individually
+   * (`SET LOCAL statement_timeout`); pass `0` to disable. Overrides the
+   * connection-level default. On timeout a `QueryTimeoutError` is thrown.
+   *
+   * @example
+   * await db.users.withTimeout(5000).where(u => gt(u.id, 0)).toList();
+   */
+  withTimeout(timeoutMs: number): DbEntityTable<TEntity> {
+    const originalContext = this.context;
+    const tableName = this.tableName;
+    const client = (originalContext as any).client;
+    const currentExecutor = (originalContext as any).executor as QueryExecutor | undefined;
+    const newExecutor = currentExecutor
+      ? currentExecutor.withTimeout(timeoutMs)
+      : new QueryExecutor(client, undefined, timeoutMs);
+    const collectionStrategy = (originalContext as any).queryOptions?.collectionStrategy;
+
+    const proxyContext = new Proxy(originalContext, {
+      get(target, prop) {
+        if (prop === 'executor') {
+          return newExecutor;
+        }
+        if (prop === 'getTable') {
+          return (name: string) => {
+            const originalAccessor = (target as any).tableAccessors.get(name);
+            if (!originalAccessor) {
+              return (target as any).getTable(name);
+            }
+            if (name === tableName) {
+              const schemaRegistry = (target as any).schemaRegistry;
+              const originalTableBuilder = (originalAccessor as any).tableBuilder;
+              return new TableAccessor(
+                originalTableBuilder,
+                client,
+                schemaRegistry,
+                newExecutor,
+                collectionStrategy
+              );
+            }
+            return originalAccessor;
+          };
+        }
+        return (target as any)[prop];
+      }
+    });
+
     return new DbEntityTable(proxyContext as any, this.tableName, this.tableBuilder);
   }
 

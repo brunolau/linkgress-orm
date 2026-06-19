@@ -16,6 +16,50 @@ export interface QueryExecutionOptions {
    * Default: false (uses text protocol)
    */
   useBinaryProtocol?: boolean;
+
+  /**
+   * Per-query timeout override, in milliseconds. Set by `.withTimeout(ms)`.
+   *
+   * When present, the driver runs *this query only* inside a short transaction
+   * that issues `SET LOCAL statement_timeout` first — so the override is scoped
+   * to the query (auto-resets at COMMIT) and cannot affect other queries on the
+   * pooled connection. A value of `0` disables the timeout for this query
+   * (overriding any connection-level default). When absent, no wrapping happens
+   * and the connection-level default (if any) applies.
+   *
+   * On timeout the driver throws a {@link QueryTimeoutError}.
+   *
+   * NOTE: Currently only honored by `PostgresClient` (the `postgres`/porsager
+   * driver). `PgClient` and `BunClient` ignore it.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Error thrown when a query is cancelled because it exceeded its timeout — the
+ * per-query `.withTimeout(ms)` override or the connection-level
+ * `statement_timeout` default.
+ *
+ * The underlying database error (PostgreSQL code `57014`, "canceling statement
+ * due to statement timeout") is preserved on the `cause` property.
+ */
+export class QueryTimeoutError extends Error {
+  /** The timeout that was exceeded, in milliseconds (`0` if not known). */
+  readonly timeoutMs: number;
+  /** The SQL text of the query that timed out. */
+  readonly sql: string;
+  /** The original driver error that surfaced the cancellation, if any. */
+  readonly cause?: unknown;
+
+  constructor(timeoutMs: number, sql: string, cause?: unknown) {
+    super(`Query exceeded its timeout of ${timeoutMs}ms and was cancelled`);
+    this.name = 'QueryTimeoutError';
+    this.timeoutMs = timeoutMs;
+    this.sql = sql;
+    this.cause = cause;
+    // Restore prototype chain so `instanceof` works when targeting ES5
+    Object.setPrototypeOf(this, QueryTimeoutError.prototype);
+  }
 }
 
 /**

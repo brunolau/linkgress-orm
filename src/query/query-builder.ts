@@ -1,8 +1,8 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder } from './conditions';
 import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
-import type { QueryExecutor, CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
-import { TimeTracer } from '../entity/db-context';
+import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
+import { TimeTracer, QueryExecutor } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
@@ -216,6 +216,22 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     this.joinCounter = joinCounter || 0;
     this.collectionStrategy = collectionStrategy;
     this.schemaRegistry = schemaRegistry;
+  }
+
+  /**
+   * Override the timeout for this single query (in milliseconds). Only this query
+   * is wrapped (`SET LOCAL statement_timeout` inside a short transaction) — other
+   * queries are unaffected. Overrides the connection-level default; pass `0` to
+   * disable the timeout for this query. On timeout a `QueryTimeoutError` is thrown.
+   *
+   * @example
+   * await db.users.where(u => gt(u.id, 0)).withTimeout(5000).select(...).toList();
+   */
+  withTimeout(timeoutMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withTimeout(timeoutMs)
+      : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
   }
 
   /**
@@ -742,6 +758,19 @@ export class SelectQueryBuilder<TSelection> {
     this.schemaRegistry = schemaRegistry;
     this.ctes = ctes || [];
     this.collectionStrategy = collectionStrategy;
+  }
+
+  /**
+   * Override the timeout for this single query (in milliseconds). Only this query
+   * is wrapped (`SET LOCAL statement_timeout` inside a short transaction).
+   * Overrides the connection-level default; pass `0` to disable. On timeout a
+   * `QueryTimeoutError` is thrown.
+   */
+  withTimeout(timeoutMs: number): this {
+    this.executor = this.executor
+      ? this.executor.withTimeout(timeoutMs)
+      : new QueryExecutor(this.client, undefined, timeoutMs);
+    return this;
   }
 
   /**

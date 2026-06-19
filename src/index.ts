@@ -330,6 +330,11 @@ export {
   DatabaseClient,
   PooledConnection,
   QueryResult as ClientQueryResult,
+  QueryTimeoutError,
+} from './database/database-client.interface';
+
+export type {
+  QueryExecutionOptions,
 } from './database/database-client.interface';
 
 export {
