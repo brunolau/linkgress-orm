@@ -227,6 +227,29 @@ export interface SlowQueryInfo {
 }
 
 /**
+ * Options for {@link DataContext.transaction}.
+ */
+export interface TransactionOptions {
+  /**
+   * Statement timeout (ms) applied to EVERY statement in the transaction via
+   * `SET LOCAL statement_timeout`, overriding the connection-level default for the
+   * duration of the transaction (it auto-resets at COMMIT/ROLLBACK). Use this for
+   * long-running units of work (batch jobs, exports) that would otherwise hit a
+   * tight global default — it also covers bulk inserts/upserts that don't expose a
+   * per-query `.withTimeout()`. `0` disables the timeout for the transaction. On
+   * timeout a {@link QueryTimeoutError} is thrown.
+   */
+  timeoutMs?: number;
+  /**
+   * Slow-query "expected execution time" (ms) for statements in this transaction;
+   * a statement running longer fires `onQueryTakingTooLong` (diagnostic only, no
+   * cancellation). Defaults to `timeoutMs` when omitted, so a transaction with a
+   * deliberately raised timeout doesn't also trip the global slow-query threshold.
+   */
+  expectedExecutionMs?: number;
+}
+
+/**
  * Basenames (without extension) of the linkgress source files that can appear in
  * a query's call stack between the public terminal method (`.toList()` etc.) and
  * the user's code. Internal frames are stripped from {@link SlowQueryInfo.stack}
@@ -1693,14 +1716,31 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * Each transaction gets its own isolated context instance with fresh table accessors.
    */
   async transaction<TResult>(
-    fn: (ctx: this) => Promise<TResult>
+    fn: (ctx: this) => Promise<TResult>,
+    options?: TransactionOptions
   ): Promise<TResult> {
     return await this.client.transaction(async (queryFn) => {
       // Create a transactional client that routes all queries through the transaction
       const txClient = new TransactionalClient(queryFn, this.client);
 
+      // Raise the per-statement timeout for the WHOLE transaction up-front. `SET LOCAL`
+      // is transaction-scoped (auto-resets at COMMIT/ROLLBACK) and applies to every
+      // subsequent statement — including bulk inserts/upserts that don't expose a
+      // per-query `.withTimeout()`. Clamp to a safe non-negative integer (it is
+      // inlined into the SQL); `0` disables the timeout for the transaction.
+      if (options?.timeoutMs !== undefined) {
+        const ms = Math.max(0, Math.floor(Number(options.timeoutMs) || 0));
+        await txClient.query(`SET LOCAL statement_timeout = ${ms}`);
+      }
+
+      // Within the transaction, raise the slow-query "expected" threshold so a
+      // deliberately long unit of work doesn't trip the global threshold. Defaults
+      // to the transaction timeout when not given explicitly.
+      const expectedMs = options?.expectedExecutionMs ?? options?.timeoutMs;
+      const optionsOverride = expectedMs !== undefined ? { longRunningQueryThreshold: expectedMs } : undefined;
+
       // Create an isolated transactional context instead of mutating this.client
-      const txContext = this.createTransactionalContext(txClient);
+      const txContext = this.createTransactionalContext(txClient, optionsOverride);
 
       return await fn(txContext);
     });
@@ -1711,7 +1751,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * Used internally for transaction isolation to prevent race conditions
    * when multiple transactions run concurrently.
    */
-  protected createTransactionalContext(txClient: DatabaseClient): this {
+  protected createTransactionalContext(txClient: DatabaseClient, queryOptionsOverride?: Partial<QueryOptions>): this {
     // Create new instance preserving the prototype chain (including subclass methods/getters)
     const txContext = Object.create(Object.getPrototypeOf(this)) as this;
 
@@ -1720,11 +1760,17 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
     // Share read-only schema registry
     (txContext as any).schemaRegistry = this.schemaRegistry;
-    (txContext as any).queryOptions = this.queryOptions;
+
+    // Merge any per-transaction option override (e.g. a raised slow-query threshold)
+    // over the context's base options so the transaction's executor + accessors use it.
+    const effectiveOptions: QueryOptions | undefined = queryOptionsOverride
+      ? { ...(this.queryOptions ?? {}), ...queryOptionsOverride }
+      : this.queryOptions;
+    (txContext as any).queryOptions = effectiveOptions;
 
     // Create executor for the transactional client if logging is enabled
-    if (this.queryOptions?.logQueries || this.queryOptions?.logExecutionTime || this.queryOptions?.onQueryTakingTooLong) {
-      (txContext as any).executor = new QueryExecutor(txClient, this.queryOptions);
+    if (effectiveOptions?.logQueries || effectiveOptions?.logExecutionTime || effectiveOptions?.onQueryTakingTooLong) {
+      (txContext as any).executor = new QueryExecutor(txClient, effectiveOptions);
     }
 
     // Create fresh table accessors bound to the transactional client
@@ -1735,7 +1781,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
         txClient,
         this.schemaRegistry,
         (txContext as any).executor,
-        this.queryOptions?.collectionStrategy
+        effectiveOptions?.collectionStrategy
       );
       (txContext as any).tableAccessors.set(key, newAccessor);
 

@@ -108,7 +108,7 @@ export abstract class DatabaseClient {
    * @param callback - Function to execute within the transaction. Receives a query function.
    * @returns The result of the callback
    */
-  abstract transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T>;
+  abstract transaction<T>(callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T>;
 
   /**
    * Check if the driver supports executing multiple SQL statements in a single query
@@ -136,7 +136,7 @@ export abstract class DatabaseClient {
  */
 export class TransactionalClient extends DatabaseClient {
   constructor(
-    private queryFn: (sql: string, params?: any[]) => Promise<QueryResult>,
+    private queryFn: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>,
     private parentClient: DatabaseClient
   ) {
     super();
@@ -146,8 +146,12 @@ export class TransactionalClient extends DatabaseClient {
     return true;
   }
 
-  async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
-    return await this.queryFn(sql, params) as QueryResult<T>;
+  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    // Forward the per-query options (notably `.withTimeout()`'s `timeoutMs`) to the
+    // transaction's query fn. Earlier versions dropped these, so a per-query timeout
+    // silently no-op'd inside `db.transaction()`; the driver now honors it via a
+    // statement-scoped `SET LOCAL statement_timeout`.
+    return await this.queryFn(sql, params, options) as QueryResult<T>;
   }
 
   async connect(): Promise<PooledConnection> {
@@ -163,7 +167,7 @@ export class TransactionalClient extends DatabaseClient {
     return this.parentClient.getDriverName();
   }
 
-  async transaction<T>(_callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+  async transaction<T>(_callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     // Nested transactions not supported - could implement savepoints in the future
     throw new Error('Nested transactions are not supported');
   }

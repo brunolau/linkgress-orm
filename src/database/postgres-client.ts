@@ -73,6 +73,68 @@ async function runStatement(
 }
 
 /**
+ * Execute a single statement inside an EXISTING porsager transaction, honoring an
+ * optional per-statement timeout override.
+ *
+ * Unlike {@link runStatement}, we are already inside a transaction, so we cannot
+ * open another one to get the automatic `SET LOCAL` reset at COMMIT. Instead we
+ * capture the current `statement_timeout`, `SET LOCAL` the override for this one
+ * statement, then restore the captured value — keeping the override scoped to this
+ * statement even when other statements follow in the same transaction. (`SET LOCAL`
+ * also auto-resets at the outer COMMIT/ROLLBACK, so the restore only matters for
+ * subsequent statements.)
+ *
+ * - `timeoutMs === undefined`: run directly; any transaction/connection-level
+ *   `statement_timeout` still applies.
+ * - `timeoutMs === 0`: disable the timeout for this statement.
+ *
+ * A statement-timeout cancellation (`57014`) is surfaced as a {@link QueryTimeoutError}.
+ */
+async function runTxStatement(
+  txSql: Sql,
+  sql: string,
+  params: any[] | undefined,
+  timeoutMs: number | undefined,
+  defaultTimeoutMs: number | undefined
+): Promise<QueryResult> {
+  if (timeoutMs === undefined) {
+    try {
+      const result = await txSql.unsafe(sql, params || []);
+      return { rows: result, rowCount: result.count ?? null };
+    } catch (error) {
+      throw asTimeoutError(error, defaultTimeoutMs, sql);
+    }
+  }
+
+  // Capture the current value so we can restore it after this one statement.
+  let previous: string | undefined;
+  try {
+    const shown = await txSql.unsafe(`SHOW statement_timeout`);
+    previous = shown && shown[0] ? shown[0].statement_timeout : undefined;
+  } catch {
+    previous = undefined;
+  }
+
+  await txSql.unsafe(`SET LOCAL statement_timeout = ${normalizeTimeoutMs(timeoutMs)}`);
+  try {
+    const result = await txSql.unsafe(sql, params || []);
+    return { rows: result, rowCount: result.count ?? null };
+  } catch (error) {
+    throw asTimeoutError(error, timeoutMs, sql);
+  } finally {
+    // Best-effort restore. If the statement timed out, the transaction is now
+    // aborted and this throws — the outer ROLLBACK resets everything, so ignore it.
+    if (previous !== undefined) {
+      try {
+        await txSql.unsafe(`SET LOCAL statement_timeout = '${previous}'`);
+      } catch {
+        /* transaction aborted — nothing to restore */
+      }
+    }
+  }
+}
+
+/**
  * Wrapper for the pooled connection from postgres library
  */
 class PostgresPooledConnection implements PooledConnection {
@@ -238,14 +300,12 @@ export class PostgresClient extends DatabaseClient {
    * Execute a callback within a transaction.
    * Uses postgres library's built-in sql.begin() for proper transaction handling.
    */
-  async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+  async transaction<T>(callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     return await this.sql.begin(async (sql: Sql) => {
-      const queryFn = async (sqlStr: string, params?: any[]): Promise<QueryResult> => {
-        const result = await sql.unsafe(sqlStr, params || []);
-        return {
-          rows: result as any[],
-          rowCount: result.count ?? null,
-        };
+      const queryFn = async (sqlStr: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult> => {
+        // Honor a per-statement `.withTimeout()` override inside the transaction.
+        // `runTxStatement` scopes `SET LOCAL statement_timeout` to this statement.
+        return await runTxStatement(sql, sqlStr, params, options?.timeoutMs, this.defaultStatementTimeout);
       };
 
       return await callback(queryFn);

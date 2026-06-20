@@ -172,6 +172,7 @@ export {
   LogLevel,
   LogSection,
   SlowQueryInfo,
+  TransactionOptions,
   defaultLogger,
   LoggingOptions,
   CollectionStrategyType,
