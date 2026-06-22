@@ -147,8 +147,10 @@ export class DbModelConfig {
         // Merge with existing schema
         const existingSchema = (tableBuilder as any).schemaDef;
         const mergedTable = new TableBuilder(metadata.tableName, { ...existingSchema, ...navSchema }, metadata.indexes || [], [], metadata.schemaName);
+        if (metadata.partitioning) mergedTable.partitionBy(metadata.partitioning);
         tables.set(metadata.tableName, mergedTable);
       } else {
+        if (metadata.partitioning) tableBuilder.partitionBy(metadata.partitioning);
         tables.set(metadata.tableName, tableBuilder);
       }
     }
@@ -214,9 +216,11 @@ export class DbModelConfig {
       const existingSchema = (tableBuilder as any).schemaDef;
       const existingIndexes = (tableBuilder as any).indexDefs || [];
       const existingSchemaName = (tableBuilder as any).schemaName;
+      const existingPartitioning = (tableBuilder as any).partitioningDef;
       const foreignKeys = foreignKeysByTable.get(tableName) || [];
 
       const finalTable = new TableBuilder(tableName, existingSchema, existingIndexes, foreignKeys, existingSchemaName);
+      if (existingPartitioning) finalTable.partitionBy(existingPartitioning);
       finalTables.set(tableName, finalTable);
     }
 

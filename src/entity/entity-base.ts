@@ -1,4 +1,4 @@
-import { TableBuilder } from '../schema/table-builder';
+import { TableBuilder, PartitioningConfig } from '../schema/table-builder';
 import { ColumnBuilder } from '../schema/column-builder';
 
 /**
@@ -39,6 +39,8 @@ export interface EntityMetadata<T extends DbEntity> {
   properties: Map<keyof T, PropertyMetadata>;
   navigations: Map<keyof T, NavigationMetadata<any>>;
   indexes: IndexMetadata[];
+  /** Declarative table partitioning (parent `PARTITION BY`), set via `.hasPartitioning()`. */
+  partitioning?: PartitioningConfig;
 }
 
 /**

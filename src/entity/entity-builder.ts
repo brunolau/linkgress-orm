@@ -1,5 +1,6 @@
 import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
+import type { PartitionStrategy, PartitioningConfig } from '../schema/table-builder';
 import { TypeMapper } from '../types/type-mapper';
 import { CollationDefinition } from '../types/collation-builder';
 import { DbColumn } from './db-column';
@@ -514,6 +515,92 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
     metadata.indexes.push(indexMetadata);
 
     return new IndexBuilder<TEntity>(this.entityClass, indexMetadata);
+  }
+
+  /**
+   * Configure declarative PostgreSQL table partitioning — the parent table's
+   * `PARTITION BY <strategy> (<key>)` clause. Child partitions
+   * (`PARTITION OF ... FOR VALUES ...`) are created/rotated separately (usually
+   * at runtime), so they are not declared here.
+   *
+   * **Note:** PostgreSQL requires every partition-key column to be part of the
+   * table's PRIMARY KEY / UNIQUE constraints.
+   *
+   * @example
+   * // Strongly-typed, column-based (single or composite key):
+   * entity.hasPartitioning({ strategy: 'range', columns: e => e.createdAt });
+   * entity.hasPartitioning({ strategy: 'list',  columns: e => [e.region] });
+   * entity.hasPartitioning({ strategy: 'hash',  columns: e => [e.tenantId] });
+   *
+   * @example
+   * // Custom raw key expression (e.g. RANGE over a function of a column):
+   * entity.hasPartitioning({ strategy: 'range', expression: "date_trunc('month', created_at)" });
+   */
+  hasPartitioning(options: {
+    strategy: PartitionStrategy;
+    columns: (entity: TEntity) => TEntity[keyof TEntity] | Array<TEntity[keyof TEntity]>;
+  }): this;
+  hasPartitioning(options: {
+    strategy: PartitionStrategy;
+    expression: string;
+  }): this;
+  hasPartitioning(options: {
+    strategy: PartitionStrategy;
+    columns?: (entity: TEntity) => any;
+    expression?: string;
+  }): this {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+
+    let config: PartitioningConfig;
+    if (typeof options.expression === 'string' && options.expression.trim().length > 0) {
+      config = { strategy: options.strategy, expression: options.expression.trim() };
+    } else if (options.columns) {
+      config = { strategy: options.strategy, columns: this.resolvePartitionColumns(options.columns, metadata) };
+    } else {
+      throw new Error('hasPartitioning() requires either `columns` (a column selector) or `expression` (raw key SQL).');
+    }
+
+    metadata.partitioning = config;
+    return this;
+  }
+
+  /**
+   * Resolve a partition-key column selector (e.g. `e => e.createdAt` or
+   * `e => [e.region, e.createdAt]`) to database column names, using the same
+   * proxy mechanism as {@link hasIndex}.
+   */
+  private resolvePartitionColumns(
+    selector: (entity: TEntity) => any,
+    metadata: { properties: Map<any, PropertyMetadata> }
+  ): string[] {
+    const tempEntity = {} as TEntity;
+    const proxy = new Proxy(tempEntity, {
+      get: (_target, prop) => {
+        if (typeof prop === 'string') {
+          const propMetadata = metadata.properties.get(prop as keyof TEntity);
+          if (propMetadata) {
+            return { __indexColumn: true, columnName: propMetadata.columnName } as IndexColumnRef;
+          }
+        }
+        return undefined;
+      }
+    });
+
+    const result = selector(proxy);
+    const items: any[] = Array.isArray(result) ? result : [result];
+    const columns: string[] = [];
+    for (const item of items) {
+      const ref = item as IndexColumnRef;
+      if (ref && (ref as any).__indexColumn) {
+        columns.push(ref.columnName);
+      } else {
+        throw new Error('hasPartitioning() column selector must return entity column reference(s), e.g. `e => e.createdAt` or `e => [e.region, e.createdAt]`.');
+      }
+    }
+    if (columns.length === 0) {
+      throw new Error('hasPartitioning() requires at least one partition-key column.');
+    }
+    return columns;
   }
 
   /**

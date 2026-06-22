@@ -5,6 +5,7 @@ import { MigrationConfig } from './migration.interface';
 import { MigrationLoader } from './migration-loader';
 import { MigrationOperation } from './db-schema-manager';
 import { buildCreateIndexStatement, buildDropIndexStatement } from './index-sql';
+import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
@@ -228,6 +229,8 @@ export class MigrationScaffold {
     const statements: string[] = [];
     const pkColumnDefs: string[] = [];
     const primaryKeys: string[] = [];
+    const pkColumnNames: string[] = [];
+    const allColumnDefs: string[] = [];
     const nonPkColumns: { name: string; def: string }[] = [];
 
     for (const [colKey, colBuilder] of Object.entries(schema.columns)) {
@@ -264,12 +267,30 @@ export class MigrationScaffold {
         def += ` DEFAULT ${this.formatDefault(config.default)}`;
       }
 
+      allColumnDefs.push(def);
       if (config.primaryKey) {
         pkColumnDefs.push(def);
         primaryKeys.push(`"${config.name}"`);
+        pkColumnNames.push(config.name);
       } else {
         nonPkColumns.push({ name: config.name, def });
       }
+    }
+
+    // Partitioned tables: emit a single CREATE with ALL columns + the
+    // `PARTITION BY` clause. Partition-key columns must exist at CREATE time
+    // (they can't be deferred via ALTER ADD COLUMN), so the PK-only + ADD COLUMN
+    // split used for plain tables is skipped here.
+    if (schema.partitioning) {
+      validatePartitioningPrimaryKey(schema.partitioning, pkColumnNames, tableName);
+      const parts = [...allColumnDefs];
+      if (primaryKeys.length > 0) {
+        parts.push(`PRIMARY KEY (${primaryKeys.join(', ')})`);
+      }
+      statements.push(
+        `CREATE TABLE IF NOT EXISTS ${qualifiedName} (\n    ${parts.join(',\n    ')}\n  ) ${buildPartitionByClause(schema.partitioning)}`
+      );
+      return statements;
     }
 
     // CREATE TABLE IF NOT EXISTS with PK columns only

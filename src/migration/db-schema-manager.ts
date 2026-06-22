@@ -13,6 +13,7 @@ import {
   compareIndexDefinition,
   canonicalDefsEquivalent,
 } from './index-sql';
+import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 
 /**
  * Database column information from pg
@@ -356,6 +357,7 @@ export class DbSchemaManager {
   ): Promise<void> {
     const columnDefs: string[] = [];
     const primaryKeys: string[] = [];
+    const pkColumnNames: string[] = [];
     const skipForeignKeys = options?.skipForeignKeys ?? false;
 
     for (const [colKey, colBuilder] of Object.entries(tableSchema.columns)) {
@@ -408,6 +410,7 @@ export class DbSchemaManager {
 
       if (config.primaryKey) {
         primaryKeys.push(`"${config.name}"`);
+        pkColumnNames.push(config.name);
       }
     }
 
@@ -454,10 +457,19 @@ export class DbSchemaManager {
     }
 
     const qualifiedTableName = this.getQualifiedTableName(tableName, tableSchema.schema);
+
+    // Declarative partitioning: append `PARTITION BY ...` AFTER the column list's
+    // closing paren (PostgreSQL requires the partition key columns to be in the PK).
+    let partitionByClause = '';
+    if (tableSchema.partitioning) {
+      validatePartitioningPrimaryKey(tableSchema.partitioning, pkColumnNames, tableName);
+      partitionByClause = ` ${buildPartitionByClause(tableSchema.partitioning)}`;
+    }
+
     const createTableSQL = `
       CREATE TABLE IF NOT EXISTS ${qualifiedTableName} (
         ${columnDefs.join(',\n        ')}
-      )
+      )${partitionByClause}
     `;
 
     if (this.logQueries) {

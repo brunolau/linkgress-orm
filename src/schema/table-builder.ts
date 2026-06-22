@@ -65,6 +65,39 @@ export interface IndexDefinition {
 }
 
 /**
+ * PostgreSQL declarative-partitioning strategy.
+ * - `'range'` — partition by ranges of the key (e.g. dates).
+ * - `'list'`  — partition by an explicit list of key values.
+ * - `'hash'`  — partition by hash of the key (even distribution).
+ */
+export type PartitionStrategy = 'range' | 'list' | 'hash';
+
+/**
+ * Declarative table-partitioning configuration — describes the parent table's
+ * `PARTITION BY <strategy> (<key>)` clause. Child partitions (`PARTITION OF ...
+ * FOR VALUES ...`) are managed separately (they are typically created/rotated at
+ * runtime), so they are not part of this declaration.
+ *
+ * PostgreSQL requires every partition-key column to be included in the table's
+ * PRIMARY KEY / UNIQUE constraints.
+ */
+export interface PartitioningConfig {
+  /** Partitioning strategy: RANGE, LIST, or HASH. */
+  strategy: PartitionStrategy;
+  /**
+   * Partition-key columns (database column names). Mutually exclusive with
+   * {@link expression}.
+   */
+  columns?: string[];
+  /**
+   * Raw partition-key expression — the contents of the `PARTITION BY <strategy>
+   * (...)` parentheses, e.g. `date_trunc('month', created_at)`. Mutually
+   * exclusive with {@link columns}.
+   */
+  expression?: string;
+}
+
+/**
  * Foreign key action type
  */
 export type ForeignKeyAction = 'cascade' | 'restrict' | 'no action' | 'set null' | 'set default';
@@ -105,6 +138,8 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   relations: Record<string, RelationConfig>;
   indexes: IndexDefinition[];
   foreignKeys: ForeignKeyConstraint[];
+  /** Declarative partitioning config for this table (parent `PARTITION BY`). */
+  partitioning?: PartitioningConfig;
   /**
    * Performance optimization: Pre-computed map of property names to database column names
    * Avoids repeated .build().name calls during query building
@@ -170,6 +205,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private relationDefs: Record<string, RelationConfig> = {};
   private indexDefs: IndexDefinition[] = [];
   private foreignKeyDefs: ForeignKeyConstraint[] = [];
+  private partitioningDef?: PartitioningConfig;
 
   constructor(name: string, schema: TSchema, indexes?: IndexDefinition[], foreignKeys?: ForeignKeyConstraint[], schemaName?: string) {
     this.tableName = name;
@@ -229,6 +265,17 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private _cachedSchema?: TableSchema<any>;
 
   /**
+   * Configure declarative table partitioning (the parent `PARTITION BY` clause).
+   * @example
+   * builder.partitionBy({ strategy: 'range', columns: ['created_at'] });
+   */
+  partitionBy(config: PartitioningConfig): this {
+    this.partitioningDef = config;
+    this._cachedSchema = undefined; // invalidate cached schema
+    return this;
+  }
+
+  /**
    * Build the final table schema
    */
   build(): TableSchema<any> {
@@ -269,6 +316,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       relations: this.relationDefs,
       indexes: this.indexDefs,
       foreignKeys: this.foreignKeyDefs,
+      partitioning: this.partitioningDef,
       columnNameMap,
       relationEntries,
       relationSchemaCache,

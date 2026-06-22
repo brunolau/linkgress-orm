@@ -205,6 +205,12 @@ export {
   ixNormalized,
 } from './entity/entity-base';
 
+// Declarative table partitioning
+export {
+  PartitionStrategy,
+  PartitioningConfig,
+} from './schema/table-builder';
+
 export {
   DbColumn,
   UnwrapDbColumns,
