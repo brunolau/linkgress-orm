@@ -166,6 +166,14 @@ export {
   isCte,
 } from './query/cte-builder';
 
+// CTE-rooted query support (FROM a CTE, with FULL OUTER / RIGHT / CROSS joins)
+export {
+  CteRootQueryBuilder,
+  CteJoinedQueryBuilder,
+  CteJoinType,
+  onTrue,
+} from './query/cte-root-query';
+
 // Internal DataContext (for library use only - users should use DbContext)
 export {
   QueryOptions,

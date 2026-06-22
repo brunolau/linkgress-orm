@@ -150,22 +150,46 @@ export class DbCteBuilder {
       params: [],
     };
 
-    // Build the CTE query and get selection metadata
-    const mockRow = (query as any)._createMockRow();
-    const selectionResult = (query as any).selector(mockRow);
-
-    const sql = (query as any).buildQuery(selectionResult, {
+    const queryContext = {
       ctes: new Map(),
       cteCounter: 0,
       paramCounter: context.paramCounter,
       allParams: context.params,
-    }).sql;
+    };
+
+    let sql: string;
+    let selectionResult: Record<string, any>;
+
+    // Grouped query builders (`.groupBy(...).select(...)`, possibly with a
+    // trailing `.leftJoin(...)`) render their body — including SUM/COUNT/MIN/MAX
+    // aggregates and the GROUP BY — through `buildCteQuery`. They do NOT expose
+    // `_createMockRow`/`selector`, so detect and handle them first. Column
+    // definitions / mappers come from `getSelectionMetadata`. This lets an
+    // aggregate query be used as a *plain* CTE (one row per group), distinct
+    // from `withAggregation` which folds the whole group into a json_agg array.
+    if (typeof (query as any).buildCteQuery === 'function') {
+      const result = (query as any).buildCteQuery(queryContext);
+      sql = result.sql;
+      selectionResult = typeof (query as any).getSelectionMetadata === 'function'
+        ? (query as any).getSelectionMetadata()
+        : {};
+    } else {
+      // Standard SelectQueryBuilder — render via mock row + selector.
+      const mockRow = (query as any)._createMockRow();
+      selectionResult = (query as any).selector(mockRow);
+      sql = (query as any).buildQuery(selectionResult, queryContext).sql;
+    }
 
     // Update parameter offset for next CTE
-    this.paramOffset = context.paramCounter;
+    this.paramOffset = queryContext.paramCounter;
 
     // Create column definitions from the selection
     const columnDefs = {} as TSelection;
+    if (selectionResult) {
+      for (const key of Object.keys(selectionResult)) {
+        (columnDefs as any)[key] = key;
+      }
+    }
 
     const cte = new DbCte<TSelection>(cteName, sql, context.params, columnDefs, selectionResult);
     this.ctes.push(cte);

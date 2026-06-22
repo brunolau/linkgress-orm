@@ -184,6 +184,7 @@ Array<{
 
 ### Advanced
 - **[Collection Strategies](./docs/collection-strategies.md)** - CTE, LATERAL, and temp table strategies for one-to-many queries
+- **[CTEs (Common Table Expressions)](./docs/guides/cte-guide.md)** - Build CTEs, query from a CTE root, and FULL OUTER / RIGHT / CROSS joins
 - **[Subqueries](./docs/guides/subquery-guide.md)** - Using subqueries in your queries
 - **[Custom Types](./docs/guides/schema-configuration.md#custom-types)** - Create custom type mappers
 

@@ -92,6 +92,41 @@ const result = await db.users
   .toList();
 ```
 
+## Grouped / Aggregate CTE Bodies
+
+`with()` also accepts a **grouped** query body — a `.groupBy(...).select(...)` chain
+that emits `SUM` / `COUNT` / `MIN` / `MAX` aggregates and a `GROUP BY` clause. The
+result is a plain CTE with **one row per group** (this is distinct from
+[`withAggregation()`](#aggregation-ctes-with-withaggregation), which folds the whole
+group into a single JSONB array column):
+
+```typescript
+const spendByStatusCte = cteBuilder.with(
+  'spend_by_status',
+  db.orders
+    .where(o => eq(o.userId, userId))
+    .select(o => ({ status: o.status, totalPrice: o.totalAmount }))
+    .groupBy(o => ({ status: o.status }))
+    .select(g => ({
+      status: g.key.status,
+      totalPrice: g.sum(o => o.totalPrice),  // SUM(...) aggregate
+    }))
+);
+```
+
+**Generated CTE body:**
+```sql
+SELECT "orders"."status" as "status",
+       CAST(SUM("orders"."total_amount") AS DOUBLE PRECISION) as "totalPrice"
+FROM "orders"
+WHERE "orders"."user_id" = $1
+GROUP BY "orders"."status"
+```
+
+The resulting `spendByStatusCte.cte` carries one column per projected alias
+(`status`, `totalPrice`) and can be joined like any other CTE — including as the
+FROM root of a [CTE-rooted query](#querying-from-a-cte-full-outer--right--cross-joins).
+
 ## Aggregation CTEs with `withAggregation()`
 
 Create CTEs that group rows into JSONB arrays:
@@ -216,6 +251,135 @@ const result = await db.users
   .leftJoin(cte2.cte, ...)
   .toList();
 ```
+
+## Querying from a CTE (FULL OUTER / RIGHT / CROSS joins)
+
+The examples above attach a CTE to an **entity-rooted** query
+(`db.users.with(cte).leftJoin(cte, …)`) — there the FROM root must be a real table
+and joins are `INNER` / `LEFT` only.
+
+When the FROM root should itself be a CTE — and when you need join flavours the
+entity path cannot express (`FULL OUTER`, `RIGHT`, `CROSS`, or an `ON TRUE`
+predicate) — start the query with `db.selectFromCte(rootCte)`:
+
+```typescript
+const rows = await db
+  .selectFromCte(spend.cte)
+  .fullOuterJoin(tier.cte, onTrue())
+  .select((s, t) => ({
+    status: s.status,
+    totalPrice: s.totalPrice,
+    currentTierId: t.currentTierId,
+  }))
+  .toList();
+```
+
+### Join methods
+
+A CTE-rooted query exposes the full set of SQL join flavours, because both sides are
+already materialized relations (the CTE bodies):
+
+| Method | SQL |
+| --- | --- |
+| `.innerJoin(cte, condition)` | `INNER JOIN … ON …` |
+| `.leftJoin(cte, condition)` | `LEFT JOIN … ON …` |
+| `.rightJoin(cte, condition)` | `RIGHT JOIN … ON …` |
+| `.fullOuterJoin(cte, condition)` | `FULL OUTER JOIN … ON …` |
+| `.crossJoin(cte)` | `CROSS JOIN …` (no `ON`) |
+
+After joining, call `.select((root, joined) => ({ … }))` — the selector receives one
+FieldRef proxy per source, in FROM order (root first, then each joined CTE). You can
+also `.select(root => ({ … }))` with no join to project the root CTE directly.
+`.orderBy(...)`, `.limit(n)`, `.offset(n)`, `.toList()` and `.first()` round out the
+query (`orderBy` matches the column **output aliases**, e.g. `r => [[r.status, 'DESC']]`).
+
+### The `onTrue()` helper and `ON TRUE`
+
+PostgreSQL requires an `ON` / `USING` clause on a `FULL OUTER JOIN` (a bare one is a
+syntax error). Use the exported `onTrue()` helper for the cross-product
+(`ON TRUE`) form that keeps **every** row of both sides while pairing them up:
+
+```typescript
+import { onTrue } from 'linkgress-orm';
+
+db.selectFromCte(spend.cte)
+  .fullOuterJoin(tier.cte, onTrue())   // … FULL OUTER JOIN "current_tier" ON TRUE
+  .select((s, t) => ({ /* … */ }));
+```
+
+`onTrue()` simply renders the constant predicate `TRUE`; it can be passed to any of
+the joins that take a condition.
+
+### Worked example: buyer spend + current tier
+
+A complete, copy-pasteable example. Two CTEs are defined with the builder — a
+**grouped** `spend` total (one row per order status) and a single-row `current_tier`
+— then joined with `FULL OUTER JOIN … ON TRUE` so the result is preserved in all four
+cases: both sides present, spend-only (tier `NULL`), tier-only (spend `NULL`), or
+neither (zero rows).
+
+```typescript
+import { DbCteBuilder, eq, and, onTrue } from 'linkgress-orm';
+
+const cteBuilder = new DbCteBuilder();
+
+const spend = cteBuilder.with(
+  'spend',
+  db.orders
+    .where(o => and(eq(o.userId, userId), eq(o.status, 'completed')))
+    .select(o => ({ status: o.status, totalPrice: o.totalAmount }))
+    .groupBy(o => ({ status: o.status }))
+    .select(g => ({ status: g.key.status, totalPrice: g.sum(o => o.totalPrice) }))
+);
+
+const tier = cteBuilder.with(
+  'current_tier',
+  db.users
+    .where(u => and(eq(u.id, userId), eq(u.isActive, true)))
+    .select(u => ({ currentTierId: u.id }))
+    .limit(1)
+);
+
+const rows = await db
+  .selectFromCte(spend.cte)
+  .fullOuterJoin(tier.cte, onTrue())
+  .select((s, t) => ({
+    status: s.status,            // string | null
+    totalPrice: s.totalPrice,    // number | null
+    currentTierId: t.currentTierId, // number | null
+  }))
+  .toList();
+```
+
+**Generated SQL:**
+```sql
+WITH "spend" AS (
+  SELECT "orders"."status" as "status",
+         CAST(SUM("orders"."total_amount") AS DOUBLE PRECISION) as "totalPrice"
+  FROM "orders"
+  WHERE ("orders"."user_id" = $1 AND "orders"."status" = $2)
+  GROUP BY "orders"."status"
+), "current_tier" AS (
+  SELECT "users"."id" as "currentTierId"
+  FROM "users"
+  WHERE ("users"."id" = $3 AND "users"."is_active" = $4)
+  LIMIT 1
+)
+SELECT "spend"."status" as "status",
+       "spend"."totalPrice" as "totalPrice",
+       "current_tier"."currentTierId" as "currentTierId"
+FROM "spend"
+FULL OUTER JOIN "current_tier" ON TRUE
+```
+
+`-- params: [userId, 'completed', userId, true]`
+
+Every CTE body's parameters are emitted first, in `WITH` declaration order (root CTE,
+then each joined CTE), followed by any `ON`-predicate parameters — so the whole
+statement keeps a single, sequential `$1..$n` numbering.
+
+> **Tip:** Call `.toSql()` (or `.buildQuery()` for `{ sql, params }`) on a CTE-rooted
+> query to inspect the generated SQL without executing it.
 
 ## Type Safety
 

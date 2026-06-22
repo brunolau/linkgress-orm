@@ -11,6 +11,7 @@ import { InferRowType } from '../schema/row-type';
 import { DbSchemaManager } from '../migration/db-schema-manager';
 import { DbSequence, SequenceConfig } from '../schema/sequence-builder';
 import type { DbCte } from '../query/cte-builder';
+import { CteRootQueryBuilder } from '../query/cte-root-query';
 import type { Subquery } from '../query/subquery';
 import type { UnionQueryBuilder } from '../query/union-builder';
 import type { FutureQuery, FutureSingleQuery, FutureCountQuery } from '../query/future-query';
@@ -1691,6 +1692,47 @@ export class DataContext<TSchema extends ContextSchema = any> {
   async query<T = any>(sql: string, params?: any[]): Promise<T[]> {
     const result = await this.client.query(sql, params);
     return result.rows as T[];
+  }
+
+  /**
+   * Start a query whose FROM root is a {@link DbCte} (rather than an entity
+   * table), enabling join shapes the entity-anchored
+   * `db.<table>.with(...).leftJoin(cte, …)` path cannot express — notably
+   * `FULL OUTER` / `RIGHT` / `CROSS` joins and `ON TRUE` predicates between two
+   * CTEs.
+   *
+   * @example
+   * ```typescript
+   * const cteBuilder = new DbCteBuilder();
+   * const spend = cteBuilder.with('spend',
+   *   db.orders
+   *     .where(o => and(eq(o.userId, userId), eq(o.status, OrderState.PAID)))
+   *     .select(o => ({ currency: o.currency, totalPrice: o.totalPrice }))
+   *     .groupBy(o => ({ currency: o.currency }))
+   *     .select(g => ({ currency: g.key.currency, totalPrice: g.sum(o => o.totalPrice) }))
+   * );
+   * const tier = cteBuilder.with('current_tier',
+   *   db.tierAssignments
+   *     .where(t => and(eq(t.userId, userId), eq(t.isCurrent, true)))
+   *     .select(t => ({ currentTierId: t.tierId }))
+   *     .limit(1)
+   * );
+   *
+   * const rows = await db
+   *   .selectFromCte(spend.cte)
+   *   .fullOuterJoin(tier.cte, onTrue())
+   *   .select((s, t) => ({
+   *     currency: s.currency,
+   *     totalPrice: s.totalPrice,
+   *     currentTierId: t.currentTierId,
+   *   }))
+   *   .toList();
+   * ```
+   */
+  selectFromCte<TRootColumns extends Record<string, any>>(
+    rootCte: DbCte<TRootColumns>
+  ): CteRootQueryBuilder<TRootColumns> {
+    return new CteRootQueryBuilder(rootCte, this.client, this.executor);
   }
 
   /**
