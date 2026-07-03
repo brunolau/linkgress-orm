@@ -225,6 +225,7 @@ export {
   isDbColumn,
   InsertData,
   UpdateData,
+  UpsertData,
   ExtractDbColumns,
   ExtractDbColumnKeys,
 } from './entity/db-column';

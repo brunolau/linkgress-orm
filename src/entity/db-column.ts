@@ -169,6 +169,20 @@ export type UpdateData<TEntity> = {
 };
 
 /**
+ * Type for upsert values - like InsertData but each value may also be a SqlFragment<T>,
+ * allowing SQL expressions to be computed inside the single INSERT ... ON CONFLICT
+ * statement (e.g. a self-contained scalar subquery:
+ * `sql<number>\`(SELECT COUNT(*)::int FROM "post" WHERE "user_id" = ${userId})\``).
+ * The computed value flows through `EXCLUDED."col"` into the DO UPDATE arm, so the
+ * whole read-fold-write cycle stays one round trip.
+ *
+ * Fragments must be self-contained SQL: they render inside the VALUES tuple, where no
+ * table alias is in scope (entity column references are not resolvable there), and
+ * their interpolated values are parameterized as-is (column type mappers do not apply).
+ */
+export type UpsertData<TEntity> = UpdateData<TEntity>;
+
+/**
  * Marker to indicate DbEntity type (imported to avoid circular dependency)
  */
 interface DbEntity {

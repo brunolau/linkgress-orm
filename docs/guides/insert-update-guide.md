@@ -219,6 +219,47 @@ console.log(`Upserted ${users.length} users`);
 - Handling duplicate key scenarios gracefully
 - Bulk data imports with conflict resolution
 
+### Upsert with SQL Expression Values
+
+Upsert values may be [magic SQL strings](querying.md#magic-sql-strings) (`SqlFragment`),
+not just literals. The fragment renders as a SQL expression inside the `VALUES` tuple —
+e.g. a scalar subquery computed by the INSERT itself. On conflict the computed value
+flows into the `DO UPDATE` arm via `EXCLUDED."col"`, so a read-fold-write cycle
+(aggregate something, then persist the result) is a **single round trip**:
+
+```typescript
+import { sql } from 'linkgress-orm';
+
+// Recompute a user's post-view total and upsert the accumulator row — one statement.
+const rows = await db.userStats.upsertBulk(
+  [
+    {
+      userId,
+      totalViews: sql<number>`(
+        SELECT COALESCE(SUM("views"), 0)::int
+        FROM "posts"
+        WHERE "user_id" = ${userId}
+      )`,
+      updatedAt: new Date(),
+    },
+  ],
+  {
+    primaryKey: 'userId',
+    updateColumns: ['totalViews', 'updatedAt'],
+  }
+).returning(s => ({ totalViews: s.totalViews }));
+```
+
+Rules of the road:
+
+- Fragments must be **self-contained SQL** — they render inside a `VALUES` tuple where
+  no table alias is in scope, so entity column references are not resolvable there.
+- Interpolated values bind as ordinary parameters (numbering stays consistent across
+  mixed rows of fragment and plain values).
+- Fragment values bypass the column's type mapper — the fragment IS the SQL.
+- An aggregate-only scalar subquery always yields exactly one row, so the INSERT arm
+  still materializes when the source has zero rows (`SUM → NULL → COALESCE(…, 0)`).
+
 ## Delete Operations
 
 Linkgress ORM uses a **fluent API** for delete operations. You first specify the condition using `.where()`, then call `.delete()`.

@@ -1,6 +1,6 @@
 import { DatabaseClient, QueryResult, TransactionalClient, QueryExecutionOptions } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
-import { UnwrapDbColumns, InsertData, UpdateData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
+import { UnwrapDbColumns, InsertData, UpdateData, UpsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
@@ -3650,10 +3650,18 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * // With returning(selector) - returns selected columns
    * const results = await db.users.upsertBulk([{ id: 1, username: 'alice' }])
    *   .returning(u => ({ id: u.id }));
+   *
+   * // Values may be SqlFragments (self-contained SQL expressions, e.g. a scalar
+   * // subquery) — computed in the same statement and flowing into the DO UPDATE
+   * // arm via EXCLUDED, so a fold + upsert stays ONE round trip:
+   * const rows = await db.users.upsertBulk(
+   *   [{ username: 'alice', loginCount: sql<number>`(SELECT COUNT(*) FROM "login" WHERE "username" = ${'alice'})` }],
+   *   { primaryKey: 'username', updateColumns: ['loginCount'] }
+   * ).returning(u => ({ loginCount: u.loginCount }));
    * ```
    */
   upsertBulk(
-    values: InsertData<TEntity>[],
+    values: UpsertData<TEntity>[],
     config?: EntityUpsertConfig<TEntity>
   ): FluentUpsert<TEntity> {
     const table = this;
@@ -3769,7 +3777,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * @internal
    */
   private async upsertBulkSingle<TReturning>(
-    values: InsertData<TEntity>[],
+    values: UpsertData<TEntity>[],
     primaryKeys: string[],
     updateColumns: string[] | undefined,
     updateColumnFilter: ((colId: string) => boolean) | undefined,
@@ -3815,6 +3823,24 @@ export class DbEntityTable<TEntity extends DbEntity> {
       const rowValues: string[] = [];
       for (const col of columnConfigs) {
         const value = (record as any)[col.propName];
+
+        // If the value is a SqlFragment, inline it as a SQL expression (with its own
+        // params merged into our params array) — mirrors update()'s UpdateData handling.
+        // This allows e.g. a scalar subquery to be computed inside the INSERT itself
+        // (and to flow into the DO UPDATE arm via EXCLUDED). The fragment must be
+        // self-contained (no table alias is in scope inside a VALUES tuple) and its
+        // interpolated values bypass the column's type mapper.
+        if (value instanceof SqlFragment) {
+          const sqlBuildContext: SqlBuildContext = {
+            paramCounter: paramIndex,
+            params,
+          };
+          const fragmentSql = value.buildSql(sqlBuildContext);
+          paramIndex = sqlBuildContext.paramCounter;
+          rowValues.push(fragmentSql);
+          continue;
+        }
+
         const mappedValue = col.mapper
           ? col.mapper.toDriver(value !== undefined ? value : null)
           : (value !== undefined ? value : null);

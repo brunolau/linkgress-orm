@@ -737,6 +737,63 @@ describe('Insert, Update, Delete Operations', () => {
         expect(newUser).toBeDefined();
       });
     });
+
+    test('should compute SqlFragment values inside the upsert statement (single round trip)', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        // Self-contained scalar subquery: folds the user's post views, computed by the
+        // INSERT itself; on conflict the computed value flows into the DO UPDATE arm
+        // via EXCLUDED."age". Interpolated values (divisor, userId) bind as parameters.
+        const viewsFold = (userId: number) =>
+          sql<number>`(SELECT COALESCE(SUM("views"), 0)::int / ${10} FROM "posts" WHERE "user_id" = ${userId})`;
+
+        // Conflict path: alice exists, the DO UPDATE arm receives the computed fold.
+        const updated = await db.users.upsertBulk(
+          [{ username: 'alice', email: 'fold@test.com', age: viewsFold(users.alice.id) }],
+          {
+            primaryKey: ['username'],
+            updateColumns: ['email', 'age'],
+          }
+        ).returning();
+
+        expect(updated).toHaveLength(1);
+        expect(updated[0].age).toBe(25); // (100 + 150) / 10
+        expect(updated[0].email).toBe('fold@test.com');
+
+        // Insert path: new row, fragment computed on the INSERT arm. The aggregate
+        // over ZERO matching rows still yields one row (SUM -> NULL -> COALESCE 0).
+        const inserted = await db.users.upsertBulk(
+          [{ username: 'fragment_user', email: 'zero@test.com', age: viewsFold(-1) }],
+          {
+            primaryKey: ['username'],
+            updateColumns: ['email', 'age'],
+          }
+        ).returning();
+
+        expect(inserted).toHaveLength(1);
+        expect(inserted[0].age).toBe(0);
+
+        // Mixed rows: a fragment value and plain values in one statement keep the
+        // parameter numbering consistent across rows.
+        const mixed = await db.users.upsertBulk(
+          [
+            { username: 'alice', email: 'mixed-a@test.com', age: viewsFold(users.alice.id) },
+            { username: 'bob', email: 'mixed-b@test.com', age: 77 },
+          ],
+          {
+            primaryKey: ['username'],
+            updateColumns: ['email', 'age'],
+          }
+        ).returning();
+
+        expect(mixed).toHaveLength(2);
+        const fragmentAlice = mixed.find(u => u.username === 'alice');
+        const plainBob = mixed.find(u => u.username === 'bob');
+        expect(fragmentAlice?.age).toBe(25);
+        expect(plainBob?.age).toBe(77);
+      });
+    });
   });
 
   describe('Transaction-like behavior', () => {
