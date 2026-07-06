@@ -102,4 +102,24 @@ describe('SqlFragment as field in comparison operators', () => {
     expect(sql).toBe('COALESCE("product"."end_at", "product"."start_at") >= $1');
     expect(ctx.params).toEqual([value.getTime()]);
   });
+
+  test('coalesce with mapped field should apply toDriver to literal fallback values', () => {
+    const mapper = {
+      toDriver: (value: Date) => value.getTime(),
+      fromDriver: (value: number) => new Date(value),
+    };
+    const mappedEnd = {
+      __dbColumnName: 'end_at',
+      __fieldName: 'endAt',
+      __tableAlias: 'product',
+      __mapper: mapper,
+    } as any;
+    const fallback = new Date('2026-07-07T00:00:00.000Z');
+    const fragment = coalesce(mappedEnd, fallback);
+    const ctx = makeContext();
+    const sql = fragment.buildSql(ctx);
+
+    expect(sql).toBe('COALESCE("product"."end_at", $1)');
+    expect(ctx.params).toEqual([fallback.getTime()]);
+  });
 });

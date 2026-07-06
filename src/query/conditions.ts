@@ -194,6 +194,16 @@ function applyToDriverMapper(value: any, mapper: any): any {
     : value;
 }
 
+function isSqlFragmentLiteral(value: any): boolean {
+  return !(
+    getValueMapper(value) ||
+    value instanceof Placeholder ||
+    value instanceof SqlFragment ||
+    value instanceof RawSql ||
+    (value && typeof value === 'object' && 'buildSql' in value && typeof value.buildSql === 'function')
+  );
+}
+
 /**
  * Base class for all WHERE conditions with helper methods
  */
@@ -934,7 +944,12 @@ export function coalesce(
   }
   parts.push(')');
 
-  return new SqlFragment<any>(parts, all, all.map(getValueMapper).find(Boolean));
+  const mapper = all.map(getValueMapper).find(Boolean);
+  const values = mapper
+    ? all.map(value => isSqlFragmentLiteral(value) ? applyToDriverMapper(value, mapper) : value)
+    : all;
+
+  return new SqlFragment<any>(parts, values, mapper);
 }
 
 /**
