@@ -176,6 +176,24 @@ export class Placeholder<TName extends string = string> {
   constructor(public readonly name: TName) {}
 }
 
+function getValueMapper(value: any): any | undefined {
+  if (value && typeof value === 'object') {
+    if ('__mapper' in value && value.__mapper) {
+      return value.__mapper;
+    }
+    if (typeof value.getMapper === 'function') {
+      return value.getMapper();
+    }
+  }
+  return undefined;
+}
+
+function applyToDriverMapper(value: any, mapper: any): any {
+  return mapper && typeof mapper.toDriver === 'function'
+    ? mapper.toDriver(value)
+    : value;
+}
+
 /**
  * Base class for all WHERE conditions with helper methods
  */
@@ -266,13 +284,7 @@ export abstract class WhereConditionBase {
     } else {
       // Value is a literal, use a parameter
       // Apply toDriver mapper if the source field has one
-      let mappedValue = value;
-      if (sourceField && this.isFieldRef(sourceField) && '__mapper' in sourceField && (sourceField as any).__mapper) {
-        const mapper = (sourceField as any).__mapper;
-        if (typeof mapper.toDriver === 'function') {
-          mappedValue = mapper.toDriver(value);
-        }
-      }
+      const mappedValue = applyToDriverMapper(value, getValueMapper(sourceField));
       context.params.push(mappedValue);
       return `$${context.paramCounter++}`;
     }
@@ -543,13 +555,10 @@ export class InComparison<V = any> extends WhereComparisonBase<V> {
     }
 
     // Apply toDriver mapper if the field has one
-    let mappedValues = this.values;
-    if (this.isFieldRef(this.field) && '__mapper' in this.field && (this.field as any).__mapper) {
-      const mapper = (this.field as any).__mapper;
-      if (typeof mapper.toDriver === 'function') {
-        mappedValues = this.values.map(v => mapper.toDriver(v));
-      }
-    }
+    const mapper = getValueMapper(this.field);
+    const mappedValues = mapper
+      ? this.values.map(v => applyToDriverMapper(v, mapper))
+      : this.values;
 
     const params = mappedValues.map(() => `$${context.paramCounter++}`).join(', ');
     context.params.push(...mappedValues);
@@ -580,13 +589,10 @@ export class NotInComparison<V = any> extends WhereComparisonBase<V> {
     }
 
     // Apply toDriver mapper if the field has one
-    let mappedValues = this.values;
-    if (this.isFieldRef(this.field) && '__mapper' in this.field && (this.field as any).__mapper) {
-      const mapper = (this.field as any).__mapper;
-      if (typeof mapper.toDriver === 'function') {
-        mappedValues = this.values.map(v => mapper.toDriver(v));
-      }
-    }
+    const mapper = getValueMapper(this.field);
+    const mappedValues = mapper
+      ? this.values.map(v => applyToDriverMapper(v, mapper))
+      : this.values;
 
     const params = mappedValues.map(() => `$${context.paramCounter++}`).join(', ');
     context.params.push(...mappedValues);
@@ -928,7 +934,7 @@ export function coalesce(
   }
   parts.push(')');
 
-  return new SqlFragment<any>(parts, all);
+  return new SqlFragment<any>(parts, all, all.map(getValueMapper).find(Boolean));
 }
 
 /**

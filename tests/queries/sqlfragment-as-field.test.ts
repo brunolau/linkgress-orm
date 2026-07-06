@@ -1,5 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
-import { SqlFragment, SqlBuildContext, LikeComparison, ILikeComparison, EqComparison, GtComparison, LtComparison, InComparison } from '../../src/query/conditions';
+import { coalesce, gte, SqlFragment, SqlBuildContext, LikeComparison, ILikeComparison, EqComparison, GtComparison, LtComparison, InComparison } from '../../src/query/conditions';
 
 /**
  * Tests for using SqlFragment as the field (left-hand side) in comparison operators.
@@ -75,5 +75,31 @@ describe('SqlFragment as field in comparison operators', () => {
     const sql = comparison.buildSql(ctx);
     expect(sql).toBe('"product"."internal_id"::text IN ($1, $2)');
     expect(ctx.params).toEqual(['a', 'b']);
+  });
+
+  test('coalesce with mapped fields should apply toDriver to comparison values', () => {
+    const mapper = {
+      toDriver: (value: Date) => value.getTime(),
+      fromDriver: (value: number) => new Date(value),
+    };
+    const mappedStart = {
+      __dbColumnName: 'start_at',
+      __fieldName: 'startAt',
+      __tableAlias: 'product',
+      __mapper: mapper,
+    } as any;
+    const mappedEnd = {
+      __dbColumnName: 'end_at',
+      __fieldName: 'endAt',
+      __tableAlias: 'product',
+      __mapper: mapper,
+    } as any;
+    const value = new Date('2026-07-07T00:00:00.000Z');
+    const comparison = gte(coalesce(mappedEnd, mappedStart), value);
+    const ctx = makeContext();
+    const sql = comparison.buildSql(ctx);
+
+    expect(sql).toBe('COALESCE("product"."end_at", "product"."start_at") >= $1');
+    expect(ctx.params).toEqual([value.getTime()]);
   });
 });
