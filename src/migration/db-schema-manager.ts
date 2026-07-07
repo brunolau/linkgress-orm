@@ -59,6 +59,7 @@ export type MigrationOperation =
   | { type: 'create_schema'; schemaName: string }
   | { type: 'create_collation'; collation: CollationDefinition }
   | { type: 'create_enum'; enumName: string; values: readonly string[] }
+  | { type: 'add_enum_value'; enumName: string; values: string[] }
   | { type: 'create_sequence'; config: SequenceConfig }
   | { type: 'create_table'; tableName: string; schema: TableSchema }
   | { type: 'drop_table'; tableName: string }
@@ -899,14 +900,29 @@ $$`;
     // Check enums
     const modelEnums = EnumTypeRegistry.getAll();
     for (const [enumName, enumDef] of modelEnums.entries()) {
-      const result = await this.client.query(`
-        SELECT EXISTS (
-          SELECT 1 FROM pg_type WHERE typname = $1
-        ) as exists
+      const existing = await this.client.query<{ enumlabel: string }>(`
+        SELECT e.enumlabel
+        FROM pg_type t
+        JOIN pg_enum e ON e.enumtypid = t.oid
+        WHERE t.typname = $1
       `, [enumName]);
 
-      if (!result.rows[0]?.exists) {
+      if (existing.rows.length === 0) {
+        // Enum type doesn't exist yet — create it with the full value set.
         operations.push({ type: 'create_enum', enumName, values: enumDef.values });
+        continue;
+      }
+
+      // Enum already exists: append any model values missing from the database. This sync is
+      // intentionally ADD-ONLY. Removing a value (ALTER TYPE ... DROP VALUE) is destructive —
+      // it fails if any row still references the label — and callers frequently retain
+      // historical/stale labels on purpose (PostgreSQL cannot drop an in-use enum value), so
+      // pruning here would break otherwise-valid migrations. Removal stays a manual migration.
+      const present = new Set(existing.rows.map(row => row.enumlabel));
+      const missing = enumDef.values.filter(value => !present.has(value));
+
+      if (missing.length > 0) {
+        operations.push({ type: 'add_enum_value', enumName, values: missing });
       }
     }
 
@@ -1090,7 +1106,7 @@ $$`;
       const tablesToCreate = new Set<string>();
 
       for (const op of operations) {
-        if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'create_sequence') {
+        if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'add_enum_value' || op.type === 'create_sequence') {
           phase1Ops.push(op);
         } else if (op.type === 'create_table') {
           phase1Ops.push(op);
@@ -1234,6 +1250,10 @@ $$`;
         await this.executeCreateEnum(operation.enumName, operation.values);
         break;
 
+      case 'add_enum_value':
+        await this.executeAddEnumValues(operation.enumName, operation.values);
+        break;
+
       case 'create_sequence':
         await this.executeCreateSequence(operation.config);
         break;
@@ -1330,6 +1350,18 @@ $$`;
     const valueList = values.map(v => `'${v}'`).join(', ');
     await this.client.query(`CREATE TYPE "${enumName}" AS ENUM (${valueList})`);
     this.logger(`  ✓ ENUM type "${enumName}" created\n`);
+  }
+
+  private async executeAddEnumValues(enumName: string, values: string[]): Promise<void> {
+    // Each ADD VALUE is its own statement (PostgreSQL only accepts one new label per
+    // ALTER TYPE). IF NOT EXISTS keeps it idempotent and safe under concurrent migrations;
+    // values are appended at the end of the enum. Run in autocommit (the migrate() phases
+    // are not wrapped in a transaction), so each added label is usable by later operations.
+    for (const value of values) {
+      this.logger(`  Adding value '${value}' to ENUM "${enumName}"...`);
+      await this.client.query(`ALTER TYPE "${enumName}" ADD VALUE IF NOT EXISTS '${value}'`);
+      this.logger(`  ✓ Value '${value}' added to ENUM "${enumName}"\n`);
+    }
   }
 
   /**
@@ -2019,6 +2051,8 @@ $$`;
         return `Create collation "${operation.collation.name}" (provider=${operation.collation.provider}, locale=${operation.collation.locale}, deterministic=${operation.collation.deterministic})`;
       case 'create_enum':
         return `Create ENUM type "${operation.enumName}" (${operation.values.join(', ')})`;
+      case 'add_enum_value':
+        return `Add value(s) to ENUM "${operation.enumName}" (${operation.values.join(', ')})`;
       case 'create_sequence':
         const seqName = operation.config.schema
           ? `"${operation.config.schema}"."${operation.config.name}"`
