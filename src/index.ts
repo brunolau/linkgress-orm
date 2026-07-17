@@ -160,6 +160,7 @@ export {
 
 // CTE (Common Table Expression) support
 export {
+  CteTableRef,
   DbCte,
   DbCteBuilder,
   InferCteColumns,

@@ -1364,6 +1364,14 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   }
 
   /**
+   * Check if value is a CTE table reference created by DbCte.as().
+   * Duck-typed on marker properties to avoid a circular import with cte-builder.
+   */
+  private isCteTableRef(value: any): value is { __isCteTableRef: true; __cteName: string; __tableAlias?: string } {
+    return typeof value === 'object' && value !== null && value.__isCteTableRef === true && typeof value.__cteName === 'string';
+  }
+
+  /**
    * Build the SQL string with proper parameter placeholders
    */
   buildSql(context: SqlBuildContext): string {
@@ -1393,6 +1401,12 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
             context.placeholders.set(value.name, context.paramCounter);
             sql += `$${context.paramCounter++}`;
           }
+        }
+        // Check if value is a CTE table reference (DbCte.as()) - render as a FROM-clause identifier
+        else if (this.isCteTableRef(value)) {
+          sql += value.__tableAlias && value.__tableAlias !== value.__cteName
+            ? `"${value.__cteName}" AS "${value.__tableAlias}"`
+            : `"${value.__cteName}"`;
         }
         // Check if value is a FieldRef
         else if (this.isFieldRef(value)) {

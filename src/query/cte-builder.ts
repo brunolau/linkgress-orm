@@ -82,6 +82,20 @@ type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
   : T;
 
 /**
+ * Reference to a CTE for use inside sql`` template literals, created via DbCte.as().
+ * Interpolating the ref itself renders the FROM-clause identifier
+ * (`"cte_name" AS "alias"`); interpolating a column property renders a
+ * qualified column identifier (`"alias"."column"`).
+ */
+export type CteTableRef<TColumns> = {
+  readonly __isCteTableRef: true;
+  readonly __cteName: string;
+  readonly __tableAlias: string;
+} & {
+  [K in keyof TColumns & string]: FieldRef<K, ExtractValueType<TColumns[K]>>;
+};
+
+/**
  * Represents a Common Table Expression (CTE) with strong typing
  */
 export class DbCte<TColumns> {
@@ -107,6 +121,61 @@ export class DbCte<TColumns> {
    */
   getColumn<K extends keyof TColumns>(columnName: K): TColumns[K] {
     return columnName as TColumns[K];
+  }
+
+  /**
+   * Create a typed reference to this CTE for use inside sql`` template literals,
+   * mirroring SQL's `FROM cte AS alias`. Column properties render as qualified
+   * identifiers, the ref itself renders as the FROM-clause table reference —
+   * no hand-written string identifiers needed:
+   *
+   * @example
+   * const stats = cteBuilder.with('post_stats', db.posts.select(p => ({
+   *   postId: p.id,
+   *   views: p.views,
+   *   authorId: p.userId,
+   * })));
+   * const ps = stats.cte.as('ps');
+   *
+   * sql`(SELECT COALESCE(SUM(${ps.views}), 0) FROM ${ps} WHERE ${ps.authorId} = ${u.id})`
+   * // -> (SELECT COALESCE(SUM("ps"."views"), 0) FROM "post_stats" AS "ps" WHERE "ps"."authorId" = "users"."id")
+   *
+   * Without an alias, columns are qualified by the CTE name and the table ref
+   * renders as just `"post_stats"`.
+   */
+  as(alias?: string): CteTableRef<TColumns> {
+    const effectiveAlias = alias || this.name;
+    const ref: Record<string, any> = {
+      __isCteTableRef: true,
+      __cteName: this.name,
+      __tableAlias: effectiveAlias,
+    };
+
+    for (const key of Object.keys(this.columnDefs || {})) {
+      const fieldRef: Record<string, any> = {
+        __fieldName: key,
+        __dbColumnName: key,
+        __tableAlias: effectiveAlias,
+      };
+
+      // Preserve mapper / aggregation-array metadata, mirroring the internal
+      // CTE mock row (createMockRowForCte) so refs behave identically wherever
+      // FieldRefs are accepted.
+      const metaValue = this.selectionMetadata ? this.selectionMetadata[key] : undefined;
+      if (metaValue && typeof metaValue === 'object') {
+        if (typeof (metaValue as any).getMapper === 'function') {
+          fieldRef.getMapper = () => (metaValue as any).getMapper();
+        }
+        if ((metaValue as any).__isAggregationArray) {
+          fieldRef.__isAggregationArray = true;
+          fieldRef.__innerSelectionMetadata = (metaValue as any).__innerSelectionMetadata;
+        }
+      }
+
+      ref[key] = fieldRef;
+    }
+
+    return ref as CteTableRef<TColumns>;
   }
 
   /**
