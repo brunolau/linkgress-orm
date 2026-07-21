@@ -135,10 +135,16 @@ async function runTxStatement(
 }
 
 /**
- * Wrapper for the pooled connection from postgres library
+ * Wrapper for the pooled connection from postgres library.
+ *
+ * Backed by `sql.reserve()` (postgres >= 3.4) when available, so the
+ * connection is genuinely pinned to ONE session — session state (temp
+ * tables, SET, advisory locks) is visible across queries on this wrapper.
+ * Falls back to the shared pool on older versions, where no pinning
+ * guarantee exists.
  */
 class PostgresPooledConnection implements PooledConnection {
-  constructor(private sql: Sql, private defaultStatementTimeout?: number) {}
+  constructor(private sql: Sql, private reserved: boolean, private defaultStatementTimeout?: number) {}
 
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // postgres library doesn't have explicit binary protocol toggle
@@ -147,8 +153,9 @@ class PostgresPooledConnection implements PooledConnection {
   }
 
   release(): void {
-    // postgres library handles connection pooling automatically
-    // No explicit release needed
+    if (this.reserved && typeof (this.sql as any).release === 'function') {
+      (this.sql as any).release();
+    }
   }
 }
 
@@ -177,17 +184,30 @@ export class PostgresClient extends DatabaseClient {
       this.sql = config;
       this.ownsConnection = false;
     } else {
+      let postgres: any;
+
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const postgres = require('postgres');
-        this.sql = postgres(this.normalizeConfig(config));
-        this.ownsConnection = true;
+        const postgresModule = require('postgres');
+        // Under Bun (and other ESM-interop loaders) require() can return a
+        // module-namespace object ({ default: postgres }) instead of the
+        // callable itself — unwrap it.
+        postgres = typeof postgresModule === 'function' ? postgresModule : postgresModule?.default;
       } catch (error) {
         throw new Error(
           'PostgresClient requires the "postgres" package to be installed. ' +
           'Install it with: npm install postgres'
         );
       }
+
+      if (typeof postgres !== 'function') {
+        throw new Error('The "postgres" package did not resolve to a callable factory (unexpected module shape).');
+      }
+
+      // Outside the try/catch: a pool-construction error (e.g. invalid options)
+      // must propagate as-is, not masquerade as a missing package.
+      this.sql = postgres(this.normalizeConfig(config));
+      this.ownsConnection = true;
     }
   }
 
@@ -231,10 +251,17 @@ export class PostgresClient extends DatabaseClient {
   }
 
   async connect(): Promise<PooledConnection> {
-    // postgres library doesn't expose individual connections in the same way
-    // We'll return a wrapper that uses the same sql instance
-    // For transactions, the library handles it through sql.begin()
-    return new PostgresPooledConnection(this.sql, this.defaultStatementTimeout);
+    // Reserve a dedicated connection when the driver supports it (>= 3.4) so
+    // the PooledConnection contract (one pinned session) actually holds.
+    if (typeof this.sql.reserve === 'function') {
+      const reserved = await this.sql.reserve();
+
+      return new PostgresPooledConnection(reserved, true, this.defaultStatementTimeout);
+    }
+
+    // Fallback: shared pool instance (no session pinning). Transactions are
+    // unaffected — they go through sql.begin() on the transaction() method.
+    return new PostgresPooledConnection(this.sql, false, this.defaultStatementTimeout);
   }
 
   async end(): Promise<void> {
@@ -257,16 +284,40 @@ export class PostgresClient extends DatabaseClient {
   }
 
   /**
+   * Normalize a porsager `.simple()` result into an array of result sets.
+   *
+   * For a SINGLE statement, `.simple()` returns the RowList itself (an array of
+   * row objects carrying a string `command`); for MULTIPLE statements it
+   * returns a plain array of RowLists. Distinguish by element shape — a result
+   * set's elements are row objects, never arrays.
+   */
+  private static normalizeSimpleResultSets(results: any): any[] {
+    if (results.length > 0) {
+      return Array.isArray(results[0]) ? results : [results];
+    }
+
+    return typeof results.command === 'string' ? [results] : results;
+  }
+
+  /**
    * Execute a multi-statement query using the simple protocol
    * This bypasses prepared statements and allows multiple statements
    * WARNING: Only use with safe, validated inputs!
    */
   async querySimple<T = any>(sql: string): Promise<QueryResult<T>> {
     const results = await this.sql.unsafe(sql).simple();
+    const resultSets = PostgresClient.normalizeSimpleResultSets(results);
 
-    // .simple() returns an array of results for each statement
-    // Return the last non-empty result (usually the SELECT)
-    const lastResult = results[results.length - 1] || [];
+    // Return the last ROW-BEARING result set (the SELECT) — trailing
+    // row-less statements (DROP TABLE cleanup etc.) must not shadow it.
+    let lastResult: any = [];
+
+    for (let i = resultSets.length - 1; i >= 0; i--) {
+      if ((resultSets[i]?.length ?? 0) > 0) {
+        lastResult = resultSets[i];
+        break;
+      }
+    }
 
     return {
       rows: lastResult as T[],
@@ -282,7 +333,7 @@ export class PostgresClient extends DatabaseClient {
     const results = await this.sql.unsafe(sql).simple();
 
     // Convert each result set to QueryResult format
-    return results.map((result: any) => ({
+    return PostgresClient.normalizeSimpleResultSets(results).map((result: any) => ({
       rows: result as any[],
       rowCount: result.count ?? result.length ?? null,
     }));

@@ -1,21 +1,58 @@
-import { PgClient } from '../../src';
+import { PgClient, PostgresClient, BunClient, DatabaseClient } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 
 // Shared database instances per strategy (reuse connections)
 const sharedDatabases: Map<string, AppDatabase> = new Map();
 
-// Shared PgClient (single connection pool for all strategies)
-let sharedClient: PgClient | null = null;
+// Shared client (single connection pool for all strategies)
+let sharedClient: DatabaseClient | null = null;
 
-function getSharedClient(): PgClient {
+type TestDriver = 'pg' | 'postgres' | 'bun';
+
+/**
+ * Which DatabaseClient implementation the suite runs on.
+ * Defaults to 'pg' (node-postgres). Override with LINKGRESS_TEST_DRIVER to run
+ * the same suite against another driver, e.g. under Bun:
+ *   LINKGRESS_TEST_DRIVER=bun bun test tests/
+ */
+function resolveTestDriver(): TestDriver {
+  const driver = (process.env.LINKGRESS_TEST_DRIVER || 'pg').toLowerCase();
+
+  if (driver !== 'pg' && driver !== 'postgres' && driver !== 'bun') {
+    throw new Error(`Unknown LINKGRESS_TEST_DRIVER "${driver}" (expected pg | postgres | bun)`);
+  }
+
+  return driver;
+}
+
+function createClientForDriver(): DatabaseClient {
+  const host = process.env.DB_HOST || 'localhost';
+  const port = parseInt(process.env.DB_PORT || '5432');
+  const database = process.env.DB_NAME || 'linkgress_test';
+  const user = process.env.DB_USER || 'postgres';
+  const password = process.env.DB_PASSWORD || 'postgres';
+
+  const driver = resolveTestDriver();
+
+  if (driver === 'bun') {
+    // LINKGRESS_TEST_BUN_PREPARE=false runs the suite in Bun's text-results
+    // mode (unnamed statements): native arrays decode correctly, so the
+    // strategies keep array_agg (supportsBinaryArrayResults() = true).
+    const prepare = process.env.LINKGRESS_TEST_BUN_PREPARE !== 'false';
+
+    return new BunClient({ hostname: host, port, database, username: user, password, prepare });
+  }
+
+  if (driver === 'postgres') {
+    return new PostgresClient({ host, port, database, username: user, password });
+  }
+
+  return new PgClient({ host, port, database, user, password });
+}
+
+function getSharedClient(): DatabaseClient {
   if (!sharedClient) {
-    sharedClient = new PgClient({
-      host: process.env.DB_HOST || 'localhost',
-      port: parseInt(process.env.DB_PORT || '5432'),
-      database: process.env.DB_NAME || 'linkgress_test',
-      user: process.env.DB_USER || 'postgres',
-      password: process.env.DB_PASSWORD || 'postgres',
-    });
+    sharedClient = createClientForDriver();
   }
   return sharedClient;
 }
@@ -35,17 +72,12 @@ export function createTestDatabase(options?: {
 }
 
 /**
- * Create a fresh PgClient for tests that need their own isolated schema
- * (e.g., tests that use a custom DbContext with different tables)
+ * Create a fresh client for tests that need their own isolated schema
+ * (e.g., tests that use a custom DbContext with different tables).
+ * Honors LINKGRESS_TEST_DRIVER like the shared client.
  */
-export function createFreshClient(): PgClient {
-  return new PgClient({
-    host: process.env.DB_HOST || 'localhost',
-    port: parseInt(process.env.DB_PORT || '5432'),
-    database: process.env.DB_NAME || 'linkgress_test',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || 'postgres',
-  });
+export function createFreshClient(): DatabaseClient {
+  return createClientForDriver();
 }
 
 /**

@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq } from '../../src';
 
@@ -162,7 +163,7 @@ describe('Transaction Support', () => {
         const initialCount = await db.users.count();
 
         // Execute transaction that will fail
-        await expect(
+        await expectToReject(
           db.transaction(async (ctx) => {
             // Insert a user
             await ctx.users.insert({
@@ -184,7 +185,7 @@ describe('Transaction Support', () => {
             // Throw an error to trigger rollback
             throw new Error('Intentional error for rollback test');
           })
-        ).rejects.toThrow('Intentional error for rollback test');
+        , 'Intentional error for rollback test');
 
         // Verify the user was NOT committed (rolled back)
         const finalCount = await db.users.count();
@@ -205,7 +206,7 @@ describe('Transaction Support', () => {
         const initialUserCount = await db.users.count();
         const initialPostCount = await db.posts.count();
 
-        await expect(
+        await expectToReject(
           db.transaction(async (ctx) => {
             // Insert a user
             const user = await ctx.users.insert({
@@ -244,7 +245,7 @@ describe('Transaction Support', () => {
             // Throw error after multiple inserts
             throw new Error('Rollback all operations');
           })
-        ).rejects.toThrow('Rollback all operations');
+        , 'Rollback all operations');
 
         // Verify both operations were rolled back
         const finalUserCount = await db.users.count();
@@ -273,7 +274,7 @@ describe('Transaction Support', () => {
         const initialCount = await db.users.count();
 
         // Try to insert a user, then insert another with duplicate username (unique constraint)
-        await expect(
+        await expectToReject(
           db.transaction(async (ctx) => {
             await ctx.users.insert({
               username: 'constraint_user1',
@@ -298,7 +299,7 @@ describe('Transaction Support', () => {
               isActive: true,
             });
           })
-        ).rejects.toThrow(); // Database constraint error
+        ); // Database constraint error
 
         // Verify both inserts were rolled back (including the successful first one)
         const finalCount = await db.users.count();

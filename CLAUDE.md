@@ -27,11 +27,21 @@ changelog/           # Versioned changelog files (v0.3.0.md, v0.4.0.md, etc.)
 
 ## Database Clients
 
-- `PgClient` - Uses the `pg` npm package
-- `PostgresClient` - Uses the `postgres` npm package
-- `BunClient` - For Bun runtime
+- `PgClient` - Uses the `pg` npm package (`supportsBinaryProtocol()` = false — pg's `rowMode:'array'` is NOT a binary protocol and corrupts name-based mappings)
+- `PostgresClient` - Uses the `postgres` npm package (unwraps ESM-namespace `require()` results for Bun interop; `connect()` pins a real session via `sql.reserve()`)
+- `BunClient` - For Bun runtime; resolves `Bun.SQL` from the global (fallback `require('bun')`) — there is NO `bun:sql` module. Options: `prepare: false` (text-results mode, see below), `datesAsStrings` (Date results → PG-text strings, replaces the missing type-parser hook)
 - Use `db.query()` for SQL execution (works with all clients)
 - `querySimple()` only exists on PostgresClient/BunClient, not PgClient
+- `array()` custom type serializes JS arrays to PG array LITERAL strings (driver-universal); `DbCteBuilder` takes an optional client so CTE bodies respect `supportsBinaryArrayResults()`
+
+### Bun runtime notes
+
+- `pnpm test:bun` (or `bun tests-bun/run-jest-suite.ts`) — runs the WHOLE jest suite under Bun, one `bun test` process per file (jest-equivalent module isolation; a single shared module graph breaks schema-mutating files). Combine with `LINKGRESS_TEST_DRIVER=bun|postgres|pg` (default `pg`).
+- `pnpm test:bun:contract` (`bun test tests-bun/`) — Bun-only client-contract tests (BunClient + PostgresClient ESM interop).
+- **Never use `expect(...).rejects` / `.resolves` matchers in this suite** — under bun:test (Bun 1.3.14) they hang or misreport on DB-backed promises and wedge the rest of the file. Use `expectToReject()` from `tests/utils/expect-rejects.ts` (same matching semantics), or plain `await` for "should not throw".
+- **BunClient is suite-green in BOTH modes**: Bun.SQL (≤ 1.3.14) cannot decode native ARRAY result columns in binary/prepared mode — arrays either PANIC the runtime ("incorrect alignment", data-dependent on preceding column byte lengths) or decode as numeric-keyed objects. Default (prepared) mode: `supportsBinaryArrayResults()` = false → strategies emit `json_agg` instead of `array_agg`; raw SQL selecting native arrays can still crash (repro: `debug/bun-sql-binary-array-repro.ts`). **`prepare: false` (text-results) mode**: arrays decode correctly, the panic surface disappears entirely, capability auto-reports true (array_agg kept), and the client pre-stringifies object params (Bun's text mode would send "[object Object]"). ~0.05–0.08 ms/query re-parse cost; run the suite in this mode with `LINKGRESS_TEST_BUN_PREPARE=false`. BunClient result sets are passed through without copying — never re-introduce `Array.from` on them.
+- Bun.SQL serializes JS-array params as JSON: fine for `jsonb` targets, but binding a JS array to a native `int[]` column fails with a protocol error (08P01). The `array()` custom type therefore does not work with BunClient for writes.
+- Multi-statement `.simple()` result shapes differ by driver (postgres.js collapses row-less statements and mislabels commands; Bun emits one entry per statement; both return the bare result set for a single statement) — `querySimple`/`querySimpleMulti` normalize via `normalizeSimpleResultSets` + last-row-bearing-set selection. Keep mocks faithful to REAL shapes (result sets are true arrays with `command`/`count`).
 
 ## Query Builder Architecture
 

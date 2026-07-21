@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, ixNormalized } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -171,7 +172,7 @@ describe('ixNormalized / search_normalize support', () => {
 
     try {
       await client.query(`DROP TABLE IF EXISTS users_norm_gin_unique CASCADE`);
-      await expect(db.getSchemaManager().ensureCreated()).rejects.toThrow(/UNIQUE and a GIN/i);
+      await expectToReject(db.getSchemaManager().ensureCreated(), /UNIQUE and a GIN/i);
     } finally {
       await client.query(`DROP TABLE IF EXISTS users_norm_gin_unique CASCADE`);
       await db.dispose();

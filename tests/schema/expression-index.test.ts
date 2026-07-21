@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, boolean as pgBoolean, ixLower, ixUnaccent } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -251,9 +252,9 @@ describe('Expression & Partial Index Support', () => {
       // Two active users with same email should fail
       await db.users.insert({ name: 'Alice', email: 'alice@test.com', active: true });
 
-      await expect(
+      await expectToReject(
         db.users.insert({ name: 'Alice2', email: 'alice@test.com', active: true })
-      ).rejects.toThrow();
+      );
 
       // Inactive user with same email should be allowed
       await db.users.insert({ name: 'Alice3', email: 'alice@test.com', active: false });

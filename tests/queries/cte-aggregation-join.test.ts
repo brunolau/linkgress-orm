@@ -1,4 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { DbCteBuilder, eq, gt, sql } from '../../src';
 import PgIntDateTimeUtils from '../../debug/types/pgIntDatetimeUtils';
@@ -322,7 +323,7 @@ describe('CTE with Aggregation and Join', () => {
       await seedTestData(db);
 
       // temptable strategy should throw an error when nested collections are used
-      await expect(async () => {
+      await expectToReject(async () => {
         await db.users
           .withQueryOptions({ collectionStrategy: 'temptable' })
           .where(p => gt(p.id, -1))
@@ -336,7 +337,7 @@ describe('CTE with Aggregation and Join', () => {
             })).toList('taskOrders')
           }))
           .toList();
-      }).rejects.toThrow('Nested collections in temptable strategy are not supported');
+      }, 'Nested collections in temptable strategy are not supported');
     });
   });
 

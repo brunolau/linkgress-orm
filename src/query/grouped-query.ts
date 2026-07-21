@@ -18,6 +18,8 @@ interface QueryContext {
   cteCounter: number;
   paramCounter: number;
   allParams: any[];
+  /** True when the driver cannot decode native ARRAY result columns (BunClient). */
+  useJsonArrayAggregation?: boolean;
 }
 
 /**
@@ -544,6 +546,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
     };
@@ -744,6 +747,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
+        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
       };
@@ -1921,6 +1925,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
     };
@@ -1970,6 +1975,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
+        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
       };

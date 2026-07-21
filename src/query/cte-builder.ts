@@ -193,7 +193,15 @@ export class DbCteBuilder {
   private ctes: DbCte<any>[] = [];
   private paramOffset: number = 1;
 
-  constructor() {}
+  /**
+   * @param client - Optional. When provided, CTE bodies are built with the
+   *   driver's capabilities in mind — notably `supportsBinaryArrayResults()`:
+   *   array-producing aggregations (toNumberList/toStringList) inside CTE
+   *   definitions emit json_agg for drivers that cannot decode native arrays
+   *   (BunClient in binary mode). Without a client, CTE SQL is built
+   *   driver-agnostically (array_agg), matching previous behavior.
+   */
+  constructor(private client?: DatabaseClient) {}
 
   /**
    * Create a regular CTE from a query
@@ -222,6 +230,7 @@ export class DbCteBuilder {
     const queryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: this.client ? !this.client.supportsBinaryArrayResults() : undefined,
       paramCounter: context.paramCounter,
       allParams: context.params,
     };
@@ -423,6 +432,7 @@ export class DbCteBuilder {
     const queryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: this.client ? !this.client.supportsBinaryArrayResults() : undefined,
       paramCounter: context.paramCounter,
       allParams: context.params,
     };
@@ -479,6 +489,7 @@ export class DbCteBuilder {
     const queryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: this.client ? !this.client.supportsBinaryArrayResults() : undefined,
       paramCounter: context.paramCounter,
       allParams: context.params,
     };

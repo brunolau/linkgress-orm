@@ -151,6 +151,13 @@ export interface CollectionAggregationConfig {
   relationName: string;
 
   /**
+   * True when the driver cannot decode native ARRAY result columns
+   * (BunClient) — 'array' aggregations must emit json_agg instead of
+   * array_agg so no native array reaches the wire.
+   */
+  useJsonArrayAggregation?: boolean;
+
+  /**
    * Target table to query
    */
   targetTable: string;

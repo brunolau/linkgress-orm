@@ -626,7 +626,7 @@ GROUP BY "__fk_${foreignKey}"
     const cteSQL = `
 SELECT
   "__fk_${foreignKey}" as parent_id,
-  array_agg(
+  ${config.useJsonArrayAggregation ? 'json_agg' : 'array_agg'}(
     "${arrayField}"${arrayAggOrderBy}
   ) as data
 FROM (

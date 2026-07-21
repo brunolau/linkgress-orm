@@ -1,4 +1,5 @@
 import { withDatabase, seedTestData } from '../utils/test-database';
+import { expectToReject } from '../utils/expect-rejects';
 import { eq } from '../../src/query/conditions';
 
 describe('Bulk Update', () => {
@@ -139,11 +140,11 @@ describe('Bulk Update', () => {
       await withDatabase(async (db) => {
         await seedTestData(db);
 
-        await expect(
+        await expectToReject(
           db.users.bulkUpdate([
             { age: 50 } as any, // Missing id
           ])
-        ).rejects.toThrow('Record at index 0 is missing primary key "id"');
+        , 'Record at index 0 is missing primary key "id"');
       });
     });
 
@@ -151,11 +152,11 @@ describe('Bulk Update', () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);
 
-        await expect(
+        await expectToReject(
           db.users.bulkUpdate([
             { id: users.alice.id },
           ])
-        ).rejects.toThrow('No columns to update');
+        , 'No columns to update');
       });
     });
   });

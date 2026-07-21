@@ -23,22 +23,31 @@ export {
   bytea,
   enumColumn,
   ColumnBuilder,
+} from './schema/column-builder';
+
+export type {
   IdentityOptions,
 } from './schema/column-builder';
 
 // Enum types
 export {
   pgEnum,
-  EnumTypeDefinition,
   EnumTypeRegistry,
+} from './types/enum-builder';
+
+export type {
+  EnumTypeDefinition,
   EnumValues,
 } from './types/enum-builder';
 
 // Collation types
 export {
   pgCollation,
-  CollationDefinition,
   CollationRegistry,
+} from './types/collation-builder';
+
+export type {
+  CollationDefinition,
 } from './types/collation-builder';
 
 // Query builders
@@ -51,8 +60,11 @@ export {
 // Union query builder
 export {
   UnionQueryBuilder,
-  UnionType,
   isUnionQueryBuilder,
+} from './query/union-builder';
+
+export type {
+  UnionType,
 } from './query/union-builder';
 
 // Future queries for batch execution
@@ -61,12 +73,15 @@ export {
   FutureSingleQuery,
   FutureCountQuery,
   FutureQueryRunner,
-  AnyFutureQuery,
-  FutureQueryResult,
-  FutureQueryResults,
   isFutureQuery,
   isFutureSingleQuery,
   isFutureCountQuery,
+} from './query/future-query';
+
+export type {
+  AnyFutureQuery,
+  FutureQueryResult,
+  FutureQueryResults,
 } from './query/future-query';
 
 // Prepared statements
@@ -78,23 +93,26 @@ export {
   GroupedQueryBuilder,
   GroupedSelectQueryBuilder,
   GroupedJoinedQueryBuilder,
+} from './query/grouped-query';
+
+export type {
   GroupedItem,
 } from './query/grouped-query';
 
 export {
   JoinQueryBuilder,
+} from './query/join-builder';
+
+export type {
   JoinType,
   JoinDefinition,
 } from './query/join-builder';
 
 // Conditions
 export {
-  Condition,
-  ConditionOperator,
   ConditionBuilder,
   SqlFragment,
   RawSql,
-  FieldRef,
   Placeholder,
   eq,
   ne,
@@ -131,17 +149,22 @@ export {
   jsonbSelectText,
   jsonbArraySome,
   jsonbConditionUnwrap,
-  JsonbElement,
   flagHas,
   flagHasAll,
   flagHasAny,
   flagHasNone,
 } from './query/conditions';
 
+export type {
+  Condition,
+  ConditionOperator,
+  FieldRef,
+  JsonbElement,
+} from './query/conditions';
+
 // Subquery support
 export {
   Subquery,
-  SubqueryFieldRef,
   isSubquery,
   exists,
   notExists,
@@ -153,6 +176,10 @@ export {
   gteSubquery,
   ltSubquery,
   lteSubquery,
+} from './query/subquery';
+
+export type {
+  SubqueryFieldRef,
   SubqueryResult,
   SubqueryMode,
   CollectionSubquerySource,
@@ -160,38 +187,47 @@ export {
 
 // CTE (Common Table Expression) support
 export {
-  CteTableRef,
   DbCte,
   DbCteBuilder,
-  InferCteColumns,
   isCte,
+} from './query/cte-builder';
+
+export type {
+  CteTableRef,
+  InferCteColumns,
 } from './query/cte-builder';
 
 // CTE-rooted query support (FROM a CTE, with FULL OUTER / RIGHT / CROSS joins)
 export {
   CteRootQueryBuilder,
   CteJoinedQueryBuilder,
-  CteJoinType,
   onTrue,
+} from './query/cte-root-query';
+
+export type {
+  CteJoinType,
 } from './query/cte-root-query';
 
 // Internal DataContext (for library use only - users should use DbContext)
 export {
+  defaultLogger,
+  TimeTracer,
+} from './entity/db-context';
+
+export type {
   QueryOptions,
   LogLevel,
   LogSection,
   SlowQueryInfo,
   TransactionOptions,
-  defaultLogger,
   LoggingOptions,
   CollectionStrategyType,
-  TimeTracer,
   TimeTraceEntry,
   QueryTimeTrace,
 } from './entity/db-context';
 
 // Collection strategy pattern
-export {
+export type {
   ICollectionStrategy,
   CollectionStrategyType as CollectionStrategy,
   CollectionAggregationConfig,
@@ -206,24 +242,30 @@ export {
 // New Entity-first API with full typing
 export {
   DbEntity,
-  EntityConstructor,
   EntityMetadataStore,
-  IndexMethod,
   ixLower,
   ixUnaccent,
   ixNormalized,
 } from './entity/entity-base';
 
+export type {
+  EntityConstructor,
+  IndexMethod,
+} from './entity/entity-base';
+
 // Declarative table partitioning
-export {
+export type {
   PartitionStrategy,
   PartitioningConfig,
 } from './schema/table-builder';
 
 export {
   DbColumn,
-  UnwrapDbColumns,
   isDbColumn,
+} from './entity/db-column';
+
+export type {
+  UnwrapDbColumns,
   InsertData,
   UpdateData,
   UpsertData,
@@ -252,8 +294,11 @@ export {
 export {
   DatabaseContext as DbContext,
   DbEntityTable,
-  EntityQuery,
   EntityInsertBuilder,
+} from './entity/db-context';
+
+export type {
+  EntityQuery,
   EntityUpsertConfig,
   EntityCollectionQuery,
   IEntityQueryable,
@@ -266,31 +311,35 @@ export {
 
 // Types
 export {
+  TypeAliases,
+} from './types/column-types';
+
+export type {
   ColumnType,
   TypeScriptType,
-  TypeAliases,
   TypeAlias,
 } from './types/column-types';
 
 // Custom types
 export {
-  CustomType,
   CustomTypeBuilder,
   customType,
   json as jsonType,
   array,
   enumType,
   point,
-  Point,
   vector,
   interval,
+} from './types/custom-types';
+
+export type {
+  CustomType,
+  Point,
   Interval,
 } from './types/custom-types';
 
 // Type mappers
 export {
-  TypeMapper,
-  CustomTypeDefinition,
   customType as createCustomType,
   identityMapper,
   applyToDriver,
@@ -298,12 +347,20 @@ export {
   applyFromDriverArray,
 } from './types/type-mapper';
 
+export type {
+  TypeMapper,
+  CustomTypeDefinition,
+} from './types/type-mapper';
+
 // Sequences
 export {
   DbSequence,
-  SequenceConfig,
   SequenceBuilder,
   sequence,
+} from './schema/sequence-builder';
+
+export type {
+  SequenceConfig,
 } from './schema/sequence-builder';
 
 // Migration tools
@@ -348,9 +405,12 @@ export type {
 // Database clients
 export {
   DatabaseClient,
+  QueryTimeoutError,
+} from './database/database-client.interface';
+
+export type {
   PooledConnection,
   QueryResult as ClientQueryResult,
-  QueryTimeoutError,
 } from './database/database-client.interface';
 
 export type {

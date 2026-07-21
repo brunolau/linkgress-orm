@@ -128,6 +128,20 @@ export abstract class DatabaseClient {
   supportsBinaryProtocol(): boolean {
     return false;
   }
+
+  /**
+   * Whether the driver can decode native PostgreSQL ARRAY result columns
+   * (int[], text[], ...) in parameterized queries.
+   *
+   * Bun's SQL client (≤ 1.3.14) cannot: binary array results either panic the
+   * runtime ("incorrect alignment") or decode as numeric-keyed objects. When
+   * this returns false, query builders emit json_agg-based aggregations
+   * instead of array_agg so no native array ever reaches the wire.
+   * Default: true.
+   */
+  supportsBinaryArrayResults(): boolean {
+    return true;
+  }
 }
 
 /**
@@ -178,5 +192,9 @@ export class TransactionalClient extends DatabaseClient {
 
   supportsBinaryProtocol(): boolean {
     return this.parentClient.supportsBinaryProtocol();
+  }
+
+  supportsBinaryArrayResults(): boolean {
+    return this.parentClient.supportsBinaryArrayResults();
   }
 }

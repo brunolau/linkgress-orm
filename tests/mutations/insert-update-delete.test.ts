@@ -1,4 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData, createTestDatabase, setupDatabase, cleanupDatabase } from '../utils/test-database';
 import { eq, sql, coalesce, jsonbMerge } from '../../src';
 
@@ -339,12 +340,12 @@ describe('Insert, Update, Delete Operations', () => {
         });
 
         // Try to insert with same username (unique constraint)
-        await expect(
+        await expectToReject(
           db.users.insert({
             username: 'unique',
             email: 'different@test.com',
           })
-        ).rejects.toThrow();
+        );
       });
     });
   });

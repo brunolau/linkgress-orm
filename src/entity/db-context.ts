@@ -30,6 +30,15 @@ import {
 } from '../query/sql-utils';
 
 /**
+ * Per-schema cache of the entity column mapping plan used by
+ * DbEntityTable.mapResultToEntity. Schema objects come from the shared
+ * registry and are stable for the lifetime of a DataContext, so the plan is
+ * computed once per schema instead of per row (WeakMap: dropped together
+ * with the schema when a context is released).
+ */
+const entityMappingPlanCache = new WeakMap<object, Array<{ propName: string; dbColumnName: string; mapper?: any }>>();
+
+/**
  * Collection aggregation strategy type
  */
 export type CollectionStrategyType = 'cte' | 'temptable' | 'lateral';
@@ -3946,28 +3955,74 @@ export class DbEntityTable<TEntity extends DbEntity> {
   }
 
   /**
-   * Map database column names back to property names
+   * Map database column names back to property names.
+   *
+   * The property/column/mapper plan is derived from the schema ONCE and cached
+   * per schema object (the registry returns stable instances): the previous
+   * implementation ran Object.entries + ColumnBuilder.build() PER COLUMN PER
+   * ROW — ~30k config constructions for a 3000-row × 10-column read, the
+   * single largest ORM-side cost in the CPU profile (~4% of total samples).
    */
   private mapResultToEntity(result: any): UnwrapDbColumns<TEntity> {
-    const schema = this._getSchema();
+    const plan = this.getEntityMappingPlan();
     const mapped: any = {};
-    for (const [propName, colBuilder] of Object.entries(schema.columns)) {
-      const config = (colBuilder as any).build();
-      const dbColumnName = config.name;
-      if (dbColumnName in result) {
-        const rawValue = result[dbColumnName];
+
+    for (let i = 0; i < plan.length; i++) {
+      const entry = plan[i];
+      if (entry.dbColumnName in result) {
+        const rawValue = result[entry.dbColumnName];
         // Apply fromDriver mapper if present
-        mapped[propName] = config.mapper ? config.mapper.fromDriver(rawValue) : rawValue;
+        mapped[entry.propName] = entry.mapper ? entry.mapper.fromDriver(rawValue) : rawValue;
       }
     }
     return mapped as UnwrapDbColumns<TEntity>;
   }
 
+  /** Lazily built + schema-cached column plan for {@link mapResultToEntity}. */
+  private getEntityMappingPlan(): Array<{ propName: string; dbColumnName: string; mapper?: any }> {
+    const schema = this._getSchema();
+    let plan = entityMappingPlanCache.get(schema);
+
+    if (!plan) {
+      plan = Object.entries(schema.columns).map(([propName, colBuilder]) => {
+        const config = (colBuilder as any).build();
+        return { propName, dbColumnName: config.name, mapper: config.mapper };
+      });
+      entityMappingPlanCache.set(schema, plan);
+    }
+
+    return plan;
+  }
+
   /**
-   * Map array of database results to entities
+   * Map array of database results to entities.
+   *
+   * All rows of one result set share the same column shape, so the
+   * present-column subset of the mapping plan is derived from the first row
+   * once, and the per-row loop runs without `in` checks.
    */
   private mapResultsToEntities(results: any[]): UnwrapDbColumns<TEntity>[] {
-    return results.map(r => this.mapResultToEntity(r));
+    if (results.length === 0) {
+      return [];
+    }
+
+    const presentPlan = this.getEntityMappingPlan().filter(entry => entry.dbColumnName in results[0]);
+    const mapped: UnwrapDbColumns<TEntity>[] = new Array(results.length);
+
+    for (let rowIndex = 0; rowIndex < results.length; rowIndex++) {
+      const row = results[rowIndex];
+      const entity: any = {};
+
+      for (let i = 0; i < presentPlan.length; i++) {
+        const entry = presentPlan[i];
+        const rawValue = row[entry.dbColumnName];
+        entity[entry.propName] = entry.mapper ? entry.mapper.fromDriver(rawValue) : rawValue;
+      }
+
+      mapped[rowIndex] = entity;
+    }
+
+    return mapped;
   }
 
   /**

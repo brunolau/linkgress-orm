@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -122,14 +123,14 @@ describe('Unique Index Support', () => {
       });
 
       // Try to insert duplicate - should fail due to unique constraint
-      await expect(
+      await expectToReject(
         db.products.insert({
           productSource: 'source1',
           productSubtype: 'subtype1',
           entityId: 'entity1',
           name: 'Product 2 with same unique key',
         })
-      ).rejects.toThrow(/duplicate key|unique constraint|violates unique/i);
+      , /duplicate key|unique constraint|violates unique/i);
 
       // Insert with different entityId - should succeed
       await db.products.insert({

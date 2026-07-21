@@ -188,7 +188,11 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     lateralAlias: string,
     context: QueryContext
   ): CollectionAggregationResult {
-    const { arrayField, targetTable, foreignKey, sourceTable, whereClause, isDistinct, selectedFields, aggregationType, aggregateField, aggregateExpression, defaultValue, relationName, selectorNavigationJoins } = config;
+    const { arrayField, targetTable, foreignKey, sourceTable, whereClause, isDistinct, selectedFields, aggregationType, aggregateField, aggregateExpression, defaultValue, relationName, selectorNavigationJoins, useJsonArrayAggregation } = config;
+    // json_agg keeps native arrays off the wire for drivers that cannot
+    // decode binary ARRAY results (BunClient) — element values are identical
+    // for the toNumberList/toStringList use-cases.
+    const arrayAggFn = useJsonArrayAggregation ? 'json_agg' : 'array_agg';
 
     // Use a unique table alias to avoid conflicts with outer query tables
     const innerTableAlias = `${lateralAlias}_${relationName}`;
@@ -241,13 +245,13 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
       // Pattern: (SELECT array_agg(x) FROM (SELECT DISTINCT x FROM ...) sub)
       // This is more efficient than array_agg(DISTINCT x) which forces a sort
       if (isDistinct) {
-        subquerySQL = `(SELECT COALESCE(array_agg("${arrayField}"), ${defaultValue})
+        subquerySQL = `(SELECT COALESCE(${arrayAggFn}("${arrayField}"), ${defaultValue})
 FROM (SELECT DISTINCT ${fieldExpression} as "${arrayField}"
 FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL}) "sq")`;
       } else {
-        subquerySQL = `(SELECT COALESCE(array_agg(${fieldExpression}), ${defaultValue})
+        subquerySQL = `(SELECT COALESCE(${arrayAggFn}(${fieldExpression}), ${defaultValue})
 FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
@@ -749,7 +753,7 @@ FROM (
     // Note: We don't add ORDER BY inside array_agg because the inner subquery already sorts
 
     const lateralSQL = `
-SELECT array_agg(
+SELECT ${config.useJsonArrayAggregation ? 'json_agg' : 'array_agg'}(
   "${arrayField}"
 ) as data
 FROM (

@@ -1,28 +1,23 @@
 import { describe, test, expect, jest } from '@jest/globals';
 
-// Mock the bun:sql module since we're not running under Bun
-const mockResult = {
-  count: 2,
-  length: 2,
-  [Symbol.iterator]: function* () {
-    yield { id: 1, name: 'Alice' };
-    yield { id: 2, name: 'Bob' };
-  }
+// Mock result sets faithful to real Bun.SQL shapes: a result set is a REAL
+// array of row objects carrying `command` and `count` properties (verified
+// against Bun 1.3.14 — see debug/bun-sql-binary-array-repro.ts probes).
+const makeResultSet = (rows: any[], command: string): any => {
+  const resultSet: any = [...rows];
+  resultSet.command = command;
+  resultSet.count = rows.length;
+  return resultSet;
 };
 
-const mockEmptyResult = {
-  count: 0,
-  length: 0,
-  [Symbol.iterator]: function* () {}
-};
+const mockResult = makeResultSet([
+  { id: 1, name: 'Alice' },
+  { id: 2, name: 'Bob' },
+], 'SELECT');
 
-const mockInsertResult = {
-  count: 1,
-  length: 1,
-  [Symbol.iterator]: function* () {
-    yield { id: 3, name: 'Charlie' };
-  }
-};
+const mockEmptyResult = makeResultSet([], 'SELECT');
+
+const mockInsertResult = makeResultSet([{ id: 3, name: 'Charlie' }], 'INSERT');
 
 // Create mock SQL instance
 const createMockSql = () => {

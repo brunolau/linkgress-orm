@@ -169,6 +169,11 @@ export interface QueryContext {
    * Example: { "posts": "lateral_0_posts" }
    */
   lateralTableAliasMap?: Map<string, string>;
+  /**
+   * True when the driver cannot decode native ARRAY result columns
+   * (BunClient) — array-producing aggregations must use json_agg.
+   */
+  useJsonArrayAggregation?: boolean;
 }
 
 /**
@@ -1513,6 +1518,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1548,6 +1554,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1583,6 +1590,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1618,6 +1626,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1647,6 +1656,7 @@ export class SelectQueryBuilder<TSelection> {
       const context: QueryContext = tracer.trace('createContext', () => ({
         ctes: new Map(),
         cteCounter: 0,
+        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: 1,
         allParams: [],
         collectionStrategy: this.collectionStrategy,
@@ -1712,6 +1722,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1775,6 +1786,7 @@ export class SelectQueryBuilder<TSelection> {
     const queryContext: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: context.paramCounter,
       allParams: context.params,
       collectionStrategy: this.collectionStrategy,
@@ -1861,6 +1873,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -1917,6 +1930,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -1970,6 +1984,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       executor: this.executor,
@@ -1994,6 +2009,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = tracer.trace('createContext', () => ({
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -2093,10 +2109,19 @@ export class SelectQueryBuilder<TSelection> {
 
     // Check if we can use fully optimized single-query approach
     // Requirements: PostgresClient with querySimpleMulti support AND no parameters in base query
+    // AND every collection expressible by the naive per-collection SQL that
+    // executeFullyOptimized emits (plain flat list over a single-column `id`
+    // correlation). Anything richer — collection .where(), limit/offset, scalar
+    // aggregations, firstOrDefault, toNumberList/toStringList, DISTINCT,
+    // constant-FK (`__LIT:`) predicates, navigation paths, selectMany joins,
+    // nested/fragment/mapped selector fields — must go through the two-phase
+    // path, whose strategy builders handle those features. The naive SQL used
+    // to silently drop them (e.g. a `.where()` filter on the collection).
     const canUseFullOptimization =
       this.client.supportsMultiStatementQueries() &&
       baseParams.length === 0 &&
-      collections.length > 0;
+      collections.length > 0 &&
+      collections.every(c => this.isNaiveCollectionFastPathSafe(c.builder));
 
     if (canUseFullOptimization) {
       return this.executeFullyOptimized(baseSql, baseSelection, selectionResult, context, collections, tracer);
@@ -2240,6 +2265,114 @@ export class SelectQueryBuilder<TSelection> {
    * Execute using fully optimized single-query approach (PostgresClient only)
    * Combines base query + all collections into ONE multi-statement query
    */
+  /**
+   * Whether a collection can be served by the naive per-collection SQL emitted
+   * in {@link executeFullyOptimized} (`SELECT fk AS parent_id, <flat fields>
+   * FROM target WHERE fk IN (SELECT __pk_id FROM tmp_base)`). That SQL knows
+   * nothing about collection filters, pagination, aggregations, constant-FK
+   * predicates, navigation correlation, or mapper transforms — so any of those
+   * features disqualifies the fast path and the query falls back to the
+   * two-phase execution whose strategy builders implement them correctly.
+   */
+  private isNaiveCollectionFastPathSafe(builder: CollectionQueryBuilder<any>): boolean {
+    const b = builder as any;
+
+    if (b.whereCond) {
+      return false;
+    }
+    if (b.limitValue != null || b.offsetValue != null) {
+      return false;
+    }
+    if (b.aggregationType) {
+      return false;
+    }
+    if (b.flattenResultType) {
+      return false;
+    }
+    if (b.isDistinct) {
+      return false;
+    }
+    if (typeof b.isSingleResult === 'function' && b.isSingleResult()) {
+      return false;
+    }
+    if ((b.navigationPath?.length ?? 0) > 0 || (b.selectManyJoins?.length ?? 0) > 0 || b.foreignKeyTableAlias) {
+      return false;
+    }
+
+    // Single-column `fk = parent.id` correlation only; composite keys and
+    // `__LIT:` constant predicates (SCD2 is_current etc.) need the strategies.
+    const hasLiteralMarker = (arr?: string[]) =>
+      (arr ?? []).some(entry => typeof entry === 'string' && entry.startsWith('__LIT:'));
+    if (hasLiteralMarker(b.foreignKeys) || hasLiteralMarker(b.matches)) {
+      return false;
+    }
+    if ((b.foreignKeys?.length ?? 0) > 1) {
+      return false;
+    }
+    if ((b.matches?.length ?? 0) > 0 && !(b.matches.length === 1 && b.matches[0] === 'id')) {
+      return false;
+    }
+
+    // Selector must project only direct, unmapped FieldRef columns — nested
+    // objects, SQL fragments, and nested collection builders are silently
+    // dropped by the naive field loop, and custom mappers would be skipped.
+    // Column types must additionally be "jsonb-stable": the naive path returns
+    // DRIVER-native values (numeric => string, timestamp => Date), while every
+    // aggregating strategy returns json_agg semantics (numeric => number,
+    // timestamp => ISO string). Only allow types where both representations
+    // are identical, so all execution paths stay value-equal.
+    if (!b.selector || typeof b.createMockItem !== 'function') {
+      return false;
+    }
+
+    const JSONB_STABLE_TYPES = new Set([
+      'smallint',
+      'integer',
+      'smallserial',
+      'serial',
+      'real',
+      'double precision',
+      'boolean',
+      'varchar',
+      'char',
+      'text',
+      'uuid',
+      'json',
+      'jsonb',
+    ]);
+
+    try {
+      const selected = b.selector(b.createMockItem());
+
+      for (const value of Object.values(selected)) {
+        if (!(value && typeof value === 'object' && '__dbColumnName' in (value as any))) {
+          return false;
+        }
+        if ((value as any).__mapper) {
+          return false;
+        }
+
+        const fieldName = (value as any).__fieldName;
+        const meta = b.targetTableSchema?.columnMetadataCache?.get?.(fieldName);
+
+        if (meta?.hasMapper) {
+          return false;
+        }
+
+        const columnBuilder = b.targetTableSchema?.columns?.[fieldName];
+        const columnConfig = typeof columnBuilder?.build === 'function' ? columnBuilder.build() : null;
+
+        if (!columnConfig || !JSONB_STABLE_TYPES.has(columnConfig.type)) {
+          return false;
+        }
+      }
+    } catch {
+      return false;
+    }
+
+    return true;
+  }
+
   private async executeFullyOptimized(
     baseSql: string,
     baseSelection: any,
@@ -2719,6 +2852,7 @@ export class SelectQueryBuilder<TSelection> {
     const context: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       placeholders: new Map(),
@@ -5919,6 +6053,7 @@ ${joinClauses.join('\n')}`;
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
+        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         placeholders: outerContext.placeholders,  // Pass placeholders through for prepared statements
@@ -7486,8 +7621,10 @@ export class CollectionQueryBuilder<TItem = any> {
         arrayField = firstField.alias;
       }
 
-      // Use typed empty array literal (PostgreSQL will infer type from array_agg)
-      defaultValue = "'{}'";  // Empty array literal
+      // Use typed empty array literal (PostgreSQL will infer type from array_agg).
+      // Drivers that cannot decode native arrays aggregate via json_agg instead,
+      // so the default must be a JSON empty array for those.
+      defaultValue = context.useJsonArrayAggregation ? "'[]'::json" : "'{}'";
     } else {
       // JSON aggregation (default) - use JSON instead of JSONB for better performance
       aggregationType = 'jsonb';
@@ -7543,6 +7680,7 @@ export class CollectionQueryBuilder<TItem = any> {
       aggregateExpression,
       arrayField,
       defaultValue,
+      useJsonArrayAggregation: context.useJsonArrayAggregation,
       // Use the reserved counter for LATERAL strategy, otherwise increment as before
       counter: reservedCounter !== undefined ? reservedCounter : context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,

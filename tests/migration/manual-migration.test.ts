@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { expectToReject } from '../utils/expect-rejects';
 import * as path from 'path';
 import { createFreshClient } from '../utils/test-database';
 import {
@@ -14,7 +15,7 @@ import {
   varchar,
   text,
   boolean,
-  PgClient,
+  DatabaseClient,
 } from '../../src';
 import { DatabaseContext } from '../../src/entity/db-context';
 
@@ -79,7 +80,7 @@ export default class implements Migration {
 }
 
 describe('Manual Migration System', () => {
-  let client: PgClient;
+  let client: DatabaseClient;
   let db: TestMigrationDb;
 
   beforeAll(async () => {
@@ -258,7 +259,7 @@ describe('Manual Migration System', () => {
       fs.mkdirSync(TEST_MIGRATIONS_DIR, { recursive: true });
       fs.writeFileSync(path.join(TEST_MIGRATIONS_DIR, 'migration.js'), '');
 
-      await expect(loader.loadMigration('migration.js')).rejects.toThrow(
+      await expectToReject(loader.loadMigration('migration.js'),
         'Must be a .ts file'
       );
     });
@@ -283,7 +284,7 @@ describe('Manual Migration System', () => {
         `export default 42;`
       );
 
-      await expect(loader.loadMigration('20260101-120000.ts')).rejects.toThrow(
+      await expectToReject(loader.loadMigration('20260101-120000.ts'),
         "must export a class/object with an 'up' method"
       );
     });
@@ -553,7 +554,7 @@ describe('Manual Migration System', () => {
       // Ensure the schema exists first
       await db.getSchemaManager().ensureCreated();
 
-      await expect(scaffold.scaffold()).rejects.toThrow(
+      await expectToReject(scaffold.scaffold(),
         'No schema differences detected'
       );
     });

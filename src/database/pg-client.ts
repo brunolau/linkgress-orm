@@ -18,13 +18,8 @@ function isPgPoolInstance(value: any): boolean {
 class PgPooledConnection implements PooledConnection {
   constructor(private client: PoolClient) {}
 
-  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
-    // pg library supports binary protocol via types option
-    const queryConfig = options?.useBinaryProtocol
-      ? { text: sql, values: params, rowMode: 'array' as const }
-      : { text: sql, values: params };
-
-    const result = await this.client.query(queryConfig);
+  async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    const result = await this.client.query(sql, params);
 
     return {
       rows: result.rows as T[],
@@ -60,27 +55,34 @@ export class PgClient extends DatabaseClient {
       this.pool = config;
       this.ownsConnection = false;
     } else {
+      let Pool: any;
+
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { Pool } = require('pg');
-        this.pool = new Pool(config);
-        this.ownsConnection = true;
+        const pgModule = require('pg');
+        // Under ESM-interop loaders require() can return a module-namespace
+        // object ({ default: ... }) — unwrap it (same fix as PostgresClient).
+        Pool = pgModule?.Pool ?? pgModule?.default?.Pool;
       } catch (error) {
         throw new Error(
           'PgClient requires the "pg" package to be installed. ' +
           'Install it with: npm install pg'
         );
       }
+
+      if (typeof Pool !== 'function') {
+        throw new Error('The "pg" package did not expose a Pool constructor (unexpected module shape).');
+      }
+
+      // Outside the try/catch: a pool-construction error (e.g. invalid options)
+      // must propagate as-is, not masquerade as a missing package.
+      this.pool = new Pool(config);
+      this.ownsConnection = true;
     }
   }
 
-  async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
-    // pg library supports binary protocol via types option
-    const queryConfig = options?.useBinaryProtocol
-      ? { text: sql, values: params, rowMode: 'array' as const }
-      : { text: sql, values: params };
-
-    const result = await this.pool.query(queryConfig);
+  async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    const result = await this.pool.query(sql, params);
 
     return {
       rows: result.rows as T[],
@@ -143,10 +145,13 @@ export class PgClient extends DatabaseClient {
   }
 
   /**
-   * pg library supports binary protocol via rowMode option
+   * pg has no binary result protocol toggle. The previous implementation
+   * mapped `useBinaryProtocol` to pg's `rowMode: 'array'`, which is NOT the
+   * binary protocol — it changes the row SHAPE to positional arrays and would
+   * corrupt every column-name-based result mapping downstream.
    */
   supportsBinaryProtocol(): boolean {
-    return true;
+    return false;
   }
 
   /**

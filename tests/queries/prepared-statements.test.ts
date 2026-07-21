@@ -1,4 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, lt, gte, lte, and, or, like, sql, PreparedQuery, inSubquery } from '../../src';
 
@@ -69,9 +70,9 @@ describe('Prepared Statements', () => {
           .prepare('getUserById');
 
         // Should throw when parameter is missing
-        await expect(
+        await expectToReject(
           getUserById.execute({} as any)
-        ).rejects.toThrow('Missing parameter: userId');
+        , 'Missing parameter: userId');
       });
     });
 

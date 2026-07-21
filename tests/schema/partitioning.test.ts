@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, timestamp } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -173,8 +174,8 @@ describe('hasPartitioning() — end-to-end against PostgreSQL', () => {
     const db = new BadDb(client);
     try {
       await drop(client, TABLE);
-      await expect(db.getSchemaManager().ensureCreated())
-        .rejects.toThrow(/partition-key column.*"bucket"|"bucket".*PRIMARY KEY/i);
+      await expectToReject(db.getSchemaManager().ensureCreated(),
+        /partition-key column.*"bucket"|"bucket".*PRIMARY KEY/i);
     } finally {
       await drop(client, TABLE);
       await db.dispose();

@@ -1,4 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, createTestDatabase, createFreshClient } from '../utils/test-database';
 import { eq, inArray, DbContext, DbEntityTable, DbEntity, DbColumn, DbModelConfig, integer, varchar, pgEnum, enumColumn } from '../../src';
 
@@ -152,13 +153,13 @@ describe('PostgreSQL ENUM Support', () => {
 
     test('should reject invalid enum values', async () => {
       await withDatabase(async (db) => {
-        await expect(async () => {
+        await expectToReject(async () => {
           await db.tasks.insert({
             title: 'Invalid task',
             status: 'invalid_status' as any,
             priority: 'low',
           });
-        }).rejects.toThrow();
+        });
       });
     });
   });

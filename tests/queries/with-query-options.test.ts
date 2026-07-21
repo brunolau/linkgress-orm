@@ -134,8 +134,12 @@ describe('withQueryOptions Method', () => {
           }))
           .toList();
 
-        // Temp table strategy should create temp tables
-        expect(logs.some(log => log.includes('tmp_parent_ids'))).toBe(true);
+        // Temp table strategy should create temp tables. Depending on the
+        // driver there are two valid temp-table plans: the two-phase path
+        // creates `tmp_parent_ids_N`, while multi-statement drivers
+        // (postgres.js/Bun) may fuse base + collections into one round trip
+        // using a `tmp_base_N` temp table.
+        expect(logs.some(log => log.includes('tmp_parent_ids') || log.includes('tmp_base'))).toBe(true);
         expect(results.length).toBeGreaterThan(0);
       } finally {
         console.log = originalLog;

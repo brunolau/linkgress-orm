@@ -111,8 +111,9 @@ export class TempTableCollectionStrategy implements ICollectionStrategy {
    * Build aggregation using multi-statement query (single round trip)
    * Supported by postgres.js using .simple() mode
    *
-   * For JSONB/array collections: fetches raw rows and groups in JavaScript (fast!)
-   * For scalar aggregations: uses database aggregation (necessary)
+   * Uses the same server-side aggregation SQL as the legacy path (json_agg /
+   * scalar aggregates) so both execution modes return identical values; only
+   * the transport differs (one multi-statement round trip vs several queries).
    */
   private async buildAggregationMultiStatement(
     config: CollectionAggregationConfig,
@@ -126,9 +127,6 @@ export class TempTableCollectionStrategy implements ICollectionStrategy {
 
     // Build the value placeholders for INSERT (interpolate integer parent IDs - safe)
     const valuePlaceholders = config.parentIds!.map(id => `(${id})`).join(',');
-
-    // Determine if we're doing client-side grouping (JSONB/array) or server-side (scalar)
-    const isClientSideGrouping = config.aggregationType === 'jsonb' || config.aggregationType === 'array';
 
     // Combine everything into a single multi-statement query
     const multiStatementSQL = `
@@ -163,51 +161,12 @@ DROP TABLE IF EXISTS ${tempTableName};
       result = await executor.query(multiStatementSQL, []);
     }
 
-    // Group results by parent_id
+    // Group results by parent_id — every aggregation type returns
+    // (parent_id, data) rows, aggregated server-side.
     const dataMap = new Map<number, any>();
 
-    if (isClientSideGrouping) {
-      // Client-side grouping for JSONB/array - much faster than json_agg!
-      if (config.aggregationType === 'jsonb') {
-        if (config.isSingleResult) {
-          // For firstOrDefault(), take only the first row per parent
-          for (const row of result.rows) {
-            const parentId = row.parent_id;
-            // Only set if not already set (first row wins)
-            if (!dataMap.has(parentId)) {
-              const { parent_id, ...rowData } = row;
-              dataMap.set(parentId, rowData);  // Single object, not array
-            }
-          }
-        } else {
-          // Group rows by parent_id and build arrays
-          for (const row of result.rows) {
-            const parentId = row.parent_id;
-            if (!dataMap.has(parentId)) {
-              dataMap.set(parentId, []);
-            }
-
-            // Extract the actual data (everything except parent_id)
-            const { parent_id, ...rowData } = row;
-            dataMap.get(parentId)!.push(rowData);
-          }
-        }
-      } else if (config.aggregationType === 'array') {
-        // Group rows by parent_id and extract array field
-        const arrayField = config.arrayField!;
-        for (const row of result.rows) {
-          const parentId = row.parent_id;
-          if (!dataMap.has(parentId)) {
-            dataMap.set(parentId, []);
-          }
-          dataMap.get(parentId)!.push(row[arrayField]);
-        }
-      }
-    } else {
-      // Server-side aggregation (scalar) - data already aggregated
-      for (const row of result.rows) {
-        dataMap.set(row.parent_id, row.data);
-      }
+    for (const row of result.rows) {
+      dataMap.set(row.parent_id, row.data);
     }
 
     // Return result with fetched data
@@ -394,12 +353,21 @@ ${aggregationSQL}
       configWithInterpolatedParams.whereParams = []; // Clear params since they're now interpolated
     }
 
-    // For multi-statement optimization: use simple SELECT instead of aggregation
-    // This allows us to group in JavaScript which is much faster than json_agg
+    // Use the SAME server-side aggregation SQL as the legacy path so both
+    // execution modes produce identical value semantics (json_agg turns
+    // numerics into JSON numbers and timestamps into ISO strings — client-side
+    // row grouping used to leak driver-native values like numeric strings and
+    // Date objects, diverging from the CTE/lateral/legacy strategies).
     switch (config.aggregationType) {
       case 'jsonb':
+        return this.buildJsonbAggregationSQL(configWithInterpolatedParams, tempTableName);
+
       case 'array':
-        return this.buildSimpleSelectSQL(configWithInterpolatedParams, tempTableName);
+        // json_agg instead of array_agg: identical element values for the
+        // list use-cases (toNumberList/toStringList), and it keeps native
+        // Postgres arrays off the wire — Bun's SQL client cannot decode
+        // binary array results (see debug/bun-sql-binary-array-repro.ts).
+        return this.buildArrayAggregationSQL(configWithInterpolatedParams, tempTableName, true);
 
       case 'count':
       case 'min':
@@ -415,117 +383,6 @@ ${aggregationSQL}
       default:
         throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
     }
-  }
-
-  /**
-   * Build a simple SELECT query without aggregation
-   * Results will be grouped in JavaScript for better performance
-   *
-   * When LIMIT/OFFSET is specified, uses ROW_NUMBER() window function to correctly
-   * apply pagination per parent row (not globally).
-   */
-  private buildSimpleSelectSQL(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, limitValue, offsetValue } = config;
-
-    // Helper to collect all leaf fields from a potentially nested structure
-    const collectLeafFields = (fields: SelectedField[], prefix: string = ''): Array<{ alias: string; expression: string }> => {
-      const result: Array<{ alias: string; expression: string }> = [];
-      for (const field of fields) {
-        const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
-        if (field.nested) {
-          result.push(...collectLeafFields(field.nested, fullAlias));
-        } else if (field.expression) {
-          result.push({ alias: fullAlias, expression: field.expression });
-        }
-      }
-      return result;
-    };
-
-    const leafFields = collectLeafFields(selectedFields);
-
-    // Build SELECT fields (rewrite collection markers)
-    const selectFields = leafFields
-      .map(f => {
-        const rewrittenExpr = this.rewriteCollectionMarker(f.expression, targetTable) || f.expression;
-        return `${rewrittenExpr} as "${f.alias}"`;
-      })
-      .join(', ');
-
-    // Build WHERE clause (rewrite collection markers)
-    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
-
-    // Build ORDER BY clause
-    const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
-
-    // If LIMIT or OFFSET is specified, use ROW_NUMBER() for per-parent pagination
-    if (limitValue !== undefined || offsetValue !== undefined) {
-      return this.buildSimpleSelectSQLWithRowNumber(
-        config, tempTableName, selectFields, additionalWhere, orderBySQL
-      );
-    }
-
-    // No LIMIT/OFFSET - use simple SELECT
-    const sql = `
-SELECT
-  "${foreignKey}" as parent_id,
-  ${selectFields}
-FROM "${targetTable}"
-WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-${orderBySQL}
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build simple SELECT with ROW_NUMBER() for per-parent LIMIT/OFFSET
-   */
-  private buildSimpleSelectSQLWithRowNumber(
-    config: CollectionAggregationConfig,
-    tempTableName: string,
-    selectFields: string,
-    additionalWhere: string,
-    orderBySQL: string
-  ): string {
-    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
-
-    // Build ORDER BY for ROW_NUMBER() - use the order clause or default to id DESC
-    const rowNumberOrderBy = orderByClause || `"id" DESC`;
-
-    // Build the row number filter condition
-    const offset = offsetValue || 0;
-    let rowNumberFilter: string;
-    if (limitValue !== undefined) {
-      rowNumberFilter = `WHERE "__rn" > ${offset} AND "__rn" <= ${offset + limitValue}`;
-    } else {
-      rowNumberFilter = `WHERE "__rn" > ${offset}`;
-    }
-
-    const sql = `
-SELECT
-  parent_id,
-  ${selectFields.split(', ').map(f => {
-    // Extract just the alias part for outer select
-    const match = f.match(/as "([^"]+)"$/);
-    return match ? `"${match[1]}"` : f;
-  }).join(', ')}
-FROM (
-  SELECT
-    "${foreignKey}" as parent_id,
-    ${selectFields},
-    ROW_NUMBER() OVER (PARTITION BY "${foreignKey}" ORDER BY ${rowNumberOrderBy}) as "__rn"
-  FROM "${targetTable}"
-  WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-) sub
-${rowNumberFilter}
-${orderBySQL.replace(/ORDER BY/i, 'ORDER BY')}
-    `.trim();
-
-    return sql;
   }
 
   /**
@@ -694,7 +551,8 @@ GROUP BY t."${foreignKey}"
    */
   private buildArrayAggregationSQL(
     config: CollectionAggregationConfig,
-    tempTableName: string
+    tempTableName: string,
+    useJsonAgg: boolean = false
   ): string {
     const { arrayField, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue } = config;
 
@@ -715,15 +573,17 @@ GROUP BY t."${foreignKey}"
     // If LIMIT or OFFSET is specified, use ROW_NUMBER() for per-parent pagination
     if (limitValue !== undefined || offsetValue !== undefined) {
       return this.buildArrayAggregationSQLWithRowNumber(
-        config, tempTableName, additionalWhere
+        config, tempTableName, additionalWhere, useJsonAgg
       );
     }
+
+    const aggFn = useJsonAgg ? 'json_agg' : 'array_agg';
 
     // No LIMIT/OFFSET - use simple aggregation
     const sql = `
 SELECT
   t."${foreignKey}" as parent_id,
-  array_agg(t."${arrayField}"${arrayAggOrderBy}) as data
+  ${aggFn}(t."${arrayField}"${arrayAggOrderBy}) as data
 FROM (
   SELECT "${foreignKey}", "${arrayField}"
   FROM "${targetTable}"
@@ -742,7 +602,8 @@ GROUP BY t."${foreignKey}"
   private buildArrayAggregationSQLWithRowNumber(
     config: CollectionAggregationConfig,
     tempTableName: string,
-    additionalWhere: string
+    additionalWhere: string,
+    useJsonAgg: boolean = false
   ): string {
     const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
 
@@ -758,10 +619,12 @@ GROUP BY t."${foreignKey}"
       rowNumberFilter = `WHERE "__rn" > ${offset}`;
     }
 
+    const aggFn = useJsonAgg ? 'json_agg' : 'array_agg';
+
     const sql = `
 SELECT
   t."${foreignKey}" as parent_id,
-  array_agg(t."${arrayField}") as data
+  ${aggFn}(t."${arrayField}") as data
 FROM (
   SELECT "${foreignKey}", "${arrayField}", ROW_NUMBER() OVER (PARTITION BY "${foreignKey}" ORDER BY ${rowNumberOrderBy}) as "__rn"
   FROM "${targetTable}"

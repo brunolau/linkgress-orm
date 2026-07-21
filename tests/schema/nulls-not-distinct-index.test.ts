@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach } from '@jest/globals';
+import { expectToReject } from '../utils/expect-rejects';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -105,9 +106,9 @@ describe('NULLS NOT DISTINCT unique index (end-to-end)', () => {
       // First NULL row is fine; the second collides because NULLs compare equal
       // under NULLS NOT DISTINCT (a plain UNIQUE index would allow both).
       await client.query(`INSERT INTO ${TABLE} (external_ref) VALUES (NULL)`);
-      await expect(
+      await expectToReject(
         client.query(`INSERT INTO ${TABLE} (external_ref) VALUES (NULL)`)
-      ).rejects.toThrow(/duplicate key|unique constraint|violates unique/i);
+      , /duplicate key|unique constraint|violates unique/i);
 
       // A distinct non-null value still inserts fine.
       await client.query(`INSERT INTO ${TABLE} (external_ref) VALUES ('abc')`);

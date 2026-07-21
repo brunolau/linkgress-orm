@@ -82,10 +82,39 @@ export const json = <T = any>() =>
  * Array type
  * Note: PostgreSQL drivers return arrays as already-parsed
  */
+/**
+ * Serialize a JS array into a PostgreSQL array literal ('{1,2,3}',
+ * '{"a","b"}', nested arrays recursively). Strings are quoted with
+ * backslash/quote escaping; null/undefined elements become NULL.
+ */
+const toPgArrayLiteral = (values: readonly any[]): string => {
+  const parts = values.map((value) => {
+    if (value === null || value === undefined) {
+      return 'NULL';
+    }
+    if (Array.isArray(value)) {
+      return toPgArrayLiteral(value);
+    }
+    if (typeof value === 'number' || typeof value === 'bigint') {
+      return String(value);
+    }
+    if (typeof value === 'boolean') {
+      return value ? 't' : 'f';
+    }
+    const text = value instanceof Date ? value.toISOString() : String(value);
+    return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  });
+  return `{${parts.join(',')}}`;
+};
+
 export const array = <T = any>(itemType: string) =>
   customType<T[], T[]>({
     dataType: `${itemType}[]`,
-    toDriver: (value: T[]) => value as any, // Driver accepts arrays directly
+    // Serialize to a PG array literal STRING: every driver accepts it (the
+    // server casts text -> array), unlike raw JS arrays — postgres.js/pg
+    // serialize those themselves, but Bun's SQL client sends them as JSON
+    // (binary mode: protocol error 08P01; text mode: "1,2,3" without braces).
+    toDriver: (value: T[]) => (value == null ? (value as any) : (toPgArrayLiteral(value) as any)),
     fromDriver: (value: T[]) => value,       // Driver returns parsed arrays
   });
 

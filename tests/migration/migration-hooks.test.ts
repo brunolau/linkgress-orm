@@ -163,8 +163,10 @@ describe('Migration Hooks', () => {
 
     const simpleDb = new SimpleDatabase(simpleClient);
 
-    // Should not throw error
-    await expect(simpleDb.getSchemaManager().ensureCreated()).resolves.not.toThrow();
+    // Should not throw error — plain await: a rejection fails the test
+    // directly. (`.resolves.not.toThrow()` misreports under bun:test, same
+    // family as the `.rejects` hang expectToReject works around.)
+    await simpleDb.getSchemaManager().ensureCreated();
 
     // Clean up test-specific table only
     await simpleClient.query('DROP TABLE IF EXISTS simple_users CASCADE');

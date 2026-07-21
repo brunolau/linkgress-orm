@@ -350,6 +350,16 @@ export interface BunSqlOptions {
   prepare?: boolean;
 
   /**
+   * Linkgress extension (not passed to Bun): convert Date values in result
+   * rows to PostgreSQL-text strings ('YYYY-MM-DD HH:MM:SS.mmm' UTC; plain
+   * 'YYYY-MM-DD' when the value is exactly UTC midnight, matching DATE
+   * columns). Bun's SQL client has no custom type-parser hook, so apps whose
+   * data contract expects timestamps as raw strings (e.g. custom `types`
+   * parsers on postgres.js) can restore that contract here. Default: false.
+   */
+  datesAsStrings?: boolean;
+
+  /**
    * Whether to return large integers as BigInt (default: false)
    * When false, large integers are returned as strings
    */
