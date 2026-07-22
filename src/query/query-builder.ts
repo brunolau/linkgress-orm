@@ -192,7 +192,18 @@ const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
 /**
  * Query builder for a table
  */
+/**
+ * Monotonic sequence for query-chain identities. Every root builder gets a
+ * fresh id; derived builders inherit it. Field refs bake the id so a
+ * standalone subquery can detect same-table refs leaking in from an OUTER
+ * chain (alias collision → the correlation would silently bind to the inner
+ * row — see extractOuterFieldRefs).
+ */
+let chainIdSeq = 0;
+
 export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
+  /** @internal Chain identity — see chainIdSeq. */
+  public chainId: number = ++chainIdSeq;
   private schema: TSchema;
   private client: DatabaseClient;
   private whereCond?: Condition;
@@ -278,7 +289,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       false,  // isDistinct defaults to false
       this.schemaRegistry,  // Pass schema registry for nested navigation resolution
       [],  // ctes - start with empty array
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     );
   }
 
@@ -315,7 +327,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       false,
       this.schemaRegistry,  // Pass schema registry for nested navigation resolution
       ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     );
   }
 
@@ -331,6 +344,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     const mock: any = {};
     const tableAlias = this.schema.name;
+    const chainId = this.chainId;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
@@ -358,6 +372,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
+              __chainId: chainId,
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
             };
@@ -459,8 +474,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         false,  // isDistinct defaults to false
         undefined,  // schemaRegistry
         [],  // ctes
-        this.collectionStrategy
-      );
+        this.collectionStrategy,
+      this.chainId
+    );
       return qb.leftJoinSubquery(rightTable, alias, condition as any, selector as any);
     }
 
@@ -510,7 +526,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       false,  // isDistinct defaults to false
       undefined,  // schemaRegistry
       [],  // ctes
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
   }
 
@@ -544,8 +561,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         false,  // isDistinct defaults to false
         undefined,  // schemaRegistry
         [],  // ctes
-        this.collectionStrategy
-      );
+        this.collectionStrategy,
+      this.chainId
+    );
       return qb.innerJoinSubquery(rightTable, alias, condition as any, selector as any);
     }
 
@@ -595,7 +613,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       false,  // isDistinct defaults to false
       undefined,  // schemaRegistry
       [],  // ctes
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
   }
 
@@ -723,6 +742,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
  * Select query builder with nested collection support
  */
 export class SelectQueryBuilder<TSelection> {
+  /** @internal Chain identity — see chainIdSeq. */
+  public chainId: number;
   private schema: TableSchema;
   private client: DatabaseClient;
   private selector: (row: any) => TSelection;
@@ -760,11 +781,13 @@ export class SelectQueryBuilder<TSelection> {
     isDistinct?: boolean,
     schemaRegistry?: Map<string, TableSchema>,
     ctes?: DbCte<any>[],
-    collectionStrategy?: CollectionStrategyType
+    collectionStrategy?: CollectionStrategyType,
+    chainId?: number
   ) {
     this.schema = schema;
     this.client = client;
     this.selector = selector;
+    this.chainId = chainId ?? ++chainIdSeq;
     this.whereCond = whereCond;
     this.limitValue = limit;
     this.offsetValue = offset;
@@ -829,7 +852,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -838,6 +862,74 @@ export class SelectQueryBuilder<TSelection> {
    * Multiple where() calls are chained with AND logic
    * Note: The row parameter represents the selected shape (after select())
    */
+  /**
+   * INNER JOIN used purely as a row FILTER — the selection shape is preserved
+   * (unlike innerJoin, no selector is required and the builder stays chainable
+   * as the same entity/selection type). The ON condition receives (left, right)
+   * mocks; an optional third callback contributes an extra WHERE predicate with
+   * the same (left, right) arguments.
+   *
+   * Intended for scope-style predicates that hop across an N:1 FK (e.g.
+   * order_item → invoicing_partner_data): a JOIN against the "one" side never
+   * duplicates left rows. Joining a 1:N side WILL duplicate rows — callers own
+   * that trade-off (use exists()/inSubquery for semi-join semantics instead).
+   */
+  joinFilter<TRight = any>(
+    rightTable: { _getSchema: () => TableSchema },
+    on: (left: any, right: TRight) => Condition,
+    filter?: (left: any, right: TRight) => Condition
+  ): this {
+    return this.addFilterJoin('INNER', rightTable, on, filter);
+  }
+
+  /**
+   * LEFT JOIN used purely as a row FILTER — see joinFilter. Useful with an
+   * IS NULL predicate in the filter callback for anti-join shapes
+   * ("rows with NO matching right row").
+   */
+  leftJoinFilter<TRight = any>(
+    rightTable: { _getSchema: () => TableSchema },
+    on: (left: any, right: TRight) => Condition,
+    filter?: (left: any, right: TRight) => Condition
+  ): this {
+    return this.addFilterJoin('LEFT', rightTable, on, filter);
+  }
+
+  private addFilterJoin<TRight>(
+    type: JoinType,
+    rightTable: { _getSchema: () => TableSchema },
+    on: (left: any, right: TRight) => Condition,
+    filter?: (left: any, right: TRight) => Condition
+  ): this {
+    const rightSchema = rightTable._getSchema();
+    const rightAlias = `${rightSchema.name}_${this.joinCounter}`;
+    this.joinCounter = this.joinCounter + 1;
+
+    const mockRow = this._createMockRow();
+    const selectedMock = this.selector(mockRow);
+    const leftMock = this.createFieldRefProxy(selectedMock, true);
+    const rightMock = this.createMockRowForTable(rightSchema, rightAlias);
+
+    const onCondition = on(leftMock, rightMock as TRight);
+    this.manualJoins = [
+      ...this.manualJoins,
+      {
+        type,
+        table: rightSchema.name,
+        alias: rightAlias,
+        schema: rightSchema,
+        condition: onCondition,
+      },
+    ];
+
+    if (filter) {
+      const filterCondition = filter(leftMock, rightMock as TRight);
+      this.whereCond = this.whereCond ? andCondition(this.whereCond, filterCondition) : filterCondition;
+    }
+
+    return this;
+  }
+
   where(condition: (row: any) => Condition): this {
     const mockRow = this._createMockRow();
     // Apply the selector to get the selected shape that the user sees in the WHERE condition
@@ -996,7 +1088,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1095,7 +1188,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1150,7 +1244,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1211,7 +1306,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1279,7 +1375,8 @@ export class SelectQueryBuilder<TSelection> {
       this.isDistinct,
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1507,7 +1604,8 @@ export class SelectQueryBuilder<TSelection> {
       true,  // Set isDistinct to true
       this.schemaRegistry,
       this.ctes,
-      this.collectionStrategy
+      this.collectionStrategy,
+      this.chainId
     );
   }
 
@@ -3780,6 +3878,7 @@ ${joinClauses.join('\n')}`;
   _createMockRow(): any {
     const mock: any = {};
     const tableAlias = this.schema.name;
+    const chainId = this.chainId;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
@@ -3807,6 +3906,7 @@ ${joinClauses.join('\n')}`;
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
+              __chainId: chainId,
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
             };
@@ -6107,8 +6207,26 @@ ${joinClauses.join('\n')}`;
         const tableAlias = ref.__tableAlias as string;
         // If the table alias doesn't match our current schema, it's from an outer query
         // Also check if it's not a navigation property of this table (which would be in schema.relations)
+        // and not one of our own manual-join aliases (filter-joins qualify refs by join alias).
         if (tableAlias !== currentTableName && !this.schema.relations[tableAlias]) {
-          outerRefs.push(ref);
+          if (!this.manualJoins.some(j => j.alias === tableAlias)) {
+            outerRefs.push(ref);
+          }
+        } else if (
+          tableAlias === currentTableName
+          && (ref as any).__chainId != null
+          && this.chainId != null
+          && (ref as any).__chainId !== this.chainId
+        ) {
+          // A ref over OUR table name that was created by a DIFFERENT query chain:
+          // this is a same-table correlated standalone subquery. Inner and outer
+          // FROM would share the alias, so the "correlation" would silently bind
+          // to the INNER row and return wrong results — refuse loudly instead.
+          throw new Error(
+            `Correlated standalone subquery over table "${currentTableName}" references the same table from the outer query. `
+            + `Both sides would share the alias "${currentTableName}" and the correlation would silently compare the inner row with itself. `
+            + `Correlate through a different table or key column, or materialize the outer value before building the subquery.`
+          );
         }
       }
     }

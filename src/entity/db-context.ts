@@ -2119,6 +2119,32 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   where(condition: (entity: EntityQuery<TEntity>) => Condition): IEntityQueryable<TEntity>;
 
   /**
+   * INNER JOIN used purely as a row FILTER — keeps the entity shape (no
+   * selector), so scope-style predicates can hop across an N:1 FK in ONE
+   * query level (e.g. order_item ⋈ invoicing_partner_data). The optional
+   * third callback contributes an extra WHERE predicate with the same
+   * (left, right) arguments. Only the right table's COLUMNS are addressable
+   * (no navigations). Joining a 1:N side duplicates left rows — use
+   * exists()/inSubquery for semi-join semantics there.
+   */
+  joinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity>;
+
+  /**
+   * LEFT JOIN used purely as a row FILTER — see joinFilter. Combine with an
+   * IS NULL predicate in `filter` for anti-join shapes ("no matching right
+   * row").
+   */
+  leftJoinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity>;
+
+  /**
    * Select specific fields from the entity
    */
   select<TSelection>(
@@ -2297,6 +2323,20 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
 
   where(
     condition: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>) => Condition
+  ): EntitySelectQueryBuilder<TEntity, TSelection>;
+
+  /** INNER JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.joinFilter}. */
+  joinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition
+  ): EntitySelectQueryBuilder<TEntity, TSelection>;
+
+  /** LEFT JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.leftJoinFilter}. */
+  leftJoinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   orderBy<T>(selector: (row: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => T): EntitySelectQueryBuilder<TEntity, TSelection>;
@@ -3183,6 +3223,63 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const queryBuilder = this.context.getTable(this.tableName)
       .where(condition as any)
       .select(allColumnsSelector);
+    return queryBuilder as any as IEntityQueryable<TEntity>;
+  }
+
+  /**
+   * INNER JOIN as a pure row filter directly off the table — see
+   * {@link IEntityQueryable.joinFilter}.
+   */
+  joinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity> {
+    return (this.asEntityQueryable() as any).joinFilter(
+      rightTable,
+      on,
+      filter,
+    );
+  }
+
+  /**
+   * LEFT JOIN as a pure row filter directly off the table — see
+   * {@link IEntityQueryable.leftJoinFilter}.
+   */
+  leftJoinFilter<TRight extends DbEntity>(
+    rightTable: DbEntityTable<TRight>,
+    on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity> {
+    return (this.asEntityQueryable() as any).leftJoinFilter(
+      rightTable,
+      on,
+      filter,
+    );
+  }
+
+  /**
+   * Entity queryable over all rows (select-all shape) — shared bootstrap for
+   * filter-joins invoked directly on the table.
+   */
+  private asEntityQueryable(): IEntityQueryable<TEntity> {
+    const schema = this._getSchema();
+    const allColumnsSelector = (e: any) => {
+      const result: any = {};
+      for (const colName of Object.keys(schema.columns)) {
+        result[colName] = e[colName];
+      }
+      for (const relName of Object.keys(schema.relations)) {
+        Object.defineProperty(result, relName, {
+          get: () => e[relName],
+          enumerable: false,
+          configurable: true,
+        });
+      }
+      return result;
+    };
+
+    const queryBuilder = this.context.getTable(this.tableName).select(allColumnsSelector);
     return queryBuilder as any as IEntityQueryable<TEntity>;
   }
 
