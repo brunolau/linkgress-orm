@@ -9,16 +9,27 @@ type BunSql = any;
  *
  * Bun exposes SQL on the `Bun` global and via the virtual `bun` module —
  * there is no `bun:sql` builtin. Prefer the global (no module resolution
- * involved, works under every bundler), fall back to `require('bun')` for
- * environments that strip globals.
+ * involved, works under every bundler), fall back to requiring the `bun`
+ * module for environments that strip globals.
+ *
+ * The `bun` module only exists inside the Bun runtime. Bundlers (Vite/Rolldown,
+ * webpack, …) statically resolve a literal `require('bun')` at build time and
+ * fail because the module can't be resolved outside Bun — and because this file
+ * is re-exported from the package entry, that breaks any downstream bundle even
+ * when only PgClient/PostgresClient are used. The specifier is therefore
+ * assembled at runtime from an expression bundlers won't constant-fold (a plain
+ * string literal or `'b' + 'un'` both get folded and re-trigger the error), so
+ * static analysis can't see it. This branch only ever runs under Bun, where the
+ * module is present; under Node it throws and is caught by the constructor.
  */
 function resolveBunSqlConstructor(): any {
   const bunGlobal = (globalThis as any).Bun;
   if (bunGlobal && typeof bunGlobal.SQL === 'function') {
     return bunGlobal.SQL;
   }
+  const bunModuleId = ['b', 'u', 'n'].join('');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { SQL } = require('bun');
+  const { SQL } = require(bunModuleId);
   return SQL;
 }
 
