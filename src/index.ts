@@ -251,12 +251,14 @@ export {
 export type {
   EntityConstructor,
   IndexMethod,
+  StatisticsMetadata,
 } from './entity/entity-base';
 
 // Declarative table partitioning
 export type {
   PartitionStrategy,
   PartitioningConfig,
+  StatisticsDefinition,
 } from './schema/table-builder';
 
 export {

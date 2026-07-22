@@ -13,6 +13,7 @@ import {
   compareIndexDefinition,
   canonicalDefsEquivalent,
 } from './index-sql';
+import { buildCreateStatisticsStatement } from './statistics-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 
 /**
@@ -69,6 +70,7 @@ export type MigrationOperation =
   | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean }
   | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
+  | { type: 'create_statistics'; tableName: string; schema?: string; statisticsName: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
 
@@ -747,6 +749,12 @@ $$`;
       await this.createIndexes(tableName, tableSchema);
     }
 
+    // Create extended-statistics objects (after indexes so the ANALYZE they
+    // trigger also refreshes freshly indexed expression columns)
+    for (const [tableName, tableSchema] of sortedTables) {
+      await this.createStatistics(tableName, tableSchema);
+    }
+
     if (this.logQueries) {
       this.logger('✓ Database schema created successfully\n');
     }
@@ -770,6 +778,16 @@ $$`;
     const indexes = tableSchema.indexes || [];
     for (const index of indexes) {
       await this.executeCreateIndex(tableName, index, tableSchema.schema);
+    }
+  }
+
+  /**
+   * Create extended-statistics objects for a table
+   */
+  private async createStatistics(tableName: string, tableSchema: TableSchema): Promise<void> {
+    const statistics = tableSchema.statistics || [];
+    for (const spec of statistics) {
+      await this.executeCreateStatistics(tableName, spec, tableSchema.schema);
     }
   }
 
@@ -1047,6 +1065,22 @@ $$`;
           }
         }
 
+        // Compare extended-statistics objects — by NAME only (create missing;
+        // never drop or rebuild — rename an object to change its definition).
+        const existingStatistics = await this.getExistingStatistics(tableName, schema.schema);
+        for (const modelStatistics of schema.statistics || []) {
+          if (!existingStatistics.includes(modelStatistics.name)) {
+            operations.push({
+              type: 'create_statistics',
+              tableName,
+              schema: schema.schema,
+              statisticsName: modelStatistics.name,
+              expressions: modelStatistics.expressions,
+              kinds: modelStatistics.kinds,
+            });
+          }
+        }
+
         // Compare foreign key constraints
         const existingForeignKeys = await this.getExistingForeignKeys(tableName, schema.schema);
         const modelForeignKeys = schema.foreignKeys || [];
@@ -1310,6 +1344,14 @@ $$`;
         } else {
           this.logger(`  ⊘ Skipped dropping index "${operation.indexName}"\n`, 'warn');
         }
+        break;
+
+      case 'create_statistics':
+        await this.executeCreateStatistics(operation.tableName, {
+          name: operation.statisticsName,
+          expressions: operation.expressions,
+          kinds: operation.kinds,
+        }, operation.schema);
         break;
 
       case 'create_foreign_key':
@@ -1599,6 +1641,51 @@ $$`;
     this.logger(`  Dropping index ${qualifiedIndexName}...`);
     await this.client.query(`DROP INDEX ${qualifiedIndexName}`);
     this.logger(`  ✓ Index ${qualifiedIndexName} dropped\n`);
+  }
+
+  /**
+   * Create an extended-statistics object and immediately `ANALYZE` its table
+   * so the statistics take effect without waiting for autovacuum. Idempotent
+   * (`IF NOT EXISTS`), mirroring `executeCreateIndex`.
+   */
+  private async executeCreateStatistics(
+    tableName: string,
+    spec: { name: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> },
+    schema?: string
+  ): Promise<void> {
+    if (!spec.expressions || spec.expressions.length === 0) {
+      throw new Error(`Statistics "${spec.name}" has no ON entries. Declare columns via the hasStatistics() selector and/or expressions via .withExpression().`);
+    }
+    if (spec.kinds && spec.kinds.length > 0 && spec.expressions.length < 2) {
+      throw new Error(`Statistics "${spec.name}" sets kinds (${spec.kinds.join(', ')}) with a single ON entry. PostgreSQL rejects a kinds list on univariate expression statistics — add a second entry or drop .withKinds().`);
+    }
+
+    const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
+    this.logger(`  Creating statistics "${spec.name}" on ${qualifiedTableName}...`);
+
+    await this.client.query(buildCreateStatisticsStatement(spec, qualifiedTableName, { ifNotExists: true }));
+    // Populate the new statistics right away — plans depend on them, and the
+    // per-table ANALYZE is cheap relative to a schema migration.
+    await this.client.query(`ANALYZE ${qualifiedTableName}`);
+
+    this.logger(`  ✓ Statistics "${spec.name}" created (table analyzed)\n`);
+  }
+
+  /**
+   * Names of the extended-statistics objects defined on a table, resolved via
+   * the table's namespace so the lookup is independent of search_path.
+   */
+  private async getExistingStatistics(tableName: string, schemaName?: string): Promise<string[]> {
+    const result = await this.client.query(`
+      SELECT s.stxname
+      FROM pg_statistic_ext s
+      JOIN pg_class c ON c.oid = s.stxrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1
+        AND c.relname = $2
+    `, [schemaName || 'public', tableName]);
+
+    return result.rows.map((row: { stxname: string }) => row.stxname);
   }
 
   /**
@@ -2081,6 +2168,10 @@ $$`;
         return `Recreate index "${operation.indexName}" on "${operation.tableName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
+      case 'create_statistics': {
+        const kindsDesc = operation.kinds && operation.kinds.length > 0 ? ` (${operation.kinds.join(', ')})` : '';
+        return `Create statistics "${operation.statisticsName}"${kindsDesc} on "${operation.tableName}" (${operation.expressions.join(', ')})`;
+      }
       case 'create_foreign_key':
         const fk = operation.constraint;
         let desc = `Create foreign key "${fk.name}" on "${operation.tableName}" (${fk.columns.join(', ')}) references "${fk.referencedTable}" (${fk.referencedColumns.join(', ')})`;

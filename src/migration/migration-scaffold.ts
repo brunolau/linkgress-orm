@@ -5,6 +5,7 @@ import { MigrationConfig } from './migration.interface';
 import { MigrationLoader } from './migration-loader';
 import { MigrationOperation } from './db-schema-manager';
 import { buildCreateIndexStatement, buildDropIndexStatement } from './index-sql';
+import { buildCreateStatisticsStatement, buildDropStatisticsStatement } from './statistics-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
@@ -97,6 +98,21 @@ export class MigrationScaffold {
         return [`DROP INDEX IF EXISTS ${qualifiedIndex}`];
       }
 
+      case 'create_statistics': {
+        const statsTable = op.schema
+          ? `"${op.schema}"."${op.tableName}"`
+          : `"${op.tableName}"`;
+        return [
+          buildCreateStatisticsStatement(
+            { name: op.statisticsName, expressions: op.expressions, kinds: op.kinds },
+            statsTable,
+            { ifNotExists: true }
+          ),
+          // Populate the statistics immediately — plans depend on them.
+          `ANALYZE ${statsTable}`,
+        ];
+      }
+
       case 'create_foreign_key':
         return this.buildCreateForeignKeySql(op.tableName, op.constraint, op.schema);
 
@@ -178,6 +194,9 @@ export class MigrationScaffold {
 
       case 'drop_index':
         return [`-- Cannot auto-generate: recreate index "${op.indexName}"`];
+
+      case 'create_statistics':
+        return [buildDropStatisticsStatement(`"${op.statisticsName}"`, { ifExists: true })];
 
       case 'create_foreign_key': {
         const fkTable = op.schema

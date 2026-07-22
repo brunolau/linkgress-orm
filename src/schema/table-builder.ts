@@ -65,6 +65,33 @@ export interface IndexDefinition {
 }
 
 /**
+ * PostgreSQL extended-statistics object declared on a table
+ * (`CREATE STATISTICS … ON <entries> FROM <table>`), covering univariate
+ * expression statistics (a single parenthesized expression entry) and
+ * multivariate statistics (2+ column/expression entries, optionally with an
+ * explicit kinds list).
+ *
+ * Reconciled by NAME only: the schema manager creates a declared object when
+ * no same-named one exists on the table and never drops or rebuilds — rename
+ * the object to change its definition.
+ */
+export interface StatisticsDefinition {
+  name: string;
+  /**
+   * Raw SQL entries of the `ON` list, in declaration order — quoted column
+   * references (`"flags"`) and/or parenthesized expressions
+   * (`("flags" & 1::smallint)`).
+   */
+  expressions: string[];
+  /**
+   * Optional multivariate kinds (`ndistinct` / `dependencies` / `mcv`).
+   * Must be omitted for a single-expression declaration — PostgreSQL builds
+   * univariate expression statistics there and rejects a kinds list.
+   */
+  kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'>;
+}
+
+/**
  * PostgreSQL declarative-partitioning strategy.
  * - `'range'` — partition by ranges of the key (e.g. dates).
  * - `'list'`  — partition by an explicit list of key values.
@@ -138,6 +165,8 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   relations: Record<string, RelationConfig>;
   indexes: IndexDefinition[];
   foreignKeys: ForeignKeyConstraint[];
+  /** Extended-statistics objects declared on this table (`CREATE STATISTICS`). */
+  statistics?: StatisticsDefinition[];
   /** Declarative partitioning config for this table (parent `PARTITION BY`). */
   partitioning?: PartitioningConfig;
   /**
@@ -205,6 +234,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private relationDefs: Record<string, RelationConfig> = {};
   private indexDefs: IndexDefinition[] = [];
   private foreignKeyDefs: ForeignKeyConstraint[] = [];
+  private statisticsDefs: StatisticsDefinition[] = [];
   private partitioningDef?: PartitioningConfig;
 
   constructor(name: string, schema: TSchema, indexes?: IndexDefinition[], foreignKeys?: ForeignKeyConstraint[], schemaName?: string) {
@@ -316,6 +346,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       relations: this.relationDefs,
       indexes: this.indexDefs,
       foreignKeys: this.foreignKeyDefs,
+      statistics: this.statisticsDefs,
       partitioning: this.partitioningDef,
       columnNameMap,
       relationEntries,
@@ -323,6 +354,16 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       columnMetadataCache,
     };
     return this._cachedSchema;
+  }
+
+  /**
+   * Declare the table's extended-statistics objects (`CREATE STATISTICS`).
+   * Mirrors how indexes/foreign keys arrive from entity metadata; replaces any
+   * previously set list.
+   */
+  withStatistics(statistics: StatisticsDefinition[]): this {
+    this.statisticsDefs = statistics || [];
+    return this;
   }
 
   /**

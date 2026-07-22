@@ -39,6 +39,8 @@ export interface EntityMetadata<T extends DbEntity> {
   properties: Map<keyof T, PropertyMetadata>;
   navigations: Map<keyof T, NavigationMetadata<any>>;
   indexes: IndexMetadata[];
+  /** Extended-statistics objects (`CREATE STATISTICS`), set via `.hasStatistics()`. */
+  statistics?: StatisticsMetadata[];
   /** Declarative table partitioning (parent `PARTITION BY`), set via `.hasPartitioning()`. */
   partitioning?: PartitioningConfig;
 }
@@ -202,6 +204,26 @@ export interface IndexMetadata {
 }
 
 /**
+ * Extended-statistics metadata (`CREATE STATISTICS … ON <entries> FROM <table>`),
+ * declared via `entity.hasStatistics()`. Entries are raw SQL — quoted column
+ * references collected through the selector proxy and/or parenthesized
+ * expressions supplied through `withExpression()`. Reconciled by NAME only:
+ * the schema manager creates a missing object and never drops or rebuilds one
+ * (rename to change a definition).
+ */
+export interface StatisticsMetadata {
+  name: string;
+  /** Raw SQL entries of the `ON` list, in declaration order. */
+  expressions: string[];
+  /**
+   * Optional multivariate kinds. Must stay unset for a single-expression
+   * declaration — PostgreSQL builds univariate expression statistics there
+   * and rejects an explicit kinds list.
+   */
+  kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'>;
+}
+
+/**
  * Global entity metadata store
  */
 export class EntityMetadataStore {
@@ -228,6 +250,7 @@ export class EntityMetadataStore {
         properties: new Map(),
         navigations: new Map(),
         indexes: [],
+        statistics: [],
       };
       this.metadata.set(entityClass, metadata);
     }

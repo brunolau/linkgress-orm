@@ -1,4 +1,4 @@
-import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef } from './entity-base';
+import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef, StatisticsMetadata } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import type { PartitionStrategy, PartitioningConfig } from '../schema/table-builder';
 import { TypeMapper } from '../types/type-mapper';
@@ -518,6 +518,77 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
   }
 
   /**
+   * Declare a PostgreSQL extended-statistics object
+   * (`CREATE STATISTICS <name> [(kinds)] ON <entries> FROM <table>`).
+   *
+   * Plain columns come from the selector (same proxy mechanism as
+   * {@link hasIndex}); expressions the selector helpers cannot express — e.g.
+   * infix operators like a bitmask test — are supplied as raw SQL via
+   * `.withExpression()` on the returned builder. A single-expression
+   * declaration produces univariate EXPRESSION statistics (the fix for
+   * planner misestimates of predicates like `(flags & 1::smallint) = 0`);
+   * two or more entries produce multivariate statistics, optionally narrowed
+   * with `.withKinds()`.
+   *
+   * Reconciled by NAME only: `ensureCreated()` / `migrate()` create the object
+   * when a table has no same-named one and run `ANALYZE <table>` so the
+   * statistics take effect immediately. Definitions are never diffed or
+   * rebuilt — rename the object to change it.
+   *
+   * @example
+   * // Univariate expression statistics (planner selectivity for a bitmask test):
+   * entity.hasStatistics('stx_resort_admin_visible_flags')
+   *   .withExpression('("flags" & 1::smallint)');
+   *
+   * // Multivariate dependencies between two columns:
+   * entity.hasStatistics('stx_city_zip', e => [e.city, e.zip]).withKinds('dependencies');
+   */
+  hasStatistics(
+    statisticsName: string,
+    selector?: (entity: TEntity) => Array<TEntity[keyof TEntity]>
+  ): StatisticsBuilder<TEntity> {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+
+    const expressions: string[] = [];
+
+    if (selector) {
+      const tempEntity = {} as TEntity;
+      const proxy = new Proxy(tempEntity, {
+        get: (target, prop) => {
+          if (typeof prop === 'string') {
+            const propMetadata = metadata.properties.get(prop as keyof TEntity);
+            if (propMetadata) {
+              return { __indexColumn: true, columnName: propMetadata.columnName } as IndexColumnRef;
+            }
+          }
+          return undefined;
+        }
+      });
+
+      const result = selector(proxy);
+
+      for (const item of result) {
+        const ref = item as unknown as IndexColumnRef;
+        if (ref && ref.__indexColumn) {
+          expressions.push(ref.expression ? ref.expression : `"${ref.columnName}"`);
+        }
+      }
+    }
+
+    const statisticsMetadata: StatisticsMetadata = {
+      name: statisticsName,
+      expressions,
+    };
+
+    if (!metadata.statistics) {
+      metadata.statistics = [];
+    }
+    metadata.statistics.push(statisticsMetadata);
+
+    return new StatisticsBuilder<TEntity>(this.entityClass, statisticsMetadata);
+  }
+
+  /**
    * Configure declarative PostgreSQL table partitioning — the parent table's
    * `PARTITION BY <strategy> (<key>)` clause. Child partitions
    * (`PARTITION OF ... FOR VALUES ...`) are created/rotated separately (usually
@@ -721,6 +792,42 @@ export class IndexBuilder<TEntity extends DbEntity> {
    */
   nullsNotDistinct(): this {
     this.indexMetadata.nullsNotDistinct = true;
+    return this;
+  }
+}
+
+/**
+ * Fluent configuration for an extended-statistics object declared via
+ * {@link EntityTypeBuilder.hasStatistics}. Mutates the metadata object pushed
+ * by `hasStatistics`, mirroring how {@link IndexBuilder} works.
+ */
+export class StatisticsBuilder<TEntity extends DbEntity> {
+  constructor(
+    private entityClass: EntityConstructor<TEntity>,
+    private statisticsMetadata: StatisticsMetadata
+  ) {}
+
+  /**
+   * Append raw SQL entries to the statistics `ON` list — the escape hatch for
+   * expressions the selector helpers cannot express (infix operators, casts).
+   * PostgreSQL requires each expression entry to be parenthesized.
+   *
+   * @example
+   * entity.hasStatistics('stx_flags_system')
+   *   .withExpression('("flags" & 1::smallint)')
+   */
+  withExpression(...expressions: string[]): this {
+    this.statisticsMetadata.expressions.push(...expressions);
+    return this;
+  }
+
+  /**
+   * Restrict the multivariate statistics kinds built for a 2+-entry
+   * declaration. Do not set kinds on a single-expression declaration —
+   * PostgreSQL rejects the combination.
+   */
+  withKinds(...kinds: Array<'ndistinct' | 'dependencies' | 'mcv'>): this {
+    this.statisticsMetadata.kinds = kinds;
     return this;
   }
 }

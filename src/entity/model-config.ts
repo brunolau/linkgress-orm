@@ -64,6 +64,7 @@ export class DbModelConfig {
       }
 
       const tableBuilder = new TableBuilder(metadata.tableName, schema, metadata.indexes || [], [], metadata.schemaName);
+      tableBuilder.withStatistics(metadata.statistics || []);
       tablesWithoutNav.set(metadata.tableName, { table: tableBuilder, entityClass, metadata });
     }
 
@@ -147,6 +148,7 @@ export class DbModelConfig {
         // Merge with existing schema
         const existingSchema = (tableBuilder as any).schemaDef;
         const mergedTable = new TableBuilder(metadata.tableName, { ...existingSchema, ...navSchema }, metadata.indexes || [], [], metadata.schemaName);
+        mergedTable.withStatistics(metadata.statistics || []);
         if (metadata.partitioning) mergedTable.partitionBy(metadata.partitioning);
         tables.set(metadata.tableName, mergedTable);
       } else {
@@ -217,9 +219,11 @@ export class DbModelConfig {
       const existingIndexes = (tableBuilder as any).indexDefs || [];
       const existingSchemaName = (tableBuilder as any).schemaName;
       const existingPartitioning = (tableBuilder as any).partitioningDef;
+      const existingStatistics = (tableBuilder as any).statisticsDefs || [];
       const foreignKeys = foreignKeysByTable.get(tableName) || [];
 
       const finalTable = new TableBuilder(tableName, existingSchema, existingIndexes, foreignKeys, existingSchemaName);
+      finalTable.withStatistics(existingStatistics);
       if (existingPartitioning) finalTable.partitionBy(existingPartitioning);
       finalTables.set(tableName, finalTable);
     }
