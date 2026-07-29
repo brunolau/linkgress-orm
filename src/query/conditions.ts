@@ -987,6 +987,133 @@ export function jsonbMerge<T extends object = any>(
 type PropertyType<T, K extends keyof T> = T[K];
 
 // ============================================================================
+// Arithmetic operators
+// ============================================================================
+
+/**
+ * Build a parenthesised infix arithmetic fragment from the given operands.
+ * Mapper handling mirrors `coalesce`: the first operand-provided mapper wins and
+ * is applied to plain literals so they bind in driver representation.
+ */
+function arithmetic(operator: string, operands: any[]): SqlFragment<number> {
+  // Build parts: '(', ' + ', ' + ', ..., ')'
+  const parts: string[] = ['('];
+  for (let i = 1; i < operands.length; i++) {
+    parts.push(operator);
+  }
+  parts.push(')');
+
+  const mapper = operands.map(getValueMapper).find(Boolean);
+  const values = mapper
+    ? operands.map(value => isSqlFragmentLiteral(value) ? applyToDriverMapper(value, mapper) : value)
+    : operands;
+
+  return new SqlFragment<number>(parts, values, mapper);
+}
+
+/**
+ * Addition - emits `(a + b + ...)`.
+ * Accepts two or more operands; each may be a column, SqlFragment or literal.
+ *
+ * The result is always parenthesised so it nests safely inside other
+ * expressions. NULL semantics are unchanged: `NULL + 1` is `NULL` in SQL, so
+ * combine with `coalesce` when a null operand should read as zero.
+ *
+ * @example
+ * // Use in select
+ * db.posts.select(p => ({
+ *   score: add(p.views, p.commentCount),
+ * }))
+ *
+ * @example
+ * // Conditional increment in update — no raw sql template needed
+ * db.discountCodes.where(c => eq(c.id, id)).update(c => ({
+ *   usedCount: add(c.usedCount, n),
+ * }))
+ *
+ * @example
+ * // Compose with coalesce when an operand may be NULL
+ * db.users.select(u => ({
+ *   total: add(u.age, coalesce(u.bonusYears, 0)),
+ * }))
+ */
+export function add<T1, T2, TRest extends any[]>(
+  value1: FieldLike<T1> | T1,
+  value2: FieldLike<T2> | T2,
+  ...rest: TRest
+): SqlFragment<number> {
+  return arithmetic(' + ', [value1, value2, ...rest]);
+}
+
+/**
+ * Multiplication - emits `(a * b * ...)`.
+ * Accepts two or more operands; each may be a column, SqlFragment or literal.
+ *
+ * The result is always parenthesised, so mixing precedence levels is safe:
+ * `add(a, mul(b, c))` emits `(a + (b * c))`. NULL semantics are unchanged.
+ *
+ * @example
+ * // Line total in select
+ * db.orderItems.select(i => ({
+ *   lineTotal: mul(i.quantity, i.unitPrice),
+ * }))
+ */
+export function mul<T1, T2, TRest extends any[]>(
+  value1: FieldLike<T1> | T1,
+  value2: FieldLike<T2> | T2,
+  ...rest: TRest
+): SqlFragment<number> {
+  return arithmetic(' * ', [value1, value2, ...rest]);
+}
+
+/**
+ * Subtraction - emits `(left - right)`.
+ *
+ * Deliberately binary rather than variadic: subtraction is left-associative, so
+ * a variadic form reads ambiguously. Nest explicitly for longer chains —
+ * `sub(sub(a, b), c)`. NULL semantics are unchanged.
+ *
+ * @example
+ * // Remaining capacity in select
+ * db.events.select(e => ({
+ *   remaining: sub(e.capacity, e.soldCount),
+ * }))
+ *
+ * @example
+ * // Decrement in update
+ * db.products.where(p => eq(p.id, id)).update(p => ({
+ *   stock: sub(p.stock, quantity),
+ * }))
+ */
+export function sub<T1, T2>(
+  left: FieldLike<T1> | T1,
+  right: FieldLike<T2> | T2
+): SqlFragment<number> {
+  return arithmetic(' - ', [left, right]);
+}
+
+/**
+ * Division - emits `(left / right)`.
+ *
+ * Deliberately binary rather than variadic: division is left-associative, so a
+ * variadic form reads ambiguously. Nest explicitly for longer chains —
+ * `div(div(a, b), c)`. NULL semantics are unchanged, and PostgreSQL integer
+ * division still truncates — cast an operand if you need a fractional result.
+ *
+ * @example
+ * // Average price per unit, guarding the divisor with coalesce
+ * db.orders.select(o => ({
+ *   perUnit: div(o.totalAmount, coalesce(o.itemCount, 1)),
+ * }))
+ */
+export function div<T1, T2>(
+  left: FieldLike<T1> | T1,
+  right: FieldLike<T2> | T2
+): SqlFragment<number> {
+  return arithmetic(' / ', [left, right]);
+}
+
+// ============================================================================
 // Flag/Bitmask Operators
 // ============================================================================
 
