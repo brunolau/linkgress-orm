@@ -797,6 +797,141 @@ describe('Insert, Update, Delete Operations', () => {
     });
   });
 
+  describe('MERGE (mergeBulk) operations', () => {
+    test('matches purely on the per-query ON condition — no unique constraint involved', async () => {
+      await withDatabase(async (db) => {
+        // registry_items deliberately has NO unique index on crm_id: the identity
+        // lives in the statement (`on: 'crmId'`), not in any constraint. The same
+        // input through upsertBulk would fail with "there is no unique or
+        // exclusion constraint matching the ON CONFLICT specification".
+        const inserted = await db.registryItems.mergeBulk(
+          [
+            { crmId: 'reg-1', name: 'One', active: true },
+            { crmId: 'reg-2', name: 'Two', active: true },
+          ],
+          { on: 'crmId', updateColumns: ['name', 'active'] }
+        ).returning();
+
+        expect(inserted).toHaveLength(2);
+
+        const merged = await db.registryItems.mergeBulk(
+          [
+            { crmId: 'reg-1', name: 'One RENAMED', active: true },
+            { crmId: 'reg-3', name: 'Three', active: true },
+          ],
+          { on: 'crmId', updateColumns: ['name', 'active'] }
+        ).returning();
+
+        expect(merged).toHaveLength(2);
+
+        const all = await db.registryItems.orderBy(r => r.id).toList();
+        expect(all).toHaveLength(3);
+        expect(all.find(r => r.crmId === 'reg-1')?.name).toBe('One RENAMED');
+        expect(all.find(r => r.crmId === 'reg-1')?.id).toBe(inserted.find(r => r.crmId === 'reg-1')!.id);
+        expect(all.find(r => r.crmId === 'reg-3')).toBeDefined();
+      });
+    });
+
+    test('matchWhere scopes the match — a deactivated row frees its crmId', async () => {
+      await withDatabase(async (db) => {
+        const [first] = await db.registryItems.mergeBulk(
+          [{ crmId: 'reg-free', name: 'Original', active: true }],
+          { on: 'crmId', matchWhere: 't."active" = TRUE', updateColumns: ['name', 'active'] }
+        ).returning();
+
+        await db.registryItems.where(r => eq(r.id, first.id)).update({ active: false });
+
+        // The inactive row falls outside the match scope, so the merge takes the
+        // NOT MATCHED arm and mints a fresh active row (soft-deletable masterdata
+        // semantics, stated explicitly in the query).
+        const [reborn] = await db.registryItems.mergeBulk(
+          [{ crmId: 'reg-free', name: 'Reborn', active: true }],
+          { on: 'crmId', matchWhere: 't."active" = TRUE', updateColumns: ['name', 'active'] }
+        ).returning();
+
+        expect(reborn.id).not.toBe(first.id);
+
+        const all = await db.registryItems.where(r => eq(r.crmId, 'reg-free')).toList();
+        expect(all).toHaveLength(2);
+        expect(all.filter(r => r.active)).toHaveLength(1);
+        expect(all.find(r => r.active)?.name).toBe('Reborn');
+      });
+    });
+
+    test('returning() maps selected columns (PostgreSQL 17+)', async () => {
+      await withDatabase(async (db) => {
+        const rows = await db.registryItems.mergeBulk(
+          [{ crmId: 'reg-ret', name: 'Returned', active: true }],
+          { on: 'crmId', updateColumns: ['name', 'active'] }
+        ).returning(r => ({ id: r.id, name: r.name }));
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].id).toBeGreaterThan(0);
+        expect(rows[0].name).toBe('Returned');
+        expect((rows[0] as any).crmId).toBeUndefined();
+      });
+    });
+
+    test('empty updateColumns renders WHEN MATCHED DO NOTHING (insert-only merge)', async () => {
+      await withDatabase(async (db) => {
+        await db.registryItems.mergeBulk(
+          [{ crmId: 'reg-keep', name: 'Keep me', active: true }],
+          { on: 'crmId' }
+        );
+
+        await db.registryItems.mergeBulk(
+          [
+            { crmId: 'reg-keep', name: 'MUST NOT OVERWRITE', active: true },
+            { crmId: 'reg-new', name: 'Fresh', active: true },
+          ],
+          { on: 'crmId', updateColumns: [] }
+        );
+
+        const all = await db.registryItems.toList();
+        expect(all.find(r => r.crmId === 'reg-keep')?.name).toBe('Keep me');
+        expect(all.find(r => r.crmId === 'reg-new')?.name).toBe('Fresh');
+      });
+    });
+
+    test('chunked merges process every row', async () => {
+      await withDatabase(async (db) => {
+        await db.registryItems.mergeBulk(
+          [
+            { crmId: 'reg-c1', name: 'C1', active: true },
+            { crmId: 'reg-c2', name: 'C2', active: true },
+            { crmId: 'reg-c3', name: 'C3', active: true },
+          ],
+          { on: 'crmId', updateColumns: ['name', 'active'], chunkSize: 1 }
+        );
+
+        const all = await db.registryItems.toList();
+        expect(all).toHaveLength(3);
+      });
+    });
+
+    test('rejects when one target row is matched by multiple source rows (Postgres MERGE contract)', async () => {
+      await withDatabase(async (db) => {
+        await db.registryItems.mergeBulk(
+          [{ crmId: 'reg-dup', name: 'Target', active: true }],
+          { on: 'crmId' }
+        );
+
+        // Postgres: "MERGE command cannot affect row a second time" — inputs must
+        // be deduplicated by the `on` key(s) before calling mergeBulk.
+        await expectToReject(
+          db.registryItems.mergeBulk(
+            [
+              { crmId: 'reg-dup', name: 'Dup A', active: true },
+              { crmId: 'reg-dup', name: 'Dup B', active: true },
+            ],
+            { on: 'crmId', updateColumns: ['name', 'active'] }
+          ) as unknown as Promise<void>,
+          /second time/i
+        );
+      });
+    });
+  });
+
   describe('Transaction-like behavior', () => {
     test('should rollback on error', async () => {
       const db = createTestDatabase();

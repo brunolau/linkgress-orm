@@ -877,6 +877,12 @@ export interface FluentUpsert<TEntity extends DbEntity> extends PromiseLike<void
 }
 
 /**
+ * Fluent MERGE operation — same thenable/returning shape as {@link FluentUpsert}.
+ * `returning()` on MERGE requires PostgreSQL 17+.
+ */
+export type FluentMerge<TEntity extends DbEntity> = FluentUpsert<TEntity>;
+
+/**
  * Fluent delete operation for SelectQueryBuilder
  * Used with db.table.where(...).delete()
  */
@@ -1934,6 +1940,45 @@ export type EntityUpsertConfig<TEntity extends DbEntity> = {
 
   /**
    * Filter function to determine if column should be updated on conflict
+   */
+  updateColumnFilter?: (columnName: string) => boolean;
+};
+
+/**
+ * Merge configuration for entity-level {@link DbEntityTable.mergeBulk}
+ * (PostgreSQL `MERGE`, 15+).
+ */
+export type EntityMergeConfig<TEntity extends DbEntity> = {
+  /**
+   * Identity column(s) of THIS statement's match — rendered as
+   * `ON t."col" = s."col" [AND …]`. Unlike `upsertBulk`'s `primaryKey`, no
+   * unique index or constraint is consulted: MERGE matches on the join
+   * condition alone. Required — the identity is always stated explicitly at
+   * the call site.
+   */
+  on: keyof ExtractDbColumns<TEntity> | (keyof ExtractDbColumns<TEntity>)[] | ((entity: TEntity) => any);
+  /**
+   * Extra raw SQL ANDed into the match condition. The target row is aliased
+   * `t`, the incoming source row `s` — qualify columns to avoid ambiguity,
+   * e.g. `t."active" = TRUE`.
+   */
+  matchWhere?: string;
+  /**
+   * Size of insert chunk for bulk merges
+   */
+  chunkSize?: number;
+  /**
+   * Reference item to detect columns. If not specified, first value from array is used
+   */
+  referenceItem?: any;
+  /**
+   * Columns updated by the WHEN MATCHED arm. Can be property names or lambda
+   * selectors. Defaults to every inserted column that is not part of `on`;
+   * an explicitly empty selection renders `WHEN MATCHED THEN DO NOTHING`.
+   */
+  updateColumns?: (keyof ExtractDbColumns<TEntity>)[] | ((entity: TEntity) => Partial<ExtractDbColumns<TEntity>>);
+  /**
+   * Filter function to determine if column should be updated by WHEN MATCHED
    */
   updateColumnFilter?: (columnName: string) => boolean;
 };
@@ -4036,6 +4081,283 @@ export class DbEntityTable<TEntity extends DbEntity> {
 
     // Standard RETURNING (no navigation properties)
     const returningClause = this.buildReturningClause(returning as any);
+    if (returningClause) {
+      sql += ` RETURNING ${returningClause.sql}`;
+    }
+
+    const result = executor
+      ? await executor.query(sql, params)
+      : await client.query(sql, params);
+
+    if (!returningClause) {
+      return undefined;
+    }
+
+    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
+  }
+
+  /**
+   * Bulk MERGE (PostgreSQL 15+) — upsert-like semantics with a PER-QUERY match
+   * condition instead of a unique-index arbiter.
+   *
+   * `ON CONFLICT` requires a unique/exclusion constraint matching the conflict
+   * target; `MERGE` does not — the identity is whatever the statement's `ON`
+   * condition says. `config.on` names the identity column(s) explicitly and
+   * `config.matchWhere` scopes the match with raw SQL (target alias `t`,
+   * source alias `s`), e.g. soft-deletable masterdata matching only ACTIVE
+   * rows:
+   *
+   * ```typescript
+   * await db.registryItems.mergeBulk(items, {
+   *   on: 'crmId',
+   *   matchWhere: 't."active" = TRUE',
+   *   updateColumns: ['name', 'active'],
+   * });
+   * ```
+   *
+   * Renders:
+   * `MERGE INTO … AS t USING (VALUES …) AS s (…) ON t."crm_id" = s."crm_id"
+   *  AND (t."active" = TRUE) WHEN MATCHED THEN UPDATE SET … WHEN NOT MATCHED
+   *  THEN INSERT …`.
+   *
+   * Caveats (PostgreSQL semantics, not ORM choices):
+   *  - each TARGET row may be matched by at most ONE source row — Postgres
+   *    raises `MERGE command cannot affect row a second time` otherwise, so
+   *    dedupe the input by the `on` key(s);
+   *  - MERGE has no `ON CONFLICT`-style speculative insertion: two concurrent
+   *    merges can both take the NOT MATCHED arm (duplicate rows, or a unique
+   *    violation if an index exists). Prefer `upsertBulk` for hot concurrent
+   *    paths; MERGE suits single-writer sync/batch flows;
+   *  - `.returning()` requires PostgreSQL 17+ and does not support navigation
+   *    properties.
+   */
+  mergeBulk(
+    values: UpsertData<TEntity>[],
+    config: EntityMergeConfig<TEntity>
+  ): FluentMerge<TEntity> {
+    const table = this;
+
+    const executeMergeBulk = async <TResult>(
+      returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
+    ): Promise<any> => {
+      if (values.length === 0) {
+        return returning === undefined ? undefined : [];
+      }
+
+      // Resolve the match columns (lambda, string, or array). Always explicit —
+      // there is no constraint to fall back to, so `on` is required.
+      let onKeys: string[] = [];
+      if (typeof config.on === 'function') {
+        onKeys = table.extractPropertyNames(config.on as (entity: TEntity) => any);
+      } else if (Array.isArray(config.on)) {
+        onKeys = config.on as string[];
+      } else if (config.on != null) {
+        onKeys = [config.on as string];
+      }
+      if (onKeys.length === 0) {
+        throw new Error('mergeBulk requires config.on — the explicit identity column(s) for the match condition');
+      }
+
+      // Handle updateColumns (can be lambda or array)
+      let updateColumns: string[] | undefined;
+      if (config.updateColumns) {
+        updateColumns = typeof config.updateColumns === 'function'
+          ? table.extractPropertyNames(config.updateColumns)
+          : (config.updateColumns as string[]);
+      }
+
+      // Calculate chunk size (same bound as upsertBulk)
+      let chunkSize = config.chunkSize;
+      if (chunkSize == null) {
+        const POSTGRES_MAX_PARAMS = 65535;
+        const columnCount = Object.keys(values[0]).length;
+        const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
+        chunkSize = Math.floor(maxRowsPerBatch * 0.6);
+      }
+
+      if (values.length > chunkSize) {
+        const allResults: any[] = [];
+        for (let i = 0; i < values.length; i += chunkSize) {
+          const chunk = values.slice(i, i + chunkSize);
+          const chunkResults = await table.mergeBulkSingle(
+            chunk, onKeys, config.matchWhere, updateColumns, config.updateColumnFilter, returning
+          );
+          if (chunkResults) allResults.push(...chunkResults);
+        }
+        return returning === undefined ? undefined : allResults;
+      }
+
+      return table.mergeBulkSingle(
+        values, onKeys, config.matchWhere, updateColumns, config.updateColumnFilter, returning
+      );
+    };
+
+    return {
+      then<TResult1 = void, TResult2 = never>(
+        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+      ): PromiseLike<TResult1 | TResult2> {
+        return executeMergeBulk(undefined).then(onfulfilled, onrejected);
+      },
+      returning<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
+        const returningConfig = selector ?? true;
+        return {
+          then<T1 = any, T2 = never>(
+            onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
+            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
+          ): PromiseLike<T1 | T2> {
+            return executeMergeBulk(returningConfig).then(onfulfilled, onrejected);
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * Execute a single MERGE batch
+   * @internal
+   */
+  private async mergeBulkSingle<TReturning>(
+    values: UpsertData<TEntity>[],
+    onKeys: string[],
+    matchWhere: string | undefined,
+    updateColumns: string[] | undefined,
+    updateColumnFilter: ((colId: string) => boolean) | undefined,
+    returning: TReturning
+  ): Promise<any[] | void> {
+    const schema = this._getSchema();
+    const executor = this._getExecutor();
+    const client = this._getClient();
+    const qualifiedTableName = this._getQualifiedTableName();
+
+    // Extract all unique column names from all data objects (mirrors upsertBulkSingle,
+    // minus the identity-column skip — MERGE source rows carry every provided value).
+    const columnConfigs: Array<{ propName: string; dbName: string; sqlType?: string; mapper?: any }> = [];
+    const columnSet = new Set<string>();
+
+    for (const data of values) {
+      for (const key of Object.keys(data)) {
+        if (!columnSet.has(key)) {
+          const column = schema.columns[key];
+          if (column) {
+            const cfg = (column as any).build();
+            columnSet.add(key);
+            columnConfigs.push({
+              propName: key,
+              dbName: cfg.name,
+              sqlType: cfg.type,
+              mapper: cfg.mapper,
+            });
+          }
+        }
+      }
+    }
+
+    for (const onKey of onKeys) {
+      if (!columnConfigs.some(c => c.propName === onKey)) {
+        throw new Error(`mergeBulk: identity column "${onKey}" is not present in the provided values`);
+      }
+    }
+
+    // VALUES column types resolve from the FIRST row: cast it to the declared
+    // column types so `s.*` compares and assigns with proper types instead of
+    // `unknown`/text (serial pseudo-types cast to their integer base).
+    const castForType = (sqlType?: string): string => {
+      if (!sqlType || sqlType === 'array') return '';
+      const baseType = sqlType === 'serial' ? 'integer'
+        : sqlType === 'smallserial' ? 'smallint'
+        : sqlType === 'bigserial' ? 'bigint'
+        : sqlType;
+      return `::${baseType}`;
+    };
+
+    const valuesClauses: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    for (let rowIndex = 0; rowIndex < values.length; rowIndex++) {
+      const record = values[rowIndex];
+      const rowValues: string[] = [];
+      for (const col of columnConfigs) {
+        const value = (record as any)[col.propName];
+        const cast = rowIndex === 0 ? castForType(col.sqlType) : '';
+
+        // SqlFragment values inline as SQL expressions, matching upsertBulkSingle.
+        if (value instanceof SqlFragment) {
+          const sqlBuildContext: SqlBuildContext = {
+            paramCounter: paramIndex,
+            params,
+          };
+          const fragmentSql = value.buildSql(sqlBuildContext);
+          paramIndex = sqlBuildContext.paramCounter;
+          rowValues.push(`(${fragmentSql})${cast}`);
+          continue;
+        }
+
+        const mappedValue = col.mapper
+          ? col.mapper.toDriver(value !== undefined ? value : null)
+          : (value !== undefined ? value : null);
+        rowValues.push(`$${paramIndex++}${cast}`);
+        params.push(mappedValue);
+      }
+      valuesClauses.push(`(${rowValues.join(', ')})`);
+    }
+
+    const sourceColumnList = columnConfigs.map(c => `"${c.dbName}"`).join(', ');
+
+    const onConditions = onKeys.map(onKey => {
+      const col = columnConfigs.find(c => c.propName === onKey)!;
+      return `t."${col.dbName}" = s."${col.dbName}"`;
+    });
+    if (matchWhere) {
+      onConditions.push(`(${matchWhere})`);
+    }
+
+    let sql = `MERGE INTO ${qualifiedTableName} AS t`
+      + ` USING (VALUES ${valuesClauses.join(', ')}) AS s (${sourceColumnList})`
+      + ` ON ${onConditions.join(' AND ')}`;
+
+    // WHEN MATCHED arm: update the requested columns (default: everything that
+    // is not part of the match identity); empty selection → DO NOTHING.
+    let columnsToUpdate: string[];
+    if (updateColumns) {
+      columnsToUpdate = updateColumns;
+    } else if (updateColumnFilter) {
+      columnsToUpdate = Array.from(columnSet).filter(updateColumnFilter);
+    } else {
+      columnsToUpdate = Array.from(columnSet).filter(key => !onKeys.includes(key));
+    }
+
+    if (columnsToUpdate.length === 0) {
+      sql += ` WHEN MATCHED THEN DO NOTHING`;
+    } else {
+      const updateSetClauses = columnsToUpdate.map(propName => {
+        const col = columnConfigs.find(c => c.propName === propName);
+        let dbName: string;
+        if (col) {
+          dbName = col.dbName;
+        } else {
+          const schemaCol = schema.columns[propName];
+          const cfg = schemaCol ? (schemaCol as any).build() : null;
+          dbName = cfg ? cfg.name : propName;
+        }
+        return `"${dbName}" = s."${dbName}"`;
+      });
+      sql += ` WHEN MATCHED THEN UPDATE SET ${updateSetClauses.join(', ')}`;
+    }
+
+    sql += ` WHEN NOT MATCHED THEN INSERT (${sourceColumnList})`
+      + ` VALUES (${columnConfigs.map(c => `s."${c.dbName}"`).join(', ')})`;
+
+    // RETURNING (PostgreSQL 17+). Navigation properties are not supported here.
+    // Columns are target-qualified (`t.`): in MERGE … RETURNING both the target
+    // and source aliases are in scope, so unqualified names are ambiguous.
+    if (returning && returning !== true && typeof returning === 'function'
+      && this.detectNavigationInReturning(returning as any)) {
+      throw new Error('mergeBulk .returning() does not support navigation properties');
+    }
+
+    const returningClause = this.buildReturningClause(returning as any, 't');
     if (returningClause) {
       sql += ` RETURNING ${returningClause.sql}`;
     }

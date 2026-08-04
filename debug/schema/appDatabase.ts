@@ -24,6 +24,7 @@ import { CartDiscountCode } from "../model/cartDiscountCode";
 import { DiscountCode } from "../model/discountCode";
 import { Discount } from "../model/discount";
 import { DiscountProduct } from "../model/discountProduct";
+import { RegistryItem } from "../model/registryItem";
 
 // Define PostgreSQL ENUM types
 const orderStatusEnum = pgEnum('order_status', ['pending', 'processing', 'completed', 'cancelled', 'refunded'] as const);
@@ -119,6 +120,10 @@ export class AppDatabase extends DbContext {
 
     get discountProducts(): DbEntityTable<DiscountProduct> {
         return this.table(DiscountProduct);
+    }
+
+    get registryItems(): DbEntityTable<RegistryItem> {
+        return this.table(RegistryItem);
     }
 
     protected override setupModel(model: DbModelConfig): void {
@@ -365,6 +370,18 @@ export class AppDatabase extends DbContext {
 
             entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'capacity_groups_id_seq' }));
             entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
+        });
+
+        // Configure RegistryItem entity — external-sync row used by the mergeBulk
+        // tests. Deliberately NO unique index: the MERGE match runs purely off the
+        // statement's ON condition (`on: 'crmId'` + `matchWhere: 't."active" = TRUE'`).
+        model.entity(RegistryItem, entity => {
+            entity.toTable('registry_items');
+
+            entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'registry_items_id_seq' }));
+            entity.property(e => e.crmId).hasType(varchar('crm_id', 100)).isRequired();
+            entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
+            entity.property(e => e.active).hasType(boolean('active')).isRequired().hasDefaultValue(true);
         });
 
         // Configure Tag entity

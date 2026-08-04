@@ -153,6 +153,7 @@ async function truncateAllTables(db: AppDatabase): Promise<void> {
       posts,
       schema_posts,
       auth.schema_users,
+      registry_items,
       users
     RESTART IDENTITY CASCADE
   `);

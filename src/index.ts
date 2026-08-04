@@ -306,6 +306,8 @@ export {
 export type {
   EntityQuery,
   EntityUpsertConfig,
+  EntityMergeConfig,
+  FluentMerge,
   EntityCollectionQuery,
   IEntityQueryable,
   EntitySelectQueryBuilder,
