@@ -285,6 +285,14 @@ export abstract class WhereConditionBase {
       return `$${context.paramCounter++}`;
     }
 
+    // SqlFragment — build it to inline its SQL (mirrors getDbColumnName's field-side
+    // handling). Without this the fragment object falls through to the literal branch
+    // and is serialized into a bound parameter, so the driver sends the fragment's SQL
+    // text as a string value (e.g. "invalid input syntax for type integer").
+    if (value instanceof SqlFragment) {
+      return value.buildSql(context);
+    }
+
     if (this.isFieldRef(value)) {
       // Value is a field reference, use it with table alias if present
       if ('__tableAlias' in value && (value as any).__tableAlias) {
@@ -327,7 +335,9 @@ export abstract class WhereComparisonBase<V = any> extends WhereConditionBase {
     } else if (this.isFieldRef(this.field)) {
       refs.push(this.field);
     }
-    if (this.value !== undefined && this.isFieldRef(this.value)) {
+    if (this.value instanceof SqlFragment) {
+      refs.push(...this.value.getFieldRefs());
+    } else if (this.value !== undefined && this.isFieldRef(this.value)) {
       refs.push(this.value);
     }
     return refs;
@@ -631,10 +641,14 @@ export class BetweenComparison<V = any> extends WhereComparisonBase<V> {
    */
   override getFieldRefs(): FieldRef[] {
     const refs = super.getFieldRefs();
-    if (this.isFieldRef(this.min)) {
+    if (this.min instanceof SqlFragment) {
+      refs.push(...this.min.getFieldRefs());
+    } else if (this.isFieldRef(this.min)) {
       refs.push(this.min);
     }
-    if (this.isFieldRef(this.max)) {
+    if (this.max instanceof SqlFragment) {
+      refs.push(...this.max.getFieldRefs());
+    } else if (this.isFieldRef(this.max)) {
       refs.push(this.max);
     }
     return refs;
