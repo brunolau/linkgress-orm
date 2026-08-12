@@ -14,6 +14,7 @@ import {
   canonicalDefsEquivalent,
 } from './index-sql';
 import { buildCreateStatisticsStatement } from './statistics-sql';
+import { buildSetDatabaseSettingStatement, parseDbRoleSettingEntry } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 
 /**
@@ -71,6 +72,7 @@ export type MigrationOperation =
   | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_statistics'; tableName: string; schema?: string; statisticsName: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> }
+  | { type: 'set_database_setting'; name: string; value: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
 
@@ -86,6 +88,7 @@ export class DbSchemaManager {
   private concurrentIndexes: boolean;
   private recreateChangedIndexes: boolean;
   private searchNormalizeRequired: boolean;
+  private databaseSettings: Map<string, string>;
   /** Monotonic counter for unique temp object names during index confirmation. */
   private indexCheckSeq = 0;
   private rl: readline.Interface | null = null;
@@ -106,6 +109,13 @@ export class DbSchemaManager {
        * `model.useSearchNormalize()` for query-only usage.
        */
       searchNormalizeRequired?: boolean;
+      /**
+       * Database-level settings declared via `model.hasDbSetting(...)`,
+       * converged by `ensureCreated()` / `migrate()` through
+       * `ALTER DATABASE <current> SET` (persisted in `pg_db_role_setting`).
+       * Undeclared settings are never touched.
+       */
+      databaseSettings?: Map<string, string>;
       /**
        * When true, every index created by this schema manager uses
        * `CREATE INDEX CONCURRENTLY`, regardless of per-index `.concurrent()`.
@@ -134,6 +144,7 @@ export class DbSchemaManager {
     this.concurrentIndexes = options?.concurrentIndexes ?? false;
     this.recreateChangedIndexes = options?.recreateChangedIndexes ?? true;
     this.searchNormalizeRequired = options?.searchNormalizeRequired ?? false;
+    this.databaseSettings = options?.databaseSettings ?? new Map();
   }
 
   /**
@@ -755,6 +766,10 @@ $$`;
       await this.createStatistics(tableName, tableSchema);
     }
 
+    // Converge database-level settings last — they affect FUTURE sessions,
+    // never the DDL above.
+    await this.applyDatabaseSettings();
+
     if (this.logQueries) {
       this.logger('✓ Database schema created successfully\n');
     }
@@ -789,6 +804,69 @@ $$`;
     for (const spec of statistics) {
       await this.executeCreateStatistics(tableName, spec, tableSchema.schema);
     }
+  }
+
+  /**
+   * Converge declared database-level settings (`model.hasDbSetting`) — apply
+   * every declaration that is missing from `pg_db_role_setting` or whose
+   * stored value drifted. Undeclared settings are never touched.
+   */
+  private async applyDatabaseSettings(): Promise<void> {
+    for (const op of await this.analyzeDatabaseSettings()) {
+      await this.executeSetDatabaseSetting(op as Extract<MigrationOperation, { type: 'set_database_setting' }>);
+    }
+  }
+
+  /**
+   * Diff declared database-level settings against the database-wide
+   * (`setrole = 0`) entries of `pg_db_role_setting`.
+   */
+  private async analyzeDatabaseSettings(): Promise<MigrationOperation[]> {
+    if (this.databaseSettings.size === 0) {
+      return [];
+    }
+
+    const existing = await this.getExistingDatabaseSettings();
+    const operations: MigrationOperation[] = [];
+    for (const [name, value] of this.databaseSettings) {
+      if (existing.get(name.toLowerCase()) !== value) {
+        operations.push({ type: 'set_database_setting', name, value });
+      }
+    }
+    return operations;
+  }
+
+  /**
+   * Database-wide settings currently persisted for the connected database,
+   * keyed by lower-cased parameter name (GUC names are case-insensitive).
+   */
+  private async getExistingDatabaseSettings(): Promise<Map<string, string>> {
+    const result = await this.client.query(`
+      SELECT entry
+      FROM pg_db_role_setting, LATERAL unnest(setconfig) AS entry
+      WHERE setrole = 0
+        AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+    `);
+
+    const settings = new Map<string, string>();
+    for (const row of result.rows as Array<{ entry: string }>) {
+      const parsed = parseDbRoleSettingEntry(row.entry);
+      if (parsed) {
+        settings.set(parsed.name.toLowerCase(), parsed.value);
+      }
+    }
+    return settings;
+  }
+
+  /**
+   * Execute one `ALTER DATABASE <current> SET name = value` (as a DO block —
+   * see `dbsetting-sql.ts`). Requires the migrating role to own the database.
+   */
+  private async executeSetDatabaseSetting(operation: Extract<MigrationOperation, { type: 'set_database_setting' }>): Promise<void> {
+    if (this.logQueries) {
+      this.logger(`  Setting database parameter ${operation.name} = ${operation.value}\n`);
+    }
+    await this.client.query(buildSetDatabaseSettingStatement(operation.name, operation.value));
   }
 
   /**
@@ -1102,6 +1180,12 @@ $$`;
       }
     }
 
+    // Database-level settings declared via `model.hasDbSetting(...)` —
+    // converge-only (missing or drifted values; undeclared keys untouched).
+    for (const settingOp of await this.analyzeDatabaseSettings()) {
+      operations.push(settingOp);
+    }
+
     return operations;
   }
 
@@ -1352,6 +1436,10 @@ $$`;
           expressions: operation.expressions,
           kinds: operation.kinds,
         }, operation.schema);
+        break;
+
+      case 'set_database_setting':
+        await this.executeSetDatabaseSetting(operation);
         break;
 
       case 'create_foreign_key':
@@ -2172,6 +2260,8 @@ $$`;
         const kindsDesc = operation.kinds && operation.kinds.length > 0 ? ` (${operation.kinds.join(', ')})` : '';
         return `Create statistics "${operation.statisticsName}"${kindsDesc} on "${operation.tableName}" (${operation.expressions.join(', ')})`;
       }
+      case 'set_database_setting':
+        return `Set database parameter ${operation.name} = ${operation.value} (ALTER DATABASE ... SET, persists for new sessions)`;
       case 'create_foreign_key':
         const fk = operation.constraint;
         let desc = `Create foreign key "${fk.name}" on "${operation.tableName}" (${fk.columns.join(', ')}) references "${fk.referencedTable}" (${fk.referencedColumns.join(', ')})`;

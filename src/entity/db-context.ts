@@ -5766,6 +5766,7 @@ export abstract class DatabaseContext extends DataContext {
         },
         sequenceRegistry: this.sequenceRegistry,
         searchNormalizeRequired: this.searchNormalizeRequired,
+        databaseSettings: this.modelConfig.getDatabaseSettings(),
         concurrentIndexes: options?.concurrentIndexes,
         recreateChangedIndexes: options?.recreateChangedIndexes,
       }

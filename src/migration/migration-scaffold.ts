@@ -6,6 +6,7 @@ import { MigrationLoader } from './migration-loader';
 import { MigrationOperation } from './db-schema-manager';
 import { buildCreateIndexStatement, buildDropIndexStatement } from './index-sql';
 import { buildCreateStatisticsStatement, buildDropStatisticsStatement } from './statistics-sql';
+import { buildResetDatabaseSettingStatement, buildSetDatabaseSettingStatement } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
@@ -113,6 +114,11 @@ export class MigrationScaffold {
         ];
       }
 
+      case 'set_database_setting':
+        // A DO block resolving current_database() at RUN time — the file cannot
+        // know the target database's name. Idempotent (SET overwrites).
+        return [buildSetDatabaseSettingStatement(op.name, op.value)];
+
       case 'create_foreign_key':
         return this.buildCreateForeignKeySql(op.tableName, op.constraint, op.schema);
 
@@ -197,6 +203,12 @@ export class MigrationScaffold {
 
       case 'create_statistics':
         return [buildDropStatisticsStatement(`"${op.statisticsName}"`, { ifExists: true })];
+
+      case 'set_database_setting':
+        // RESET of an unset parameter is a no-op, so the down is idempotent.
+        // If the setting REPLACED a different prior value, that value is not
+        // recoverable from the catalog — the reset returns to server defaults.
+        return [buildResetDatabaseSettingStatement(op.name)];
 
       case 'create_foreign_key': {
         const fkTable = op.schema

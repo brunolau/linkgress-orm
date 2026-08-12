@@ -2,12 +2,18 @@ import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base'
 import { EntityConfigBuilder } from './entity-builder';
 import { TableBuilder, ForeignKeyConstraint } from '../schema/table-builder';
 import { DbNavigation, DbNavigationCollection } from '../schema/navigation';
+import {
+  assertValidDatabaseSettingName,
+  assertValidDatabaseSettingValue,
+  normalizeDatabaseSettingValue,
+} from '../migration/dbsetting-sql';
 
 /**
  * Model builder for configuring entities
  */
 export class DbModelConfig {
   private _searchNormalizeRequired = false;
+  private _databaseSettings = new Map<string, string>();
 
   /**
    * Configure an entity
@@ -42,6 +48,46 @@ export class DbModelConfig {
    */
   isSearchNormalizeRequired(): boolean {
     return this._searchNormalizeRequired;
+  }
+
+  /**
+   * Declare a database-level configuration setting the schema manager keeps in
+   * sync — `model.hasDbSetting('jit', 'off')` in `setupModel` makes every
+   * environment built or migrated from this model run with that setting.
+   *
+   * Applied via `ALTER DATABASE <current> SET name = value`, which PERSISTS
+   * the setting in `pg_db_role_setting`: it survives restarts and every NEW
+   * connection to the database inherits it. `ensureCreated()` applies the
+   * declared settings on a fresh database; `migrate()` re-applies any that
+   * are missing or whose stored value drifted from the declaration.
+   *
+   * Converge-only, like declared statistics objects: settings this model does
+   * NOT declare are never touched, and REMOVING a declaration leaves the
+   * database value in place — `RESET` it via a hand migration when that is
+   * intended. The migrating role must OWN the database (or be superuser);
+   * that is PostgreSQL's own `ALTER DATABASE` privilege rule.
+   *
+   * Values: strings pass through verbatim (`'off'`, `'32MB'`, `'UTC'`),
+   * booleans normalize to the canonical `on`/`off`, numbers to decimal text.
+   * Drift comparison is by that stored text, so an equivalent spelling applied
+   * by hand (`'false'` vs a declared `'off'`) converges to the declared form
+   * on the next migrate.
+   */
+  hasDbSetting(name: string, value: string | number | boolean): this {
+    assertValidDatabaseSettingName(name);
+    const normalized = normalizeDatabaseSettingValue(value);
+    assertValidDatabaseSettingValue(normalized);
+    this._databaseSettings.set(name, normalized);
+    return this;
+  }
+
+  /**
+   * Declared database-level settings, in declaration order (last declaration
+   * per key wins).
+   * @internal
+   */
+  getDatabaseSettings(): Map<string, string> {
+    return this._databaseSettings;
   }
 
   /**
