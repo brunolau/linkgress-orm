@@ -1,0 +1,184 @@
+Append  (cost=12974.37..107490.29 rows=10 width=64) (actual time=3.070..27.046 rows=10.00 loops=1)
+  Buffers: shared hit=840
+  ->  Aggregate  (cost=12974.37..12974.38 rows=1 width=64) (actual time=3.070..3.071 rows=1.00 loops=1)
+        Buffers: shared hit=175
+        ->  Subquery Scan on t  (cost=12939.36..12964.36 rows=2000 width=101) (actual time=1.296..1.668 rows=2000.00 loops=1)
+              Buffers: shared hit=175
+              ->  Limit  (cost=12939.36..12944.36 rows=2000 width=77) (actual time=1.294..1.410 rows=2000.00 loops=1)
+                    Buffers: shared hit=175
+                    ->  Sort  (cost=12939.36..12950.93 rows=4626 width=77) (actual time=1.293..1.334 rows=2000.00 loops=1)
+                          Sort Key: orders.id
+                          Sort Method: top-N heapsort  Memory: 362kB
+                          Buffers: shared hit=175
+                          ->  Bitmap Heap Scan on orders  (cost=60.28..12662.60 rows=4626 width=77) (actual time=0.082..0.751 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=168
+                                Buffers: shared hit=175
+                                ->  Bitmap Index Scan on orders_customer_id_idx  (cost=0.00..59.12 rows=4626 width=0) (actual time=0.067..0.067 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=12974.37..12974.38 rows=1 width=64) (actual time=3.082..3.084 rows=1.00 loops=1)
+        Buffers: shared hit=175
+        ->  Subquery Scan on t_1  (cost=12939.36..12964.36 rows=2000 width=101) (actual time=1.200..1.571 rows=2000.00 loops=1)
+              Buffers: shared hit=175
+              ->  Limit  (cost=12939.36..12944.36 rows=2000 width=77) (actual time=1.198..1.313 rows=2000.00 loops=1)
+                    Buffers: shared hit=175
+                    ->  Sort  (cost=12939.36..12950.93 rows=4626 width=77) (actual time=1.198..1.240 rows=2000.00 loops=1)
+                          Sort Key: orders_1.id
+                          Sort Method: top-N heapsort  Memory: 362kB
+                          Buffers: shared hit=175
+                          ->  Bitmap Heap Scan on orders orders_1  (cost=60.28..12662.60 rows=4626 width=77) (actual time=0.082..0.672 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=168
+                                Buffers: shared hit=175
+                                ->  Bitmap Index Scan on orders_customer_id_idx  (cost=0.00..59.12 rows=4626 width=0) (actual time=0.066..0.066 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=12974.37..12974.38 rows=1 width=64) (actual time=2.894..2.896 rows=1.00 loops=1)
+        Buffers: shared hit=175
+        ->  Subquery Scan on t_2  (cost=12939.36..12964.36 rows=2000 width=101) (actual time=1.051..1.445 rows=2000.00 loops=1)
+              Buffers: shared hit=175
+              ->  Limit  (cost=12939.36..12944.36 rows=2000 width=77) (actual time=1.049..1.183 rows=2000.00 loops=1)
+                    Buffers: shared hit=175
+                    ->  Sort  (cost=12939.36..12950.93 rows=4626 width=77) (actual time=1.049..1.112 rows=2000.00 loops=1)
+                          Sort Key: orders_2.id
+                          Sort Method: top-N heapsort  Memory: 362kB
+                          Buffers: shared hit=175
+                          ->  Bitmap Heap Scan on orders orders_2  (cost=60.28..12662.60 rows=4626 width=77) (actual time=0.065..0.521 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=168
+                                Buffers: shared hit=175
+                                ->  Bitmap Index Scan on orders_customer_id_idx  (cost=0.00..59.12 rows=4626 width=0) (actual time=0.054..0.054 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=11157.49..11157.50 rows=1 width=64) (actual time=2.199..2.201 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_3  (cost=11122.49..11147.49 rows=2000 width=55) (actual time=0.703..1.073 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=11122.49..11127.49 rows=2000 width=31) (actual time=0.700..0.837 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=11122.49..11135.53 rows=5214 width=31) (actual time=0.700..0.741 rows=2000.00 loops=1)
+                          Sort Key: tickets.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on tickets  (cost=60.84..10810.54 rows=5214 width=31) (actual time=0.062..0.278 rows=5000.00 loops=1)
+                                Recheck Cond: (event_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on tickets_event_id_idx  (cost=0.00..59.53 rows=5214 width=0) (actual time=0.053..0.053 rows=5000.00 loops=1)
+                                      Index Cond: (event_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=11157.49..11157.50 rows=1 width=64) (actual time=2.120..2.121 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_4  (cost=11122.49..11147.49 rows=2000 width=55) (actual time=0.684..1.018 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=11122.49..11127.49 rows=2000 width=31) (actual time=0.681..0.796 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=11122.49..11135.53 rows=5214 width=31) (actual time=0.680..0.720 rows=2000.00 loops=1)
+                          Sort Key: tickets_1.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on tickets tickets_1  (cost=60.84..10810.54 rows=5214 width=31) (actual time=0.057..0.241 rows=5000.00 loops=1)
+                                Recheck Cond: (event_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on tickets_event_id_idx  (cost=0.00..59.53 rows=5214 width=0) (actual time=0.047..0.047 rows=5000.00 loops=1)
+                                      Index Cond: (event_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=11157.49..11157.50 rows=1 width=64) (actual time=2.046..2.047 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_5  (cost=11122.49..11147.49 rows=2000 width=55) (actual time=0.615..0.962 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=11122.49..11127.49 rows=2000 width=31) (actual time=0.612..0.727 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=11122.49..11135.53 rows=5214 width=31) (actual time=0.612..0.654 rows=2000.00 loops=1)
+                          Sort Key: tickets_2.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on tickets tickets_2  (cost=60.84..10810.54 rows=5214 width=31) (actual time=0.045..0.226 rows=5000.00 loops=1)
+                                Recheck Cond: (event_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on tickets_event_id_idx  (cost=0.00..59.53 rows=5214 width=0) (actual time=0.040..0.040 rows=5000.00 loops=1)
+                                      Index Cond: (event_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=11157.49..11157.50 rows=1 width=64) (actual time=3.044..3.045 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_6  (cost=11122.49..11147.49 rows=2000 width=55) (actual time=0.717..1.247 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=11122.49..11127.49 rows=2000 width=31) (actual time=0.714..0.886 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=11122.49..11135.53 rows=5214 width=31) (actual time=0.714..0.772 rows=2000.00 loops=1)
+                          Sort Key: tickets_3.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on tickets tickets_3  (cost=60.84..10810.54 rows=5214 width=31) (actual time=0.044..0.221 rows=5000.00 loops=1)
+                                Recheck Cond: (event_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on tickets_event_id_idx  (cost=0.00..59.53 rows=5214 width=0) (actual time=0.040..0.040 rows=5000.00 loops=1)
+                                      Index Cond: (event_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=7979.02..7979.03 rows=1 width=64) (actual time=3.299..3.300 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_7  (cost=7944.02..7969.02 rows=2000 width=55) (actual time=0.905..1.434 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=7944.02..7949.02 rows=2000 width=31) (actual time=0.902..1.047 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=7944.02..7957.51 rows=5396 width=31) (actual time=0.901..0.968 rows=2000.00 loops=1)
+                          Sort Key: payments.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on payments  (cost=70.24..7621.18 rows=5396 width=31) (actual time=0.090..0.375 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on payments_customer_id_idx  (cost=0.00..68.89 rows=5396 width=0) (actual time=0.075..0.075 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=7979.02..7979.03 rows=1 width=64) (actual time=3.107..3.108 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_8  (cost=7944.02..7969.02 rows=2000 width=55) (actual time=1.073..1.553 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=7944.02..7949.02 rows=2000 width=31) (actual time=1.068..1.204 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=7944.02..7957.51 rows=5396 width=31) (actual time=1.068..1.124 rows=2000.00 loops=1)
+                          Sort Key: payments_1.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on payments payments_1  (cost=70.24..7621.18 rows=5396 width=31) (actual time=0.074..0.354 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on payments_customer_id_idx  (cost=0.00..68.89 rows=5396 width=0) (actual time=0.063..0.063 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+  ->  Aggregate  (cost=7979.02..7979.03 rows=1 width=64) (actual time=2.169..2.169 rows=1.00 loops=1)
+        Buffers: shared hit=45
+        ->  Subquery Scan on t_9  (cost=7944.02..7969.02 rows=2000 width=55) (actual time=0.673..1.028 rows=2000.00 loops=1)
+              Buffers: shared hit=45
+              ->  Limit  (cost=7944.02..7949.02 rows=2000 width=31) (actual time=0.671..0.792 rows=2000.00 loops=1)
+                    Buffers: shared hit=45
+                    ->  Sort  (cost=7944.02..7957.51 rows=5396 width=31) (actual time=0.671..0.717 rows=2000.00 loops=1)
+                          Sort Key: payments_2.id
+                          Sort Method: top-N heapsort  Memory: 237kB
+                          Buffers: shared hit=45
+                          ->  Bitmap Heap Scan on payments payments_2  (cost=70.24..7621.18 rows=5396 width=31) (actual time=0.055..0.242 rows=5000.00 loops=1)
+                                Recheck Cond: (customer_id = 4)
+                                Heap Blocks: exact=38
+                                Buffers: shared hit=45
+                                ->  Bitmap Index Scan on payments_customer_id_idx  (cost=0.00..68.89 rows=5396 width=0) (actual time=0.046..0.046 rows=5000.00 loops=1)
+                                      Index Cond: (customer_id = 4)
+                                      Index Searches: 1
+                                      Buffers: shared hit=7
+Planning Time: 0.287 ms
+Execution Time: 27.471 ms

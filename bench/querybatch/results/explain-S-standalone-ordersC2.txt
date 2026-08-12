@@ -1,0 +1,10 @@
+Sort  (cost=48.70..48.73 rows=11 width=77) (actual time=0.017..0.018 rows=50.00 loops=1)
+  Sort Key: id
+  Sort Method: quicksort  Memory: 29kB
+  Buffers: shared hit=5
+  ->  Index Scan using orders_customer_id_idx on orders  (cost=0.42..48.51 rows=11 width=77) (actual time=0.006..0.011 rows=50.00 loops=1)
+        Index Cond: (customer_id = 2)
+        Index Searches: 1
+        Buffers: shared hit=5
+Planning Time: 0.044 ms
+Execution Time: 0.025 ms

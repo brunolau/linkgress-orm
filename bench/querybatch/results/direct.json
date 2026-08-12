@@ -1,0 +1,425 @@
+{
+	"profile": "direct",
+	"port": 5432,
+	"node": "v24.13.0",
+	"roundtripMs": {
+		"p50": 0.08,
+		"p90": 0.12
+	},
+	"scenarios": {
+		"S": {
+			"queryCount": 12,
+			"iters": 200,
+			"variants": {
+				"seq-pool": {
+					"group": "baseline",
+					"p50": 2.95,
+					"p90": 3.37,
+					"max": 9.32,
+					"mean": 3.08,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"parallel-pool": {
+					"group": "baseline",
+					"p50": 0.8,
+					"p90": 0.91,
+					"max": 1.25,
+					"mean": 0.81,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-postgresjs": {
+					"group": "pipeline",
+					"p50": 2.61,
+					"p90": 2.96,
+					"max": 7.3,
+					"mean": 2.67,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-begin": {
+					"group": "pipeline",
+					"p50": 2.68,
+					"p90": 3,
+					"max": 4.82,
+					"mean": 2.74,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-prepared": {
+					"group": "pipeline",
+					"p50": 0.75,
+					"p90": 0.82,
+					"max": 4.22,
+					"mean": 0.77,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"pg-1conn-queue": {
+					"group": "pipeline",
+					"p50": 2.09,
+					"p90": 2.36,
+					"max": 4.69,
+					"mean": 2.13,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg": {
+					"group": "single-statement",
+					"p50": 1.5,
+					"p90": 1.58,
+					"max": 1.8,
+					"mean": 1.5,
+					"n": 200,
+					"resultBytes": 22504,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg-prep": {
+					"group": "single-statement",
+					"p50": 0.94,
+					"p90": 1.33,
+					"max": 1.44,
+					"mean": 1.02,
+					"n": 200,
+					"resultBytes": 22504,
+					"parity": "ok",
+					"error": null
+				},
+				"union-row-json": {
+					"group": "single-statement",
+					"p50": 1.38,
+					"p90": 1.46,
+					"max": 1.75,
+					"mean": 1.39,
+					"n": 200,
+					"resultBytes": 22504,
+					"parity": "ok",
+					"error": null
+				},
+				"scalar-subqueries": {
+					"group": "single-statement",
+					"p50": 1.4,
+					"p90": 1.51,
+					"max": 1.88,
+					"mean": 1.41,
+					"n": 200,
+					"resultBytes": 22504,
+					"parity": "ok",
+					"error": null
+				},
+				"json-build-object": {
+					"group": "single-statement",
+					"p50": 1.41,
+					"p90": 1.52,
+					"max": 3.4,
+					"mean": 1.43,
+					"n": 200,
+					"resultBytes": 22504,
+					"parity": "ok",
+					"error": null
+				},
+				"simple-multi": {
+					"group": "single-statement",
+					"p50": 0.86,
+					"p90": 0.93,
+					"max": 4.4,
+					"mean": 0.89,
+					"n": 200,
+					"resultBytes": 22714,
+					"parity": "ok",
+					"error": null
+				}
+			}
+		},
+		"M": {
+			"queryCount": 30,
+			"iters": 100,
+			"variants": {
+				"seq-pool": {
+					"group": "baseline",
+					"p50": 11.52,
+					"p90": 13.86,
+					"max": 19.62,
+					"mean": 12.13,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"parallel-pool": {
+					"group": "baseline",
+					"p50": 4.05,
+					"p90": 5.16,
+					"max": 12.45,
+					"mean": 4.5,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-postgresjs": {
+					"group": "pipeline",
+					"p50": 10.4,
+					"p90": 11.37,
+					"max": 17.9,
+					"mean": 10.59,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-begin": {
+					"group": "pipeline",
+					"p50": 10.42,
+					"p90": 12.24,
+					"max": 19.34,
+					"mean": 11.03,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-prepared": {
+					"group": "pipeline",
+					"p50": 4.31,
+					"p90": 4.58,
+					"max": 8.26,
+					"mean": 4.39,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"pg-1conn-queue": {
+					"group": "pipeline",
+					"p50": 9.91,
+					"p90": 11.15,
+					"max": 17.35,
+					"mean": 10.16,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg": {
+					"group": "single-statement",
+					"p50": 7.48,
+					"p90": 8.16,
+					"max": 10.42,
+					"mean": 7.64,
+					"n": 100,
+					"resultBytes": 254132,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg-prep": {
+					"group": "single-statement",
+					"p50": 6.75,
+					"p90": 7.04,
+					"max": 8.41,
+					"mean": 6.61,
+					"n": 100,
+					"resultBytes": 254132,
+					"parity": "ok",
+					"error": null
+				},
+				"union-row-json": {
+					"group": "single-statement",
+					"p50": 7.24,
+					"p90": 7.91,
+					"max": 10.36,
+					"mean": 7.44,
+					"n": 100,
+					"resultBytes": 254132,
+					"parity": "ok",
+					"error": null
+				},
+				"scalar-subqueries": {
+					"group": "single-statement",
+					"p50": 7.86,
+					"p90": 8.39,
+					"max": 11.63,
+					"mean": 7.98,
+					"n": 100,
+					"resultBytes": 254132,
+					"parity": "ok",
+					"error": null
+				},
+				"json-build-object": {
+					"group": "single-statement",
+					"p50": 8.11,
+					"p90": 8.76,
+					"max": 13.45,
+					"mean": 8.31,
+					"n": 100,
+					"resultBytes": 254132,
+					"parity": "ok",
+					"error": null
+				},
+				"simple-multi": {
+					"group": "single-statement",
+					"p50": 4.78,
+					"p90": 5.36,
+					"max": 8.64,
+					"mean": 5.03,
+					"n": 100,
+					"resultBytes": 256910,
+					"parity": "ok",
+					"error": null
+				}
+			}
+		},
+		"L": {
+			"queryCount": 10,
+			"iters": 25,
+			"variants": {
+				"seq-pool": {
+					"group": "baseline",
+					"p50": 23.64,
+					"p90": 34.28,
+					"max": 38.73,
+					"mean": 27.06,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"parallel-pool": {
+					"group": "baseline",
+					"p50": 16.19,
+					"p90": 23.92,
+					"max": 28.91,
+					"mean": 17.63,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-postgresjs": {
+					"group": "pipeline",
+					"p50": 26.83,
+					"p90": 34.78,
+					"max": 38.96,
+					"mean": 28.31,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-begin": {
+					"group": "pipeline",
+					"p50": 24.83,
+					"p90": 35.94,
+					"max": 37.34,
+					"mean": 26.94,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"pipeline-prepared": {
+					"group": "pipeline",
+					"p50": 16.19,
+					"p90": 18.54,
+					"max": 21.67,
+					"mean": 16.53,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"pg-1conn-queue": {
+					"group": "pipeline",
+					"p50": 41.24,
+					"p90": 44.02,
+					"max": 45.36,
+					"mean": 40.37,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg": {
+					"group": "single-statement",
+					"p50": 23.81,
+					"p90": 29.98,
+					"max": 31.35,
+					"mean": 24.67,
+					"n": 25,
+					"resultBytes": 2349126,
+					"parity": "ok",
+					"error": null
+				},
+				"union-json-agg-prep": {
+					"group": "single-statement",
+					"p50": 24.07,
+					"p90": 25.44,
+					"max": 26.61,
+					"mean": 24.32,
+					"n": 25,
+					"resultBytes": 2349126,
+					"parity": "ok",
+					"error": null
+				},
+				"union-row-json": {
+					"group": "single-statement",
+					"p50": 27.58,
+					"p90": 32.99,
+					"max": 34.63,
+					"mean": 28.51,
+					"n": 25,
+					"resultBytes": 2349126,
+					"parity": "ok",
+					"error": null
+				},
+				"scalar-subqueries": {
+					"group": "single-statement",
+					"p50": 31.91,
+					"p90": 34.16,
+					"max": 43.69,
+					"mean": 32.5,
+					"n": 25,
+					"resultBytes": 2349126,
+					"parity": "ok",
+					"error": null
+				},
+				"json-build-object": {
+					"group": "single-statement",
+					"p50": 32.61,
+					"p90": 34,
+					"max": 37.93,
+					"mean": 32.8,
+					"n": 25,
+					"resultBytes": 2349126,
+					"parity": "ok",
+					"error": null
+				},
+				"simple-multi": {
+					"group": "single-statement",
+					"p50": 16.2,
+					"p90": 23.98,
+					"max": 24.23,
+					"mean": 17.5,
+					"n": 25,
+					"resultBytes": 2371526,
+					"parity": "ok",
+					"error": null
+				}
+			}
+		}
+	}
+}
