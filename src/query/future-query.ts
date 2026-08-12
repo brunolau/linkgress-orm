@@ -7,14 +7,22 @@ import type { QueryExecutor } from '../entity/db-context';
  * @internal
  */
 export interface FutureBatchMeta {
-  /** Selection produces nested-path rows (nested object selections) — not batchable. */
+  /** Selection produces nested-path rows (nested object selections) — reconstructed by the shared transform. */
   hasNestedPaths: boolean;
   /**
    * Restores driver-equivalent values on a row delivered via JSON
-   * (timestamps/dates/decimals lose their driver parsing through json_agg).
+   * (timestamps/dates/bytea lose their driver parsing through json_agg).
    * Undefined when no selected column needs revival.
    */
   reviveJsonRow?: (row: any) => any;
+  /**
+   * Flat aliases of declared bigint/decimal/numeric columns. Their values can
+   * exceed float53 precision, and JSON.parse silently collapses arbitrary-
+   * precision JSON numerals to floats — unrecoverable client-side. QueryBatch
+   * therefore casts these columns to ::text server-side (jsonb override in the
+   * envelope), which IS the drivers' delivery form for these types.
+   */
+  textColumns?: string[];
 }
 
 /**

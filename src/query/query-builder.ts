@@ -2003,10 +2003,7 @@ export class SelectQueryBuilder<TSelection> {
       this.client,
       this.executor
     );
-    future._batchMeta = {
-      hasNestedPaths: nestedPaths.size > 0,
-      reviveJsonRow: this.buildJsonRowReviver(selectionResult),
-    };
+    future._batchMeta = this.buildBatchMeta(selectionResult, nestedPaths.size > 0);
 
     return future;
   }
@@ -2068,10 +2065,7 @@ export class SelectQueryBuilder<TSelection> {
       this.client,
       this.executor
     );
-    future._batchMeta = {
-      hasNestedPaths: nestedPaths.size > 0,
-      reviveJsonRow: this.buildJsonRowReviver(selectionResult),
-    };
+    future._batchMeta = this.buildBatchMeta(selectionResult, nestedPaths.size > 0);
 
     return future;
   }
@@ -2119,24 +2113,29 @@ export class SelectQueryBuilder<TSelection> {
    * Returns undefined when no selected column needs revival.
    * @internal
    */
-  private buildJsonRowReviver(selection: any): FutureBatchMeta['reviveJsonRow'] {
+  private buildBatchMeta(selection: any, hasNestedPaths: boolean): FutureBatchMeta {
     const revivals: Array<{ key: string; revive: (value: any) => any }> = [];
-    this.collectJsonRowRevivals(selection, undefined, revivals);
+    const textColumns: string[] = [];
+    this.collectJsonRowRevivals(selection, undefined, revivals, textColumns);
 
-    if (revivals.length === 0) {
-      return undefined;
-    }
+    const reviveJsonRow = revivals.length === 0
+      ? undefined
+      : (row: any) => {
+          for (const { key, revive } of revivals) {
+            const value = row[key];
 
-    return (row: any) => {
-      for (const { key, revive } of revivals) {
-        const value = row[key];
+            if (value !== null && value !== undefined) {
+              row[key] = revive(value);
+            }
+          }
 
-        if (value !== null && value !== undefined) {
-          row[key] = revive(value);
-        }
-      }
+          return row;
+        };
 
-      return row;
+    return {
+      hasNestedPaths,
+      reviveJsonRow,
+      textColumns: textColumns.length > 0 ? textColumns : undefined,
     };
   }
 
@@ -2154,7 +2153,8 @@ export class SelectQueryBuilder<TSelection> {
   private collectJsonRowRevivals(
     selection: any,
     pathPrefix: string | undefined,
-    revivals: Array<{ key: string; revive: (value: any) => any }>
+    revivals: Array<{ key: string; revive: (value: any) => any }>,
+    textColumns: string[]
   ): void {
     for (const key in selection) {
       const value = selection[key];
@@ -2171,10 +2171,29 @@ export class SelectQueryBuilder<TSelection> {
         }
 
         const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
+        // A custom fromDriver mapper is the column's type authority: it was
+        // written against the driver's RAW output (apps like gopass configure
+        // timestamp parser passthrough, so their mappers expect the
+        // text-protocol string). For mapper columns, revival reconstructs that
+        // text form — json's ISO 'T' separator back to the driver's space, a
+        // timestamptz's ':00' offset minutes collapsed to the driver's short
+        // form — and never hands the mapper a Date it does not expect.
+        const hasMapper = config.mapper != null;
 
-        if (config.type === 'timestamp' || config.type === 'timestamptz') {
-          revivals.push({ key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
+        if (config.type === 'timestamp') {
+          revivals.push(hasMapper
+            ? { key: flatKey, revive: (v) => (typeof v === 'string' ? v.replace('T', ' ') : v) }
+            : { key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
+        } else if (config.type === 'timestamptz') {
+          revivals.push(hasMapper
+            ? { key: flatKey, revive: (v) => (typeof v === 'string' ? v.replace('T', ' ').replace(/([+-]\d{2}):00$/, '$1') : v) }
+            : { key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
         } else if (config.type === 'date') {
+          if (hasMapper) {
+            // json 'YYYY-MM-DD' IS the driver text form — the mapper gets it as-is.
+            continue;
+          }
+
           revivals.push({
             key: flatKey,
             revive: (v) => {
@@ -2188,14 +2207,36 @@ export class SelectQueryBuilder<TSelection> {
               return new Date(year, month - 1, day);
             },
           });
-        } else if (config.type === 'decimal' || config.type === 'numeric') {
+        } else if (config.type === 'decimal' || config.type === 'numeric' || config.type === 'bigint') {
+          // Values of these types can exceed float53 precision, and JSON.parse
+          // silently collapses arbitrary-precision JSON numerals to floats —
+          // unrecoverable here. The batch therefore casts them ::text
+          // server-side (see the envelope in query-batch.ts); these fallback
+          // revivals only normalize a NUMBER that slipped through (older
+          // metadata without textColumns) and no-op on the cast strings.
+          textColumns.push(flatKey);
           const scale = config.scale;
           revivals.push({
             key: flatKey,
-            revive: (v) => (typeof v === 'number' ? (scale != null ? v.toFixed(scale) : String(v)) : v),
+            revive: (v) => (typeof v === 'number' ? (scale != null && config.type !== 'bigint' ? v.toFixed(scale) : String(v)) : v),
           });
-        } else if (config.type === 'bigint') {
-          revivals.push({ key: flatKey, revive: (v) => (typeof v === 'number' ? String(v) : v) });
+        } else if (config.type === 'bytea') {
+          // Driver delivery is a byte buffer; row_to_json emits the '\x…' hex text.
+          revivals.push({
+            key: flatKey,
+            revive: (v) => {
+              if (typeof v !== 'string' || !v.startsWith('\\x')) {
+                return v;
+              }
+
+              const hex = v.slice(2);
+              const bufferCtor = (globalThis as any).Buffer;
+
+              return bufferCtor
+                ? bufferCtor.from(hex, 'hex')
+                : Uint8Array.from(hex.match(/../g)?.map((pair) => parseInt(pair, 16)) ?? []);
+            },
+          });
         }
 
         continue;
@@ -2207,19 +2248,25 @@ export class SelectQueryBuilder<TSelection> {
       const proto = Object.getPrototypeOf(value);
 
       if ((proto === Object.prototype || proto === null) && !('__collectionResult' in value)) {
-        this.collectJsonRowRevivals(value, pathPrefix ? `${pathPrefix}__${key}` : `__nested__${key}`, revivals);
+        this.collectJsonRowRevivals(
+          value,
+          pathPrefix ? `${pathPrefix}__${key}` : `__nested__${key}`,
+          revivals,
+          textColumns
+        );
       }
     }
   }
 
   /**
-   * Union-leg hook: builds the json-row reviver for a previously consumed union
-   * selection so UnionQueryBuilder.future() can attach batch metadata. Same
-   * mechanics as the standalone future factories.
+   * Union-leg hook: builds the full batch metadata (reviver + text-cast column
+   * aliases) for a previously consumed union selection so
+   * UnionQueryBuilder.future() can attach it. Same mechanics as the standalone
+   * future factories.
    * @internal
    */
-  _buildUnionJsonRowReviver(selectionResult: any): FutureBatchMeta['reviveJsonRow'] {
-    return this.buildJsonRowReviver(selectionResult);
+  _buildUnionBatchMeta(selectionResult: any, hasNestedPaths: boolean): FutureBatchMeta {
+    return this.buildBatchMeta(selectionResult, hasNestedPaths);
   }
 
   /**

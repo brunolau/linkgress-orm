@@ -26,7 +26,7 @@ export interface UnionLegBuilder {
   /** @internal */
   _applyUnionPostProcessing?(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): any[];
   /** @internal */
-  _buildUnionJsonRowReviver?(selectionResult: any): ((row: any) => any) | undefined;
+  _buildUnionBatchMeta?(selectionResult: any, hasNestedPaths: boolean): import('./future-query').FutureBatchMeta;
 }
 
 /**
@@ -311,12 +311,9 @@ export class UnionQueryBuilder<TSelection> {
     };
 
     const future = new FutureQuery<TSelection>(sql, params, transformFn, this.client, this.executor);
-    future._batchMeta = {
-      hasNestedPaths: (firstLegMeta?.nestedPaths.size ?? 0) > 0,
-      reviveJsonRow: firstLegMeta && firstLegOwner?._buildUnionJsonRowReviver
-        ? firstLegOwner._buildUnionJsonRowReviver(firstLegMeta.selectionResult)
-        : undefined,
-    };
+    future._batchMeta = firstLegMeta && firstLegOwner?._buildUnionBatchMeta
+      ? firstLegOwner._buildUnionBatchMeta(firstLegMeta.selectionResult, firstLegMeta.nestedPaths.size > 0)
+      : { hasNestedPaths: (firstLegMeta?.nestedPaths.size ?? 0) > 0 };
 
     return future;
   }

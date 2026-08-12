@@ -1,5 +1,6 @@
 
-import { DbContext, DbEntityTable, DbModelConfig, integer, varchar, boolean, timestamp, jsonb, decimal, text, smallint, sql, pgEnum, enumColumn } from "../../src";
+import { DbContext, DbEntityTable, DbModelConfig, integer, varchar, boolean, timestamp, jsonb, decimal, text, smallint, sql, pgEnum, enumColumn, serial, bigint, numeric, real, doublePrecision, timestamptz, date, time, uuid, json, char, bytea } from "../../src";
+import { TypeZooRow } from "../model/typeZoo";
 import { Order } from "../model/order";
 import { Post } from "../model/post";
 import { User } from "../model/user";
@@ -9,6 +10,7 @@ import { SchemaUser } from "../model/schema-user";
 import { SchemaPost } from "../model/schema-post";
 import { pgHourMinute } from "../types/hour-minute";
 import { pgIntDatetime } from "../types/int-datetime";
+import { pgTextTimestamp } from "../types/text-timestamp";
 import { OrderTask } from "../model/orderTask";
 import { PostComment } from "../model/postComment";
 // New entities for testing sibling collection isolation (complex ecommerce pattern)
@@ -42,6 +44,10 @@ export class AppDatabase extends DbContext {
 
     get posts(): DbEntityTable<Post> {
         return this.table(Post);
+    }
+
+    get typeZoo(): DbEntityTable<TypeZooRow> {
+        return this.table(TypeZooRow);
     }
 
     get orders(): DbEntityTable<Order> {
@@ -162,6 +168,7 @@ export class AppDatabase extends DbContext {
             entity.property(e => e.views).hasType(integer('views')).hasDefaultValue(0);
             entity.property(e => e.publishTime).hasType(smallint('publish_time')).hasCustomMapper(pgHourMinute);
             entity.property(e => e.customDate).hasType(integer('custom_date')).hasCustomMapper(pgIntDatetime);
+            entity.property(e => e.stringStampedAt).hasType(timestamp('string_stamped_at')).hasCustomMapper(pgTextTimestamp);
             entity.property(e => e.category).hasType(enumColumn('category', postCategoryEnum)).hasDefaultValue(`'tech'`);
 
             entity.hasOne(e => e.user, () => User)
@@ -178,6 +185,32 @@ export class AppDatabase extends DbContext {
 
             // Add an index on userId and publishedAt for better query performance
             entity.hasIndex('ix_posts_query', e => [e.userId, e.publishedAt]);
+        });
+
+        // QueryBatch fidelity playground — one nullable column per declarable type.
+        model.entity(TypeZooRow, (entity) => {
+            entity.toTable('type_zoo');
+            entity.property(e => e.id).hasType(serial('id')).isPrimaryKey();
+            entity.property(e => e.label).hasType(varchar('label', 64)).isRequired();
+            entity.property(e => e.vInteger).hasType(integer('v_integer'));
+            entity.property(e => e.vSmallint).hasType(smallint('v_smallint'));
+            entity.property(e => e.vBigint).hasType(bigint('v_bigint'));
+            entity.property(e => e.vDecimal).hasType(decimal('v_decimal', 20, 4));
+            entity.property(e => e.vNumeric).hasType(numeric('v_numeric'));
+            entity.property(e => e.vReal).hasType(real('v_real'));
+            entity.property(e => e.vDouble).hasType(doublePrecision('v_double'));
+            entity.property(e => e.vBool).hasType(boolean('v_bool'));
+            entity.property(e => e.vTimestamp).hasType(timestamp('v_timestamp'));
+            entity.property(e => e.vTimestamptz).hasType(timestamptz('v_timestamptz'));
+            entity.property(e => e.vDate).hasType(date('v_date'));
+            entity.property(e => e.vTime).hasType(time('v_time'));
+            entity.property(e => e.vUuid).hasType(uuid('v_uuid'));
+            entity.property(e => e.vText).hasType(text('v_text'));
+            entity.property(e => e.vVarchar).hasType(varchar('v_varchar', 255));
+            entity.property(e => e.vChar).hasType(char('v_char', 10));
+            entity.property(e => e.vJson).hasType(json('v_json'));
+            entity.property(e => e.vJsonb).hasType(jsonb('v_jsonb'));
+            entity.property(e => e.vBytea).hasType(bytea('v_bytea'));
         });
 
         // Configure PostComment entity (links posts to orders for testing sibling collection isolation)

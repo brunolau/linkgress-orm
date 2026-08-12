@@ -1,7 +1,9 @@
 import { describe, test, expect, jest } from '@jest/globals';
-import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt } from '../../src';
+import postgres from 'postgres';
+import { withDatabase, seedTestData, testConnectionConfig } from '../utils/test-database';
+import { eq, gt, PostgresClient } from '../../src';
 import { QueryBatch } from '../../src/query/query-batch';
+import { AppDatabase } from '../../debug/schema/appDatabase';
 
 describe('QueryBatch', () => {
   describe('single round trip execution', () => {
@@ -367,6 +369,54 @@ describe('QueryBatch', () => {
         expect(batch.getList(key)).toEqual(expected);
         expect(expected.length).toBeGreaterThan(0);
         expect(batch.getItem(bobKey)).not.toBeNull();
+      });
+    });
+
+    test('timestamp column with a custom fromDriver mapper receives the driver text form, never a Date', async () => {
+      // gopass-eshop regression: the app configures postgres.js with timestamp
+      // parser PASSTHROUGH — the driver delivers 'YYYY-MM-DD HH:MM:SS' strings —
+      // and a custom mapper turns that string into the app's date abstraction.
+      // For mapper columns the batch reviver must reconstruct that text form;
+      // Date-ifying ahead of the mapper breaks its string surgery (`.replace`).
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+        const bob = await db.users.where(u => eq(u.username, 'bob')).select(u => ({ id: u.id })).firstOrDefault();
+
+        const instance = postgres({
+          ...testConnectionConfig(),
+          max: 1,
+          types: {
+            timestamp: { to: 1114, from: [1114], serialize: (x: string) => x, parse: (x: string) => x },
+          },
+        });
+        const textDb = new AppDatabase(new PostgresClient(instance), { logQueries: false });
+
+        try {
+          const [inserted] = await textDb.posts.insertBulk([{
+            title: 'mapper-batch-fidelity',
+            userId: bob!.id,
+            views: 0,
+            publishTime: { hour: 9, minute: 30 },
+            stringStampedAt: '2026-08-12T09:30:00',
+          }]).returning();
+
+          const buildQuery = () => textDb.posts
+            .where(p => eq(p.id, inserted.id))
+            .select(p => ({ id: p.id, stamp: p.stringStampedAt }));
+
+          const expected = await buildQuery().toList();
+          // standalone under the passthrough driver: the mapper's output is the ISO string
+          expect(expected[0].stamp).toBe('2026-08-12T09:30:00');
+
+          const batch = new QueryBatch();
+          const key = batch.addList(buildQuery(), 'mapperStamps');
+          await batch.executeBatch();
+
+          expect(batch.getList(key)).toEqual(expected);
+        } finally {
+          await textDb.posts.where(p => eq(p.title, 'mapper-batch-fidelity')).delete();
+          await instance.end();
+        }
       });
     });
   });

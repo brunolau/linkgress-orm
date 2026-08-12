@@ -25,6 +25,21 @@ function resolveTestDriver(): TestDriver {
   return driver;
 }
 
+/**
+ * Connection parameters the suite runs against — exported so tests that build
+ * their OWN driver instance (e.g. custom postgres.js `types` parser configs)
+ * hit the same database as the shared client.
+ */
+export function testConnectionConfig() {
+  return {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME || 'linkgress_test',
+    username: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'postgres',
+  };
+}
+
 function createClientForDriver(): DatabaseClient {
   const host = process.env.DB_HOST || 'localhost';
   const port = parseInt(process.env.DB_PORT || '5432');

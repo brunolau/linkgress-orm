@@ -51,7 +51,19 @@ interface BatchEntry {
   future: FutureQuery<any> | FutureSingleQuery<any> | FutureCountQuery;
 }
 
-const PARAM_PLACEHOLDER = /\$(\d+)/g;
+/**
+ * Quoted SQL segments (single-quoted literals with '' escaping, double-quoted
+ * identifiers with "" escaping) pass through verbatim; only bare $N
+ * placeholders outside them are renumbered. Without this, a branch at a
+ * nonzero offset would corrupt dollar-digit sequences INSIDE string literals
+ * (`'price: $1'` → `'price: $8'`).
+ */
+const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|\$(\d+)/g;
+
+const renumberPlaceholders = (sqlText: string, offset: number): string =>
+  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, digits) =>
+    digits !== undefined ? `$${Number(digits) + offset}` : match
+  );
 
 /**
  * Collects heterogeneous queries and executes them in a SINGLE database round
@@ -140,13 +152,21 @@ export class QueryBatch {
 
     this.entries.forEach((entry, ix) => {
       const offset = params.length;
-      const branchSql =
-        offset === 0
-          ? entry.future._sql
-          : entry.future._sql.replace(PARAM_PLACEHOLDER, (_match, n) => `$${Number(n) + offset}`);
+      const branchSql = offset === 0 ? entry.future._sql : renumberPlaceholders(entry.future._sql, offset);
+
+      // Declared bigint/decimal/numeric columns are cast ::text server-side —
+      // JSON.parse would collapse their arbitrary-precision numerals to floats,
+      // and text IS the drivers' delivery form for these types. The jsonb
+      // concat overrides just those keys of the row envelope.
+      const textColumns = entry.future._batchMeta?.textColumns;
+      const rowExpr = textColumns && textColumns.length > 0
+        ? `to_jsonb(__batch_q)${textColumns
+            .map((column) => ` || jsonb_build_object('${column.replace(/'/g, "''")}', (__batch_q."${column.replace(/"/g, '""')}")::text)`)
+            .join('')}`
+        : 'row_to_json(__batch_q)';
 
       branches.push(
-        `SELECT ${ix} AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (\n${branchSql}\n) __batch_q`
+        `SELECT ${ix} AS __batch_ix, coalesce(json_agg(${rowExpr}), '[]'::json) AS __batch_items FROM (\n${branchSql}\n) __batch_q`
       );
       params.push(...entry.future._params);
     });
