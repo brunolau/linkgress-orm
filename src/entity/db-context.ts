@@ -5016,6 +5016,8 @@ WHERE ${whereClause}`.trim();
           __isDbColumn: true,
           // Include mapper for toDriver transformation in conditions
           __mapper: config.mapper,
+          // Column SQL type — lets flag* emit width-exact mask casts
+          __sqlType: config.type,
         }),
         enumerable: true,
       });

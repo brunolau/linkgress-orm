@@ -1132,6 +1132,33 @@ export function div<T1, T2>(
 // ============================================================================
 
 /**
+ * Explicit mask cast per integer width, resolved from the column FieldRef's
+ * `__sqlType` (attached by the schema-aware mock builders).
+ *
+ * Semantically NO cast is needed: an untyped bind parameter is already
+ * inferred to the column's width by describe, so `int2 & $1` resolves the
+ * int2 operator and the column is never converted. The cast exists to make
+ * the emitted SQL carry that fact EXPLICITLY, so the expression tree is
+ * deterministic across every way the statement is (re)produced — the same
+ * predicate inlined with a bare int4 literal promotes the COLUMN instead
+ * (`(col)::integer & 1`), a different tree that expression statistics built
+ * for the runtime form do not match. int4 columns need no annotation (a bare
+ * parameter and a bare literal both land on int4). Columns whose refs carry
+ * no type info (CTE columns, post-select shapes) keep the historical
+ * uncast emission.
+ */
+const FLAG_MASK_CAST_BY_TYPE: Record<string, string> = {
+  smallint: '::smallint',
+  bigint: '::bigint',
+};
+
+/** The `::type` suffix for a flag mask bound against `column`, or ''. */
+function flagMaskCast(column: unknown): string {
+  const sqlType = (column as { __sqlType?: string } | null)?.__sqlType;
+  return sqlType ? FLAG_MASK_CAST_BY_TYPE[sqlType] ?? '' : '';
+}
+
+/**
  * Creates a SQL condition to check if a flag is set in a numeric column
  * Uses bitwise AND to check if the specific bit is non-zero
  *
@@ -1152,7 +1179,7 @@ export function flagHas<T extends number>(
   flag: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', ') != 0'],
+    ['(', ' & ', `${flagMaskCast(column)}) != 0`],
     [column, flag]
   );
 }
@@ -1172,8 +1199,9 @@ export function flagHasAll<T extends number>(
   column: FieldLike<T> | DbColumn<T>,
   flags: T
 ): SqlFragment<boolean> {
+  const cast = flagMaskCast(column);
   return new SqlFragment<boolean>(
-    ['(', ' & ', ') = ', ''],
+    ['(', ' & ', `${cast}) = `, cast],
     [column, flags, flags]
   );
 }
@@ -1194,7 +1222,7 @@ export function flagHasAny<T extends number>(
   flags: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', ') != 0'],
+    ['(', ' & ', `${flagMaskCast(column)}) != 0`],
     [column, flags]
   );
 }
@@ -1215,7 +1243,7 @@ export function flagHasNone<T extends number>(
   flag: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', ') = 0'],
+    ['(', ' & ', `${flagMaskCast(column)}) = 0`],
     [column, flag]
   );
 }

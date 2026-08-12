@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { createFreshClient } from '../utils/test-database';
-import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, flagHas, flagHasAll, flagHasAny, flagHasNone } from '../../src';
+import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, smallint, bigint, varchar, flagHas, flagHasAll, flagHasAny, flagHasNone } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 
 // Define flag enum for testing
@@ -271,5 +271,148 @@ describe('Flag Operators', () => {
 
       expect(results.length).toBe(4); // admin, active_admin, premium_active, all_flags
     });
+  });
+});
+
+// Typed mask emission — the flag helpers resolve the COLUMN's integer width and
+// cast the mask to it explicitly (`& $1::smallint` / `& $1::bigint`; int4 needs
+// nothing). Semantically the cast changes nothing at runtime: an untyped bind
+// parameter was already inferred to the column's width by describe. What it
+// buys is a DETERMINISTIC expression tree: SQL reconstructed from logs with
+// inlined int4 literals used to promote the COLUMN instead
+// (`(col)::integer & 1` — a different tree that expression statistics built for
+// the runtime form do not match; that mismatch cost a production query 13× in
+// plan quality before it was caught).
+describe('Flag Operators — typed mask (column-width casts)', () => {
+  class WidthResort extends DbEntity {
+    id!: DbColumn<number>;
+    name!: DbColumn<string>;
+    mode!: DbColumn<number>;
+    flags!: DbColumn<number>;
+    bigFlags!: DbColumn<number>;
+  }
+
+  class WidthProduct extends DbEntity {
+    id!: DbColumn<number>;
+    resortId!: DbColumn<number>;
+    resort!: WidthResort;
+  }
+
+  class WidthTestDatabase extends DbContext {
+    get widthResorts(): DbEntityTable<WidthResort> {
+      return this.table(WidthResort);
+    }
+
+    get widthProducts(): DbEntityTable<WidthProduct> {
+      return this.table(WidthProduct);
+    }
+
+    protected override setupModel(model: DbModelConfig): void {
+      model.entity(WidthResort, entity => {
+        entity.toTable('flag_width_resort_test');
+        entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_width_resort_test_id_seq' }));
+        entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
+        entity.property(e => e.mode).hasType(smallint('mode').default(0));
+        entity.property(e => e.flags).hasType(integer('flags').default(0));
+        entity.property(e => e.bigFlags).hasType(bigint('big_flags').default(0));
+      });
+
+      model.entity(WidthProduct, entity => {
+        entity.toTable('flag_width_product_test');
+        entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_width_product_test_id_seq' }));
+        entity.property(e => e.resortId).hasType(integer('resort_id'));
+        entity.hasOne(e => e.resort, () => WidthResort).withForeignKey(e => e.resortId).withPrincipalKey(e => e.id);
+      });
+    }
+  }
+
+  const emittedSql = (query: { future: () => unknown }): string =>
+    (query.future() as { _sql: string })._sql;
+
+  test('smallint column: mask is cast ::smallint in every helper', async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    const client = createFreshClient();
+    const db2 = new WidthTestDatabase(client);
+
+    try {
+      expect(emittedSql(db2.widthResorts.where(r => flagHasNone(r.mode, 1)).select(r => ({ id: r.id }))))
+        .toContain('& $1::smallint) = 0');
+      expect(emittedSql(db2.widthResorts.where(r => flagHas(r.mode, 1)).select(r => ({ id: r.id }))))
+        .toContain('& $1::smallint) != 0');
+      expect(emittedSql(db2.widthResorts.where(r => flagHasAny(r.mode, 3)).select(r => ({ id: r.id }))))
+        .toContain('& $1::smallint) != 0');
+      expect(emittedSql(db2.widthResorts.where(r => flagHasAll(r.mode, 3)).select(r => ({ id: r.id }))))
+        .toContain('& $1::smallint) = $2::smallint');
+    } finally {
+      await db2.dispose();
+    }
+  });
+
+  test('integer column: no cast (bare parameter already resolves to int4)', async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    const client = createFreshClient();
+    const db2 = new WidthTestDatabase(client);
+
+    try {
+      const sql = emittedSql(db2.widthResorts.where(r => flagHasNone(r.flags, 1)).select(r => ({ id: r.id })));
+      expect(sql).toContain('& $1) = 0');
+      expect(sql).not.toContain('::smallint');
+      expect(sql).not.toContain('::bigint');
+    } finally {
+      await db2.dispose();
+    }
+  });
+
+  test('bigint column: mask is cast ::bigint', async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    const client = createFreshClient();
+    const db2 = new WidthTestDatabase(client);
+
+    try {
+      expect(emittedSql(db2.widthResorts.where(r => flagHasNone(r.bigFlags, 1)).select(r => ({ id: r.id }))))
+        .toContain('& $1::bigint) = 0');
+    } finally {
+      await db2.dispose();
+    }
+  });
+
+  test('navigation column keeps its width: reference-path smallint gets ::smallint', async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    const client = createFreshClient();
+    const db2 = new WidthTestDatabase(client);
+
+    try {
+      const sql = emittedSql(db2.widthProducts.where(p => flagHasNone(p.resort.mode, 1)).select(p => ({ id: p.id })));
+      expect(sql).toContain('"mode" & $1::smallint) = 0');
+    } finally {
+      await db2.dispose();
+    }
+  });
+
+  test('filters correctly end-to-end across all three widths', async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    const client = createFreshClient();
+    const db2 = new WidthTestDatabase(client);
+
+    try {
+      await client.query('DROP TABLE IF EXISTS flag_width_product_test CASCADE');
+      await client.query('DROP TABLE IF EXISTS flag_width_resort_test CASCADE');
+      await db2.getSchemaManager().ensureCreated();
+
+      await db2.widthResorts.insert({ name: 'both', mode: 1, flags: 1, bigFlags: 1 } as never);
+      await db2.widthResorts.insert({ name: 'none', mode: 4, flags: 4, bigFlags: 4 } as never);
+
+      const bySmall = await db2.widthResorts.where(r => flagHas(r.mode, 1)).select(r => ({ name: r.name })).toList();
+      const byInt = await db2.widthResorts.where(r => flagHasNone(r.flags, 1)).select(r => ({ name: r.name })).toList();
+      const byBig = await db2.widthResorts.where(r => flagHasAll(r.bigFlags, 1)).select(r => ({ name: r.name })).toList();
+
+      expect(bySmall.map(r => r.name)).toEqual(['both']);
+      expect(byInt.map(r => r.name)).toEqual(['none']);
+      expect(byBig.map(r => r.name)).toEqual(['both']);
+    } finally {
+      await client.query('DROP TABLE IF EXISTS flag_width_product_test CASCADE');
+      await client.query('DROP TABLE IF EXISTS flag_width_resort_test CASCADE');
+      await db2.dispose();
+    }
   });
 });

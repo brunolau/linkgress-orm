@@ -355,10 +355,14 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
+    const columnSqlTypes: Record<string, string> = {};
     for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
       const config = (colBuilder as any).build();
       if (config.mapper) {
         columnMappers[colName] = config.mapper;
+      }
+      if (config.type) {
+        columnSqlTypes[colName] = config.type;
       }
     }
 
@@ -376,6 +380,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               __chainId: chainId,
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
+              // Column SQL type — lets flag* emit width-exact mask casts
+              __sqlType: columnSqlTypes[colName],
             };
           }
           return cached;
@@ -4149,10 +4155,14 @@ ${joinClauses.join('\n')}`;
 
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
+    const columnSqlTypes: Record<string, string> = {};
     for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
       const config = (colBuilder as any).build();
       if (config.mapper) {
         columnMappers[colName] = config.mapper;
+      }
+      if (config.type) {
+        columnSqlTypes[colName] = config.type;
       }
     }
 
@@ -4170,6 +4180,8 @@ ${joinClauses.join('\n')}`;
               __chainId: chainId,
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
+              // Column SQL type — lets flag* emit width-exact mask casts
+              __sqlType: columnSqlTypes[colName],
             };
           }
           return cached;
@@ -6690,10 +6702,14 @@ export class ReferenceQueryBuilder<TItem = any> {
 
       // Build a mapper lookup for columns (only when needed)
       const columnMappers: Record<string, any> = {};
+      const columnSqlTypes: Record<string, string> = {};
       for (const [colName, colBuilder] of Object.entries(this.targetTableSchema.columns)) {
         const config = (colBuilder as any).build();
         if (config.mapper) {
           columnMappers[colName] = config.mapper;
+        }
+        if (config.type) {
+          columnSqlTypes[colName] = config.type;
         }
       }
 
@@ -6714,6 +6730,7 @@ export class ReferenceQueryBuilder<TItem = any> {
                 __tableAlias: tableAlias,  // Alias for SQL generation
                 __sourceTable: sourceTable,  // Actual table name for mapper lookup
                 __mapper: mapper,  // Include mapper for toDriver transformation in conditions
+                __sqlType: columnSqlTypes[colName],  // Column SQL type — lets flag* emit width-exact mask casts
                 __navigationAliases: navigationAliases,  // All intermediate navigation aliases for JOIN resolution
               };
             }
