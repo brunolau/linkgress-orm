@@ -112,6 +112,68 @@ describe('Query timeouts (PostgresClient)', () => {
     });
   });
 
+  /**
+   * A client built from an ALREADY-CONSTRUCTED porsager instance — the shape an app uses
+   * when it owns the pool itself (e.g. to rebuild it on a failover). `normalizeConfig()`
+   * never runs on this path, so the client used to have no idea what the connection-level
+   * `statement_timeout` was and reported every cancellation by it as the `timeoutMs ?? 0`
+   * sentinel: "Query exceeded its timeout of 0ms and was cancelled" — a message that names
+   * no limit, leaving `[SQL Error]` logs undiagnosable.
+   */
+  describe('connection-level default on a pre-built postgres instance', () => {
+    let sqlInstance: any;
+    let client: PostgresClient;
+
+    beforeAll(() => {
+      const postgres = require('postgres');
+      const { max, ...rest } = connectionBase;
+      sqlInstance = postgres({ ...rest, max, connection: { statement_timeout: 400 } });
+      client = new PostgresClient(sqlInstance);
+    });
+
+    afterAll(async () => {
+      await sqlInstance.end();
+    });
+
+    it('reports the connection default instead of the 0ms sentinel', async () => {
+      const err = await captureError(client.query('SELECT pg_sleep(5)'));
+      expect(err).toBeInstanceOf(QueryTimeoutError);
+      expect(err.timeoutMs).toBe(400);
+      expect(err.message).toContain('400ms');
+      expect(err.message).not.toMatch(/timeout of 0ms/);
+      expect(err.cause?.code).toBe('57014');
+    });
+
+    it('reports the connection default for a statement inside a transaction', async () => {
+      const err = await captureError(
+        client.transaction(async (query) => await query('SELECT pg_sleep(5)'))
+      );
+      expect(err).toBeInstanceOf(QueryTimeoutError);
+      expect(err.timeoutMs).toBe(400);
+      expect(err.message).toContain('400ms');
+    });
+
+    it('still reports a per-query override in preference to the connection default', async () => {
+      const err = await captureError(client.query('SELECT pg_sleep(5)', [], { timeoutMs: 200 }));
+      expect(err).toBeInstanceOf(QueryTimeoutError);
+      expect(err.timeoutMs).toBe(200);
+    });
+
+    it('leaves the sentinel alone when the instance sets no statement_timeout', async () => {
+      const postgres = require('postgres');
+      const plain = postgres({ ...connectionBase });
+      const plainClient = new PostgresClient(plain);
+      try {
+        // Nothing to attribute — the only cap is the per-query override, reported as-is.
+        const err = await captureError(plainClient.query('SELECT pg_sleep(5)', [], { timeoutMs: 300 }));
+        expect(err).toBeInstanceOf(QueryTimeoutError);
+        expect(err.timeoutMs).toBe(300);
+      } finally {
+        await plain.end();
+      }
+    });
+  });
+
   describe('query-builder / context level (end-to-end)', () => {
     beforeAll(async () => {
       // Seed at least one row so the per-row pg_sleep in the projection executes.
@@ -146,6 +208,39 @@ describe('Query timeouts (PostgresClient)', () => {
         expect(err).toBeInstanceOf(QueryTimeoutError);
       } finally {
         await client.end();
+      }
+    });
+
+    it('names the connection default in the logged [SQL Error] line', async () => {
+      // Mirrors how an app wires this up: it builds the pool, hands the instance to the
+      // client, and routes DbContext's logger to its own logging stack. The `[SQL Error]`
+      // line is what an operator actually reads, so it must carry the cap that fired.
+      const postgres = require('postgres');
+      const { max, ...rest } = connectionBase;
+      const sqlInstance = postgres({ ...rest, max, connection: { statement_timeout: 400 } });
+      const client = new PostgresClient(sqlInstance);
+      const errorLines: string[] = [];
+      const db = new AppDatabase(client, {
+        collectionStrategy: 'cte',
+        logQueries: true,
+        logger: (message: string, section?: string) => {
+          if (section === 'error') {
+            errorLines.push(message);
+          }
+        },
+      } as any);
+
+      try {
+        const err = await captureError(
+          db.users.select(u => ({ id: u.id, slept: sql<unknown>`pg_sleep(5)` })).toList()
+        );
+        expect(err).toBeInstanceOf(QueryTimeoutError);
+        expect(errorLines).toHaveLength(1);
+        expect(errorLines[0]).toContain('[SQL Error]');
+        expect(errorLines[0]).toContain('400ms');
+        expect(errorLines[0]).not.toMatch(/timeout of 0ms/);
+      } finally {
+        await sqlInstance.end();
       }
     });
 
