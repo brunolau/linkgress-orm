@@ -84,6 +84,18 @@ export type {
   FutureQueryResults,
 } from './query/future-query';
 
+// QueryBatch — heterogeneous queries in ONE round trip (UNION ALL + json envelopes)
+export { QueryBatch } from './query/query-batch';
+
+export type {
+  BatchListKey,
+  BatchItemKey,
+  BatchCountKey,
+  BatchListSource,
+  BatchItemSource,
+  BatchCountSource,
+} from './query/query-batch';
+
 // Prepared statements
 export {
   PreparedQuery,

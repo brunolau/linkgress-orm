@@ -2,6 +2,22 @@ import type { DatabaseClient, QueryResult } from '../database/database-client.in
 import type { QueryExecutor } from '../entity/db-context';
 
 /**
+ * Metadata attached by the query builder so QueryBatch can safely embed the
+ * query as a json_agg branch of a single UNION ALL statement.
+ * @internal
+ */
+export interface FutureBatchMeta {
+  /** Selection produces nested-path rows (nested object selections) — not batchable. */
+  hasNestedPaths: boolean;
+  /**
+   * Restores driver-equivalent values on a row delivered via JSON
+   * (timestamps/dates/decimals lose their driver parsing through json_agg).
+   * Undefined when no selected column needs revival.
+   */
+  reviveJsonRow?: (row: any) => any;
+}
+
+/**
  * Represents a deferred query that will be executed later.
  * Captures the SQL, parameters, and transformation logic at creation time.
  *
@@ -20,6 +36,8 @@ export class FutureQuery<TResult> {
   readonly _executor?: QueryExecutor;
   /** @internal */
   readonly _mode: 'list' | 'single' | 'count';
+  /** @internal Populated by the query builder for QueryBatch support */
+  _batchMeta?: FutureBatchMeta;
 
   constructor(
     sql: string,
@@ -89,6 +107,8 @@ export class FutureSingleQuery<TResult> {
   readonly _executor?: QueryExecutor;
   /** @internal */
   readonly _mode: 'single' = 'single';
+  /** @internal Populated by the query builder for QueryBatch support */
+  _batchMeta?: FutureBatchMeta;
 
   constructor(
     sql: string,
@@ -154,6 +174,8 @@ export class FutureCountQuery {
   readonly _executor?: QueryExecutor;
   /** @internal */
   readonly _mode: 'count' = 'count';
+  /** @internal Populated by the query builder for QueryBatch support */
+  _batchMeta?: FutureBatchMeta;
 
   constructor(
     sql: string,

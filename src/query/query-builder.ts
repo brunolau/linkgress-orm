@@ -11,7 +11,8 @@ import { DbCte, isCte } from './cte-builder';
 import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
-import { FutureQuery, FutureSingleQuery, FutureCountQuery } from './future-query';
+import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } from './future-query';
+import type { ColumnConfig } from '../schema/column-builder';
 import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere } from './join-utils';
 
 /**
@@ -1995,13 +1996,19 @@ export class SelectQueryBuilder<TSelection> {
       return this.transformResults(processedRows, selectionResult) as ResolveCollectionResults<TSelection>[];
     };
 
-    return new FutureQuery<ResolveCollectionResults<TSelection>>(
+    const future = new FutureQuery<ResolveCollectionResults<TSelection>>(
       sql,
       params,
       transformFn,
       this.client,
       this.executor
     );
+    future._batchMeta = {
+      hasNestedPaths: nestedPaths.size > 0,
+      reviveJsonRow: this.buildJsonRowReviver(selectionResult),
+    };
+
+    return future;
   }
 
   /**
@@ -2054,13 +2061,19 @@ export class SelectQueryBuilder<TSelection> {
       return this.transformResults(processedRows, selectionResult) as ResolveCollectionResults<TSelection>[];
     };
 
-    return new FutureSingleQuery<ResolveCollectionResults<TSelection>>(
+    const future = new FutureSingleQuery<ResolveCollectionResults<TSelection>>(
       sql,
       params,
       transformFn,
       this.client,
       this.executor
     );
+    future._batchMeta = {
+      hasNestedPaths: nestedPaths.size > 0,
+      reviveJsonRow: this.buildJsonRowReviver(selectionResult),
+    };
+
+    return future;
   }
 
   /**
@@ -2090,7 +2103,106 @@ export class SelectQueryBuilder<TSelection> {
 
     const { sql, params } = this.buildAggregateQuery(context, 'count');
 
-    return new FutureCountQuery(sql, params, this.client, this.executor);
+    const future = new FutureCountQuery(sql, params, this.client, this.executor);
+    future._batchMeta = { hasNestedPaths: false };
+
+    return future;
+  }
+
+  /**
+   * Build a value reviver for rows delivered as JSON (QueryBatch json_agg
+   * envelope). JSON serialization bypasses the driver's type parsers:
+   * timestamps and dates arrive as ISO strings, numerics as JSON numbers.
+   * The reviver restores driver-equivalent values BEFORE the normal transform
+   * pipeline runs, driven by the DECLARED column types of the selected fields —
+   * never by value shape, so string columns are never misinterpreted.
+   * Returns undefined when no selected column needs revival.
+   * @internal
+   */
+  private buildJsonRowReviver(selection: any): FutureBatchMeta['reviveJsonRow'] {
+    const revivals: Array<{ key: string; revive: (value: any) => any }> = [];
+
+    for (const key in selection) {
+      const value = selection[key];
+
+      if (!value || typeof value !== 'object' || !('__fieldName' in value)) {
+        continue;
+      }
+
+      const config = this.resolveFieldColumnConfig(value);
+
+      if (!config) {
+        continue;
+      }
+
+      if (config.type === 'timestamp' || config.type === 'timestamptz') {
+        revivals.push({ key, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
+      } else if (config.type === 'date') {
+        revivals.push({
+          key,
+          revive: (v) => {
+            if (typeof v !== 'string') {
+              return v;
+            }
+
+            // Mirror the drivers' date parsing: local midnight, not UTC
+            const [year, month, day] = v.split('-').map(Number);
+
+            return new Date(year, month - 1, day);
+          },
+        });
+      } else if (config.type === 'decimal' || config.type === 'numeric') {
+        const scale = config.scale;
+        revivals.push({
+          key,
+          revive: (v) => (typeof v === 'number' ? (scale != null ? v.toFixed(scale) : String(v)) : v),
+        });
+      } else if (config.type === 'bigint') {
+        revivals.push({ key, revive: (v) => (typeof v === 'number' ? String(v) : v) });
+      }
+    }
+
+    if (revivals.length === 0) {
+      return undefined;
+    }
+
+    return (row: any) => {
+      for (const { key, revive } of revivals) {
+        const value = row[key];
+
+        if (value !== null && value !== undefined) {
+          row[key] = revive(value);
+        }
+      }
+
+      return row;
+    };
+  }
+
+  /**
+   * Resolve the declared column config for a selected FieldRef: base table
+   * fast path, then schema registry lookup for navigation-sourced fields.
+   * Mirrors the mapper resolution order used by transformResults().
+   * @internal
+   */
+  private resolveFieldColumnConfig(fieldRef: any): ColumnConfig | undefined {
+    const sourceTable = fieldRef.__sourceTable;
+    const schema =
+      !sourceTable || sourceTable === this.schema.name ? this.schema : this.schemaRegistry?.get(sourceTable);
+
+    if (!schema) {
+      return undefined;
+    }
+
+    const cached = schema.columnMetadataCache?.get(fieldRef.__fieldName);
+
+    if (cached?.config) {
+      return cached.config;
+    }
+
+    const column = schema.columns?.[fieldRef.__fieldName];
+
+    return column && typeof column.build === 'function' ? column.build() : undefined;
   }
 
   /**
