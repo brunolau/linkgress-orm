@@ -874,9 +874,15 @@ export class SelectQueryBuilder<TSelection> {
    * order_item → invoicing_partner_data): a JOIN against the "one" side never
    * duplicates left rows. Joining a 1:N side WILL duplicate rows — callers own
    * that trade-off (use exists()/inSubquery for semi-join semantics instead).
+   *
+   * Also accepts a {@link DbCte}: the right side then addresses the CTE's
+   * columns, and the CTE is auto-attached to the statement's WITH list (as if
+   * `.with(cte)` had been called). The canonical candidate-set shape — a
+   * MATERIALIZED CTE of ids inner-joined back to the entity — keeps the CTE
+   * the driving side of the plan while the selection carries the projection.
    */
   joinFilter<TRight = any>(
-    rightTable: { _getSchema: () => TableSchema },
+    rightTable: { _getSchema: () => TableSchema } | DbCte<TRight>,
     on: (left: any, right: TRight) => Condition,
     filter?: (left: any, right: TRight) => Condition
   ): this {
@@ -886,10 +892,11 @@ export class SelectQueryBuilder<TSelection> {
   /**
    * LEFT JOIN used purely as a row FILTER — see joinFilter. Useful with an
    * IS NULL predicate in the filter callback for anti-join shapes
-   * ("rows with NO matching right row").
+   * ("rows with NO matching right row"). Accepts a {@link DbCte} like
+   * joinFilter does.
    */
   leftJoinFilter<TRight = any>(
-    rightTable: { _getSchema: () => TableSchema },
+    rightTable: { _getSchema: () => TableSchema } | DbCte<TRight>,
     on: (left: any, right: TRight) => Condition,
     filter?: (left: any, right: TRight) => Condition
   ): this {
@@ -898,10 +905,19 @@ export class SelectQueryBuilder<TSelection> {
 
   private addFilterJoin<TRight>(
     type: JoinType,
-    rightTable: { _getSchema: () => TableSchema },
+    rightTable: { _getSchema: () => TableSchema } | DbCte<TRight>,
     on: (left: any, right: TRight) => Condition,
     filter?: (left: any, right: TRight) => Condition
   ): this {
+    if (isCte(rightTable)) {
+      return this.addCteFilterJoin(
+        type,
+        rightTable,
+        on,
+        filter
+      );
+    }
+
     const rightSchema = rightTable._getSchema();
     const rightAlias = `${rightSchema.name}_${this.joinCounter}`;
     this.joinCounter = this.joinCounter + 1;
@@ -922,6 +938,49 @@ export class SelectQueryBuilder<TSelection> {
         condition: onCondition,
       },
     ];
+
+    if (filter) {
+      const filterCondition = filter(leftMock, rightMock as TRight);
+      this.whereCond = this.whereCond ? andCondition(this.whereCond, filterCondition) : filterCondition;
+    }
+
+    return this;
+  }
+
+  /**
+   * joinFilter / leftJoinFilter against a CTE: identical pure-filter
+   * semantics, with the right-side mock addressing the CTE's columns. The CTE
+   * is auto-attached to the query's WITH list (deduplicated by name), so the
+   * emitted statement always carries its definition even without an explicit
+   * `.with(cte)`.
+   */
+  private addCteFilterJoin<TRight>(
+    type: JoinType,
+    cte: DbCte<TRight>,
+    on: (left: any, right: TRight) => Condition,
+    filter?: (left: any, right: TRight) => Condition
+  ): this {
+    const mockRow = this._createMockRow();
+    const selectedMock = this.selector(mockRow);
+    const leftMock = this.createFieldRefProxy(selectedMock, true);
+    const rightMock = this.createMockRowForCte(cte as DbCte<any>);
+
+    const onCondition = on(leftMock, rightMock as TRight);
+    this.manualJoins = [
+      ...this.manualJoins,
+      {
+        type,
+        table: cte.name,
+        alias: cte.name,
+        schema: null as any,
+        condition: onCondition,
+        cte: cte as DbCte<any>,
+      },
+    ];
+
+    if (!this.ctes.some(existing => existing.name === cte.name)) {
+      this.ctes = [...this.ctes, cte as DbCte<any>];
+    }
 
     if (filter) {
       const filterCondition = filter(leftMock, rightMock as TRight);
@@ -5164,7 +5223,7 @@ ${joinClauses.join('\n')}`;
     // Add user-defined CTEs (from .with() method)
     // Note: CTE params were already added to context.allParams at the start of buildQuery
     for (const cte of this.ctes) {
-      allCtes.push(`"${cte.name}" AS (${cte.query})`);
+      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
     }
 
     // Add generated CTEs (from collection queries)
@@ -5515,7 +5574,7 @@ ${joinClauses.join('\n')}`;
     const allCtes: string[] = [];
 
     for (const cte of this.ctes) {
-      allCtes.push(`"${cte.name}" AS (${cte.query})`);
+      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
     }
 
     if (context.ctes.size > 0) {

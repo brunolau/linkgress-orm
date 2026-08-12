@@ -105,15 +105,25 @@ export class DbCte<TColumns> {
    */
   public readonly aggregationColumns: Set<string>;
 
+  /**
+   * When true the CTE is emitted `AS MATERIALIZED` — an optimizer fence that
+   * forces PostgreSQL to compute the CTE once and treat its result as an
+   * opaque relation. Use for candidate-set CTEs whose join order must not be
+   * dissolved into the outer plan (PostgreSQL 12+ inlines plain CTEs).
+   */
+  public readonly materialized: boolean;
+
   constructor(
     public readonly name: string,
     public readonly query: string,
     public readonly params: unknown[],
     public readonly columnDefs: TColumns,
     public readonly selectionMetadata?: Record<string, any>,
-    aggregationColumns?: string[]
+    aggregationColumns?: string[],
+    materialized?: boolean
   ) {
     this.aggregationColumns = new Set(aggregationColumns || []);
+    this.materialized = materialized ?? false;
   }
 
   /**
@@ -220,7 +230,16 @@ export class DbCteBuilder {
    */
   with<TSelection extends Record<string, unknown>>(
     cteName: string,
-    query: SelectQueryBuilder<TSelection> | { toList: () => Promise<TSelection[]> }
+    query: SelectQueryBuilder<TSelection> | { toList: () => Promise<TSelection[]> },
+    options?: {
+      /**
+       * Emit the CTE `AS MATERIALIZED` — an optimizer fence forcing PostgreSQL
+       * to compute it once as an opaque relation instead of inlining it into
+       * the outer plan (the PG12+ default for single-reference CTEs). Use for
+       * candidate-set CTEs that must drive the outer join order.
+       */
+      materialized?: boolean;
+    }
   ): { cte: DbCte<TSelection> } {
     const context: SqlBuildContext = {
       paramCounter: this.paramOffset,
@@ -269,7 +288,15 @@ export class DbCteBuilder {
       }
     }
 
-    const cte = new DbCte<TSelection>(cteName, sql, context.params, columnDefs, selectionResult);
+    const cte = new DbCte<TSelection>(
+      cteName,
+      sql,
+      context.params,
+      columnDefs,
+      selectionResult,
+      undefined,
+      options?.materialized
+    );
     this.ctes.push(cte);
 
     return { cte };

@@ -2179,6 +2179,16 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   ): IEntityQueryable<TEntity>;
 
   /**
+   * {@link joinFilter} against a CTE — the right side addresses the CTE's
+   * columns, and the CTE is auto-attached to the statement's WITH list.
+   */
+  joinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: EntityQuery<TEntity>, right: TRightCols) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: TRightCols) => Condition
+  ): IEntityQueryable<TEntity>;
+
+  /**
    * LEFT JOIN used purely as a row FILTER — see joinFilter. Combine with an
    * IS NULL predicate in `filter` for anti-join shapes ("no matching right
    * row").
@@ -2187,6 +2197,13 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
     rightTable: DbEntityTable<TRight>,
     on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
     filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity>;
+
+  /** {@link leftJoinFilter} against a CTE — see the joinFilter CTE overload. */
+  leftJoinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: EntityQuery<TEntity>, right: TRightCols) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: TRightCols) => Condition
   ): IEntityQueryable<TEntity>;
 
   /**
@@ -2377,11 +2394,25 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
     filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
+  /** INNER JOIN as a pure row filter against a CTE — see the {@link IEntityQueryable.joinFilter} CTE overload. */
+  joinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: TRightCols) => Condition,
+    filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: TRightCols) => Condition
+  ): EntitySelectQueryBuilder<TEntity, TSelection>;
+
   /** LEFT JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.leftJoinFilter}. */
   leftJoinFilter<TRight extends DbEntity>(
     rightTable: DbEntityTable<TRight>,
     on: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition,
     filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: EntityQuery<TRight>) => Condition
+  ): EntitySelectQueryBuilder<TEntity, TSelection>;
+
+  /** LEFT JOIN as a pure row filter against a CTE — see the {@link IEntityQueryable.leftJoinFilter} CTE overload. */
+  leftJoinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: TRightCols) => Condition,
+    filter?: (left: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>, right: TRightCols) => Condition
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   orderBy<T>(selector: (row: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => T): EntitySelectQueryBuilder<TEntity, TSelection>;
@@ -3279,6 +3310,17 @@ export class DbEntityTable<TEntity extends DbEntity> {
     rightTable: DbEntityTable<TRight>,
     on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
     filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity>;
+  /** {@link joinFilter} against a CTE — see the {@link IEntityQueryable.joinFilter} CTE overload. */
+  joinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: EntityQuery<TEntity>, right: TRightCols) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: TRightCols) => Condition
+  ): IEntityQueryable<TEntity>;
+  joinFilter(
+    rightTable: any,
+    on: (left: any, right: any) => Condition,
+    filter?: (left: any, right: any) => Condition
   ): IEntityQueryable<TEntity> {
     return (this.asEntityQueryable() as any).joinFilter(
       rightTable,
@@ -3295,6 +3337,17 @@ export class DbEntityTable<TEntity extends DbEntity> {
     rightTable: DbEntityTable<TRight>,
     on: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition,
     filter?: (left: EntityQuery<TEntity>, right: EntityQuery<TRight>) => Condition
+  ): IEntityQueryable<TEntity>;
+  /** {@link leftJoinFilter} against a CTE — see the {@link IEntityQueryable.leftJoinFilter} CTE overload. */
+  leftJoinFilter<TRightCols extends Record<string, any>>(
+    rightTable: import('../query/cte-builder').DbCte<TRightCols>,
+    on: (left: EntityQuery<TEntity>, right: TRightCols) => Condition,
+    filter?: (left: EntityQuery<TEntity>, right: TRightCols) => Condition
+  ): IEntityQueryable<TEntity>;
+  leftJoinFilter(
+    rightTable: any,
+    on: (left: any, right: any) => Condition,
+    filter?: (left: any, right: any) => Condition
   ): IEntityQueryable<TEntity> {
     return (this.asEntityQueryable() as any).leftJoinFilter(
       rightTable,

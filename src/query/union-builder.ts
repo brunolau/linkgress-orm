@@ -278,6 +278,37 @@ export class UnionQueryBuilder<TSelection> {
   }
 
   /**
+   * Render this union as a CTE body for `DbCteBuilder.with(...)` — parameter
+   * numbering chains through the outer context's counter/array, mirroring
+   * {@link asSubquery}'s nested mode, so a union CTE composes with other CTEs
+   * and the outer statement without placeholder collisions.
+   * @internal
+   */
+  buildCteQuery(queryContext: { paramCounter?: number; allParams?: unknown[] }): { sql: string } {
+    const context: SqlBuildContext = {
+      paramCounter: queryContext.paramCounter ?? 1,
+      params: (queryContext.allParams ?? []) as any[],
+    };
+    const sql = this.buildSql(context);
+    queryContext.paramCounter = context.paramCounter;
+    return { sql };
+  }
+
+  /**
+   * First-leg selection metadata — canonical for the whole union because
+   * PostgreSQL enforces column-shape equality across every leg. This is what
+   * lets a union serve as a CTE body with typed column refs.
+   * @internal
+   */
+  getSelectionMetadata(): Record<string, any> {
+    const firstLeg = this.components[0]?.ownerBuilder as any;
+    if (firstLeg && typeof firstLeg._createMockRow === 'function' && typeof firstLeg.selector === 'function') {
+      return firstLeg.selector(firstLeg._createMockRow());
+    }
+    return {};
+  }
+
+  /**
    * Create an unlaunched future for this union so it can join a QueryBatch
    * (one round trip shared with other queries). Mirrors toList(): SQL + params
    * come from the same buildSql() pass, and the FIRST leg's metadata drives
