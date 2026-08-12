@@ -20,6 +20,32 @@ function normalizeTimeoutMs(timeoutMs: number): number {
 }
 
 /**
+ * Read the connection-level `statement_timeout` back off an already-constructed porsager
+ * instance (`sql.options.connection`, where porsager keeps the parameters it sends at
+ * connect). Callers that build their own pool — typically to keep ownership of it for
+ * failover recycling — never go through {@link PostgresClient.normalizeConfig}, so this is
+ * the only way the client can learn which cap the server is enforcing. Without it every
+ * cancellation by that cap is reported as the `timeoutMs ?? 0` sentinel and renders as
+ * "Query exceeded its timeout of 0ms and was cancelled", naming no limit at all.
+ *
+ * Returns `undefined` when the instance sets no timeout, so the sentinel behaviour is
+ * unchanged for pools that genuinely have no connection-level cap.
+ */
+function readConnectionStatementTimeout(sqlInstance: Sql): number | undefined {
+  const configured = sqlInstance?.options?.connection?.statement_timeout;
+
+  if (configured === undefined || configured === null) {
+    return undefined;
+  }
+
+  // porsager passes connection parameters through as given — a number here, but a string
+  // when it came from a connection-string parameter.
+  const timeoutMs = typeof configured === 'number' ? configured : Number(configured);
+
+  return Number.isFinite(timeoutMs) ? timeoutMs : undefined;
+}
+
+/**
  * Translate a statement-timeout cancellation (PostgreSQL `57014`) into a typed
  * {@link QueryTimeoutError}. Any other error is returned unchanged.
  */
@@ -183,6 +209,9 @@ export class PostgresClient extends DatabaseClient {
     if (isPostgresSqlInstance(config)) {
       this.sql = config;
       this.ownsConnection = false;
+      // The instance already carries its connection parameters — recover the default cap
+      // from them so timeout errors can name it (see readConnectionStatementTimeout).
+      this.defaultStatementTimeout = readConnectionStatementTimeout(config);
     } else {
       let postgres: any;
 
