@@ -209,12 +209,6 @@ export class QueryBatch {
       throw new Error(`QueryBatch: identifier "${id}" is already registered`);
     }
 
-    if (future._batchMeta?.hasNestedPaths) {
-      throw new Error(
-        `QueryBatch: query "${id}" uses a nested object selection, which is not supported in a batch — use a flat selection or execute it separately`
-      );
-    }
-
     this.entries.push({ id, kind, future });
   }
 

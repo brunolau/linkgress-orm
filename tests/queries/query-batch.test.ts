@@ -247,16 +247,126 @@ describe('QueryBatch', () => {
       });
     });
 
-    test('rejects nested-object selections with a descriptive error', async () => {
-      await withDatabase(async (db) => {
-        const batch = new QueryBatch();
+  });
 
-        expect(() =>
-          batch.addList(
-            db.posts.select(p => ({ title: p.title, author: { name: p.user!.username } })),
-            'nested'
-          )
-        ).toThrow(/nested|flat/i);
+  describe('nested, collection and union selections', () => {
+    test('reconstructs nested-object selections identically to standalone execution (incl. Date/decimal leaves)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const buildQuery = () => db.orders
+          .select(o => ({
+            id: o.id,
+            meta: {
+              status: o.status,
+              createdAt: o.createdAt,
+              amount: o.totalAmount,
+            },
+          }))
+          .orderBy(o => o.id);
+
+        const expected = await buildQuery().toList();
+
+        const batch = new QueryBatch();
+        const key = batch.addList(buildQuery(), 'nestedOrders');
+        await batch.executeBatch();
+        const batched = batch.getList(key);
+
+        expect(batched).toEqual(expected);
+        expect(batched.length).toBeGreaterThan(0);
+        // nested LEAVES must be revived to driver-equivalent types, not left as JSON strings
+        expect(batched[0].meta.createdAt?.constructor).toBe(expected[0].meta.createdAt?.constructor);
+        expect(typeof batched[0].meta.amount).toBe(typeof expected[0].meta.amount);
+      });
+    });
+
+    test('nested selections through a navigation property batch identically', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const buildQuery = () => db.posts
+          .select(p => ({ title: p.title, author: { name: p.user!.username } }))
+          .orderBy(p => p.title);
+
+        const expected = await buildQuery().toList();
+
+        const batch = new QueryBatch();
+        const key = batch.addList(buildQuery(), 'postsWithAuthor');
+        await batch.executeBatch();
+
+        expect(batch.getList(key)).toEqual(expected);
+        expect(expected.length).toBeGreaterThan(0);
+      });
+    });
+
+    test('collection (json_agg lateral) selections batch identically to standalone execution', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const buildQuery = () => db.users
+          .select(u => ({
+            userId: u.id,
+            username: u.username,
+            posts: u.posts!
+              .select(p => ({
+                postId: p.id,
+                title: p.title,
+                views: p.views,
+              }))
+              .orderBy(p => [[p.views, 'DESC']])
+              .toList('posts'),
+          }))
+          .orderBy(u => u.userId);
+
+        const expected = await buildQuery().toList();
+
+        const batch = new QueryBatch();
+        const key = batch.addList(buildQuery(), 'usersWithPosts');
+        await batch.executeBatch();
+        const batched = batch.getList(key);
+
+        expect(batched).toEqual(expected);
+        expect(batched.length).toBeGreaterThan(0);
+        expect(Array.isArray(batched[0].posts)).toBe(true);
+      });
+    });
+
+    test('unionAll queries batch identically to standalone execution (order + nested projection preserved)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const buildUnion = () => db.users
+          .where(u => eq(u.isActive, true))
+          .select(u => ({ id: u.id, info: { name: u.username } }))
+          .unionAll(db.users
+            .where(u => eq(u.isActive, false))
+            .select(u => ({ id: u.id, info: { name: u.username } })))
+          .orderBy(r => r.id);
+
+        const expected = await buildUnion().toList();
+
+        const batch = new QueryBatch();
+        const key = batch.addList(buildUnion(), 'allUsersUnion');
+        const bobKey = batch.addFirstOrDefault(
+          db.users.where(u => eq(u.username, 'bob')).select(u => ({ id: u.id, name: u.username })),
+          'bob'
+        );
+
+        const client = (db as any).client;
+        const querySpy = jest.spyOn(client, 'query');
+
+        try {
+          await batch.executeBatch();
+
+          // the union rides the SAME single round trip as the other branch
+          expect(querySpy).toHaveBeenCalledTimes(1);
+        } finally {
+          querySpy.mockRestore();
+        }
+
+        expect(batch.getList(key)).toEqual(expected);
+        expect(expected.length).toBeGreaterThan(0);
+        expect(batch.getItem(bobKey)).not.toBeNull();
       });
     });
   });

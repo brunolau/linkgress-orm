@@ -4,6 +4,7 @@ import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
+import { FutureQuery } from './future-query';
 import { Subquery } from './subquery';
 
 /**
@@ -24,6 +25,8 @@ export interface UnionLegBuilder {
   _consumeUnionMetadata?(): { nestedPaths: Set<string>; selectionResult: any } | undefined;
   /** @internal */
   _applyUnionPostProcessing?(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): any[];
+  /** @internal */
+  _buildUnionJsonRowReviver?(selectionResult: any): ((row: any) => any) | undefined;
 }
 
 /**
@@ -272,6 +275,50 @@ export class UnionQueryBuilder<TSelection> {
     }
 
     return result.rows as TSelection[];
+  }
+
+  /**
+   * Create an unlaunched future for this union so it can join a QueryBatch
+   * (one round trip shared with other queries). Mirrors toList(): SQL + params
+   * come from the same buildSql() pass, and the FIRST leg's metadata drives
+   * both post-processing (nested reconstruction, collection mappers) and JSON
+   * revival — correct because UNION semantics force every leg to project the
+   * identical column shape, so the shape-driven mapping applies to all rows.
+   */
+  future(): FutureQuery<TSelection> {
+    const { sql, params } = this.buildSql();
+
+    let firstLegMeta: { nestedPaths: Set<string>; selectionResult: any } | undefined;
+    let firstLegOwner: UnionLegBuilder | undefined;
+    for (let i = 0; i < this.components.length; i++) {
+      const c = this.components[i];
+      if (c.ownerBuilder?._consumeUnionMetadata) {
+        const meta = c.ownerBuilder._consumeUnionMetadata();
+        if (i === 0) {
+          firstLegMeta = meta;
+          firstLegOwner = c.ownerBuilder;
+        }
+        // Non-first legs: just drain to avoid stale state on the builder.
+      }
+    }
+
+    const transformFn = (rows: any[]): TSelection[] => {
+      if (firstLegOwner?._applyUnionPostProcessing && firstLegMeta) {
+        return firstLegOwner._applyUnionPostProcessing(rows, firstLegMeta) as TSelection[];
+      }
+
+      return rows as TSelection[];
+    };
+
+    const future = new FutureQuery<TSelection>(sql, params, transformFn, this.client, this.executor);
+    future._batchMeta = {
+      hasNestedPaths: (firstLegMeta?.nestedPaths.size ?? 0) > 0,
+      reviveJsonRow: firstLegMeta && firstLegOwner?._buildUnionJsonRowReviver
+        ? firstLegOwner._buildUnionJsonRowReviver(firstLegMeta.selectionResult)
+        : undefined,
+    };
+
+    return future;
   }
 
   /**

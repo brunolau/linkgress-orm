@@ -2121,46 +2121,7 @@ export class SelectQueryBuilder<TSelection> {
    */
   private buildJsonRowReviver(selection: any): FutureBatchMeta['reviveJsonRow'] {
     const revivals: Array<{ key: string; revive: (value: any) => any }> = [];
-
-    for (const key in selection) {
-      const value = selection[key];
-
-      if (!value || typeof value !== 'object' || !('__fieldName' in value)) {
-        continue;
-      }
-
-      const config = this.resolveFieldColumnConfig(value);
-
-      if (!config) {
-        continue;
-      }
-
-      if (config.type === 'timestamp' || config.type === 'timestamptz') {
-        revivals.push({ key, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
-      } else if (config.type === 'date') {
-        revivals.push({
-          key,
-          revive: (v) => {
-            if (typeof v !== 'string') {
-              return v;
-            }
-
-            // Mirror the drivers' date parsing: local midnight, not UTC
-            const [year, month, day] = v.split('-').map(Number);
-
-            return new Date(year, month - 1, day);
-          },
-        });
-      } else if (config.type === 'decimal' || config.type === 'numeric') {
-        const scale = config.scale;
-        revivals.push({
-          key,
-          revive: (v) => (typeof v === 'number' ? (scale != null ? v.toFixed(scale) : String(v)) : v),
-        });
-      } else if (config.type === 'bigint') {
-        revivals.push({ key, revive: (v) => (typeof v === 'number' ? String(v) : v) });
-      }
-    }
+    this.collectJsonRowRevivals(selection, undefined, revivals);
 
     if (revivals.length === 0) {
       return undefined;
@@ -2177,6 +2138,88 @@ export class SelectQueryBuilder<TSelection> {
 
       return row;
     };
+  }
+
+  /**
+   * Walk a selection — including nested-object projections — collecting revival
+   * entries keyed by the FLAT column alias each leaf is delivered under: top-level
+   * keys as-is, nested leaves under the `__nested__<path>__<leaf>` path-encoded
+   * alias that tryBuildFlatNestedSelect emits (revival runs BEFORE nested
+   * reconstruction, so it must target the flat row shape). Only plain object
+   * literals are recursed into; collections, SqlFragments and subquery builders
+   * are skipped — they are delivered as json under standalone execution too, so
+   * they need no revival.
+   * @internal
+   */
+  private collectJsonRowRevivals(
+    selection: any,
+    pathPrefix: string | undefined,
+    revivals: Array<{ key: string; revive: (value: any) => any }>
+  ): void {
+    for (const key in selection) {
+      const value = selection[key];
+
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        continue;
+      }
+
+      if ('__fieldName' in value) {
+        const config = this.resolveFieldColumnConfig(value);
+
+        if (!config) {
+          continue;
+        }
+
+        const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
+
+        if (config.type === 'timestamp' || config.type === 'timestamptz') {
+          revivals.push({ key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
+        } else if (config.type === 'date') {
+          revivals.push({
+            key: flatKey,
+            revive: (v) => {
+              if (typeof v !== 'string') {
+                return v;
+              }
+
+              // Mirror the drivers' date parsing: local midnight, not UTC
+              const [year, month, day] = v.split('-').map(Number);
+
+              return new Date(year, month - 1, day);
+            },
+          });
+        } else if (config.type === 'decimal' || config.type === 'numeric') {
+          const scale = config.scale;
+          revivals.push({
+            key: flatKey,
+            revive: (v) => (typeof v === 'number' ? (scale != null ? v.toFixed(scale) : String(v)) : v),
+          });
+        } else if (config.type === 'bigint') {
+          revivals.push({ key: flatKey, revive: (v) => (typeof v === 'number' ? String(v) : v) });
+        }
+
+        continue;
+      }
+
+      // Recurse only into plain object literals — the nested-object projections
+      // tryBuildFlatNestedSelect flattens. Class instances (collections, SqlFragment,
+      // Subquery) and collection-result markers must not be walked.
+      const proto = Object.getPrototypeOf(value);
+
+      if ((proto === Object.prototype || proto === null) && !('__collectionResult' in value)) {
+        this.collectJsonRowRevivals(value, pathPrefix ? `${pathPrefix}__${key}` : `__nested__${key}`, revivals);
+      }
+    }
+  }
+
+  /**
+   * Union-leg hook: builds the json-row reviver for a previously consumed union
+   * selection so UnionQueryBuilder.future() can attach batch metadata. Same
+   * mechanics as the standalone future factories.
+   * @internal
+   */
+  _buildUnionJsonRowReviver(selectionResult: any): FutureBatchMeta['reviveJsonRow'] {
+    return this.buildJsonRowReviver(selectionResult);
   }
 
   /**
