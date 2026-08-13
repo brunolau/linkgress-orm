@@ -7493,6 +7493,24 @@ export class CollectionQueryBuilder<TItem = any> {
       return;
     }
 
+    // Seed the chain the projection ACTUALLY navigated, not just its terminal alias.
+    // Without this, a projection that names only the deep leaf (e.g. `oi.productPrice.product.resort.name`
+    // with no sibling scalar off `productPrice` / `product`) leaves the intermediates out of
+    // `allTableAliases` entirely, so resolveNavigationJoins' direct-relation phase has nothing to
+    // anchor on and falls through to the name-based schema-graph BFS - which happily reaches
+    // `resort` one hop sooner through an unrelated same-table FK (`order_item.cashback_product_id`)
+    // and silently returns another row's data.
+    // This is the same `__navigationAliases` signal QueryBuilder.collectTableAliasesFromSelection,
+    // GroupedQueryBuilder and DbContext already consume, and the same treatment nested
+    // CollectionQueryBuilder values already get in detectNavigationJoins.
+    if (Array.isArray(fieldRef.__navigationAliases)) {
+      for (const navAlias of fieldRef.__navigationAliases) {
+        if (navAlias && navAlias !== this.targetTable) {
+          allTableAliases.add(navAlias);
+        }
+      }
+    }
+
     // Collect this table alias for later resolution
     allTableAliases.add(tableAlias);
 
@@ -7583,41 +7601,79 @@ export class CollectionQueryBuilder<TItem = any> {
         }
       }
 
-      // Try to resolve each unresolved alias
+      // PHASE 1 - direct relation lookups, run to a FIXPOINT.
+      // A join added here immediately becomes an anchor candidate for the remaining aliases in
+      // this very pass, so a parent that is itself several hops away from the root (e.g.
+      // order_item -> product_price -> product) can still anchor its own children. Without the
+      // fixpoint those children never see their real parent (joinedSchemas was snapshotted before
+      // the parent was joined) and fall through to the BFS below, which anchors them on whatever
+      // other relation happens to point at the same table - e.g.
+      // order_item.cashback_product_id -> product - silently returning another row's data.
+      let progressed = true;
+
+      // Termination (why no maxIterations guard is needed here, unlike every other loop in this
+      // file): `progressed` is only ever set on a path that also adds a NEW alias to `resolved`
+      // - every other path `continue`s - so `resolved` grows strictly monotonically and is
+      // bounded above by `allTableAliases.size`. The loop therefore runs at most
+      // `allTableAliases.size + 1` times.
+      while (progressed) {
+        progressed = false;
+
+        for (const alias of allTableAliases) {
+          if (resolved.has(alias)) {
+            continue;
+          }
+
+          if (joins.some(j => j.alias === alias)) {
+            resolved.add(alias);
+            continue;
+          }
+
+          // Look for this alias in any of the already joined schemas (direct lookup)
+          for (const [schemaAlias, schema] of joinedSchemas) {
+            const relation = schema.relations?.[alias];
+            if (!relation || relation.type !== 'one') {
+              continue;
+            }
+
+            const targetSchema = this.addNavigationJoin(alias, relation, joins, schemaAlias);
+            if (targetSchema) {
+              // Keep the anchor map current so the alias we just joined can serve as the
+              // source for further direct lookups in the next fixpoint round
+              joinedSchemas.set(alias, targetSchema);
+            }
+
+            resolved.add(alias);
+            progressed = true;
+            break;
+          }
+        }
+      }
+
+      // PHASE 2 - only aliases with no direct relation path at all fall back to the transitive
+      // schema-graph BFS, which searches by relation NAME and therefore cannot tell which of
+      // several relations pointing at the same table the projection actually meant
       for (const alias of allTableAliases) {
-        if (resolved.has(alias) || joins.some(j => j.alias === alias)) {
-          resolved.add(alias);
+        if (resolved.has(alias) || !this.schemaRegistry) {
           continue;
         }
 
-        // First, look for this alias in any of the already joined schemas (direct lookup)
-        let found = false;
-        for (const [schemaAlias, schema] of joinedSchemas) {
-          if (schema.relations && schema.relations[alias]) {
-            const relation = schema.relations[alias];
-            if (relation.type === 'one') {
-              this.addNavigationJoin(alias, relation, joins, schemaAlias);
-              resolved.add(alias);
-              found = true;
-              break;
+        const path = this.findNavigationPath(alias, joinedSchemas, startSchema);
+        if (path.length === 0) {
+          continue;
+        }
+
+        // Add all intermediate joins
+        for (const step of path) {
+          if (!joins.some(j => j.alias === step.alias)) {
+            const stepSchema = this.addNavigationJoin(step.alias, step.relation, joins, step.sourceAlias);
+            if (stepSchema) {
+              joinedSchemas.set(step.alias, stepSchema);
             }
           }
         }
 
-        // If not found directly, search transitively through all schemas in registry
-        // to find an intermediate path
-        if (!found && this.schemaRegistry) {
-          const path = this.findNavigationPath(alias, joinedSchemas, startSchema);
-          if (path.length > 0) {
-            // Add all intermediate joins
-            for (const step of path) {
-              if (!joins.some(j => j.alias === step.alias)) {
-                this.addNavigationJoin(step.alias, step.relation, joins, step.sourceAlias);
-              }
-            }
-            resolved.add(alias);
-          }
-        }
+        resolved.add(alias);
       }
     }
   }

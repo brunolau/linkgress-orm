@@ -37,8 +37,9 @@
  */
 
 import { describe, test, expect } from '@jest/globals';
-import { createFreshClient } from '../utils/test-database';
+import { withCapturedSql } from '../utils/test-database';
 import {
+  DatabaseClient,
   DbContext,
   DbEntityTable,
   DbModelConfig,
@@ -131,7 +132,7 @@ class CfkProjectionDatabase extends DbContext {
   }
 }
 
-async function cleanupSchema(client: any): Promise<void> {
+async function cleanupSchema(client: DatabaseClient): Promise<void> {
   await client.query('DROP TABLE IF EXISTS cfk_children_3 CASCADE');
   await client.query('DROP TABLE IF EXISTS cfk_children CASCADE');
   await client.query('DROP TABLE IF EXISTS cfk_parents CASCADE');
@@ -146,25 +147,12 @@ async function withCapture<T>(
   strategy: 'cte' | 'lateral' | 'temptable',
   testFn: (db: CfkProjectionDatabase, captured: string[]) => Promise<T>,
 ): Promise<T> {
-  const client = createFreshClient();
-  const captured: string[] = [];
-  const db = new CfkProjectionDatabase(client, {
-    logQueries: true,
-    logParameters: false,
-    collectionStrategy: strategy,
-    logger: (msg: string) => {
-      captured.push(msg);
-    },
-  });
-
-  try {
-    await cleanupSchema(client);
-    await db.getSchemaManager().ensureCreated();
-    return await testFn(db, captured);
-  } finally {
-    await cleanupSchema(client);
-    await db.dispose();
-  }
+  return withCapturedSql(
+    (client, options) => new CfkProjectionDatabase(client, options),
+    strategy,
+    cleanupSchema,
+    testFn,
+  );
 }
 
 // ---------------------------------------------------------------------------

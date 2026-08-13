@@ -1,4 +1,4 @@
-import { PgClient, PostgresClient, BunClient, DatabaseClient } from '../../src';
+import { PgClient, PostgresClient, BunClient, DatabaseClient, DbContext, QueryOptions } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 
 // Shared database instances per strategy (reuse connections)
@@ -378,5 +378,56 @@ export async function withDatabase<T>(
   const db = getSharedDatabase(options);
   await setupDatabase(db);
   return await testFn(db);
+}
+
+/**
+ * Execute a test against a FRESH, isolated schema with `logQueries` hooked up to a
+ * capture array, so the emitted SQL can be asserted structurally (which alias a JOIN
+ * anchors on, which tables are joined at all) and not only semantically.
+ *
+ * The schema is dropped before AND after the body, so a crashed run leaves nothing behind.
+ *
+ * @param createDb  constructs the file-local DbContext for this spec
+ * @param strategy  collection aggregation strategy to exercise
+ * @param cleanup   drops this spec's tables (called before setup and in `finally`)
+ * @param testFn    the test body; receives the context and the live capture array
+ *
+ * @example
+ * await withCapturedSql(
+ *   (client, options) => new NmaDatabase(client, options),
+ *   'lateral',
+ *   dropNmaTables,
+ *   async (db, captured) => {
+ *     await db.nmaOrders.select(...).toList();
+ *     expect(captured.join('\n')).toContain('"product"."resort_id"');
+ *   },
+ * );
+ */
+export async function withCapturedSql<TDb extends DbContext, T>(
+  createDb: (client: DatabaseClient, options: QueryOptions) => TDb,
+  strategy: 'cte' | 'lateral' | 'temptable',
+  cleanup: (client: DatabaseClient) => Promise<void>,
+  testFn: (db: TDb, captured: string[]) => Promise<T>
+): Promise<T> {
+  const client = createFreshClient();
+  const captured: string[] = [];
+  const db = createDb(client, {
+    logQueries: true,
+    logParameters: false,
+    collectionStrategy: strategy,
+    logger: (msg: string) => {
+      captured.push(msg);
+    },
+  });
+
+  try {
+    await cleanup(client);
+    await db.getSchemaManager().ensureCreated();
+
+    return await testFn(db, captured);
+  } finally {
+    await cleanup(client);
+    await db.dispose();
+  }
 }
 
