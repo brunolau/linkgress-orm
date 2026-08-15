@@ -892,8 +892,8 @@ export interface FluentDelete<TSelection> extends PromiseLike<void> {
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the deleted rows */
   returning(): PromiseLike<TSelection[]>;
-  /** Return selected columns from the deleted rows */
-  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<TResult[]>;
+  /** Return selected columns from the deleted rows (SqlFragment fields unwrap to their value type) */
+  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
 }
 
 /**
@@ -905,8 +905,8 @@ export interface FluentQueryUpdate<TSelection> extends PromiseLike<void> {
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the updated rows */
   returning(): PromiseLike<TSelection[]>;
-  /** Return selected columns from the updated rows */
-  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<TResult[]>;
+  /** Return selected columns from the updated rows (SqlFragment fields unwrap to their value type) */
+  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
 }
 
 /**
@@ -3961,6 +3961,244 @@ ${extraJoins.join('\n')}${orderBy}`;
   }
 
   /**
+   * Bulk sibling of {@link insertWithChildren}: N parent rows plus their child rows in
+   * ONE statement (a task-DAG persist — N task rows + one audit row each — used to
+   * cost two). Parent identity mapping rides the SAME serial-ascend guarantee the
+   * single-parent variant documents: the parent leg inserts `ORDER BY` an input
+   * ordinal, so generated serial ids ascend in input-row order, and a
+   * `row_number() OVER (ORDER BY pk)` CTE recovers each parent's input index for the
+   * child join:
+   *
+   *   WITH "__ibwc_parent__" AS (
+   *     INSERT INTO parent (cols)
+   *     SELECT cols FROM (VALUES (0, ...), (1, ...)) v("__ibwc_ord", cols)
+   *     ORDER BY v."__ibwc_ord" RETURNING *
+   *   ), "__ibwc_pord__" AS (
+   *     SELECT p.*, row_number() OVER (ORDER BY p."pk") - 1 AS "__ibwc_ord"
+   *     FROM "__ibwc_parent__" p
+   *   ), "__mutation__" AS (
+   *     INSERT INTO child ("fk", cols)
+   *     SELECT p."pk", v.cols
+   *     FROM (VALUES (0, pix, ...), ...) v("__ibwc_cord", "__ibwc_pix", cols)
+   *     JOIN "__ibwc_pord__" p ON p."__ibwc_ord" = v."__ibwc_pix"
+   *     ORDER BY v."__ibwc_cord" RETURNING <child cols>, "childPk"
+   *   )
+   *   SELECT "__mutation__".*, <parent cols + ordinal via the fk join>
+   *   FROM "__mutation__" JOIN "__ibwc_pord__" ON fk = pk ORDER BY child pk
+   *
+   * Single-statement atomicity: a failing leg rolls back both inserts. Parents come
+   * back in input order; children in child-input order.
+   *
+   * v1 restrictions: FLAT returning selectors on BOTH sides (no navigation
+   * projections); single-column auto/serial primary keys on both tables; no
+   * `unlessExists` guard; child rows must NOT carry the foreign-key property; EVERY
+   * parent must be referenced by at least one child (parents are returned through
+   * the child join — a childless parent would insert but vanish from the result, so
+   * it is rejected up front; use plain `insertBulk` for childless rows); the whole
+   * shape must fit one statement (no chunking).
+   */
+  insertBulkWithChildren<TChildEntity extends DbEntity, TParentResult, TChildResult>(config: {
+    rows: InsertData<TEntity>[];
+    children: {
+      table: DbEntityTable<TChildEntity>;
+      /** Child property that receives its parent's primary key. */
+      foreignKey: string;
+      rows: Array<{ parentIndex: number; row: Record<string, any> }>;
+    };
+    returning: {
+      parents: (entity: EntityQuery<TEntity>) => TParentResult;
+      children: (entity: EntityQuery<TChildEntity>) => TChildResult;
+    };
+  }): Promise<{ parents: UnwrapDbColumns<TParentResult>[]; children: UnwrapDbColumns<TChildResult>[] }> {
+    const { rows: childRows, foreignKey } = config.children;
+
+    if (config.rows.length === 0) {
+      throw new Error('insertBulkWithChildren: rows must be non-empty');
+    }
+
+    if (childRows.length === 0) {
+      throw new Error('insertBulkWithChildren: children.rows must be non-empty — use insertBulk for childless parents');
+    }
+
+    const referenced = new Set<number>();
+
+    for (let i = 0; i < childRows.length; i++) {
+      const { parentIndex, row } = childRows[i];
+
+      if (!Number.isInteger(parentIndex) || parentIndex < 0 || parentIndex >= config.rows.length) {
+        throw new Error(`insertBulkWithChildren: child row at index ${i} has parentIndex ${parentIndex} outside 0..${config.rows.length - 1}`);
+      }
+
+      if (row[foreignKey] !== undefined) {
+        throw new Error(`insertBulkWithChildren: child row at index ${i} carries the foreign-key property "${foreignKey}" — it is sourced from its inserted parent`);
+      }
+
+      referenced.add(parentIndex);
+    }
+
+    for (let i = 0; i < config.rows.length; i++) {
+      if (!referenced.has(i)) {
+        throw new Error(`insertBulkWithChildren: parent at index ${i} has no child row — parents return through the child join (v1); insert childless rows via insertBulk`);
+      }
+    }
+
+    const columnCount = Math.max(1, Object.keys(childRows[0].row).length + 2);
+    const singleStatementLimit = Math.floor(Math.floor(65535 / columnCount) * 0.6);
+
+    if (childRows.length + config.rows.length > singleStatementLimit) {
+      throw new Error(`insertBulkWithChildren: ${config.rows.length} parents + ${childRows.length} children exceed the ~${singleStatementLimit}-row single-statement budget`);
+    }
+
+    return this.executeInsertBulkWithChildren(config);
+  }
+
+  /** @internal Async body of {@link insertBulkWithChildren} (validation stays synchronous). */
+  private async executeInsertBulkWithChildren<TChildEntity extends DbEntity, TParentResult, TChildResult>(config: {
+    rows: InsertData<TEntity>[];
+    children: { table: DbEntityTable<TChildEntity>; foreignKey: string; rows: Array<{ parentIndex: number; row: Record<string, any> }> };
+    returning: {
+      parents: (entity: EntityQuery<TEntity>) => TParentResult;
+      children: (entity: EntityQuery<TChildEntity>) => TChildResult;
+    };
+  }): Promise<{ parents: any[]; children: any[] }> {
+    const parentSchema = this._getSchema();
+    const executor = this._getExecutor();
+    const client = this._getClient();
+    const childTable = config.children.table;
+
+    if (childTable._getClient() !== client || childTable._getExecutor() !== executor) {
+      throw new Error('insertBulkWithChildren: the child table uses a different database client or transaction than the parent — both must share one connection context');
+    }
+
+    const pkEntries = Object.entries(parentSchema.columns).filter(([, colBuilder]) => (colBuilder as any).build().primaryKey);
+
+    if (pkEntries.length !== 1) {
+      throw new Error('insertBulkWithChildren requires a single-column parent primary key');
+    }
+
+    const parentPkDbName = (pkEntries[0][1] as any).build().name;
+
+    // ---- parent leg: ordinal-ordered VALUES so serial ids ascend in input order ----
+    const parentCompiled = this.compileValuesWithCasts(parentSchema, config.rows as Array<Record<string, any>>, null);
+    const parentColNames = parentCompiled.columns.map(c => `"${c.dbName}"`).join(', ');
+    const parentSelectCols = parentCompiled.columns.map(c => `v."${c.dbName}"`).join(', ');
+    const parentValueRows = parentCompiled.valueRows.map((row, ix) => `(${ix}, ${row})`).join(', ');
+    const params: any[] = [...parentCompiled.params];
+
+    const parentMock = this.createMockEntity();
+    const parentSelection = config.returning.parents(parentMock) as Record<string, any>;
+    const parentSelCols: Array<{ prop: string; dbName: string; mapper?: any }> = [];
+
+    for (const [prop, field] of Object.entries(parentSelection)) {
+      const tableAlias = (field as any)?.__tableAlias as string | undefined;
+      const dbColumnName = (field as any)?.__dbColumnName as string | undefined;
+
+      if (dbColumnName == null || (tableAlias && tableAlias !== parentSchema.name)) {
+        throw new Error(`insertBulkWithChildren: parents returning supports flat parent columns only — "${prop}" is not one`);
+      }
+
+      const colEntry = Object.entries(parentSchema.columns).find(([, colBuilder]) => (colBuilder as any).build().name === dbColumnName);
+      parentSelCols.push({ prop, dbName: dbColumnName, mapper: colEntry ? (colEntry[1] as any).build().mapper : undefined });
+    }
+
+    const parentSql = `INSERT INTO ${this._getQualifiedTableName()} (${parentColNames})
+SELECT ${parentSelectCols} FROM (VALUES ${parentValueRows}) AS v("__ibwc_ord", ${parentColNames})
+ORDER BY v."__ibwc_ord"
+RETURNING *`;
+
+    // ---- child leg: (childOrd, parentIx, cells) VALUES joined to the ordinal CTE ----
+    const childSchema = childTable._getSchema();
+    const fkColBuilder = childSchema.columns[config.children.foreignKey];
+
+    if (!fkColBuilder) {
+      throw new Error(`insertBulkWithChildren: unknown child foreign-key property "${config.children.foreignKey}"`);
+    }
+
+    const fkDbName = (fkColBuilder as any).build().name;
+    const childCompiled = childTable.compileValuesWithCasts(childSchema, config.children.rows.map(r => r.row), config.children.foreignKey);
+    const childColNames = childCompiled.columns.map(c => `"${c.dbName}"`).join(', ');
+    const childSelectCols = childCompiled.columns.map(c => `v."${c.dbName}"`).join(', ');
+    const childValueRows = childCompiled.valueRows.map((row, ix) => `(${ix}, ${config.children.rows[ix].parentIndex}, ${row})`).join(', ');
+    const childOffset = params.length;
+    let childSql = `INSERT INTO ${(childTable as any)._getQualifiedTableName()} ("${fkDbName}", ${childColNames})
+SELECT p."${parentPkDbName}", ${childSelectCols}
+FROM (VALUES ${childValueRows}) AS v("__ibwc_cord", "__ibwc_pix", ${childColNames})
+JOIN "__ibwc_pord__" p ON p."__ibwc_ord" = v."__ibwc_pix"
+ORDER BY v."__ibwc_cord"`;
+    childSql = childOffset === 0 ? childSql : renumberPlaceholders(childSql, childOffset);
+    params.push(...childCompiled.params);
+
+    // ---- assembly: flat child returning + parent cols through the fk join ----
+    if ((childTable as any).detectNavigationInReturning(config.returning.children)) {
+      throw new Error('insertBulkWithChildren: children returning supports flat child columns only (v1)');
+    }
+
+    const childPkEntries = Object.entries(childSchema.columns).filter(([, colBuilder]) => (colBuilder as any).build().primaryKey);
+
+    if (childPkEntries.length !== 1) {
+      throw new Error('insertBulkWithChildren requires a single-column child primary key');
+    }
+
+    const childPkDbName = (childPkEntries[0][1] as any).build().name;
+    const returningClause = (childTable as any).buildReturningClause(config.returning.children);
+    const parentJoinSelects = [
+      `"__ibwc_pj__"."__ibwc_ord" AS "__ibwc_parent__.__ord"`,
+      ...parentSelCols.map(c => `"__ibwc_pj__"."${c.dbName}" AS "__ibwc_parent__.${c.prop}"`),
+    ];
+    const sql = `WITH "__ibwc_parent__" AS (
+${parentSql}
+),
+"__ibwc_pord__" AS (
+  SELECT p.*, row_number() OVER (ORDER BY p."${parentPkDbName}") - 1 AS "__ibwc_ord"
+  FROM "__ibwc_parent__" p
+),
+"__mutation__" AS (
+${childSql}
+RETURNING ${returningClause.sql}, "${fkDbName}" AS "__ibwc_child_fk__", "${childPkDbName}" AS "__ibwc_child_pk__"
+)
+SELECT "__mutation__".*, ${parentJoinSelects.join(', ')}
+FROM "__mutation__"
+JOIN "__ibwc_pord__" "__ibwc_pj__" ON "__ibwc_pj__"."${parentPkDbName}" = "__mutation__"."__ibwc_child_fk__"
+ORDER BY "__mutation__"."__ibwc_child_pk__"`;
+
+    const result = executor ? await executor.query(sql, params) : await client.query(sql, params);
+    const rawRows: any[] = result.rows;
+
+    const parentsByOrd = new Map<number, any>();
+    const strippedRows: Array<Record<string, any>> = [];
+
+    for (const row of rawRows) {
+      const ord = Number(row['__ibwc_parent__.__ord']);
+
+      if (!parentsByOrd.has(ord)) {
+        const parentRow: Record<string, any> = {};
+
+        for (const col of parentSelCols) {
+          const raw = row[`__ibwc_parent__.${col.prop}`];
+          parentRow[col.prop] = col.mapper ? col.mapper.fromDriver(raw) : raw;
+        }
+
+        parentsByOrd.set(ord, parentRow);
+      }
+
+      const clean: Record<string, any> = {};
+
+      for (const [key, value] of Object.entries(row)) {
+        if (!key.startsWith('__ibwc_parent__.') && key !== '__ibwc_child_fk__' && key !== '__ibwc_child_pk__') {
+          clean[key] = value;
+        }
+      }
+
+      strippedRows.push(clean);
+    }
+
+    const parents = [...parentsByOrd.entries()].sort((a, b) => a[0] - b[0]).map(([, parentRow]) => parentRow);
+    const children = (childTable as any).mapReturningResults(strippedRows, returningClause.aliasToProperty);
+
+    return { parents, children };
+  }
+
+  /**
    * Compile rows into a cast-annotated VALUES fragment (`$n::type` / `NULL::type`
    * per cell — the bulkUpdate technique, so a bare `VALUES` source keeps correct
    * column types) with the same column-selection rules as {@link insertBulkSingle}.
@@ -4188,6 +4426,37 @@ ${extraJoins.join('\n')}${orderBy}`;
   }
 
   /**
+   * Builds a bare `DELETE FROM t WHERE "col" IN ($1, …)` statement (no
+   * RETURNING clause) so `MutationBatch` can compose it as a data-modifying
+   * CTE leg. Each value runs through the column's toDriver mapper — the same
+   * fidelity rule the insert/update legs follow. Returns null for an empty
+   * values array (mirroring the other leg builders' empty-input semantics);
+   * an unknown column property throws at build time.
+   * @internal
+   */
+  _buildDeleteWhereInStatement(field: string, values: any[]): { sql: string; params: any[] } | null {
+    if (values.length === 0) {
+      return null;
+    }
+
+    const schema = this._getSchema();
+    const colBuilder = schema.columns[field];
+
+    if (!colBuilder) {
+      throw new Error(`deleteWhereIn: unknown column property "${field}" on entity "${schema.name}"`);
+    }
+
+    const config = (colBuilder as any).build();
+    const params = values.map(value => (config.mapper ? config.mapper.toDriver(value) : value));
+    const placeholders = params.map((_, ix) => `$${ix + 1}`).join(', ');
+
+    return {
+      sql: `DELETE FROM ${this._getQualifiedTableName()} WHERE "${config.name}" IN (${placeholders})`,
+      params,
+    };
+  }
+
+  /**
    * Upsert with advanced configuration
    * Auto-detects primary keys and supports chunking
    * Returns a fluent builder that can be awaited directly or chained with .returning()
@@ -4326,22 +4595,21 @@ ${extraJoins.join('\n')}${orderBy}`;
   }
 
   /**
-   * Execute a single upsert batch
+   * The bare `INSERT .. ON CONFLICT` assembly (no RETURNING) shared by
+   * {@link upsertBulkSingle} and the MutationBatch upsert-leg compile —
+   * one definition so the two can never drift.
    * @internal
    */
-  private async upsertBulkSingle<TReturning>(
-    values: UpsertData<TEntity>[],
+  private buildUpsertStatementCore(
+    values: Array<Record<string, any>>,
     primaryKeys: string[],
     updateColumns: string[] | undefined,
     updateColumnFilter: ((colId: string) => boolean) | undefined,
     overridingSystemValue: boolean,
     targetWhere: string | undefined,
-    setWhere: string | undefined,
-    returning: TReturning
-  ): Promise<any[] | void> {
+    setWhere: string | undefined
+  ): { sql: string; params: any[] } {
     const schema = this._getSchema();
-    const executor = this._getExecutor();
-    const client = this._getClient();
     const qualifiedTableName = this._getQualifiedTableName();
 
     // Extract all unique column names from all data objects
@@ -4459,6 +4727,182 @@ ${extraJoins.join('\n')}${orderBy}`;
         sql += ` WHERE ${setWhere}`;
       }
     }
+
+    return { sql, params };
+  }
+
+  /**
+   * Builds a bare `UPDATE t SET .. WHERE "col" IN ($1, …)` statement (no
+   * RETURNING) so `MutationBatch.addUpdateWhereIn` can compose it as a
+   * data-modifying-CTE leg. SET semantics mirror the fluent `update()`:
+   * plain values run through column mappers, `SqlFragment` values inline
+   * with their params merged, and the lambda form resolves column refs
+   * against this table's mock row. Returns null for an empty values array.
+   * @internal
+   */
+  _buildUpdateWhereInStatement(
+    field: string,
+    values: any[],
+    set: Record<string, any> | ((row: any) => Record<string, any>)
+  ): { sql: string; params: any[] } | null {
+    if (values.length === 0) {
+      return null;
+    }
+
+    const schema = this._getSchema();
+    const whereColBuilder = schema.columns[field];
+
+    if (!whereColBuilder) {
+      throw new Error(`updateWhereIn: unknown column property "${field}" on entity "${schema.name}"`);
+    }
+
+    const whereConfig = (whereColBuilder as any).build();
+    const resolvedSet = typeof set === 'function' ? set(this.createMockEntity()) : set;
+
+    const setClauses: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    for (const [key, value] of Object.entries(resolvedSet)) {
+      const column = schema.columns[key];
+      if (!column) {
+        continue;
+      }
+      const config = (column as any).build();
+
+      if (value instanceof SqlFragment) {
+        const sqlBuildContext: SqlBuildContext = {
+          paramCounter: paramIndex,
+          params,
+        };
+        const fragmentSql = value.buildSql(sqlBuildContext);
+        paramIndex = sqlBuildContext.paramCounter;
+        setClauses.push(`"${config.name}" = ${fragmentSql}`);
+        continue;
+      }
+
+      setClauses.push(`"${config.name}" = $${paramIndex++}`);
+      params.push(config.mapper ? config.mapper.toDriver(value) : value);
+    }
+
+    if (setClauses.length === 0) {
+      throw new Error(`updateWhereIn: no valid columns to update on entity "${schema.name}"`);
+    }
+
+    const whereParams = values.map(value => (whereConfig.mapper ? whereConfig.mapper.toDriver(value) : value));
+    const placeholders = whereParams.map(() => `$${paramIndex++}`).join(', ');
+    params.push(...whereParams);
+
+    return {
+      sql: `UPDATE ${this._getQualifiedTableName()} SET ${setClauses.join(', ')} WHERE "${whereConfig.name}" IN (${placeholders})`,
+      params,
+    };
+  }
+
+  /**
+   * Bare `INSERT .. ON CONFLICT` compile (no RETURNING) for the MutationBatch
+   * upsert leg — the {@link buildUpsertStatementCore} assembly with a narrow
+   * plain config (prop-name primaryKey + updateColumns; no chunking, no
+   * targetWhere/setWhere/system-value overrides in v1).
+   * @internal
+   */
+  _buildUpsertBulkStatement(
+    values: Array<Record<string, any>>,
+    config: { primaryKey: string | string[]; updateColumns?: string[] }
+  ): { sql: string; params: any[] } | null {
+    if (values.length === 0) {
+      return null;
+    }
+
+    const primaryKeys = Array.isArray(config.primaryKey) ? config.primaryKey : [config.primaryKey];
+
+    return this.buildUpsertStatementCore(
+      values,
+      primaryKeys,
+      config.updateColumns,
+      undefined,
+      false,
+      undefined,
+      undefined
+    );
+  }
+
+  /**
+   * Bare `INSERT INTO t (..) SELECT <cells> FROM "__MB_PARENT__" WHERE
+   * "__MB_PARENT__"."<col>" <> $n` compile for the MutationBatch dependent
+   * leg — a single row inserted iff the parent leg's exposed column differs
+   * from the sentinel (the conditional-audit-log shape). Cells reuse the
+   * insertWithChildren `$n::type` cast technique so types survive without a
+   * VALUES-derived table; the `__MB_PARENT__` token is rewritten to the
+   * parent's actual CTE name at batch assembly.
+   * @internal
+   */
+  _buildDependentInsertSelectStatement(
+    row: Record<string, any>,
+    whereColumnAlias: string,
+    whereNotEquals: any
+  ): { sql: string; params: any[] } {
+    const schema = this._getSchema();
+    const compiled = this.compileValuesWithCasts(schema, [row], null);
+    const columnList = compiled.columns.map(c => `"${c.dbName}"`).join(', ');
+    const params = [...compiled.params];
+    const sentinelIndex = params.length + 1;
+    params.push(whereNotEquals);
+
+    return {
+      sql: `INSERT INTO ${this._getQualifiedTableName()} (${columnList}) SELECT ${compiled.valueRows[0]} FROM "__MB_PARENT__" WHERE "__MB_PARENT__"."${whereColumnAlias}" <> $${sentinelIndex}`,
+      params,
+    };
+  }
+
+  /**
+   * Resolves entity property names to their DB column names (throws on an
+   * unknown property) — the MutationBatch expose/returning lists come in as
+   * prop names and compile to quoted DB identifiers.
+   * @internal
+   */
+  _resolveColumnDbNames(props: string[]): Array<{ prop: string; dbName: string }> {
+    const schema = this._getSchema();
+
+    return props.map((prop) => {
+      const colBuilder = schema.columns[prop];
+
+      if (!colBuilder) {
+        throw new Error(`Unknown column property "${prop}" on entity "${schema.name}"`);
+      }
+
+      return { prop, dbName: (colBuilder as any).build().name };
+    });
+  }
+
+  /**
+   * Execute a single upsert batch
+   * @internal
+   */
+  private async upsertBulkSingle<TReturning>(
+    values: UpsertData<TEntity>[],
+    primaryKeys: string[],
+    updateColumns: string[] | undefined,
+    updateColumnFilter: ((colId: string) => boolean) | undefined,
+    overridingSystemValue: boolean,
+    targetWhere: string | undefined,
+    setWhere: string | undefined,
+    returning: TReturning
+  ): Promise<any[] | void> {
+    const executor = this._getExecutor();
+    const client = this._getClient();
+
+    const built = this.buildUpsertStatementCore(
+      values as Array<Record<string, any>>,
+      primaryKeys,
+      updateColumns,
+      updateColumnFilter,
+      overridingSystemValue,
+      targetWhere,
+      setWhere
+    );
+    let sql = built.sql;
+    const params = built.params;
 
     // Check if RETURNING uses navigation properties
     const navigationInfo = returning && returning !== true && typeof returning === 'function'

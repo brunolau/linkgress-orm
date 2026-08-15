@@ -1249,6 +1249,66 @@ export function flagHasNone<T extends number>(
 }
 
 /**
+ * Value-side flag SET for UPDATE assignments — emits `(column | $mask)` so a
+ * flag flip is ONE atomic statement with no read: the read-modify-write
+ * alternative (SELECT flags → OR in JS → UPDATE) costs two roundtrips and
+ * carries a lost-update window. Idempotent by bit algebra. The mask carries
+ * the same column-width cast as the condition operators (`flagMaskCast`), so
+ * the emitted expression tree stays deterministic on int2/int8 columns.
+ *
+ * @param column - The numeric flags column being reassigned
+ * @param flags - The flag bit(s) to set (use | to combine)
+ * @returns SqlFragment<T> usable as an UPDATE assignment value
+ *
+ * @example
+ * db.orders.where(o => eq(o.id, id)).update(o => ({
+ *   workflowFlags: flagSet(o.workflowFlags, OrderWorkflowFlag.COMPLETED),
+ * }))
+ */
+export function flagSet<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flags: T
+): SqlFragment<T> {
+  return new SqlFragment<T>(
+    ['(', ' | ', `${flagMaskCast(column)})`],
+    [column, flags]
+  );
+}
+
+/**
+ * Value-side flag CLEAR for UPDATE assignments — emits `(column & ~($mask))`.
+ * The complement of {@link flagSet}: one atomic statement, no read, clearing
+ * an absent bit is a no-op.
+ *
+ * Mask cast rules differ from `flagSet` in ONE way: the mask is ALWAYS cast,
+ * falling back to `::integer` when the column ref carries no width type.
+ * Unlike `col & $1` (where the column operand fixes the parameter's type),
+ * `~($1)` presents the bare parameter to the operator alone and Postgres
+ * rejects it as ambiguous (`operator is not unique: ~ unknown`). Width-typed
+ * refs keep their exact `::smallint` / `::bigint` cast; the int4 fallback
+ * promotes cleanly against any integer column.
+ *
+ * @param column - The numeric flags column being reassigned
+ * @param flags - The flag bit(s) to clear (use | to combine)
+ * @returns SqlFragment<T> usable as an UPDATE assignment value
+ *
+ * @example
+ * db.users.where(u => eq(u.id, id)).update(u => ({
+ *   state: flagUnset(u.state, UserStateFlags.Banned),
+ * }))
+ */
+export function flagUnset<T extends number>(
+  column: FieldLike<T> | DbColumn<T>,
+  flags: T
+): SqlFragment<T> {
+  const cast = flagMaskCast(column) || '::integer';
+  return new SqlFragment<T>(
+    ['(', ' & ~(', `${cast}))`],
+    [column, flags]
+  );
+}
+
+/**
  * JSONB property selector - extracts a property from a JSONB column
  * Uses the -> operator for JSONB extraction
  *

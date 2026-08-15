@@ -3357,7 +3357,7 @@ export class SelectQueryBuilder<TSelection> {
       // Qualify columns with table name when using USING clause to avoid ambiguity
       const hasJoins = whereJoins.length > 0;
       const returningClause = returning !== 'count'
-        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins)
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins, { paramCounter: whereParams.length + 1, params: whereParams })
         : undefined;
 
       let sql = `DELETE FROM ${qualifiedTableName}`;
@@ -3382,7 +3382,7 @@ export class SelectQueryBuilder<TSelection> {
         return undefined;
       }
 
-      return queryBuilder.mapDeleteReturningResults(result.rows, returning);
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
     };
 
     return {
@@ -3563,7 +3563,7 @@ export class SelectQueryBuilder<TSelection> {
       // Qualify columns with table name when using FROM clause to avoid ambiguity
       const hasJoins = whereJoins.length > 0;
       const returningClause = returning !== 'count'
-        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins)
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, hasJoins, { paramCounter: values.length + 1, params: values })
         : undefined;
 
       let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
@@ -3588,7 +3588,7 @@ export class SelectQueryBuilder<TSelection> {
         return undefined;
       }
 
-      return queryBuilder.mapDeleteReturningResults(result.rows, returning);
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
     };
 
     return {
@@ -3626,12 +3626,16 @@ export class SelectQueryBuilder<TSelection> {
    * Build RETURNING clause for delete/update operations
    * @param returning - The returning configuration
    * @param qualifyWithTable - If true, qualify column names with the main table name (needed for DELETE with USING)
+   * @param paramContext - Statement parameter state (params array + next $n). Required when the
+   *                       selector contains SqlFragments — their parameters append here, which is
+   *                       positionally correct because RETURNING is last in the statement text.
    * @internal
    */
   private buildUpdateDeleteReturningClause<TResult>(
     returning: undefined | true | ((row: TSelection) => TResult),
-    qualifyWithTable: boolean = false
-  ): { sql: string; columns: string[] } | null {
+    qualifyWithTable: boolean = false,
+    paramContext?: { paramCounter: number; params: any[] }
+  ): { sql: string; columns: string[]; fragmentMappers?: Map<string, any> } | null {
     if (returning === undefined) {
       return null;
     }
@@ -3653,16 +3657,32 @@ export class SelectQueryBuilder<TSelection> {
     if (typeof selection === 'object' && selection !== null) {
       const columns: string[] = [];
       const sqlParts: string[] = [];
+      let fragmentMappers: Map<string, any> | undefined;
 
       for (const [alias, field] of Object.entries(selection)) {
-        if (field && typeof field === 'object' && '__dbColumnName' in field) {
+        if (field instanceof SqlFragment) {
+          // Raw fragment under its selector key (the key is the alias — a
+          // fragment-side .as() is ignored here). Params append to the
+          // statement's array; headline use case: PG18 `old."col"` capture.
+          if (!paramContext) {
+            throw new Error(
+              `Returning selector field "${alias}" is a SqlFragment, which this mutation path does not support`
+            );
+          }
+
+          const fragmentSql = field.buildSql(paramContext);
+          columns.push(alias);
+          sqlParts.push(`${fragmentSql} AS "${alias}"`);
+          fragmentMappers = fragmentMappers ?? new Map<string, any>();
+          fragmentMappers.set(alias, field.getMapper());
+        } else if (field && typeof field === 'object' && '__dbColumnName' in field) {
           const dbName = (field as any).__dbColumnName;
           columns.push(alias);
           sqlParts.push(`${tablePrefix}"${dbName}" AS "${alias}"`);
         }
       }
 
-      return { sql: sqlParts.join(', '), columns };
+      return { sql: sqlParts.join(', '), columns, fragmentMappers };
     }
 
     return null;
@@ -3670,11 +3690,15 @@ export class SelectQueryBuilder<TSelection> {
 
   /**
    * Map row results for delete/update RETURNING clause
+   * @param fragmentMappers - Per-alias mapWith mappers for SqlFragment selector fields; a
+   *                          fragment alias bypasses the schema-column mapper scan entirely
+   *                          (its value is the fragment's, not any column's).
    * @internal
    */
   private mapDeleteReturningResults<TResult>(
     rows: any[],
-    returning: undefined | true | ((row: TSelection) => TResult)
+    returning: undefined | true | ((row: TSelection) => TResult),
+    fragmentMappers?: Map<string, any>
   ): any[] {
     if (returning === true) {
       // Full entity mapping - apply fromDriver mappers
@@ -3694,6 +3718,12 @@ export class SelectQueryBuilder<TSelection> {
     return rows.map(row => {
       const mapped: any = {};
       for (const [key, value] of Object.entries(row)) {
+        if (fragmentMappers?.has(key)) {
+          const fragmentMapper = fragmentMappers.get(key);
+          mapped[key] = fragmentMapper?.fromDriver ? fragmentMapper.fromDriver(value) : value;
+          continue;
+        }
+
         // Try to find column by alias or name
         const colEntry = Object.entries(this.schema.columns).find(([propName, col]) => {
           const config = (col as any).build();
@@ -3790,6 +3820,12 @@ export class SelectQueryBuilder<TSelection> {
             if (collectionBuilder.sourceTable && collectionBuilder.sourceTable !== this.schema.name) {
               allTableAliases.add(collectionBuilder.sourceTable);
             }
+          } else if (field instanceof SqlFragment) {
+            // Raw SQL fragment — rendered verbatim by the plain returning-clause
+            // builder; it never implies navigation. Without this skip it would
+            // fall into the nested-object branch and derail the whole selector
+            // onto the CTE navigation path. (v1: FieldRefs inside returning
+            // fragments are unsupported — reference columns as raw quoted SQL.)
           } else if (!Array.isArray(field)) {
             // Nested plain object - recurse into it
             nestedObjects.set(fieldPath, field);

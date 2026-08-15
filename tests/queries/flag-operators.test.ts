@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
 import { createFreshClient } from '../utils/test-database';
-import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, smallint, bigint, varchar, flagHas, flagHasAll, flagHasAny, flagHasNone } from '../../src';
+import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, smallint, bigint, varchar, flagHas, flagHasAll, flagHasAny, flagHasNone, flagSet, flagUnset } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 
 // Define flag enum for testing
@@ -414,5 +414,127 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
       await client.query('DROP TABLE IF EXISTS flag_width_resort_test CASCADE');
       await db2.dispose();
     }
+  });
+});
+
+// ============================================================================
+// Value-side flag operators — flagSet / flagUnset in UPDATE assignments
+// ============================================================================
+// The read-modify-write alternative (SELECT flags → OR in JS → UPDATE) costs
+// two roundtrips and carries a lost-update window; these emit the bit-op
+// SQL-side so a flag flip is ONE atomic statement (`col = col | $1`,
+// `col = col & ~($1)`) and idempotency is bit algebra. Masks reuse the same
+// flagMaskCast as the condition operators, so width-typed columns keep the
+// deterministic `$N::smallint` / `$N::bigint` expression tree the block above
+// pins for WHERE clauses.
+describe('Flag Operators — value side (flagSet / flagUnset)', () => {
+  enum MarkFlags {
+    None = 0,
+    A = 1,
+    B = 2,
+    C = 4,
+  }
+
+  class MarkRow extends DbEntity {
+    id!: DbColumn<number>;
+    name!: DbColumn<string>;
+    state!: DbColumn<number>;
+    mode!: DbColumn<number>;
+  }
+
+  class MarkTestDatabase extends DbContext {
+    get markRows(): DbEntityTable<MarkRow> {
+      return this.table(MarkRow);
+    }
+
+    protected override setupModel(model: DbModelConfig): void {
+      model.entity(MarkRow, entity => {
+        entity.toTable('flag_value_ops_test');
+        entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_value_ops_test_id_seq' }));
+        entity.property(e => e.name).hasType(varchar('name', 60)).isRequired();
+        entity.property(e => e.state).hasType(integer('state')).isRequired();
+        entity.property(e => e.mode).hasType(smallint('mode')).isRequired();
+      });
+    }
+  }
+
+  let db2: MarkTestDatabase;
+  let client: ReturnType<typeof createFreshClient>;
+
+  const seedRow = async (name: string, state: number, mode = 0): Promise<void> => {
+    await db2.markRows.insert({ name, state, mode });
+  };
+
+  const stateOf = async (name: string): Promise<number> => {
+    const found = await db2.markRows.toList();
+    return found.find(r => r.name === name)!.state;
+  };
+
+  beforeAll(async () => {
+    (EntityMetadataStore as any).metadata.clear();
+    client = createFreshClient();
+    db2 = new MarkTestDatabase(client);
+    await client.query(`DROP TABLE IF EXISTS flag_value_ops_test CASCADE`);
+    await db2.getSchemaManager().ensureCreated();
+  });
+
+  afterAll(async () => {
+    await client.query(`DROP TABLE IF EXISTS flag_value_ops_test CASCADE`);
+    await db2.dispose();
+  });
+
+  test('flagSet sets the bit and preserves the others', async () => {
+    await seedRow('set-basic', MarkFlags.A | MarkFlags.B);
+
+    await db2.markRows.update(r => ({ state: flagSet(r.state, MarkFlags.C) }));
+
+    expect(await stateOf('set-basic')).toBe(MarkFlags.A | MarkFlags.B | MarkFlags.C);
+  });
+
+  test('flagSet is idempotent (bit algebra, no read required)', async () => {
+    await seedRow('set-idem', MarkFlags.A);
+
+    await db2.markRows.update(r => ({ state: flagSet(r.state, MarkFlags.C) }));
+    await db2.markRows.update(r => ({ state: flagSet(r.state, MarkFlags.C) }));
+
+    expect(await stateOf('set-idem')).toBe(MarkFlags.A | MarkFlags.C);
+  });
+
+  test('flagUnset clears only the targeted bit', async () => {
+    await seedRow('unset-basic', MarkFlags.A | MarkFlags.B | MarkFlags.C);
+
+    await db2.markRows.update(r => ({ state: flagUnset(r.state, MarkFlags.B) }));
+
+    expect(await stateOf('unset-basic')).toBe(MarkFlags.A | MarkFlags.C);
+
+    // Clearing an absent bit is a no-op.
+    await db2.markRows.update(r => ({ state: flagUnset(r.state, MarkFlags.B) }));
+
+    expect(await stateOf('unset-basic')).toBe(MarkFlags.A | MarkFlags.C);
+  });
+
+  test('smallint column round-trips through both value operators', async () => {
+    await seedRow('int2-row', 0, MarkFlags.A);
+
+    await db2.markRows.update(r => ({ mode: flagSet(r.mode, MarkFlags.C) }));
+    let rows = await db2.markRows.toList();
+    expect(rows.find(r => r.name === 'int2-row')!.mode).toBe(MarkFlags.A | MarkFlags.C);
+
+    await db2.markRows.update(r => ({ mode: flagUnset(r.mode, MarkFlags.A) }));
+    rows = await db2.markRows.toList();
+    expect(rows.find(r => r.name === 'int2-row')!.mode).toBe(MarkFlags.C);
+  });
+
+  test('width-typed refs carry the deterministic mask cast; untyped refs stay bare', () => {
+    const partsOf = (fragment: unknown): string => ((fragment as { sqlParts: string[] }).sqlParts).join('|');
+
+    expect(partsOf(flagSet({ __sqlType: 'smallint' } as never, MarkFlags.C))).toContain('::smallint');
+    expect(partsOf(flagSet({ __sqlType: 'bigint' } as never, MarkFlags.C))).toContain('::bigint');
+    expect(partsOf(flagSet({} as never, MarkFlags.C))).not.toContain('::');
+
+    expect(partsOf(flagUnset({ __sqlType: 'smallint' } as never, MarkFlags.C))).toContain('::smallint');
+    // `~($1)` on a bare parameter is ambiguous to Postgres (`operator is not
+    // unique: ~ unknown`) — flagUnset therefore always casts, int4 fallback.
+    expect(partsOf(flagUnset({} as never, MarkFlags.C))).toContain('::integer');
   });
 });

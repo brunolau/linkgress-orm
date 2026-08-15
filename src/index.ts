@@ -172,6 +172,8 @@ export {
   flagHasAll,
   flagHasAny,
   flagHasNone,
+  flagSet,
+  flagUnset,
 } from './query/conditions';
 
 export type {
