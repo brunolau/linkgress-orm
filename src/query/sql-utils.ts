@@ -1,6 +1,21 @@
 import type { TableSchema } from '../schema/table-builder';
 
 /**
+ * Quoted SQL segments (single-quoted literals with '' escaping, double-quoted
+ * identifiers with "" escaping) pass through verbatim; only bare $N
+ * placeholders outside them are renumbered. Without this, a leg at a nonzero
+ * offset would corrupt dollar-digit sequences INSIDE string literals
+ * (`'price: $1'` → `'price: $8'`). Shared by QueryBatch, MutationBatch and
+ * insertWithChildren for cross-leg parameter renumbering.
+ */
+const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|\$(\d+)/g;
+
+export const renumberPlaceholders = (sqlText: string, offset: number): string =>
+  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, digits) =>
+    digits !== undefined ? `$${Number(digits) + offset}` : match
+  );
+
+/**
  * Column configuration extracted from schema
  */
 export interface ColumnConfig {

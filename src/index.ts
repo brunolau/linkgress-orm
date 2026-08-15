@@ -86,6 +86,9 @@ export type {
 
 // QueryBatch — heterogeneous queries in ONE round trip (UNION ALL + json envelopes)
 export { QueryBatch } from './query/query-batch';
+// MutationBatch — independent insertBulk/bulkUpdate legs in ONE round trip (data-modifying CTEs)
+export { MutationBatch } from './query/mutation-batch';
+export type { MutationBatchKey } from './query/mutation-batch';
 
 export type {
   BatchListKey,

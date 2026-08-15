@@ -52,18 +52,12 @@ interface BatchEntry {
 }
 
 /**
- * Quoted SQL segments (single-quoted literals with '' escaping, double-quoted
- * identifiers with "" escaping) pass through verbatim; only bare $N
- * placeholders outside them are renumbered. Without this, a branch at a
- * nonzero offset would corrupt dollar-digit sequences INSIDE string literals
- * (`'price: $1'` → `'price: $8'`).
+ * Quote-aware `$N` renumbering (string literals containing `$1` pass through
+ * verbatim) — moved to `sql-utils` so the entity layer can share it without a
+ * module cycle; re-exported here for existing importers.
  */
-const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|\$(\d+)/g;
-
-const renumberPlaceholders = (sqlText: string, offset: number): string =>
-  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, digits) =>
-    digits !== undefined ? `$${Number(digits) + offset}` : match
-  );
+export { renumberPlaceholders } from './sql-utils';
+import { renumberPlaceholders } from './sql-utils';
 
 /**
  * Collects heterogeneous queries and executes them in a SINGLE database round
