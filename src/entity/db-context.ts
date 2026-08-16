@@ -907,6 +907,13 @@ export interface FluentQueryUpdate<TSelection> extends PromiseLike<void> {
   returning(): PromiseLike<TSelection[]>;
   /** Return selected columns from the updated rows (SqlFragment fields unwrap to their value type) */
   returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  /**
+   * Compile this UPDATE into `{ sql, params }` WITHOUT executing it — same
+   * SET/WHERE semantics as execution (SqlFragment values, fragment-capable
+   * RETURNING; navigation RETURNING unsupported). Attach the result as a
+   * data-modifying CTE via {@link DbCteBuilder.withMutation}.
+   */
+  toStatement<TResult>(selector?: (row: TSelection) => TResult): { sql: string; params: any[] };
 }
 
 /**
@@ -4852,6 +4859,90 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     return {
       sql: `INSERT INTO ${this._getQualifiedTableName()} (${columnList}) SELECT ${compiled.valueRows[0]} FROM "__MB_PARENT__" WHERE "__MB_PARENT__"."${whereColumnAlias}" <> $${sentinelIndex}`,
       params,
+    };
+  }
+
+  /**
+   * Compiles an insertBulkWithChildren persist into the CTE TRIPLE a
+   * MutationBatch leg emits as siblings of the batch statement:
+   *
+   *   `_p` — parent INSERT, input-ordinal ORDER BY (serial ids ascend in input
+   *          order), RETURNING *;
+   *   `_o` — the ordinal recovery (`row_number() OVER (ORDER BY pk) - 1`);
+   *   `_c` — child INSERT joining `_o` on the input index for the FK.
+   *
+   * Sibling CTE names are referenced through the `__MB_SELF__` token — the
+   * batch rewrites it to the leg's actual prefix at assembly. Params are ONE
+   * $1-based space across the triple (child placeholders pre-shifted here).
+   * Unlike the standalone form, childless parents are allowed — the leg reads
+   * parents from `_o` directly, not through the child join.
+   * @internal
+   */
+  _buildInsertBulkWithChildrenCtes(config: {
+    rows: Record<string, any>[];
+    children: { table: any; foreignKey: string; rows: Array<{ parentIndex: number; row: Record<string, any> }> };
+  }): { ctes: Array<{ suffix: string; sql: string }>; params: any[] } {
+    const parentSchema = this._getSchema();
+    const childTable = config.children.table;
+
+    if (childTable._getClient() !== this._getClient() || childTable._getExecutor() !== this._getExecutor()) {
+      throw new Error('insertBulkWithChildren leg: the child table uses a different database client or transaction than the parent — both must share one connection context');
+    }
+
+    const pkEntries = Object.entries(parentSchema.columns).filter(([, colBuilder]) => (colBuilder as any).build().primaryKey);
+
+    if (pkEntries.length !== 1) {
+      throw new Error('insertBulkWithChildren leg requires a single-column parent primary key');
+    }
+
+    for (const child of config.children.rows) {
+      if (child.parentIndex < 0 || child.parentIndex >= config.rows.length) {
+        throw new Error(`insertBulkWithChildren leg: child parentIndex ${child.parentIndex} is out of range for ${config.rows.length} parent row(s)`);
+      }
+    }
+
+    const parentPkDbName = (pkEntries[0][1] as any).build().name;
+    const parentCompiled = this.compileValuesWithCasts(parentSchema, config.rows, null);
+    const parentColNames = parentCompiled.columns.map(c => `"${c.dbName}"`).join(', ');
+    const parentSelectCols = parentCompiled.columns.map(c => `v."${c.dbName}"`).join(', ');
+    const parentValueRows = parentCompiled.valueRows.map((row, ix) => `(${ix}, ${row})`).join(', ');
+
+    const parentSql = `INSERT INTO ${this._getQualifiedTableName()} (${parentColNames})
+SELECT ${parentSelectCols} FROM (VALUES ${parentValueRows}) AS v("__mbw_ord", ${parentColNames})
+ORDER BY v."__mbw_ord"
+RETURNING *`;
+
+    const ordinalSql = `SELECT p.*, row_number() OVER (ORDER BY p."${parentPkDbName}") - 1 AS "__mbw_ord"
+FROM "__MB_SELF___p" p`;
+
+    const childSchema = childTable._getSchema();
+    const fkColBuilder = childSchema.columns[config.children.foreignKey];
+
+    if (!fkColBuilder) {
+      throw new Error(`insertBulkWithChildren leg: unknown child foreign-key property "${config.children.foreignKey}"`);
+    }
+
+    const fkDbName = (fkColBuilder as any).build().name;
+    const childCompiled = childTable.compileValuesWithCasts(childSchema, config.children.rows.map((r: { row: Record<string, any> }) => r.row), config.children.foreignKey);
+    const childColNames = childCompiled.columns.map((c: { dbName: string }) => `"${c.dbName}"`).join(', ');
+    const childSelectCols = childCompiled.columns.map((c: { dbName: string }) => `v."${c.dbName}"`).join(', ');
+    const childValueRows = childCompiled.valueRows.map((row: string, ix: number) => `(${ix}, ${config.children.rows[ix].parentIndex}, ${row})`).join(', ');
+
+    let childSql = `INSERT INTO ${childTable._getQualifiedTableName()} ("${fkDbName}", ${childColNames})
+SELECT o."${parentPkDbName}", ${childSelectCols}
+FROM (VALUES ${childValueRows}) AS v("__mbw_cord", "__mbw_pix", ${childColNames})
+JOIN "__MB_SELF___o" o ON o."__mbw_ord" = v."__mbw_pix"
+ORDER BY v."__mbw_cord"
+RETURNING 1`;
+    childSql = parentCompiled.params.length === 0 ? childSql : renumberPlaceholders(childSql, parentCompiled.params.length);
+
+    return {
+      ctes: [
+        { suffix: 'p', sql: parentSql },
+        { suffix: 'o', sql: ordinalSql },
+        { suffix: 'c', sql: childSql },
+      ],
+      params: [...parentCompiled.params, ...childCompiled.params],
     };
   }
 

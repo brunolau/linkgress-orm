@@ -1,6 +1,7 @@
 import { DatabaseClient } from '../database/database-client.interface';
 import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults } from './query-builder';
 import { SqlBuildContext, FieldRef, UnwrapSelection, SqlFragment } from './conditions';
+import { renumberPlaceholders } from './query-batch';
 
 /**
  * Interface for queries that can be used in CTEs
@@ -296,6 +297,47 @@ export class DbCteBuilder {
       selectionResult,
       undefined,
       options?.materialized
+    );
+    this.ctes.push(cte);
+
+    return { cte };
+  }
+
+  /**
+   * Create a DATA-MODIFYING CTE from a pre-compiled DML statement (e.g. the
+   * fluent update's `.toStatement()`), attachable to any query via `.with(cte)`.
+   *
+   * The canonical use is the CAS-gated load: the compare-and-swap UPDATE rides
+   * as a CTE of the row-load SELECT — one statement where the outer query only
+   * returns rows when the CAS matched (gate the outer WHERE on the CTE), the
+   * table read keeps PRE-update snapshot semantics, and the CTE's RETURNING
+   * exposes the POST-update values via scalar subselects. PostgreSQL executes
+   * a data-modifying CTE exactly once whether or not the outer query reads it.
+   * PostgreSQL only allows DML CTEs at the top-level statement — attach to the
+   * query that executes directly, never inside another CTE.
+   *
+   * @param cteName Name of the CTE (referenced from raw fragments as `"name"`).
+   * @param statement Compiled DML — `{ sql, params }` with $1-based placeholders.
+   * @param columns Column names the statement's RETURNING exposes (typing only).
+   */
+  withMutation<TColumns extends Record<string, string>>(
+    cteName: string,
+    statement: { sql: string; params: any[] },
+    columns: TColumns
+  ): { cte: DbCte<TColumns> } {
+    const offset = this.paramOffset - 1;
+    const sql = offset === 0 ? statement.sql : renumberPlaceholders(statement.sql, offset);
+
+    this.paramOffset += statement.params.length;
+
+    const cte = new DbCte<TColumns>(
+      cteName,
+      sql,
+      statement.params,
+      columns,
+      undefined,
+      undefined,
+      false
     );
     this.ctes.push(cte);
 

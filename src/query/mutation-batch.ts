@@ -37,6 +37,10 @@ interface MutationCapableTable {
     whereColumnAlias: string,
     whereNotEquals: any
   ): { sql: string; params: any[] };
+  _buildInsertBulkWithChildrenCtes(config: {
+    rows: Record<string, any>[];
+    children: { table: any; foreignKey: string; rows: Array<{ parentIndex: number; row: Record<string, any> }> };
+  }): { ctes: Array<{ suffix: string; sql: string }>; params: any[] };
   _resolveColumnDbNames(props: string[]): Array<{ prop: string; dbName: string }>;
   _resolveBulkUpdatePrimaryKeys(data: Record<string, any>[], config?: { primaryKey?: string | string[] }): string[];
   _getClient(): DatabaseClient;
@@ -55,6 +59,13 @@ interface MutationLeg {
   readRows?: boolean;
   /** Dependent legs reference this parent leg's CTE (the `__MB_PARENT__` token rewrite). */
   dependsOnLegId?: string;
+  /**
+   * Multi-CTE legs (insertBulkWithChildren): the CTE triple replaces the
+   * single wrapped statement — no `RETURNING 1` appending, count from the
+   * parent CTE, optional parent-row readback via `rowsSelect` (both use the
+   * `__MB_SELF__` prefix token rewritten at assembly).
+   */
+  multi?: { ctes: Array<{ suffix: string; sql: string }>; rowsSelect?: string };
 }
 
 /**
@@ -307,6 +318,52 @@ export class MutationBatch {
   }
 
   /**
+   * Register an insertBulkWithChildren leg: N parent rows + their index-mapped
+   * children ride this batch's statement as a sibling CTE triple (parent
+   * insert with input-ordinal ORDER BY → serial-ascend ordinal recovery →
+   * child insert joining the ordinal for the FK). Returns null for an empty
+   * parent array. `getAffectedCount` reports PARENT rows;
+   * `options.parentReturning` (prop names) exposes the parent rows in INPUT
+   * order via {@link getLegRows} (raw JSON values — e.g. read back generated
+   * task ids to publish after the batch commits). Unlike the standalone form,
+   * childless parents are allowed.
+   */
+  addInsertBulkWithChildren(
+    table: MutationCapableTable,
+    config: {
+      rows: Record<string, any>[];
+      children: { table: any; foreignKey: string; rows: Array<{ parentIndex: number; row: Record<string, any> }> };
+    },
+    id: string,
+    options?: { parentReturning?: string[] }
+  ): MutationBatchKey | null {
+    if (config.rows.length === 0) {
+      return null;
+    }
+
+    this.assertRegisterable(id);
+    MutationBatch.assertSingleStatementBudget([...config.rows, ...config.children.rows.map(child => child.row)], id);
+
+    const built = table._buildInsertBulkWithChildrenCtes(config);
+    const returningCols = table._resolveColumnDbNames(options?.parentReturning ?? []);
+    const rowsSelect = returningCols.length > 0
+      ? `(SELECT COALESCE(json_agg(json_build_object(${returningCols.map(c => `'${c.prop}', o."${c.dbName}"`).join(', ')}) ORDER BY o."__mbw_ord"), '[]'::json) FROM "__MB_SELF___o" o)`
+      : undefined;
+
+    this.legs.push({
+      id,
+      sql: '',
+      params: built.params,
+      client: table._getClient(),
+      executor: table._getExecutor(),
+      readRows: rowsSelect != null,
+      multi: { ctes: built.ctes, rowsSelect },
+    });
+
+    return { id };
+  }
+
+  /**
    * Register a bulk UPDATE leg (same per-row `"col__provided"` semantics as
    * standalone bulkUpdate). Returns null for an empty row array.
    */
@@ -370,6 +427,29 @@ export class MutationBatch {
 
     this.legs.forEach((leg, ix) => {
       const offset = params.length;
+
+      // Multi-CTE legs (insertBulkWithChildren) contribute their CTE triple as
+      // siblings under the leg's prefix; count comes from the parent CTE and
+      // the optional readback from the ordinal CTE.
+      if (leg.multi != null) {
+        const prefix = `__mb_${ix}`;
+
+        for (const cte of leg.multi.ctes) {
+          const renamed = cte.sql.replace(/__MB_SELF__/g, prefix);
+          cteParts.push(`"${prefix}_${cte.suffix}" AS (\n${offset === 0 ? renamed : renumberPlaceholders(renamed, offset)}\n)`);
+        }
+
+        selectParts.push(`(SELECT count(*)::int FROM "${prefix}_p") AS "${ix}"`);
+
+        if (leg.multi.rowsSelect != null) {
+          selectParts.push(`${leg.multi.rowsSelect.replace(/__MB_SELF__/g, prefix)} AS "${ix}__rows"`);
+        }
+
+        params.push(...leg.params);
+
+        return;
+      }
+
       let legSql = offset === 0 ? leg.sql : renumberPlaceholders(leg.sql, offset);
 
       // Dependent legs reference their parent's CTE via the compile-time token

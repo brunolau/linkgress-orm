@@ -3591,6 +3591,92 @@ export class SelectQueryBuilder<TSelection> {
       return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
     };
 
+    /**
+     * Compile the UPDATE into `{ sql, params }` WITHOUT executing — the
+     * standard-path assembly (same SET/WHERE/FROM semantics as execution,
+     * SqlFragment values and fragment-capable RETURNING included; navigation
+     * RETURNING is not supported here). Used to ride the statement as a
+     * data-modifying CTE (`DbCteBuilder.withMutation`).
+     */
+    const compileUpdate = <TResult>(returning?: (row: TSelection) => TResult): { sql: string; params: any[] } => {
+      if (!queryBuilder.whereCond) {
+        throw new Error('Update requires a WHERE condition. Use where() before update().');
+      }
+
+      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
+
+      const resolvedData = typeof data === 'function'
+        ? (data as (row: TSelection) => Partial<Record<string, any>>)(queryBuilder._createMockRow() as TSelection)
+        : data;
+
+      const setClauses: string[] = [];
+      const values: any[] = [];
+      let paramIndex = 1;
+
+      for (const [key, value] of Object.entries(resolvedData)) {
+        const column = queryBuilder.schema.columns[key];
+        if (column) {
+          const config = (column as any).build();
+
+          if (value instanceof SqlFragment) {
+            const sqlBuildContext: SqlBuildContext = {
+              paramCounter: paramIndex,
+              params: values,
+            };
+            const fragmentSql = value.buildSql(sqlBuildContext);
+            paramIndex = sqlBuildContext.paramCounter;
+            setClauses.push(`"${config.name}" = ${fragmentSql}`);
+            continue;
+          }
+
+          setClauses.push(`"${config.name}" = $${paramIndex++}`);
+          values.push(config.mapper ? config.mapper.toDriver(value) : value);
+        }
+      }
+
+      if (setClauses.length === 0) {
+        throw new Error('No valid columns to update');
+      }
+
+      const condBuilder = new ConditionBuilder();
+      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, paramIndex);
+      values.push(...whereParams);
+
+      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
+
+      let fromClause = '';
+      const joinConditions: string[] = [];
+      for (const join of whereJoins) {
+        const sourceTable = join.sourceAlias || queryBuilder.schema.name;
+        const joinTableName = queryBuilder.getQualifiedTableName(join.targetTable, join.targetSchema);
+        fromClause = fromClause ? `${fromClause}, ${joinTableName} AS "${join.alias}"` : `FROM ${joinTableName} AS "${join.alias}"`;
+
+        for (let i = 0; i < join.foreignKeys.length; i++) {
+          joinConditions.push(`${formatJoinValue(sourceTable, join.foreignKeys[i])} = ${formatJoinValue(join.alias, join.matches[i])}`);
+        }
+      }
+
+      const fullWhereClause = joinConditions.length > 0
+        ? `${joinConditions.join(' AND ')} AND ${whereSql}`
+        : whereSql;
+
+      const returningClause = returning != null
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: values.length + 1, params: values })
+        : null;
+
+      let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
+      if (fromClause) {
+        sql += ` ${fromClause}`;
+      }
+      sql += ` WHERE ${fullWhereClause}`;
+      if (returningClause) {
+        sql += ` RETURNING ${returningClause.sql}`;
+      }
+
+      return { sql, params: values };
+    };
+
     return {
       then<TResult1 = void, TResult2 = never>(
         onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
@@ -3607,6 +3693,9 @@ export class SelectQueryBuilder<TSelection> {
             return executeUpdate('count').then(onfulfilled, onrejected);
           }
         };
+      },
+      toStatement<TResult>(selector?: (row: TSelection) => TResult): { sql: string; params: any[] } {
+        return compileUpdate(selector);
       },
       returning<TResult>(selector?: (row: TSelection) => TResult) {
         const returningConfig = selector ?? true;
