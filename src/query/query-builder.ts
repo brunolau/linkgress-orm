@@ -7475,12 +7475,23 @@ export class CollectionQueryBuilder<TItem = any> {
     // Build JOINs needed inside the EXISTS subquery
     const allJoins: string[] = [];
 
+    // Inside a lateral, the collection's λ-root table is visible only under the
+    // lateral's generated alias (e.g. `FROM "cart_discount_code" "lateral_3_cartDiscountCodes"`).
+    // The first bridge hop / root correlation must anchor on that alias, not the raw
+    // table name — mirrors lateral-collection-strategy's own correlation handling.
+    // Only the λ-root is translated: bridge-internal aliases are emitted by this very
+    // subquery and must never be remapped, even if they collide with a lateral's
+    // target table name.
+    const aliasMap = (context as { lateralTableAliasMap?: Map<string, string> }).lateralTableAliasMap;
+    const rootAnchor = (alias: string): string => aliasMap?.get(alias) || alias;
+
     // Navigation path joins (for reference navigation like pc.order → orders)
-    for (const nav of this.navigationPath) {
+    for (const [index, nav] of this.navigationPath.entries()) {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+      const src = index === 0 ? rootAnchor(nav.sourceAlias) : nav.sourceAlias;
+      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${src}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     // SelectMany joins (for selectMany navigation through intermediate tables)
@@ -7491,18 +7502,68 @@ export class CollectionQueryBuilder<TItem = any> {
       allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
+    // Joins required by REFERENCE navigations inside the collection's own
+    // where-condition, e.g. `exists(links.where(l => eq(l.campaign.isPublic, true)))`.
+    // Navigation joins were historically derived from selectors only; an EXISTS
+    // aggregation has no selector, so a where-navigated alias rendered unjoined and
+    // the statement failed with `missing FROM-clause entry for table "<alias>"`.
+    // Reuses the selector path's machinery: seed aliases + chains from the
+    // condition's FieldRefs, then resolve multi-hop paths against the target schema.
+    if (this.whereCond) {
+      const joinedAliases = new Set<string>([
+        ...this.navigationPath.map(nav => nav.alias),
+        ...this.selectManyJoins.map(nav => nav.alias),
+      ]);
+      const targetSchema = this.schemaRegistry?.get(targetTable);
+
+      if (targetSchema) {
+        const whereJoins: NavigationJoin[] = [];
+        const whereAliases = new Set<string>();
+
+        for (const ref of this.whereCond.getFieldRefs()) {
+          const refAlias = (ref as any)?.__tableAlias as string | undefined;
+
+          // Direct columns of the target arrive under the `__collection_<table>__`
+          // marker (rewritten below) or the bare table name — neither needs a join.
+          if (!refAlias || refAlias === targetTable || refAlias.startsWith('__collection_') || joinedAliases.has(refAlias)) {
+            continue;
+          }
+          this.addNavigationJoinForFieldRef(ref, whereJoins, targetTable, targetSchema, whereAliases);
+        }
+
+        if (whereAliases.size > 0) {
+          this.resolveNavigationJoins(whereAliases, whereJoins, targetSchema);
+        }
+
+        for (const nav of whereJoins) {
+          if (joinedAliases.has(nav.alias)) {
+            continue;
+          }
+          joinedAliases.add(nav.alias);
+          const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
+          const fk = nav.foreignKeys[0];
+          const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
+          allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+        }
+      }
+    }
+
     const navJoinsSQL = allJoins.join('\n');
 
     // Build WHERE clause: correlation + additional conditions
     // Use full composite-FK / literal-predicate form when navigation declared
     // multiple key pairs (e.g. SCD2 `[productId, isCurrent] / [id, true]`).
     const fkTableAlias = this.foreignKeyTableAlias || targetTable;
+    // Root-attached collections correlate on the λ-root itself, which a lateral
+    // exposes only under its generated alias; nav-derived collections correlate on
+    // the bridge's terminal alias, which this subquery emits itself — never remap it.
+    const correlationSource = this.navigationPath.length === 0 ? rootAnchor(sourceTable) : sourceTable;
     let whereSQL: string;
     if (this.foreignKeys && this.foreignKeys.length > 0) {
       const matches = this.matches && this.matches.length > 0 ? this.matches : ['id'];
-      whereSQL = buildCollectionCorrelationWhere(fkTableAlias, sourceTable, this.foreignKeys, matches);
+      whereSQL = buildCollectionCorrelationWhere(fkTableAlias, correlationSource, this.foreignKeys, matches);
     } else {
-      whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${sourceTable}"."id"`;
+      whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${correlationSource}"."id"`;
     }
 
     if (this.whereCond) {
@@ -7922,6 +7983,10 @@ export class CollectionQueryBuilder<TItem = any> {
           paramCounter: context.paramCounter,
           params: context.allParams,
           placeholders: context.placeholders,  // Pass placeholders for prepared statements
+          // Thread the lateral alias scope into fragments: an EXISTS collection
+          // rendered inside this lateral must anchor its λ-root on the lateral's
+          // generated alias (see CollectionQueryBuilder.buildSql rootAnchor).
+          lateralTableAliasMap: context.lateralTableAliasMap,
         };
         const fragmentSql = field.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
