@@ -230,7 +230,7 @@ export interface StatisticsMetadata {
  * declared via `entity.hasCheckConstraint()`. The expression is raw SQL over
  * quoted DATABASE column names (same convention as partial-index `where`
  * clauses) — e.g. a conditional NOT NULL pairing two columns:
- * `"cashback_id" IS NULL OR "cashback_product_id" IS NOT NULL`.
+ * `"carrier_id" IS NULL OR "carrier_account_id" IS NOT NULL`.
  * Reconciled by NAME only: the schema manager adds a missing constraint and
  * never drops or rebuilds one (rename to change a definition).
  */

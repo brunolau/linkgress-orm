@@ -22,8 +22,8 @@ export interface CheckConstraintSqlSpec {
   name: string;
   /**
    * Raw SQL boolean expression of the constraint body — the contents of the
-   * `CHECK (…)` parentheses, e.g. `"cashback_id" IS NULL OR
-   * "cashback_product_id" IS NOT NULL`. Column references must use quoted
+   * `CHECK (…)` parentheses, e.g. `"carrier_id" IS NULL OR
+   * "carrier_account_id" IS NOT NULL`. Column references must use quoted
    * DATABASE column names (same convention as partial-index `where` clauses).
    */
   expression: string;

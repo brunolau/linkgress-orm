@@ -604,10 +604,10 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
    * change it.
    *
    * @example
-   * // cashback_product_id becomes mandatory once cashback_id is set:
+   * // carrier_account_id becomes mandatory once carrier_id is set:
    * entity.hasCheckConstraint(
-   *   'chk_product_cashback_requires_product',
-   *   '"cashback_id" IS NULL OR "cashback_product_id" IS NOT NULL'
+   *   'chk_shipment_carrier_requires_account',
+   *   '"carrier_id" IS NULL OR "carrier_account_id" IS NOT NULL'
    * );
    */
   hasCheckConstraint(constraintName: string, expression: string): this {
