@@ -111,6 +111,7 @@ export class DbModelConfig {
 
       const tableBuilder = new TableBuilder(metadata.tableName, schema, metadata.indexes || [], [], metadata.schemaName);
       tableBuilder.withStatistics(metadata.statistics || []);
+      tableBuilder.withCheckConstraints(metadata.checkConstraints || []);
       tablesWithoutNav.set(metadata.tableName, { table: tableBuilder, entityClass, metadata });
     }
 
@@ -195,6 +196,7 @@ export class DbModelConfig {
         const existingSchema = (tableBuilder as any).schemaDef;
         const mergedTable = new TableBuilder(metadata.tableName, { ...existingSchema, ...navSchema }, metadata.indexes || [], [], metadata.schemaName);
         mergedTable.withStatistics(metadata.statistics || []);
+        mergedTable.withCheckConstraints(metadata.checkConstraints || []);
         if (metadata.partitioning) mergedTable.partitionBy(metadata.partitioning);
         tables.set(metadata.tableName, mergedTable);
       } else {
@@ -266,10 +268,12 @@ export class DbModelConfig {
       const existingSchemaName = (tableBuilder as any).schemaName;
       const existingPartitioning = (tableBuilder as any).partitioningDef;
       const existingStatistics = (tableBuilder as any).statisticsDefs || [];
+      const existingCheckConstraints = (tableBuilder as any).checkConstraintDefs || [];
       const foreignKeys = foreignKeysByTable.get(tableName) || [];
 
       const finalTable = new TableBuilder(tableName, existingSchema, existingIndexes, foreignKeys, existingSchemaName);
       finalTable.withStatistics(existingStatistics);
+      finalTable.withCheckConstraints(existingCheckConstraints);
       if (existingPartitioning) finalTable.partitionBy(existingPartitioning);
       finalTables.set(tableName, finalTable);
     }

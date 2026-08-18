@@ -14,6 +14,7 @@ import {
   canonicalDefsEquivalent,
 } from './index-sql';
 import { buildCreateStatisticsStatement } from './statistics-sql';
+import { buildAddCheckConstraintStatement } from './check-constraint-sql';
 import { buildSetDatabaseSettingStatement, parseDbRoleSettingEntry } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 
@@ -72,6 +73,7 @@ export type MigrationOperation =
   | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_statistics'; tableName: string; schema?: string; statisticsName: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> }
+  | { type: 'create_check_constraint'; tableName: string; schema?: string; constraintName: string; expression: string }
   | { type: 'set_database_setting'; name: string; value: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
@@ -760,6 +762,12 @@ $$`;
       await this.createIndexes(tableName, tableSchema);
     }
 
+    // Create CHECK constraints (existence-guarded — no ADD CONSTRAINT IF NOT
+    // EXISTS in PostgreSQL, and ensureCreated must stay idempotent)
+    for (const [tableName, tableSchema] of sortedTables) {
+      await this.createCheckConstraints(tableName, tableSchema);
+    }
+
     // Create extended-statistics objects (after indexes so the ANALYZE they
     // trigger also refreshes freshly indexed expression columns)
     for (const [tableName, tableSchema] of sortedTables) {
@@ -803,6 +811,25 @@ $$`;
     const statistics = tableSchema.statistics || [];
     for (const spec of statistics) {
       await this.executeCreateStatistics(tableName, spec, tableSchema.schema);
+    }
+  }
+
+  /**
+   * Create the declared CHECK constraints of a table that are missing on it.
+   * Reconciled by NAME (see check-constraint-sql.ts) — existing same-named
+   * constraints are left untouched, so the pass is idempotent.
+   */
+  private async createCheckConstraints(tableName: string, tableSchema: TableSchema): Promise<void> {
+    const checkConstraints = tableSchema.checkConstraints || [];
+    if (checkConstraints.length === 0) {
+      return;
+    }
+
+    const existing = await this.getExistingCheckConstraints(tableName, tableSchema.schema);
+    for (const spec of checkConstraints) {
+      if (!existing.includes(spec.name)) {
+        await this.executeCreateCheckConstraint(tableName, spec, tableSchema.schema);
+      }
     }
   }
 
@@ -1159,6 +1186,23 @@ $$`;
           }
         }
 
+        // Compare CHECK constraints — by NAME only (create missing; never
+        // drop or rebuild — rename a constraint to change its definition).
+        if ((schema.checkConstraints || []).length > 0) {
+          const existingCheckConstraints = await this.getExistingCheckConstraints(tableName, schema.schema);
+          for (const modelCheck of schema.checkConstraints || []) {
+            if (!existingCheckConstraints.includes(modelCheck.name)) {
+              operations.push({
+                type: 'create_check_constraint',
+                tableName,
+                schema: schema.schema,
+                constraintName: modelCheck.name,
+                expression: modelCheck.expression,
+              });
+            }
+          }
+        }
+
         // Compare foreign key constraints
         const existingForeignKeys = await this.getExistingForeignKeys(tableName, schema.schema);
         const modelForeignKeys = schema.foreignKeys || [];
@@ -1292,6 +1336,17 @@ $$`;
               expressions: index.expressions,
               where: index.where,
               nullsNotDistinct: index.nullsNotDistinct,
+            });
+          }
+
+          // Add CHECK constraints for newly created tables to phase 3
+          for (const check of schema.checkConstraints || []) {
+            phase3Ops.push({
+              type: 'create_check_constraint',
+              tableName,
+              schema: schema.schema,
+              constraintName: check.name,
+              expression: check.expression,
             });
           }
         }
@@ -1435,6 +1490,13 @@ $$`;
           name: operation.statisticsName,
           expressions: operation.expressions,
           kinds: operation.kinds,
+        }, operation.schema);
+        break;
+
+      case 'create_check_constraint':
+        await this.executeCreateCheckConstraint(operation.tableName, {
+          name: operation.constraintName,
+          expression: operation.expression,
         }, operation.schema);
         break;
 
@@ -1774,6 +1836,56 @@ $$`;
     `, [schemaName || 'public', tableName]);
 
     return result.rows.map((row: { stxname: string }) => row.stxname);
+  }
+
+  /**
+   * Add a CHECK constraint, guarded by a fresh existence lookup (PostgreSQL
+   * has no ADD CONSTRAINT IF NOT EXISTS) so replays stay idempotent.
+   * PostgreSQL validates existing rows as part of the ALTER — a table holding
+   * violating rows fails the statement loudly; backfill data first.
+   */
+  private async executeCreateCheckConstraint(
+    tableName: string,
+    spec: { name: string; expression: string },
+    schema?: string
+  ): Promise<void> {
+    if (!spec.expression || spec.expression.trim().length === 0) {
+      throw new Error(`Check constraint "${spec.name}" has no expression. Pass the raw SQL boolean expression as the second argument of hasCheckConstraint().`);
+    }
+
+    const existing = await this.getExistingCheckConstraints(tableName, schema);
+    if (existing.includes(spec.name)) {
+      return;
+    }
+
+    const qualifiedTableName = this.getQualifiedTableName(tableName, schema);
+    this.logger(`  Adding check constraint "${spec.name}" to ${qualifiedTableName}...`);
+
+    await this.client.query(buildAddCheckConstraintStatement(spec, qualifiedTableName));
+
+    this.logger(`  ✓ Check constraint "${spec.name}" added
+`);
+  }
+
+  /**
+   * Names of the CHECK constraints (`contype = 'c'`) defined on a table,
+   * resolved via the table's namespace so the lookup is independent of
+   * search_path. Includes column NOT NULL-style checks PostgreSQL stores as
+   * table constraints, which is fine — reconciliation only tests declared
+   * names for membership.
+   */
+  private async getExistingCheckConstraints(tableName: string, schemaName?: string): Promise<string[]> {
+    const result = await this.client.query(`
+      SELECT con.conname
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1
+        AND c.relname = $2
+        AND con.contype = 'c'
+    `, [schemaName || 'public', tableName]);
+
+    return result.rows.map((row: { conname: string }) => row.conname);
   }
 
   /**
@@ -2260,6 +2372,8 @@ $$`;
         const kindsDesc = operation.kinds && operation.kinds.length > 0 ? ` (${operation.kinds.join(', ')})` : '';
         return `Create statistics "${operation.statisticsName}"${kindsDesc} on "${operation.tableName}" (${operation.expressions.join(', ')})`;
       }
+      case 'create_check_constraint':
+        return `Add check constraint "${operation.constraintName}" on "${operation.tableName}" CHECK (${operation.expression})`;
       case 'set_database_setting':
         return `Set database parameter ${operation.name} = ${operation.value} (ALTER DATABASE ... SET, persists for new sessions)`;
       case 'create_foreign_key':

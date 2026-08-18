@@ -6,6 +6,7 @@ import { MigrationLoader } from './migration-loader';
 import { MigrationOperation } from './db-schema-manager';
 import { buildCreateIndexStatement, buildDropIndexStatement } from './index-sql';
 import { buildCreateStatisticsStatement, buildDropStatisticsStatement } from './statistics-sql';
+import { buildAddCheckConstraintStatement, buildDropCheckConstraintStatement } from './check-constraint-sql';
 import { buildResetDatabaseSettingStatement, buildSetDatabaseSettingStatement } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
 import { TableSchema } from '../schema/table-builder';
@@ -114,6 +115,19 @@ export class MigrationScaffold {
         ];
       }
 
+      case 'create_check_constraint': {
+        const checkTable = op.schema
+          ? `"${op.schema}"."${op.tableName}"`
+          : `"${op.tableName}"`;
+        // Drop-if-exists then add, so the statement pair is idempotent (there
+        // is no ADD CONSTRAINT IF NOT EXISTS in PostgreSQL) — the same idiom
+        // the index up-scaffold uses.
+        return [
+          buildDropCheckConstraintStatement(checkTable, op.constraintName, { ifExists: true }),
+          buildAddCheckConstraintStatement({ name: op.constraintName, expression: op.expression }, checkTable),
+        ];
+      }
+
       case 'set_database_setting':
         // A DO block resolving current_database() at RUN time — the file cannot
         // know the target database's name. Idempotent (SET overwrites).
@@ -203,6 +217,13 @@ export class MigrationScaffold {
 
       case 'create_statistics':
         return [buildDropStatisticsStatement(`"${op.statisticsName}"`, { ifExists: true })];
+
+      case 'create_check_constraint': {
+        const checkTable = op.schema
+          ? `"${op.schema}"."${op.tableName}"`
+          : `"${op.tableName}"`;
+        return [buildDropCheckConstraintStatement(checkTable, op.constraintName, { ifExists: true })];
+      }
 
       case 'set_database_setting':
         // RESET of an unset parameter is a no-op, so the down is idempotent.

@@ -75,6 +75,22 @@ export interface IndexDefinition {
  * no same-named one exists on the table and never drops or rebuilds — rename
  * the object to change its definition.
  */
+/**
+ * Table CHECK constraint declared on a table
+ * (`ALTER TABLE … ADD CONSTRAINT <name> CHECK (<expression>)`). The
+ * expression is raw SQL over quoted DATABASE column names, mirroring
+ * partial-index `where` clauses.
+ *
+ * Reconciled by NAME only: the schema manager adds a declared constraint when
+ * no same-named one exists on the table and never drops or rebuilds — rename
+ * the constraint to change its definition.
+ */
+export interface CheckConstraintDefinition {
+  name: string;
+  /** Raw SQL boolean expression — the contents of the `CHECK (…)` parentheses. */
+  expression: string;
+}
+
 export interface StatisticsDefinition {
   name: string;
   /**
@@ -167,6 +183,8 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   foreignKeys: ForeignKeyConstraint[];
   /** Extended-statistics objects declared on this table (`CREATE STATISTICS`). */
   statistics?: StatisticsDefinition[];
+  /** Table CHECK constraints declared on this table. */
+  checkConstraints?: CheckConstraintDefinition[];
   /** Declarative partitioning config for this table (parent `PARTITION BY`). */
   partitioning?: PartitioningConfig;
   /**
@@ -235,6 +253,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private indexDefs: IndexDefinition[] = [];
   private foreignKeyDefs: ForeignKeyConstraint[] = [];
   private statisticsDefs: StatisticsDefinition[] = [];
+  private checkConstraintDefs: CheckConstraintDefinition[] = [];
   private partitioningDef?: PartitioningConfig;
 
   constructor(name: string, schema: TSchema, indexes?: IndexDefinition[], foreignKeys?: ForeignKeyConstraint[], schemaName?: string) {
@@ -347,6 +366,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       indexes: this.indexDefs,
       foreignKeys: this.foreignKeyDefs,
       statistics: this.statisticsDefs,
+      checkConstraints: this.checkConstraintDefs,
       partitioning: this.partitioningDef,
       columnNameMap,
       relationEntries,
@@ -363,6 +383,15 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
    */
   withStatistics(statistics: StatisticsDefinition[]): this {
     this.statisticsDefs = statistics || [];
+    return this;
+  }
+
+  /**
+   * Declare the table's CHECK constraints. Mirrors how indexes/foreign keys
+   * arrive from entity metadata; replaces any previously set list.
+   */
+  withCheckConstraints(checkConstraints: CheckConstraintDefinition[]): this {
+    this.checkConstraintDefs = checkConstraints || [];
     return this;
   }
 

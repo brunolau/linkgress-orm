@@ -1,4 +1,4 @@
-import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef, StatisticsMetadata } from './entity-base';
+import { DbEntity, EntityConstructor, EntityMetadataStore, PropertyMetadata, NavigationMetadata, ForeignKeyAction, IndexMetadata, IndexMethod, IndexColumnRef, StatisticsMetadata, CheckConstraintMetadata } from './entity-base';
 import { ColumnBuilder, IdentityOptions } from '../schema/column-builder';
 import type { PartitionStrategy, PartitioningConfig } from '../schema/table-builder';
 import { TypeMapper } from '../types/type-mapper';
@@ -586,6 +586,44 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
     metadata.statistics.push(statisticsMetadata);
 
     return new StatisticsBuilder<TEntity>(this.entityClass, statisticsMetadata);
+  }
+
+  /**
+   * Declare a table CHECK constraint
+   * (`ALTER TABLE … ADD CONSTRAINT <name> CHECK (<expression>)`).
+   *
+   * The expression is raw SQL over quoted DATABASE column names — the same
+   * convention as partial-index `where` clauses. The canonical use case is a
+   * CONDITIONAL NOT NULL pairing two columns: once column A is set, column B
+   * must be set too.
+   *
+   * Reconciled by NAME only: `ensureCreated()` / `migrate()` add the
+   * constraint when the table has no same-named one (PostgreSQL validates
+   * existing rows as part of the ALTER — backfill violating data first).
+   * Definitions are never diffed or rebuilt — rename the constraint to
+   * change it.
+   *
+   * @example
+   * // cashback_product_id becomes mandatory once cashback_id is set:
+   * entity.hasCheckConstraint(
+   *   'chk_product_cashback_requires_product',
+   *   '"cashback_id" IS NULL OR "cashback_product_id" IS NOT NULL'
+   * );
+   */
+  hasCheckConstraint(constraintName: string, expression: string): this {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+
+    const checkConstraintMetadata: CheckConstraintMetadata = {
+      name: constraintName,
+      expression,
+    };
+
+    if (!metadata.checkConstraints) {
+      metadata.checkConstraints = [];
+    }
+    metadata.checkConstraints.push(checkConstraintMetadata);
+
+    return this;
   }
 
   /**

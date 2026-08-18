@@ -41,6 +41,8 @@ export interface EntityMetadata<T extends DbEntity> {
   indexes: IndexMetadata[];
   /** Extended-statistics objects (`CREATE STATISTICS`), set via `.hasStatistics()`. */
   statistics?: StatisticsMetadata[];
+  /** Table CHECK constraints, set via `.hasCheckConstraint()`. */
+  checkConstraints?: CheckConstraintMetadata[];
   /** Declarative table partitioning (parent `PARTITION BY`), set via `.hasPartitioning()`. */
   partitioning?: PartitioningConfig;
 }
@@ -224,6 +226,21 @@ export interface StatisticsMetadata {
 }
 
 /**
+ * Table CHECK-constraint metadata (`ALTER TABLE … ADD CONSTRAINT … CHECK`),
+ * declared via `entity.hasCheckConstraint()`. The expression is raw SQL over
+ * quoted DATABASE column names (same convention as partial-index `where`
+ * clauses) — e.g. a conditional NOT NULL pairing two columns:
+ * `"cashback_id" IS NULL OR "cashback_product_id" IS NOT NULL`.
+ * Reconciled by NAME only: the schema manager adds a missing constraint and
+ * never drops or rebuilds one (rename to change a definition).
+ */
+export interface CheckConstraintMetadata {
+  name: string;
+  /** Raw SQL boolean expression — the contents of the `CHECK (…)` parentheses. */
+  expression: string;
+}
+
+/**
  * Global entity metadata store
  */
 export class EntityMetadataStore {
@@ -251,6 +268,7 @@ export class EntityMetadataStore {
         navigations: new Map(),
         indexes: [],
         statistics: [],
+        checkConstraints: [],
       };
       this.metadata.set(entityClass, metadata);
     }
