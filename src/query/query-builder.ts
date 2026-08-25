@@ -5330,7 +5330,7 @@ ${joinClauses.join('\n')}`;
     let whereClause = '';
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       whereClause = `WHERE ${sql}`;
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...params);
@@ -5695,7 +5695,7 @@ ${joinClauses.join('\n')}`;
     let whereClause = '';
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       whereClause = `WHERE ${sql}`;
       context.paramCounter = newParamCounter;
       context.allParams.push(...params);
@@ -6410,7 +6410,7 @@ ${joinClauses.join('\n')}`;
     let whereClause = '';
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       whereClause = `WHERE ${sql}`;
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...params);
@@ -6495,7 +6495,7 @@ ${joinClauses.join('\n')}`;
     let whereClause = '';
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       whereClause = `WHERE ${sql}`;
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...params);
@@ -6620,6 +6620,11 @@ ${joinClauses.join('\n')}`;
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         placeholders: outerContext.placeholders,  // Pass placeholders through for prepared statements
+        // CTEs an enclosing builder already declared at statement level stay
+        // declared for anything NESTED in this subquery too. Without this the
+        // signal dies at the subquery boundary and a CTE-rooted subquery one
+        // level deeper re-declares (and re-materializes) a CTE it was handed.
+        hoistedCteNames: outerContext.hoistedCteNames,
         executor: this.executor,
       };
 
@@ -7633,7 +7638,7 @@ export class CollectionQueryBuilder<TItem = any> {
 
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params, placeholders, paramCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql: condSql, params, placeholders, paramCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       context.paramCounter = paramCounter;
       context.params.push(...params);
       if (placeholders) {
@@ -8237,7 +8242,7 @@ export class CollectionQueryBuilder<TItem = any> {
     let whereParams: any[] | undefined;
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
       whereClause = sql;
       whereParams = params;
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
