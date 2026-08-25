@@ -159,6 +159,14 @@ export interface SqlBuildContext {
   params: any[];
   /** Map of placeholder names to their parameter indices (for prepared statements) */
   placeholders?: Map<string, number>;
+  /**
+   * Names of CTEs already declared at STATEMENT level by an enclosing builder
+   * (currently `UnionQueryBuilder.buildSql`, which hoists its legs' `.with()`
+   * CTEs so every leg can reference them). A builder that finds one of its own
+   * attached CTEs listed here must emit neither its params nor its own `WITH`
+   * entry for it — both have already been contributed by the hoisting builder.
+   */
+  hoistedCteNames?: Set<string>;
 }
 
 /**
