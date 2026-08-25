@@ -6,6 +6,7 @@ import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
 import { FutureQuery } from './future-query';
 import { Subquery } from './subquery';
+import type { DbCte } from './cte-builder';
 
 /**
  * Union type: UNION removes duplicates, UNION ALL keeps all rows
@@ -27,6 +28,12 @@ export interface UnionLegBuilder {
   _applyUnionPostProcessing?(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): any[];
   /** @internal */
   _buildUnionBatchMeta?(selectionResult: any, hasNestedPaths: boolean): import('./future-query').FutureBatchMeta;
+  /**
+   * CTEs this leg carries from `.with(...)`. The union hoists them to statement
+   * level so every leg can reference them; see `UnionQueryBuilder.buildSql`.
+   * @internal
+   */
+  _getAttachedCtes?(): DbCte<any>[];
 }
 
 /**
@@ -404,6 +411,74 @@ export class UnionQueryBuilder<TSelection> {
           params: [],
         };
 
+    // Hoist the legs' attached CTEs to STATEMENT level.
+    //
+    // Every leg renders its own `WITH` prefix and this builder wraps each leg in
+    // parentheses, so a CTE attached to leg 1 used to be scoped INSIDE
+    // `(WITH x AS (...) SELECT ...)` where no sibling leg could see it — the next
+    // leg then failed with SQLSTATE 42P01, `relation "x" does not exist`. Emitting
+    // ONE `WITH` ahead of the union is what makes a shared (typically MATERIALIZED)
+    // candidate CTE usable by all legs, which is the entire point of fencing one.
+    //
+    // Order matters twice over:
+    //   * dedupe by name, first declaration wins — the same `DbCte` attached to
+    //     several legs must be declared exactly once. Two DIFFERENT definitions
+    //     sharing one name is refused rather than deduplicated: a statement-level
+    //     `WITH` can declare each name only once, so the loser would silently bind
+    //     its leg to the winner's body AND drop its params (shifting every later
+    //     placeholder) — wrong rows with no error anywhere;
+    //   * the params are pushed BEFORE any leg body is built, because `DbCte`
+    //     bodies carry placeholders numbered from $1 and therefore have to occupy
+    //     the opening slots of the statement. This mirrors the contract
+    //     `buildQueryCore` already honours for the non-union path.
+    // `hoistedCteNames` then tells each leg to skip both the param push and its own
+    // `WITH` entry for those names.
+    const hoistedCtes: DbCte<any>[] = [];
+    for (const component of this.components) {
+      const legCtes = component.ownerBuilder?._getAttachedCtes?.() ?? [];
+      for (const cte of legCtes) {
+        const declared = hoistedCtes.find(existing => existing.name === cte.name);
+
+        if (declared === undefined) {
+          hoistedCtes.push(cte);
+          continue;
+        }
+
+        // Identity first — re-attaching the SAME `DbCte` to several legs is the
+        // intended case and a no-op. Otherwise the two definitions must be
+        // indistinguishable to be collapsed; anything else is a name collision the
+        // emitted SQL cannot represent, so fail loudly instead of binding a leg to
+        // somebody else's CTE.
+        const sameDefinition =
+          declared === cte ||
+          (declared.query === cte.query &&
+            declared.materialized === cte.materialized &&
+            declared.params.length === cte.params.length &&
+            declared.params.every((param, index) => Object.is(param, cte.params[index])));
+
+        if (!sameDefinition) {
+          throw new Error(
+            `Union legs attach two different CTEs named "${cte.name}". A statement-level WITH declares each ` +
+              `name once, so the second definition would be silently discarded and its leg would read the ` +
+              `first one's rows. Rename one of them, or attach the same DbCte instance to both legs.`
+          );
+        }
+      }
+    }
+
+    const outerHoistedCteNames = context.hoistedCteNames;
+    if (hoistedCtes.length > 0) {
+      for (const cte of hoistedCtes) {
+        context.params.push(...cte.params);
+        context.paramCounter += cte.params.length;
+      }
+
+      context.hoistedCteNames = new Set([
+        ...(outerHoistedCteNames ?? []),
+        ...hoistedCtes.map(cte => cte.name),
+      ]);
+    }
+
     const sqlParts: string[] = [];
 
     for (let i = 0; i < this.components.length; i++) {
@@ -418,7 +493,18 @@ export class UnionQueryBuilder<TSelection> {
       sqlParts.push(`(${componentSql})`);
     }
 
+    // Restore whatever the enclosing builder had declared — the hoist is scoped to
+    // this union's legs and must not leak into a sibling expression.
+    context.hoistedCteNames = outerHoistedCteNames;
+
     let sql = sqlParts.join('\n');
+
+    if (hoistedCtes.length > 0) {
+      const withParts = hoistedCtes.map(
+        cte => `"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`
+      );
+      sql = `WITH ${withParts.join(', ')}\n${sql}`;
+    }
 
     // Add ORDER BY (applies to the entire union result)
     if (this.orderByFields.length > 0) {
