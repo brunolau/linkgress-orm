@@ -12,6 +12,8 @@ import {
 } from './conditions';
 import { DbCte } from './cte-builder';
 import { parseOrderBy } from './query-utils';
+import { renumberPlaceholders } from './sql-utils';
+import { Subquery } from './subquery';
 
 /**
  * Join types supported when a CTE is the FROM root.
@@ -23,6 +25,19 @@ import { parseOrderBy } from './query-utils';
  * makes a `spend FULL OUTER JOIN current_tier ON TRUE` shape expressible.
  */
 export type CteJoinType = 'INNER' | 'LEFT' | 'RIGHT' | 'FULL OUTER' | 'CROSS';
+
+/**
+ * The value type a single-column projection carries.
+ *
+ * `'scalar'` and `'array'` subqueries must return exactly ONE column — `x IN
+ * (SELECT ...)` and `x = (SELECT ...)` are not row-comparisons here — so their
+ * result type is that column's type, not the projection object's. This is what
+ * lets `.select(r => ({ id: r.id })).asSubquery('array')` satisfy
+ * `inSubquery(field, Subquery<number[], 'array'>)` without a cast.
+ */
+export type SingleColumnValue<TSelection> = TSelection extends Record<string, any>
+  ? TSelection[keyof TSelection]
+  : TSelection;
 
 /** SQL keyword emitted for each {@link CteJoinType}. */
 const CTE_JOIN_SQL: Record<CteJoinType, string> = {
@@ -334,28 +349,10 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     };
 
     // FROM root
-    let fromClause = `FROM "${this.rootCte.name}"`;
-    for (const step of this.joinSteps) {
-      const keyword = CTE_JOIN_SQL[step.type];
-      if (step.type === 'CROSS') {
-        fromClause += `\n${keyword} "${step.cte.name}"`;
-      } else {
-        const condBuilder = new ConditionBuilder();
-        const { sql: condSql, params: condParams, paramCounter } = condBuilder.build(
-          step.condition!,
-          ctx.paramCounter
-        );
-        ctx.paramCounter = paramCounter;
-        ctx.params.push(...condParams);
-        fromClause += `\n${keyword} "${step.cte.name}" ON ${condSql}`;
-      }
-    }
+    const fromClause = this.buildFromClause(ctx);
 
     // Build the WITH clause from every referenced CTE, in declaration order.
-    const cteDecls: string[] = [`"${this.rootCte.name}" AS (${this.rootCte.query})`];
-    for (const step of this.joinSteps) {
-      cteDecls.push(`"${step.cte.name}" AS (${step.cte.query})`);
-    }
+    const cteDecls = this.collectCtes().map(cte => declareCte(cte, cte.query));
 
     // Build SELECT from the projection (root + joined CTE FieldRefs).
     const selection = this.evaluateSelection();
@@ -402,6 +399,160 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   async first(): Promise<TSelection | null> {
     const results = await this.limit(1).toList();
     return results.length > 0 ? results[0] : null;
+  }
+
+  /**
+   * Every CTE this query references, in `WITH` declaration order: the FROM
+   * root first, then each joined CTE. Their bodies carry placeholders numbered
+   * sequentially from `$1` across the whole list (a shared `DbCteBuilder`
+   * assigns them), which is what lets both build paths treat the list as one
+   * contiguous parameter block.
+   */
+  private collectCtes(): DbCte<any>[] {
+    return [this.rootCte, ...this.joinSteps.map(step => step.cte)];
+  }
+
+  /**
+   * Render this CTE-rooted query as the body of a NESTED subquery, using the
+   * enclosing statement's build context.
+   *
+   * Two shapes, chosen by whether the enclosing builder already declared these
+   * CTEs at statement level (`SqlBuildContext.hoistedCteNames`, set by
+   * `UnionQueryBuilder.buildSql` for the legs' `.with(...)` CTEs):
+   *
+   * - **Not declared upstream** — the subquery is self-contained: it emits its
+   *   own `WITH` inside its own parentheses and contributes its CTE bodies'
+   *   parameters. PostgreSQL scopes that `WITH` to this subquery, so nothing
+   *   leaks out; the cost is that a CTE referenced from N such subqueries is
+   *   written — and executed — N times.
+   * - **Already declared upstream** — the subquery emits neither the `WITH` nor
+   *   the parameters (the hoisting builder contributed both) and simply reads
+   *   the statement-level relation by name. This is the shape that lets several
+   *   subqueries share ONE materialization of an expensive candidate set.
+   *
+   * @internal
+   */
+  private buildNestedSql(outerContext: SqlBuildContext): string {
+    if (!this.selector) {
+      throw new Error('A selection is required. Call .select(...) before using a CTE-rooted query as a subquery.');
+    }
+
+    const ctes = this.collectCtes();
+    const hoisted = ctes.filter(cte => outerContext.hoistedCteNames?.has(cte.name));
+
+    // A partially-hoisted list cannot be renumbered. Every body's `$N` is
+    // relative to a single contiguous block that starts at the FIRST CTE, so
+    // relocating only some of them would need a per-CTE offset that the baked-in
+    // numbering no longer describes — the survivors would silently bind to the
+    // wrong parameters. Refuse instead of emitting wrong SQL (same stance
+    // `UnionQueryBuilder` takes on a CTE name collision).
+    if (hoisted.length > 0 && hoisted.length !== ctes.length) {
+      const hoistedNames = hoisted.map(cte => `"${cte.name}"`).join(', ');
+      const localNames = ctes.filter(cte => !hoisted.includes(cte)).map(cte => `"${cte.name}"`).join(', ');
+      throw new Error(
+        `Cannot nest this CTE-rooted subquery: ${hoistedNames} ${hoisted.length === 1 ? 'is' : 'are'} already ` +
+          `declared at statement level while ${localNames} ${localNames.includes(',') ? 'are' : 'is'} not. ` +
+          'Attach every CTE the subquery reads to the enclosing statement (.with(...)), or none of them.'
+      );
+    }
+
+    const allHoisted = hoisted.length === ctes.length;
+
+    // Parameter contract, preserved from the outermost path: every CTE body's
+    // parameters come first, in WITH declaration order, before any ON-predicate
+    // or projection parameter. The bodies number their placeholders from `$1`,
+    // so nesting shifts the whole block by however many parameters the
+    // enclosing statement has already bound.
+    const offset = outerContext.paramCounter - 1;
+    const cteDecls: string[] = [];
+
+    if (!allHoisted) {
+      for (const cte of ctes) {
+        outerContext.params.push(...cte.params);
+        outerContext.paramCounter += cte.params.length;
+        cteDecls.push(declareCte(cte, offset === 0 ? cte.query : renumberPlaceholders(cte.query, offset)));
+      }
+    }
+
+    const fromClause = this.buildFromClause(outerContext);
+    const selectParts = buildSelectParts(this.evaluateSelection(), outerContext, this.rootCte.name);
+
+    let tail = '';
+    if (this.orderByFields.length > 0) {
+      tail += `\nORDER BY ${this.orderByFields.map(({ field, direction }) => `"${field}" ${direction}`).join(', ')}`;
+    }
+    if (this.limitValue !== undefined) {
+      tail += `\nLIMIT ${this.limitValue}`;
+    }
+    if (this.offsetValue !== undefined) {
+      tail += `\nOFFSET ${this.offsetValue}`;
+    }
+
+    const withClause = cteDecls.length > 0 ? `WITH ${cteDecls.join(', ')}\n` : '';
+
+    return `${withClause}SELECT ${selectParts.join(', ')}\n${fromClause}${tail}`;
+  }
+
+  /** FROM root + every join step, appending ON-predicate params to `ctx`. */
+  private buildFromClause(ctx: SqlBuildContext): string {
+    let fromClause = `FROM "${this.rootCte.name}"`;
+
+    for (const step of this.joinSteps) {
+      const keyword = CTE_JOIN_SQL[step.type];
+      if (step.type === 'CROSS') {
+        fromClause += `\n${keyword} "${step.cte.name}"`;
+        continue;
+      }
+
+      const condBuilder = new ConditionBuilder();
+      const { sql: condSql, params: condParams, paramCounter } = condBuilder.build(step.condition!, ctx.paramCounter);
+      ctx.paramCounter = paramCounter;
+      ctx.params.push(...condParams);
+      fromClause += `\n${keyword} "${step.cte.name}" ON ${condSql}`;
+    }
+
+    return fromClause;
+  }
+
+  /**
+   * Turn this CTE-rooted select into a {@link Subquery} usable anywhere the ORM
+   * accepts one — `inSubquery` / `notInSubquery`, `exists` / `notExists`, the
+   * scalar comparisons, or a joined table source.
+   *
+   * @param mode `'table'` (default), `'array'` (for `inSubquery` / `notInSubquery`)
+   *   or `'scalar'`.
+   *
+   * @example
+   * const scope = cteBuilder.with('discount_scope', visibleDiscounts, { materialized: true });
+   * const scopeIds = db.selectFromCte(scope.cte).select(r => ({ id: r.id })).asSubquery('array');
+   *
+   * // Self-contained: emits its own WITH inside the IN (...) parentheses.
+   * await db.links.where(l => inSubquery(l.discountId, scopeIds)).count();
+   *
+   * // Shared: `.with(scope.cte)` hoists ONE declaration to statement level and
+   * // every reader — both union legs here — reads that single materialization.
+   * await db.campaigns.where(c => inSubquery(c.discountId, scopeIds))
+   *   .select(c => ({ id: c.id }))
+   *   .with(scope.cte)
+   *   .unionAll(db.products.where(p => inSubquery(p.discountId, scopeIds)).select(p => ({ id: p.productId })))
+   *   .count();
+   */
+  asSubquery<TMode extends 'scalar' | 'array' | 'table' = 'table'>(
+    mode: TMode = 'table' as TMode
+  ): Subquery<
+    TMode extends 'scalar'
+      ? SingleColumnValue<TSelection>
+      : TMode extends 'array'
+        ? SingleColumnValue<TSelection>[]
+        : TSelection,
+    TMode
+  > {
+    const sqlBuilder = (outerContext: SqlBuildContext & { tableAlias?: string }): string =>
+      this.buildNestedSql(outerContext);
+
+    const selectionMetadata = mode === 'table' ? this.evaluateSelection() : undefined;
+
+    return new Subquery(sqlBuilder, mode, selectionMetadata) as any;
   }
 
   /** Evaluate the user selector against fresh CTE FieldRef proxies. */
@@ -468,6 +619,14 @@ export class CteJoinedQueryBuilder<
   ): CteJoinedQueryBuilder<TRootColumns, TThird> {
     return super.fullOuterJoin(cte, condition) as any;
   }
+}
+
+/**
+ * One `WITH` entry for a CTE, preserving its `AS MATERIALIZED` optimizer fence.
+ * `body` is passed separately because the nested path renumbers placeholders.
+ */
+function declareCte(cte: DbCte<any>, body: string): string {
+  return `"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${body})`;
 }
 
 /**

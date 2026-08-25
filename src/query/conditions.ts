@@ -1813,15 +1813,24 @@ export const sql = Object.assign(sqlTemplate, {
 // ============================================================================
 
 export class ConditionBuilder {
+  /**
+   * @param hoistedCteNames CTEs the enclosing builder already declared at
+   *   statement level. Carried into the condition's own build context so a
+   *   nested subquery that reads one of them (see
+   *   `CteRootQueryBuilder.asSubquery`) emits a bare reference instead of
+   *   re-declaring the CTE and re-binding its parameters.
+   */
   build(
     condition: Condition,
     startParam: number = 1,
-    placeholders?: Map<string, number>
+    placeholders?: Map<string, number>,
+    hoistedCteNames?: Set<string>
   ): { sql: string; params: any[]; placeholders?: Map<string, number>; paramCounter: number } {
     const context: SqlBuildContext = {
       paramCounter: startParam,
       params: [],
       placeholders,
+      hoistedCteNames,
     };
 
     const sql = condition.buildSql(context);

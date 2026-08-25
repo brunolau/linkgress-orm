@@ -20,6 +20,13 @@ interface QueryContext {
   allParams: any[];
   /** True when the driver cannot decode native ARRAY result columns (BunClient). */
   useJsonArrayAggregation?: boolean;
+  /**
+   * Names of CTEs an enclosing builder has already declared at statement level
+   * (see {@link SqlBuildContext.hoistedCteNames}). Carried so anything nested in
+   * this query — notably a CTE-rooted subquery in the WHERE — reads the
+   * statement-level relation instead of re-declaring it.
+   */
+  hoistedCteNames?: Set<string>;
 }
 
 /**
@@ -750,6 +757,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
+        // See SelectQueryBuilder.asSubquery — the statement-level CTE set must
+        // survive the subquery boundary or anything nested re-declares it.
+        hoistedCteNames: outerContext.hoistedCteNames,
       };
 
       const { sql } = this.buildQuery(context);
@@ -1066,7 +1076,12 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     let whereClause = '';
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params } = condBuilder.build(this.whereCond, context.paramCounter);
+      const { sql, params } = condBuilder.build(
+        this.whereCond,
+        context.paramCounter,
+        undefined,
+        context.hoistedCteNames
+      );
       whereClause = `WHERE ${sql}`;
       context.paramCounter += params.length;
       context.allParams.push(...params);
@@ -1978,6 +1993,9 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
         useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
+        // See SelectQueryBuilder.asSubquery — the statement-level CTE set must
+        // survive the subquery boundary or anything nested re-declares it.
+        hoistedCteNames: outerContext.hoistedCteNames,
       };
 
       const { sql } = this.buildQuery(context);
