@@ -175,6 +175,12 @@ export interface QueryContext {
    * (BunClient) — array-producing aggregations must use json_agg.
    */
   useJsonArrayAggregation?: boolean;
+  /**
+   * Names of CTEs an enclosing builder has already declared at statement level
+   * (see {@link SqlBuildContext.hoistedCteNames}). Attached CTEs whose name is
+   * listed here contribute neither params nor a `WITH` entry from this builder.
+   */
+  hoistedCteNames?: Set<string>;
 }
 
 /**
@@ -1029,6 +1035,17 @@ export class SelectQueryBuilder<TSelection> {
       }
     }
     return this;
+  }
+
+  /**
+   * The CTEs attached to this query through `.with(...)` (or auto-attached by
+   * `joinFilter(cte, ...)`). Read by {@link UnionQueryBuilder.buildSql}, which
+   * hoists them to statement level so a CTE declared on one union leg is
+   * visible to all of them.
+   * @internal
+   */
+  _getAttachedCtes(): DbCte<any>[] {
+    return this.ctes;
   }
 
   /**
@@ -1955,6 +1972,9 @@ export class SelectQueryBuilder<TSelection> {
       allParams: context.params,
       collectionStrategy: this.collectionStrategy,
       executor: this.executor,
+      // CTEs the union already declared ahead of the whole statement — this leg
+      // must not re-declare them (nor re-push their params).
+      hoistedCteNames: context.hoistedCteNames,
     };
 
     const mockRow = this._createMockRow();
@@ -5462,8 +5482,15 @@ ${joinClauses.join('\n')}`;
    * @internal
    */
   private buildQueryCore(selection: any, context: QueryContext, includeOrderLimitOffset: boolean = true): { sql: string; params: any[]; nestedPaths: Set<string> } {
-    // Handle user-defined CTEs first - their params need to come before main query params
+    // Handle user-defined CTEs first - their params need to come before main query params.
+    // A CTE the enclosing builder already hoisted to statement level (UNION) has had both
+    // its params and its WITH entry contributed there; pushing them again would duplicate
+    // the params and shift every placeholder in this leg.
     for (const cte of this.ctes) {
+      if (context.hoistedCteNames?.has(cte.name)) {
+        continue;
+      }
+
       context.allParams.push(...cte.params);
       context.paramCounter += cte.params.length;
     }
@@ -5711,6 +5738,11 @@ ${joinClauses.join('\n')}`;
     const allCtes: string[] = [];
 
     for (const cte of this.ctes) {
+      // Hoisted to statement level by the enclosing UNION - declared there, not here.
+      if (context.hoistedCteNames?.has(cte.name)) {
+        continue;
+      }
+
       allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
     }
 
@@ -6441,6 +6473,20 @@ ${joinClauses.join('\n')}`;
    * Build aggregate query (count or exists)
    */
   private buildAggregateQuery(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
+    // User-defined CTEs first, exactly as buildQuery does: their params occupy the
+    // opening slots of the statement because DbCte bodies carry placeholders numbered
+    // from $1. Without this, `.with(cte).count()` / `.exists()` dropped the WITH clause
+    // entirely and PostgreSQL answered `relation "<cte>" does not exist` (42P01) for any
+    // query whose WHERE referenced the CTE.
+    for (const cte of this.ctes) {
+      if (context.hoistedCteNames?.has(cte.name)) {
+        continue;
+      }
+
+      context.allParams.push(...cte.params);
+      context.paramCounter += cte.params.length;
+    }
+
     // Detect navigation property joins from WHERE condition
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
@@ -6510,9 +6556,28 @@ ${joinClauses.join('\n')}`;
       ? 'SELECT COUNT(*) as count'
       : 'SELECT EXISTS(SELECT 1';
 
+    // WITH clause - same assembly as buildQuery, so an aggregate can reference the
+    // CTEs attached to the query it is aggregating.
+    const allCtes: string[] = [];
+    for (const cte of this.ctes) {
+      if (context.hoistedCteNames?.has(cte.name)) {
+        continue;
+      }
+
+      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
+    }
+
+    if (context.ctes.size > 0) {
+      for (const [cteName, { sql: cteSql }] of context.ctes.entries()) {
+        allCtes.push(`"${cteName}" AS (${cteSql})`);
+      }
+    }
+
+    const withClause = allCtes.length > 0 ? `WITH ${allCtes.join(', ')}\n` : '';
+
     const sql = type === 'count'
-      ? `${selectClause}\n${fromClause}\n${whereClause}`.trim()
-      : `${selectClause}\n${fromClause}\n${whereClause})`.trim();
+      ? `${withClause}${selectClause}\n${fromClause}\n${whereClause}`.trim()
+      : `${withClause}${selectClause}\n${fromClause}\n${whereClause})`.trim();
 
     return {
       sql,
