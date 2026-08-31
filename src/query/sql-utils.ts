@@ -30,6 +30,15 @@ export const renumberPlaceholders = (sqlText: string, offset: number): string =>
   );
 
 /**
+ * True when the SQL fragment contains a bare `$N` placeholder OUTSIDE quoted
+ * segments and comments — i.e. one {@link renumberPlaceholders} would rebind.
+ * Defined AS "renumbering changes the text" so it can never drift out of sync
+ * with the scan (capture-group positions shift when token classes are added).
+ */
+export const hasBarePlaceholder = (sqlText: string): boolean =>
+  renumberPlaceholders(sqlText, 1) !== sqlText;
+
+/**
  * Column configuration extracted from schema
  */
 export interface ColumnConfig {
