@@ -21,6 +21,10 @@ interface MutationCapableTable {
     overridingSystemValue?: boolean,
     onConflictDoNothing?: boolean
   ): { sql: string; params: any[] } | null;
+  _buildGuardedInsertBulkStatement(
+    data: Record<string, any>[],
+    guardPredicate: string
+  ): { sql: string; params: any[] } | null;
   _buildBulkUpdateStatement(data: Record<string, any>[], primaryKeys: string[]): { sql: string; params: any[] };
   _buildDeleteWhereInStatement(field: string, values: any[]): { sql: string; params: any[] } | null;
   _buildUpdateWhereInStatement(
@@ -111,12 +115,22 @@ export class MutationBatch {
   /**
    * Register a bulk INSERT leg. Returns null (and registers nothing) for an
    * empty row array or rows resolving to zero insertable columns.
+   *
+   * `options.rowGuard` turns the leg into a ROW-GUARDED insert — `INSERT ..
+   * SELECT .. FROM (VALUES ..) AS v(..) WHERE <guard>` — so each candidate row
+   * is written only when the predicate holds for it, making the statement its
+   * own race arbiter (blocked rows insert nothing and show up as a short
+   * {@link getAffectedCount}). The predicate is raw SQL evaluated per candidate
+   * row with the row exposed as `v` — refer to a cell as `v."<db_column_name>"`
+   * — and takes no parameters of its own. It cannot see the leg's own inserted
+   * rows (PostgreSQL snapshot rules), so guard only batches whose rows are
+   * mutually independent. Mutually exclusive with `onConflictDoNothing`.
    */
   addInsertBulk(
     table: MutationCapableTable,
     rows: Record<string, any>[],
     id: string,
-    options?: { overridingSystemValue?: boolean; onConflictDoNothing?: boolean }
+    options?: { overridingSystemValue?: boolean; onConflictDoNothing?: boolean; rowGuard?: string }
   ): MutationBatchKey | null {
     if (rows.length === 0) {
       return null;
@@ -125,7 +139,13 @@ export class MutationBatch {
     this.assertRegisterable(id);
     MutationBatch.assertSingleStatementBudget(rows, id);
 
-    const built = table._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
+    if (options?.rowGuard != null && (options.onConflictDoNothing || options.overridingSystemValue)) {
+      throw new Error(`MutationBatch: leg "${id}" combines rowGuard with onConflictDoNothing/overridingSystemValue — the guarded insert compiles to INSERT .. SELECT and supports neither`);
+    }
+
+    const built = options?.rowGuard != null
+      ? table._buildGuardedInsertBulkStatement(rows, options.rowGuard)
+      : table._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
 
     if (!built) {
       return null;
