@@ -16,6 +16,20 @@ export const renumberPlaceholders = (sqlText: string, offset: number): string =>
   );
 
 /**
+ * True when the SQL fragment contains a bare `$N` placeholder OUTSIDE quoted
+ * segments — i.e. one {@link renumberPlaceholders} would rebind. Same
+ * quote-aware scan, so `'literal $1 inside quotes'` stays invisible.
+ */
+export const hasBarePlaceholder = (sqlText: string): boolean => {
+  for (const match of sqlText.matchAll(QUOTED_OR_PLACEHOLDER)) {
+    if (match[3] !== undefined) {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
  * Column configuration extracted from schema
  */
 export interface ColumnConfig {

@@ -4436,9 +4436,9 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
    * Builds a ROW-GUARDED bulk insert — `INSERT INTO t (cols) SELECT v.cols FROM
    * (VALUES …) AS v(cols) WHERE <guard>` — so each candidate row is inserted
    * only when the guard predicate holds for it. The guard is evaluated by
-   * PostgreSQL as part of the insert, which makes the statement itself the race
-   * arbiter: the rows that fail the guard are silently skipped and the caller
-   * detects them through the affected count (via `MutationBatch.getAffectedCount`).
+   * PostgreSQL as part of the insert: rows that fail it are silently skipped
+   * and the caller detects them through the affected count (via
+   * `MutationBatch.getAffectedCount`).
    *
    * The predicate is raw SQL (the same contract as `hasIndex().where(…)`),
    * evaluated per candidate row with the row exposed under the `v` alias — refer
@@ -4454,6 +4454,14 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
    * inserted into judges every candidate row against the PRE-statement state.
    * Two rows of one batch that would collide with each other therefore both
    * pass — guard batches whose rows are mutually independent.
+   *
+   * NOTE (concurrency): the guard is NOT a cross-transaction race arbiter. It
+   * judges only rows committed before the statement takes its snapshot (READ
+   * COMMITTED), so two CONCURRENT transactions can both pass a count-based
+   * guard and jointly overshoot the cap. Callers must serialize concurrent
+   * writers first (e.g. an exclusive row or advisory lock taken earlier in the
+   * same transaction) — the blocked transaction's later statement then
+   * re-snapshots and the guard is effective.
    * @internal
    */
   _buildGuardedInsertBulkStatement(
