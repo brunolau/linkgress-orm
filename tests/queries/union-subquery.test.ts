@@ -13,7 +13,7 @@ import { eq, gt, inSubquery, exists } from '../../src';
  * workaround was to issue two separate queries and merge their id lists in
  * application code — extra roundtrips and no SQL-level composition.
  *
- * Real-world driver: `gopass-eshop` GOBO-240 — community fetch must select all
+ * Real-world driver: a community fetch must select all
  * users matching either `masterUserId = X` (family) OR membership in the union
  * of two `user_relations` row sets (friend-parent + friend-slave) in ONE SQL
  * roundtrip.

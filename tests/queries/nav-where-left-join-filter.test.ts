@@ -1,9 +1,9 @@
 /**
- * Repro test for GOBO-226 bug:
+ * Repro test for the bug:
  *   When a WHERE clause references a nav-property column and the relation has
  *   isMandatory=false, Linkgress generates a LEFT JOIN.  In standard SQL three-valued
  *   logic that should be fine — rows whose joined record produces NULL simply fail
- *   the predicate.  However, the *actual* observed symptom in gopass-eshop was that
+ *   the predicate.  However, the *actual* observed symptom was that
  *   `eq(p.segment.active, true)` did NOT reliably exclude rows whose segment had
  *   `active = false`.  This test proves that with an isMandatory=false (LEFT JOIN)
  *   relation, all three cases are handled correctly:
@@ -83,17 +83,17 @@ class SegmentTestDatabase extends DbContext {
 
   protected override setupModel(model: DbModelConfig): void {
     model.entity(Segment, entity => {
-      entity.toTable('gobo226_segments');
+      entity.toTable('catalog_segments');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'gobo226_segments_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'catalog_segments_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
       entity.property(e => e.active).hasType(boolean('active')).isRequired();
     });
 
     model.entity(SegmentProduct, entity => {
-      entity.toTable('gobo226_segment_products');
+      entity.toTable('catalog_segment_products');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'gobo226_segment_products_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'catalog_segment_products_id_seq' }));
       entity.property(e => e.title).hasType(varchar('title', 200)).isRequired();
       entity.property(e => e.segmentId).hasType(integer('segment_id'));  // nullable — no .isRequired()
 
@@ -107,15 +107,15 @@ class SegmentTestDatabase extends DbContext {
 }
 
 async function cleanupSchema(client: any): Promise<void> {
-  await client.query('DROP TABLE IF EXISTS gobo226_segment_products CASCADE');
-  await client.query('DROP TABLE IF EXISTS gobo226_segments CASCADE');
+  await client.query('DROP TABLE IF EXISTS catalog_segment_products CASCADE');
+  await client.query('DROP TABLE IF EXISTS catalog_segments CASCADE');
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('GOBO-226: nav-property WHERE with isMandatory=false relation', () => {
+describe('nav-property WHERE with isMandatory=false relation', () => {
   /**
    * Core repro — toList() path.
    * Standard SQL LEFT JOIN + WHERE already excludes non-matching and null-segment rows.
@@ -155,7 +155,7 @@ describe('GOBO-226: nav-property WHERE with isMandatory=false relation', () => {
 
   /**
    * Bug repro — count() path.
-   * The gopass workaround (`inArray(p.segmentId, activeSegmentIds)`) was adopted
+   * The consumer workaround (`inArray(p.segmentId, activeSegmentIds)`) was adopted
    * because count() returned unexpected numbers.  This tests count() uses the same
    * nav-property JOIN detection as toList().
    *
@@ -364,15 +364,15 @@ describe('GOBO-226: nav-property WHERE with isMandatory=false relation', () => {
 
       protected override setupModel(model: DbModelConfig): void {
         model.entity(Segment, entity => {
-          entity.toTable('gobo226_segments');
-          entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'gobo226_segments_id_seq' }));
+          entity.toTable('catalog_segments');
+          entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'catalog_segments_id_seq' }));
           entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
           entity.property(e => e.active).hasType(boolean('active')).isRequired();
         });
 
         model.entity(SegmentProduct, entity => {
-          entity.toTable('gobo226_segment_products');
-          entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'gobo226_segment_products_id_seq' }));
+          entity.toTable('catalog_segment_products');
+          entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'catalog_segment_products_id_seq' }));
           entity.property(e => e.title).hasType(varchar('title', 200)).isRequired();
           entity.property(e => e.segmentId).hasType(integer('segment_id'));
 

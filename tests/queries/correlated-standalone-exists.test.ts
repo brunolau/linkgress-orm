@@ -5,7 +5,7 @@ import { and, eq, gt, exists, notExists } from '../../src';
 /**
  * Correlated STANDALONE subqueries inside exists()/notExists().
  *
- * Motivation (gopass QA_AT-136 / QA_AT-323 class): navigation properties in
+ * Motivation: navigation properties in
  * WHERE-only positions inside correlated subselects emit dangling aliases, so
  * services fall back to UNCORRELATED standalone subqueries composed with
  * inSubquery() on an FK column. The natural alternative — EXISTS over a
@@ -19,8 +19,8 @@ import { and, eq, gt, exists, notExists } from '../../src';
  *    builder reuses the outer's alias, the correlation predicate silently
  *    binds to the inner row (wrong results, no SQL error). This is the
  *    dangerous failure mode.
- *  - correlation from INSIDE a navigation-collection lambda (the gopass
- *    refund-group counts shape) — two nesting levels.
+ *  - correlation from INSIDE a navigation-collection lambda (a
+ *    grouped-counts shape) — two nesting levels.
  */
 describe('Correlated standalone subqueries in exists()', () => {
 	test('cross-table correlated EXISTS on an FK column filters by the outer row', async () => {
@@ -86,8 +86,8 @@ describe('Correlated standalone subqueries in exists()', () => {
 
 			// Per user, count posts that HAVE a comment — via a correlated
 			// standalone EXISTS on postComments.postId = p.id, evaluated inside
-			// the u.posts collection filter (two nesting levels, like gopass'
-			// correlated hasPending/hasFailed counts). Every seeded post has
+			// the u.posts collection filter (two nesting levels, like a pair of
+			// correlated status counts). Every seeded post has
 			// exactly one comment: alice 2, bob 1, charlie 0.
 			const result = await db.users
 				.select(u => ({

@@ -9,7 +9,7 @@ import { assertType } from '../utils/type-tester';
  * (not an entity table), supporting FULL OUTER / RIGHT / CROSS joins and
  * `ON TRUE` predicates between two CTEs.
  *
- * The marquee shape is the QA_AT-108 "buyer spend + current tier" read:
+ * The marquee shape is a "buyer spend + current tier" read:
  *
  *   WITH spend AS (
  *     SELECT status, SUM(total) AS totalPrice FROM orders
@@ -32,7 +32,7 @@ describe('CTE-rooted queries (FROM a CTE; FULL OUTER / RIGHT / CROSS joins)', ()
 
   // ---- helpers --------------------------------------------------------------
 
-  /** Build the QA_AT-108-shaped spend+tier query for one buyer. */
+  /** Build the spend+tier query for one buyer. */
   const buildSpendTierQuery = (userId: number, tierActive: boolean) => {
     const b = new DbCteBuilder();
     const spend = b.with(
@@ -98,7 +98,7 @@ describe('CTE-rooted queries (FROM a CTE; FULL OUTER / RIGHT / CROSS joins)', ()
   // ---- generated SQL --------------------------------------------------------
 
   describe('generated SQL', () => {
-    test('FULL OUTER JOIN ON TRUE between two CTEs (the QA_AT-108 shape)', () => {
+    test('FULL OUTER JOIN ON TRUE between two CTEs (the spend+tier shape)', () => {
       const q = buildSpendTierQuery(42, true);
       const { sql: text, params } = (q as any).buildQuery();
 

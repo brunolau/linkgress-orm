@@ -6,7 +6,7 @@ import { gt, sql, DbCteBuilder } from '../../src';
 /**
  * DbCte.as(alias?) — typed CTE references for raw sql`` templates.
  *
- * Motivation (gopass-eshop internalProductDataProvider): a correlated scalar
+ * Motivation: a correlated scalar
  * subquery over a CTE had to hard-code every identifier as a string literal:
  *
  *   sql`(SELECT ... json_build_array("gp"."seasonId", ...) FROM "product_price_grouped_cte" AS "gp" WHERE "gp"."productIdOfPrice" = ${product.id})`

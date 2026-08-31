@@ -12,7 +12,7 @@ import { eq, exists, not, notExists, or, sql } from '../../src';
  * rendered a column of an unjoined alias and the statement failed with
  * `missing FROM-clause entry for table "order"`.
  *
- * Shape mirror of gopass-eshop QA_AT-498 `campaignPublicationCondition`:
+ * Shape mirror of a campaign-publication condition:
  * discount → campaign_links (collection) → campaign (reference) → `is_public`,
  * here spelled post → post_comments (collection) → order (reference) → `status`.
  *
@@ -95,7 +95,7 @@ describe('exists() collection with reference-navigating where', () => {
     await withDatabase(async (db) => {
       const seed = await seedTestData(db);
 
-      // Mirrors the gopass cart-load shape: a LATERAL collection over
+      // Mirrors a cart-load shape: a LATERAL collection over
       // post_comments (aliased `lateral_N_postComments` by the strategy) whose
       // selection projects an EXISTS over a reference chain rooted on the
       // lateral's own row (`pc.order.orderTasks`). Before the fix the bridge

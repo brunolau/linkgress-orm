@@ -1227,15 +1227,15 @@ describe('LATERAL Strategy SQL Generation', () => {
           }))
           .toList();
 
-        expect(results.length).toBe(2); // skiPass and liftTicket
+        expect(results.length).toBe(2); // hardback and liftTicket
 
-        // Verify skiPass has 2 tags and 2 seasons
-        const skiPass = results.find(p => p.productName === 'Ski Pass');
-        expect(skiPass).toBeDefined();
-        expect(skiPass!.tagIds).toBeInstanceOf(Array);
-        expect(skiPass!.tagIds.length).toBe(2); // winterTag, familyTag
-        expect(skiPass!.seasonIds).toBeInstanceOf(Array);
-        expect(skiPass!.seasonIds.length).toBe(2); // season 1 and 2
+        // Verify hardback has 2 tags and 2 seasons
+        const hardback = results.find(p => p.productName === 'Hardback');
+        expect(hardback).toBeDefined();
+        expect(hardback!.tagIds).toBeInstanceOf(Array);
+        expect(hardback!.tagIds.length).toBe(2); // winterTag, familyTag
+        expect(hardback!.seasonIds).toBeInstanceOf(Array);
+        expect(hardback!.seasonIds.length).toBe(2); // season 1 and 2
 
         // Verify liftTicket has 1 tag and 1 season
         const liftTicket = results.find(p => p.productName === 'Lift Ticket');
@@ -1281,15 +1281,15 @@ describe('LATERAL Strategy SQL Generation', () => {
 
         expect(results.length).toBe(2);
 
-        // Verify skiPass has 2 prices with capacity groups
-        const skiPass = results.find(p => p.productName === 'Ski Pass');
-        expect(skiPass).toBeDefined();
-        expect(skiPass!.prices.length).toBe(2);
+        // Verify hardback has 2 prices with capacity groups
+        const hardback = results.find(p => p.productName === 'Hardback');
+        expect(hardback).toBeDefined();
+        expect(hardback!.prices.length).toBe(2);
         // First price (winter) has 2 capacity groups
-        const winterPrice = skiPass!.prices.find(p => p.seasonId === 1);
+        const winterPrice = hardback!.prices.find(p => p.seasonId === 1);
         expect(winterPrice!.capacityGroupIds.length).toBe(2);
         // Second price (summer) has 1 capacity group
-        const summerPrice = skiPass!.prices.find(p => p.seasonId === 2);
+        const summerPrice = hardback!.prices.find(p => p.seasonId === 2);
         expect(summerPrice!.capacityGroupIds.length).toBe(1);
 
         // Verify liftTicket
@@ -1334,12 +1334,12 @@ describe('LATERAL Strategy SQL Generation', () => {
 
         expect(results.length).toBe(2);
 
-        // Verify skiPass
-        const skiPass = results.find(p => p.productName === 'Ski Pass');
-        expect(skiPass).toBeDefined();
-        expect(skiPass!.tagIds.length).toBe(2);
-        expect(skiPass!.prices.length).toBe(2);
-        expect(skiPass!.seasonIds.length).toBe(2);
+        // Verify hardback
+        const hardback = results.find(p => p.productName === 'Hardback');
+        expect(hardback).toBeDefined();
+        expect(hardback!.tagIds.length).toBe(2);
+        expect(hardback!.prices.length).toBe(2);
+        expect(hardback!.seasonIds.length).toBe(2);
 
         // Verify liftTicket
         const liftTicket = results.find(p => p.productName === 'Lift Ticket');
@@ -1385,12 +1385,12 @@ describe('LATERAL Strategy SQL Generation', () => {
 
         expect(results.length).toBe(2);
 
-        // Verify skiPass
-        const skiPass = results.find(p => p.productName === 'Ski Pass');
-        expect(skiPass).toBeDefined();
-        expect(skiPass!.pricesWithProductName.length).toBe(2);
-        expect(skiPass!.pricesWithProductName[0].productNameFromPrice).toBe('Ski Pass');
-        expect(skiPass!.tagIds.length).toBe(2);
+        // Verify hardback
+        const hardback = results.find(p => p.productName === 'Hardback');
+        expect(hardback).toBeDefined();
+        expect(hardback!.pricesWithProductName.length).toBe(2);
+        expect(hardback!.pricesWithProductName[0].productNameFromPrice).toBe('Hardback');
+        expect(hardback!.tagIds.length).toBe(2);
 
         // Verify liftTicket
         const liftTicket = results.find(p => p.productName === 'Lift Ticket');

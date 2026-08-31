@@ -242,7 +242,7 @@ describe('CteRootQueryBuilder.asSubquery()', () => {
     await withDatabase(async (db) => {
       await seedTestData(db);
 
-      // The real consumer shape (gopass QA_AT-533): the union leg's WHERE holds a
+      // The real consumer shape: the union leg's WHERE holds a
       // subquery over a junction table, and THAT subquery's WHERE holds the
       // CTE-rooted membership test. The statement-level CTE set has to survive
       // BOTH boundaries — `SelectQueryBuilder.asSubquery` builds a fresh

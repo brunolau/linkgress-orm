@@ -883,7 +883,7 @@ export class SelectQueryBuilder<TSelection> {
    * the same (left, right) arguments.
    *
    * Intended for scope-style predicates that hop across an N:1 FK (e.g.
-   * order_item → invoicing_partner_data): a JOIN against the "one" side never
+   * loan → borrower_data): a JOIN against the "one" side never
    * duplicates left rows. Joining a 1:N side WILL duplicate rows — callers own
    * that trade-off (use exists()/inSubquery for semi-join semantics instead).
    *
@@ -2257,7 +2257,7 @@ export class SelectQueryBuilder<TSelection> {
 
         const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
         // A custom fromDriver mapper is the column's type authority: it was
-        // written against the driver's RAW output (apps like gopass configure
+        // written against the driver's RAW output (apps that configure
         // timestamp parser passthrough, so their mappers expect the
         // text-protocol string). For mapper columns, revival reconstructs that
         // text form — json's ISO 'T' separator back to the driver's space, a
@@ -4215,7 +4215,7 @@ ${joinClauses.join('\n')}`;
       const mapped: any = {};
 
       for (const [key, value] of Object.entries(row)) {
-        // Handle nested paths (e.g., "invoicingPartner.id" -> { invoicingPartner: { id: value } })
+        // Handle nested paths (e.g., "borrower.id" -> { borrower: { id: value } })
         if (key.includes('.')) {
           const parts = key.split('.');
           let current = mapped;
@@ -6111,7 +6111,7 @@ ${joinClauses.join('\n')}`;
     // Build alias-to-field-info mapping from selected field configs
     // This allows us to find the correct mapper when:
     // 1. alias differs from property name (e.g., reservationExpiry: i.expiresAt)
-    // 2. field comes from navigation (e.g., customerBirthdate: i.userEshop.birthdate)
+    // 2. field comes from navigation (e.g., customerBirthdate: i.member.birthdate)
     const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
     interface FieldMapperInfo {
       propertyName: string;
@@ -7750,11 +7750,11 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     // Seed the chain the projection ACTUALLY navigated, not just its terminal alias.
-    // Without this, a projection that names only the deep leaf (e.g. `oi.productPrice.product.resort.name`
+    // Without this, a projection that names only the deep leaf (e.g. `oi.productPrice.product.category.name`
     // with no sibling scalar off `productPrice` / `product`) leaves the intermediates out of
     // `allTableAliases` entirely, so resolveNavigationJoins' direct-relation phase has nothing to
     // anchor on and falls through to the name-based schema-graph BFS - which happily reaches
-    // `resort` one hop sooner through an unrelated same-table FK (`order_item.cashback_product_id`)
+    // `category` one hop sooner through an unrelated same-table FK (`loan.featured_book_id`)
     // and silently returns another row's data.
     // This is the same `__navigationAliases` signal QueryBuilder.collectTableAliasesFromSelection,
     // GroupedQueryBuilder and DbContext already consume, and the same treatment nested
@@ -7860,11 +7860,11 @@ export class CollectionQueryBuilder<TItem = any> {
       // PHASE 1 - direct relation lookups, run to a FIXPOINT.
       // A join added here immediately becomes an anchor candidate for the remaining aliases in
       // this very pass, so a parent that is itself several hops away from the root (e.g.
-      // order_item -> product_price -> product) can still anchor its own children. Without the
+      // loan -> edition -> book) can still anchor its own children. Without the
       // fixpoint those children never see their real parent (joinedSchemas was snapshotted before
       // the parent was joined) and fall through to the BFS below, which anchors them on whatever
       // other relation happens to point at the same table - e.g.
-      // order_item.cashback_product_id -> product - silently returning another row's data.
+      // loan.featured_book_id -> book - silently returning another row's data.
       let progressed = true;
 
       // Termination (why no maxIterations guard is needed here, unlike every other loop in this
@@ -8356,8 +8356,8 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Step 5b: Merge navigation path joins (for intermediate tables in navigation chains)
     // These joins are needed when accessing a collection through a chain like:
-    // oi.productPrice.product.resort.productIntegrationDefinitions
-    // The navigation path contains joins for productPrice, product, resort
+    // ln.edition.book.category.formats
+    // The navigation path contains joins for productPrice, product, category
     // which must be included in the lateral subquery for correlation
     // Include selectMany joins in both all and selector navigation joins
     // selectMany joins are structural (from flattening) and needed by both CTE and LATERAL

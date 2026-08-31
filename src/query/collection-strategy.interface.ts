@@ -17,7 +17,7 @@ export interface SelectedField {
   propertyName?: string;
   /**
    * The source table name for this field (for navigation properties).
-   * When a field comes from a navigation join (e.g., i.userEshop.birthdate),
+   * When a field comes from a navigation join (e.g., i.member.birthdate),
    * this specifies which table's schema to use for mapper lookup.
    */
   sourceTable?: string;

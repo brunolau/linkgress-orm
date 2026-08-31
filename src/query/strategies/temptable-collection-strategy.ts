@@ -65,7 +65,7 @@ export class TempTableCollectionStrategy implements ICollectionStrategy {
    * with any literal FK predicates declared on the navigation (e.g. SCD2
    * `is_current = TRUE`). Returns "" or " AND <preds...>". Without this, the
    * temptable strategy leaks SCD2-closed target rows into the projection — the
-   * exact QA_GO-429 Bug D symptom.
+   * exact constant-FK projection symptom.
    */
   private buildAdditionalWhere(
     config: CollectionAggregationConfig,

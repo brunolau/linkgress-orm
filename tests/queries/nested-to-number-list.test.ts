@@ -62,14 +62,14 @@ describe('Nested toNumberList() bug regression', () => {
           }
         }
 
-        // Spot-check: skiPassPrice1 has adult + child capacity groups
-        const skiPass = results.find(p => p.productId === seeded.products.skiPass.id)!;
-        const skiPassPrice1 = skiPass.prices.find(
-          p => p.priceId === seeded.productPrices.skiPassPrice1.id
+        // Spot-check: hardbackPrice1 has adult + child capacity groups
+        const hardback = results.find(p => p.productId === seeded.products.hardback.id)!;
+        const hardbackPrice1 = hardback.prices.find(
+          p => p.priceId === seeded.productPrices.hardbackPrice1.id
         )!;
-        expect(skiPassPrice1.capacityGroupIds.length).toBe(2);
-        expect(skiPassPrice1.capacityGroupIds).toContain(seeded.capacityGroups.adultGroup.id);
-        expect(skiPassPrice1.capacityGroupIds).toContain(seeded.capacityGroups.childGroup.id);
+        expect(hardbackPrice1.capacityGroupIds.length).toBe(2);
+        expect(hardbackPrice1.capacityGroupIds).toContain(seeded.capacityGroups.adultGroup.id);
+        expect(hardbackPrice1.capacityGroupIds).toContain(seeded.capacityGroups.childGroup.id);
 
         // Spot-check: liftTicketPrice1 has only seniorGroup
         const liftTicket = results.find(p => p.productId === seeded.products.liftTicket.id)!;
@@ -105,11 +105,11 @@ describe('Nested toNumberList() bug regression', () => {
           }
         }
 
-        const skiPass = results.find(p => p.productId === seeded.products.skiPass.id)!;
-        const skiPassPrice2 = skiPass.prices.find(
-          p => p.priceId === seeded.productPrices.skiPassPrice2.id
+        const hardback = results.find(p => p.productId === seeded.products.hardback.id)!;
+        const hardbackPrice2 = hardback.prices.find(
+          p => p.priceId === seeded.productPrices.hardbackPrice2.id
         )!;
-        expect(skiPassPrice2.capacityGroupIds).toEqual([seeded.capacityGroups.adultGroup.id]);
+        expect(hardbackPrice2.capacityGroupIds).toEqual([seeded.capacityGroups.adultGroup.id]);
       }, { collectionStrategy: 'cte' });
     });
 
@@ -119,12 +119,12 @@ describe('Nested toNumberList() bug regression', () => {
 
         const results = await queryProductsWithSiblingAndNestedNumberList(db);
 
-        // skiPass prices: price1 → [adult, child], price2 → [adult]
-        const skiPass = results.find(p => p.productId === seeded.products.skiPass.id)!;
-        expect(skiPass.prices.length).toBe(2);
+        // hardback prices: price1 → [adult, child], price2 → [adult]
+        const hardback = results.find(p => p.productId === seeded.products.hardback.id)!;
+        expect(hardback.prices.length).toBe(2);
 
-        const price1 = skiPass.prices.find(p => p.priceId === seeded.productPrices.skiPassPrice1.id)!;
-        const price2 = skiPass.prices.find(p => p.priceId === seeded.productPrices.skiPassPrice2.id)!;
+        const price1 = hardback.prices.find(p => p.priceId === seeded.productPrices.hardbackPrice1.id)!;
+        const price2 = hardback.prices.find(p => p.priceId === seeded.productPrices.hardbackPrice2.id)!;
         expect([...price1.capacityGroupIds].sort()).toEqual(
           [seeded.capacityGroups.adultGroup.id, seeded.capacityGroups.childGroup.id].sort()
         );
@@ -159,13 +159,13 @@ describe('Nested toNumberList() bug regression', () => {
           }
         }
 
-        const skiPass = results.find(p => p.productId === seeded.products.skiPass.id)!;
-        const skiPassPrice1 = skiPass.prices.find(
-          p => p.priceId === seeded.productPrices.skiPassPrice1.id
+        const hardback = results.find(p => p.productId === seeded.products.hardback.id)!;
+        const hardbackPrice1 = hardback.prices.find(
+          p => p.priceId === seeded.productPrices.hardbackPrice1.id
         )!;
-        expect(skiPassPrice1.capacityGroupIds.length).toBe(2);
-        expect(skiPassPrice1.capacityGroupIds).toContain(seeded.capacityGroups.adultGroup.id);
-        expect(skiPassPrice1.capacityGroupIds).toContain(seeded.capacityGroups.childGroup.id);
+        expect(hardbackPrice1.capacityGroupIds.length).toBe(2);
+        expect(hardbackPrice1.capacityGroupIds).toContain(seeded.capacityGroups.adultGroup.id);
+        expect(hardbackPrice1.capacityGroupIds).toContain(seeded.capacityGroups.childGroup.id);
       }, { collectionStrategy: 'lateral' });
     });
 
@@ -316,8 +316,8 @@ describe('Nested toNumberList() bug regression', () => {
         expect(cartAResult.items.length).toBe(2);
         expect(cartAResult.appliedCodes.length).toBe(2);
 
-        // codeA (SUMMER10) covers skiPass + liftTicket (2 products)
-        // codeB (WINTER20) covers skiPass (1 product)
+        // codeA (SUMMER10) covers hardback + liftTicket (2 products)
+        // codeB (WINTER20) covers hardback (1 product)
         const summerCode = cartAResult.appliedCodes.find(
           c => c.discountCodeId === seeded.discountCodes.codeA.id
         )!;

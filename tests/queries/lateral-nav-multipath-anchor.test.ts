@@ -1,36 +1,36 @@
 /**
- * Repro test for QA_AT-399 (linkgress-orm side):
+ * Repro test:
  *   A nested collection projection (`parent.children.select(...).toList()`) that navigates
  *   MORE THAN ONE HOP away from the collection root, on a root that ALSO carries a competing
  *   one-hop FK to the very same target table, resolved its deepest joins against the WRONG
  *   anchor and silently returned another row's data.
  *
- *   Shape (mirrors gopass-eshop `order_item`):
+ *   Shape:
  *
- *     order_item -> product_price -> product -> resort      (the path the projection asks for)
- *     order_item -> product                                 (competing one-hop FK, `cashback_product_id`)
+ *     loan -> edition -> book -> category   (the path the projection asks for)
+ *     loan -> book                          (competing one-hop FK, `featured_book_id`)
  *
- *   Projection: `oi.productPrice.product.resort.name`
+ *   Projection: `ln.edition.book.category.name`
  *
  * THE BUG (before the fix):
  *   `CollectionQueryBuilder.resolveNavigationJoins` snapshots `joinedSchemas` ONCE per outer
- *   iteration. `product` is two hops from the collection root, so it is joined mid-iteration and
- *   never lands in that snapshot. The very next alias (`resort`) therefore fails the direct
+ *   iteration. `book` is two hops from the collection root, so it is joined mid-iteration and
+ *   never lands in that snapshot. The very next alias (`category`) therefore fails the direct
  *   relation lookup, falls through to `findNavigationPath` — a name-based BFS over the whole
  *   schema graph that has no knowledge of the projection's actual path — and the BFS reaches
- *   `resort` one hop sooner via `order_item.cashback_product_id -> product`. Emitted SQL:
+ *   `category` one hop sooner via `loan.featured_book_id -> book`. Emitted SQL:
  *
- *     LEFT JOIN "products" "cashbackProduct" ON "lateral_0_orderItems"."cashback_product_id" = ...
- *     LEFT JOIN "resorts"  "resort"          ON "cashbackProduct"."resort_id" = "resort"."id"   <-- WRONG
+ *     LEFT JOIN "books"      "featuredBook" ON "lateral_0_loans"."featured_book_id" = ...
+ *     LEFT JOIN "categories" "category"     ON "featuredBook"."category_id" = "category"."id"   <-- WRONG
  *
- *   Consumer symptom: every order line on the customer's order detail rendered the resort of its
- *   *cashback* product instead of the resort of the product actually purchased.
+ *   Consumer symptom: every line on a loan listing rendered the category of its
+ *   *featured* book instead of the category of the book actually borrowed.
  *
  * THE FIX:
  *   Run the direct-relation lookups to a FIXPOINT (keeping `joinedSchemas` current as joins are
  *   added) BEFORE any BFS fallback, so a two-hop parent can anchor its own children. Emitted SQL
- *   becomes `LEFT JOIN "resorts" "resort" ON "product"."resort_id" = "resort"."id"` and the
- *   `cashbackProduct` join disappears entirely (nothing in the projection asked for it).
+ *   becomes `LEFT JOIN "categories" "category" ON "book"."category_id" = "category"."id"` and the
+ *   `featuredBook` join disappears entirely (nothing in the projection asked for it).
  *
  * These tests MUST FAIL before the fix and PASS after.
  */
@@ -49,157 +49,157 @@ import {
 } from '../../src';
 
 // ---------------------------------------------------------------------------
-// Schema: order -> order_item -> product_price -> product -> {resort, product_type}
-// plus the competing one-hop order_item.cashback_product_id -> product
+// Schema: member -> loan -> edition -> book -> {category, format}
+// plus the competing one-hop loan.featured_book_id -> book
 // ---------------------------------------------------------------------------
 
-class NmaResort extends DbEntity {
+class NmaCategory extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
 }
 
-class NmaProductType extends DbEntity {
+class NmaFormat extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
 }
 
-class NmaProduct extends DbEntity {
+class NmaBook extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
-  resortId!: DbColumn<number>;
-  productTypeId!: DbColumn<number>;
+  categoryId!: DbColumn<number>;
+  formatId!: DbColumn<number>;
 
-  resort?: NmaResort;
-  productType?: NmaProductType;
+  category?: NmaCategory;
+  format?: NmaFormat;
 }
 
-class NmaProductPrice extends DbEntity {
+class NmaEdition extends DbEntity {
   id!: DbColumn<number>;
-  productId!: DbColumn<number>;
+  bookId!: DbColumn<number>;
   uuid!: DbColumn<string>;
 
-  product?: NmaProduct;
+  book?: NmaBook;
 }
 
-class NmaOrder extends DbEntity {
+class NmaMember extends DbEntity {
   id!: DbColumn<number>;
   code!: DbColumn<string>;
 
-  orderItems?: NmaOrderItem[];
+  loans?: NmaLoan[];
 }
 
-class NmaOrderItem extends DbEntity {
+class NmaLoan extends DbEntity {
   id!: DbColumn<number>;
-  orderId!: DbColumn<number>;
-  productPriceId!: DbColumn<number>;
+  memberId!: DbColumn<number>;
+  editionId!: DbColumn<number>;
   // Nullable in the DB (no .isRequired() on the property config) — the competing FK
-  cashbackProductId!: DbColumn<number | null>;
+  featuredBookId!: DbColumn<number | null>;
   title!: DbColumn<string>;
 
-  order?: NmaOrder;
-  productPrice?: NmaProductPrice;
-  cashbackProduct?: NmaProduct;
+  member?: NmaMember;
+  edition?: NmaEdition;
+  featuredBook?: NmaBook;
 }
 
 class NmaDatabase extends DbContext {
-  get nmaResorts(): DbEntityTable<NmaResort> {
-    return this.table(NmaResort);
+  get nmaCategories(): DbEntityTable<NmaCategory> {
+    return this.table(NmaCategory);
   }
 
-  get nmaProductTypes(): DbEntityTable<NmaProductType> {
-    return this.table(NmaProductType);
+  get nmaFormats(): DbEntityTable<NmaFormat> {
+    return this.table(NmaFormat);
   }
 
-  get nmaProducts(): DbEntityTable<NmaProduct> {
-    return this.table(NmaProduct);
+  get nmaBooks(): DbEntityTable<NmaBook> {
+    return this.table(NmaBook);
   }
 
-  get nmaProductPrices(): DbEntityTable<NmaProductPrice> {
-    return this.table(NmaProductPrice);
+  get nmaEditions(): DbEntityTable<NmaEdition> {
+    return this.table(NmaEdition);
   }
 
-  get nmaOrders(): DbEntityTable<NmaOrder> {
-    return this.table(NmaOrder);
+  get nmaMembers(): DbEntityTable<NmaMember> {
+    return this.table(NmaMember);
   }
 
-  get nmaOrderItems(): DbEntityTable<NmaOrderItem> {
-    return this.table(NmaOrderItem);
+  get nmaLoans(): DbEntityTable<NmaLoan> {
+    return this.table(NmaLoan);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(NmaResort, entity => {
-      entity.toTable('nma_resorts');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_resorts_id_seq' }));
+    model.entity(NmaCategory, entity => {
+      entity.toTable('nma_categories');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_categories_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
     });
 
-    model.entity(NmaProductType, entity => {
-      entity.toTable('nma_product_types');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_product_types_id_seq' }));
+    model.entity(NmaFormat, entity => {
+      entity.toTable('nma_formats');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_formats_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
     });
 
-    model.entity(NmaProduct, entity => {
-      entity.toTable('nma_products');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_products_id_seq' }));
+    model.entity(NmaBook, entity => {
+      entity.toTable('nma_books');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_books_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
-      entity.property(e => e.resortId).hasType(integer('resort_id')).isRequired();
-      entity.property(e => e.productTypeId).hasType(integer('product_type_id')).isRequired();
+      entity.property(e => e.categoryId).hasType(integer('category_id')).isRequired();
+      entity.property(e => e.formatId).hasType(integer('format_id')).isRequired();
 
-      entity.hasOne(e => e.resort, () => NmaResort)
-        .withForeignKey(p => p.resortId)
+      entity.hasOne(e => e.category, () => NmaCategory)
+        .withForeignKey(p => p.categoryId)
         .withPrincipalKey(r => r.id)
         .onDelete('cascade');
 
-      entity.hasOne(e => e.productType, () => NmaProductType)
-        .withForeignKey(p => p.productTypeId)
+      entity.hasOne(e => e.format, () => NmaFormat)
+        .withForeignKey(p => p.formatId)
         .withPrincipalKey(t => t.id)
         .onDelete('cascade');
     });
 
-    model.entity(NmaProductPrice, entity => {
-      entity.toTable('nma_product_prices');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_product_prices_id_seq' }));
-      entity.property(e => e.productId).hasType(integer('product_id')).isRequired();
+    model.entity(NmaEdition, entity => {
+      entity.toTable('nma_editions');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_editions_id_seq' }));
+      entity.property(e => e.bookId).hasType(integer('book_id')).isRequired();
       entity.property(e => e.uuid).hasType(varchar('uuid', 36)).isRequired();
 
-      entity.hasOne(e => e.product, () => NmaProduct)
-        .withForeignKey(pp => pp.productId)
+      entity.hasOne(e => e.book, () => NmaBook)
+        .withForeignKey(pp => pp.bookId)
         .withPrincipalKey(p => p.id)
         .onDelete('cascade');
     });
 
-    model.entity(NmaOrder, entity => {
-      entity.toTable('nma_orders');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_orders_id_seq' }));
+    model.entity(NmaMember, entity => {
+      entity.toTable('nma_members');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_members_id_seq' }));
       entity.property(e => e.code).hasType(varchar('code', 50)).isRequired();
 
-      entity.hasMany(e => e.orderItems, () => NmaOrderItem)
-        .withForeignKey(oi => oi.orderId)
+      entity.hasMany(e => e.loans, () => NmaLoan)
+        .withForeignKey(ln => ln.memberId)
         .withPrincipalKey(o => o.id);
     });
 
-    model.entity(NmaOrderItem, entity => {
-      entity.toTable('nma_order_items');
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_order_items_id_seq' }));
-      entity.property(e => e.orderId).hasType(integer('order_id')).isRequired();
-      entity.property(e => e.productPriceId).hasType(integer('product_price_id')).isRequired();
-      entity.property(e => e.cashbackProductId).hasType(integer('cashback_product_id'));
+    model.entity(NmaLoan, entity => {
+      entity.toTable('nma_loans');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'nma_loans_id_seq' }));
+      entity.property(e => e.memberId).hasType(integer('member_id')).isRequired();
+      entity.property(e => e.editionId).hasType(integer('edition_id')).isRequired();
+      entity.property(e => e.featuredBookId).hasType(integer('featured_book_id'));
       entity.property(e => e.title).hasType(varchar('title', 200)).isRequired();
 
-      entity.hasOne(e => e.order, () => NmaOrder)
-        .withForeignKey(oi => oi.orderId)
+      entity.hasOne(e => e.member, () => NmaMember)
+        .withForeignKey(ln => ln.memberId)
         .withPrincipalKey(o => o.id)
         .onDelete('cascade');
 
-      entity.hasOne(e => e.productPrice, () => NmaProductPrice)
-        .withForeignKey(oi => oi.productPriceId)
+      entity.hasOne(e => e.edition, () => NmaEdition)
+        .withForeignKey(ln => ln.editionId)
         .withPrincipalKey(pp => pp.id)
         .onDelete('cascade');
 
       // The competing one-hop FK to the SAME table the two-hop path ends on
-      entity.hasOne(e => e.cashbackProduct, () => NmaProduct)
-        .withForeignKey(oi => oi.cashbackProductId)
+      entity.hasOne(e => e.featuredBook, () => NmaBook)
+        .withForeignKey(ln => ln.featuredBookId)
         .withPrincipalKey(p => p.id)
         .onDelete('set null');
     });
@@ -207,63 +207,63 @@ class NmaDatabase extends DbContext {
 }
 
 async function cleanupSchema(client: DatabaseClient): Promise<void> {
-  await client.query('DROP TABLE IF EXISTS nma_order_items CASCADE');
-  await client.query('DROP TABLE IF EXISTS nma_orders CASCADE');
-  await client.query('DROP TABLE IF EXISTS nma_product_prices CASCADE');
-  await client.query('DROP TABLE IF EXISTS nma_products CASCADE');
-  await client.query('DROP TABLE IF EXISTS nma_product_types CASCADE');
-  await client.query('DROP TABLE IF EXISTS nma_resorts CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_loans CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_members CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_editions CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_books CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_formats CASCADE');
+  await client.query('DROP TABLE IF EXISTS nma_categories CASCADE');
 }
 
 interface SeedIds {
-  purchasedResortId: number;
-  cashbackResortId: number;
-  productPriceId: number;
-  purchasedProductId: number;
-  cashbackProductId: number;
-  orderId: number;
+  borrowedCategoryId: number;
+  featuredCategoryId: number;
+  editionId: number;
+  borrowedBookId: number;
+  featuredBookId: number;
+  memberId: number;
 }
 
 async function seed(db: NmaDatabase): Promise<SeedIds> {
-  const [purchasedResort, cashbackResort] = await db.nmaResorts.insertBulk([
-    { name: 'Jasna' },
-    { name: 'Sachticky' },
+  const [borrowedCategory, featuredCategory] = await db.nmaCategories.insertBulk([
+    { name: 'Fiction' },
+    { name: 'Reference' },
   ]).returning();
 
-  const [purchasedType, cashbackType] = await db.nmaProductTypes.insertBulk([
-    { name: 'Skipas' },
-    { name: 'Cashback' },
+  const [borrowedFormat, featuredFormat] = await db.nmaFormats.insertBulk([
+    { name: 'Hardback' },
+    { name: 'Audiobook' },
   ]).returning();
 
-  const [purchasedProduct, cashbackProduct] = await db.nmaProducts.insertBulk([
-    { name: 'Season pass',      resortId: purchasedResort.id, productTypeId: purchasedType.id },
-    { name: 'Cashback product', resortId: cashbackResort.id,  productTypeId: cashbackType.id  },
+  const [borrowedBook, featuredBook] = await db.nmaBooks.insertBulk([
+    { name: 'Borrowed title',      categoryId: borrowedCategory.id, formatId: borrowedFormat.id },
+    { name: 'Featured title', categoryId: featuredCategory.id,  formatId: featuredFormat.id  },
   ]).returning();
 
-  const [productPrice] = await db.nmaProductPrices.insertBulk([
-    { productId: purchasedProduct.id, uuid: 'pp-nma-0001' },
+  const [edition] = await db.nmaEditions.insertBulk([
+    { bookId: borrowedBook.id, uuid: 'ed-nma-0001' },
   ]).returning();
 
-  const [order] = await db.nmaOrders.insertBulk([
+  const [order] = await db.nmaMembers.insertBulk([
     { code: 'NMA-597' },
   ]).returning();
 
-  await db.nmaOrderItems.insertBulk([
+  await db.nmaLoans.insertBulk([
     {
-      orderId: order.id,
-      productPriceId: productPrice.id,
-      cashbackProductId: cashbackProduct.id,
+      memberId: order.id,
+      editionId: edition.id,
+      featuredBookId: featuredBook.id,
       title: 'Line 1',
     },
   ]);
 
   return {
-    purchasedResortId: purchasedResort.id,
-    cashbackResortId: cashbackResort.id,
-    productPriceId: productPrice.id,
-    purchasedProductId: purchasedProduct.id,
-    cashbackProductId: cashbackProduct.id,
-    orderId: order.id,
+    borrowedCategoryId: borrowedCategory.id,
+    featuredCategoryId: featuredCategory.id,
+    editionId: edition.id,
+    borrowedBookId: borrowedBook.id,
+    featuredBookId: featuredBook.id,
+    memberId: order.id,
   };
 }
 
@@ -287,28 +287,28 @@ async function withCapture<T>(
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('QA_AT-399: nested-collection navigation anchors on the projected path, not a same-table sibling FK', () => {
+describe('nested-collection navigation anchors on the projected path, not a same-table sibling FK', () => {
 
   // -----------------------------------------------------------------------
   // PRIMARY DEFECT-PROVING TEST
   // -----------------------------------------------------------------------
-  test('lateral: oi.productPrice.product.resort.name resolves via product, not via cashbackProduct', async () => {
+  test('lateral: ln.edition.book.category.name resolves via book, not via featuredBook', async () => {
     await withCapture('lateral', async (db, captured) => {
       const ids = await seed(db);
 
       // Drop the DDL / INSERT chatter so the assertions below see only the SELECT
       captured.length = 0;
 
-      const results = await db.nmaOrders
+      const results = await db.nmaMembers
         .select(o => ({
           id: o.id,
           code: o.code,
-          items: o.orderItems!.select(oi => ({
-            id: oi.id,
-            productId: oi.productPrice!.productId,
-            resortId: oi.productPrice!.product!.resortId,
-            resortName: oi.productPrice!.product!.resort!.name,
-            productTypeName: oi.productPrice!.product!.productType!.name,
+          items: o.loans!.select(ln => ({
+            id: ln.id,
+            bookId: ln.edition!.bookId,
+            categoryId: ln.edition!.book!.categoryId,
+            categoryName: ln.edition!.book!.category!.name,
+            formatName: ln.edition!.book!.format!.name,
           })).toList(),
         }))
         .toList();
@@ -318,108 +318,108 @@ describe('QA_AT-399: nested-collection navigation anchors on the projected path,
       const items = results[0].items as any[];
       expect(items).toHaveLength(1);
 
-      // Semantic: the purchased product's resort / type, NOT the cashback product's
-      expect(items[0].productId).toBe(ids.purchasedProductId);
-      expect(items[0].resortId).toBe(ids.purchasedResortId);
-      expect(items[0].resortName).toBe('Jasna');
-      expect(items[0].productTypeName).toBe('Skipas');
+      // Semantic: the borrowed book's category / type, NOT the featured book's
+      expect(items[0].bookId).toBe(ids.borrowedBookId);
+      expect(items[0].categoryId).toBe(ids.borrowedCategoryId);
+      expect(items[0].categoryName).toBe('Fiction');
+      expect(items[0].formatName).toBe('Hardback');
 
-      // Structural: the resort / product_type joins must anchor on "product"
+      // Structural: the category / format joins must anchor on "book"
       const sql = captured.join('\n');
-      expect(sql).toContain('"product"."resort_id"');
-      expect(sql).toContain('"product"."product_type_id"');
+      expect(sql).toContain('"book"."category_id"');
+      expect(sql).toContain('"book"."format_id"');
 
-      // ...and the projection never asked for cashbackProduct, so it must not be joined at all
-      expect(sql).not.toContain('"cashbackProduct"');
-      expect(sql).not.toContain('cashback_product_id');
+      // ...and the projection never asked for featuredBook, so it must not be joined at all
+      expect(sql).not.toContain('"featuredBook"');
+      expect(sql).not.toContain('featured_book_id');
     });
   });
 
   // -----------------------------------------------------------------------
   // Same defect via the CTE strategy (shares resolveNavigationJoins)
   // -----------------------------------------------------------------------
-  test('cte: oi.productPrice.product.resort.name resolves via product, not via cashbackProduct', async () => {
+  test('cte: ln.edition.book.category.name resolves via book, not via featuredBook', async () => {
     await withCapture('cte', async (db, captured) => {
       const ids = await seed(db);
 
       captured.length = 0;
 
-      const results = await db.nmaOrders
+      const results = await db.nmaMembers
         .select(o => ({
           id: o.id,
-          items: o.orderItems!.select(oi => ({
-            id: oi.id,
-            resortId: oi.productPrice!.product!.resortId,
-            resortName: oi.productPrice!.product!.resort!.name,
+          items: o.loans!.select(ln => ({
+            id: ln.id,
+            categoryId: ln.edition!.book!.categoryId,
+            categoryName: ln.edition!.book!.category!.name,
           })).toList(),
         }))
         .toList();
 
       const items = results[0].items as any[];
-      expect(items[0].resortId).toBe(ids.purchasedResortId);
-      expect(items[0].resortName).toBe('Jasna');
+      expect(items[0].categoryId).toBe(ids.borrowedCategoryId);
+      expect(items[0].categoryName).toBe('Fiction');
 
       const sql = captured.join('\n');
-      expect(sql).toContain('"product"."resort_id"');
-      expect(sql).not.toContain('"cashbackProduct"');
+      expect(sql).toContain('"book"."category_id"');
+      expect(sql).not.toContain('"featuredBook"');
     });
   });
 
   // -----------------------------------------------------------------------
   // MINIMAL PROJECTION — the hardest shape.
-  // The two tests above co-project `productId` / `resortId`, which puts the
-  // intermediate aliases (`productPrice`, `product`) into `allTableAliases`
+  // The two tests above co-project `bookId` / `categoryId`, which puts the
+  // intermediate aliases (`edition`, `book`) into `allTableAliases`
   // incidentally. Here the projection names ONLY the deep leaf, so the
   // intermediates have to come from the projection's own navigation chain
   // (`__navigationAliases`) — nothing else can supply them.
   // -----------------------------------------------------------------------
-  test('lateral: leaf-only projection (no sibling scalars) still anchors on product', async () => {
+  test('lateral: leaf-only projection (no sibling scalars) still anchors on book', async () => {
     await withCapture('lateral', async (db, captured) => {
       await seed(db);
 
       captured.length = 0;
 
-      const results = await db.nmaOrders
+      const results = await db.nmaMembers
         .select(o => ({
           id: o.id,
-          items: o.orderItems!.select(oi => ({
-            resortName: oi.productPrice!.product!.resort!.name,
+          items: o.loans!.select(ln => ({
+            categoryName: ln.edition!.book!.category!.name,
           })).toList(),
         }))
         .toList();
 
       const items = results[0].items as any[];
       expect(items).toHaveLength(1);
-      expect(items[0].resortName).toBe('Jasna');
+      expect(items[0].categoryName).toBe('Fiction');
 
       const sql = captured.join('\n');
-      expect(sql).toContain('"product"."resort_id"');
-      expect(sql).not.toContain('"cashbackProduct"');
+      expect(sql).toContain('"book"."category_id"');
+      expect(sql).not.toContain('"featuredBook"');
     });
   });
 
-  test('cte: leaf-only projection (no sibling scalars) still anchors on product', async () => {
+  test('cte: leaf-only projection (no sibling scalars) still anchors on book', async () => {
     await withCapture('cte', async (db, captured) => {
       await seed(db);
 
       captured.length = 0;
 
-      const results = await db.nmaOrders
+      const results = await db.nmaMembers
         .select(o => ({
           id: o.id,
-          items: o.orderItems!.select(oi => ({
-            resortName: oi.productPrice!.product!.resort!.name,
+          items: o.loans!.select(ln => ({
+            categoryName: ln.edition!.book!.category!.name,
           })).toList(),
         }))
         .toList();
 
       const items = results[0].items as any[];
       expect(items).toHaveLength(1);
-      expect(items[0].resortName).toBe('Jasna');
+      expect(items[0].categoryName).toBe('Fiction');
 
       const sql = captured.join('\n');
-      expect(sql).toContain('"product"."resort_id"');
-      expect(sql).not.toContain('"cashbackProduct"');
+      expect(sql).toContain('"book"."category_id"');
+      expect(sql).not.toContain('"featuredBook"');
     });
   });
 
@@ -427,54 +427,54 @@ describe('QA_AT-399: nested-collection navigation anchors on the projected path,
   // Counter-test: the one-hop sibling FK must STILL resolve correctly when the
   // projection genuinely asks for it. Guards against "always prefer the long path".
   // -----------------------------------------------------------------------
-  test('lateral: an explicit oi.cashbackProduct.resort.name still resolves via cashbackProduct', async () => {
+  test('lateral: an explicit ln.featuredBook.category.name still resolves via featuredBook', async () => {
     await withCapture('lateral', async (db, captured) => {
       const ids = await seed(db);
 
       captured.length = 0;
 
-      const results = await db.nmaOrders
+      const results = await db.nmaMembers
         .select(o => ({
           id: o.id,
-          items: o.orderItems!.select(oi => ({
-            id: oi.id,
-            cashbackProductId: oi.cashbackProduct!.id,
-            cashbackResortId: oi.cashbackProduct!.resortId,
-            cashbackResortName: oi.cashbackProduct!.resort!.name,
+          items: o.loans!.select(ln => ({
+            id: ln.id,
+            featuredBookId: ln.featuredBook!.id,
+            featuredCategoryId: ln.featuredBook!.categoryId,
+            featuredCategoryName: ln.featuredBook!.category!.name,
           })).toList(),
         }))
         .toList();
 
       const items = results[0].items as any[];
-      expect(items[0].cashbackProductId).toBe(ids.cashbackProductId);
-      expect(items[0].cashbackResortId).toBe(ids.cashbackResortId);
-      expect(items[0].cashbackResortName).toBe('Sachticky');
+      expect(items[0].featuredBookId).toBe(ids.featuredBookId);
+      expect(items[0].featuredCategoryId).toBe(ids.featuredCategoryId);
+      expect(items[0].featuredCategoryName).toBe('Reference');
 
       const sql = captured.join('\n');
-      expect(sql).toContain('"cashbackProduct"."resort_id"');
+      expect(sql).toContain('"featuredBook"."category_id"');
     });
   });
 
   // -----------------------------------------------------------------------
   // Control: the same navigation on a FLAT root query was always correct
-  // (the intermediate `product` join lands before its children are resolved).
+  // (the intermediate `book` join lands before its children are resolved).
   // Regression guard — must pass before AND after the fix.
   // -----------------------------------------------------------------------
-  test('flat root query on order_item resolves the same navigation correctly — regression guard', async () => {
+  test('flat root query on loan resolves the same navigation correctly — regression guard', async () => {
     await withCapture('lateral', async (db) => {
       const ids = await seed(db);
 
-      const rows = await db.nmaOrderItems
-        .select(oi => ({
-          id: oi.id,
-          resortId: oi.productPrice!.product!.resortId,
-          resortName: oi.productPrice!.product!.resort!.name,
+      const rows = await db.nmaLoans
+        .select(ln => ({
+          id: ln.id,
+          categoryId: ln.edition!.book!.categoryId,
+          categoryName: ln.edition!.book!.category!.name,
         }))
         .toList();
 
       expect(rows).toHaveLength(1);
-      expect(rows[0].resortId).toBe(ids.purchasedResortId);
-      expect(rows[0].resortName).toBe('Jasna');
+      expect(rows[0].categoryId).toBe(ids.borrowedCategoryId);
+      expect(rows[0].categoryName).toBe('Fiction');
     });
   });
 });

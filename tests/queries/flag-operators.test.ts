@@ -284,7 +284,7 @@ describe('Flag Operators', () => {
 // the runtime form do not match; that mismatch cost a production query 13× in
 // plan quality before it was caught).
 describe('Flag Operators — typed mask (column-width casts)', () => {
-  class WidthResort extends DbEntity {
+  class WidthCategory extends DbEntity {
     id!: DbColumn<number>;
     name!: DbColumn<string>;
     mode!: DbColumn<number>;
@@ -294,13 +294,13 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
 
   class WidthProduct extends DbEntity {
     id!: DbColumn<number>;
-    resortId!: DbColumn<number>;
-    resort!: WidthResort;
+    categoryId!: DbColumn<number>;
+    category!: WidthCategory;
   }
 
   class WidthTestDatabase extends DbContext {
-    get widthResorts(): DbEntityTable<WidthResort> {
-      return this.table(WidthResort);
+    get widthCategories(): DbEntityTable<WidthCategory> {
+      return this.table(WidthCategory);
     }
 
     get widthProducts(): DbEntityTable<WidthProduct> {
@@ -308,9 +308,9 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
     }
 
     protected override setupModel(model: DbModelConfig): void {
-      model.entity(WidthResort, entity => {
-        entity.toTable('flag_width_resort_test');
-        entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_width_resort_test_id_seq' }));
+      model.entity(WidthCategory, entity => {
+        entity.toTable('flag_width_category_test');
+        entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_width_category_test_id_seq' }));
         entity.property(e => e.name).hasType(varchar('name', 100)).isRequired();
         entity.property(e => e.mode).hasType(smallint('mode').default(0));
         entity.property(e => e.flags).hasType(integer('flags').default(0));
@@ -320,8 +320,8 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
       model.entity(WidthProduct, entity => {
         entity.toTable('flag_width_product_test');
         entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'flag_width_product_test_id_seq' }));
-        entity.property(e => e.resortId).hasType(integer('resort_id'));
-        entity.hasOne(e => e.resort, () => WidthResort).withForeignKey(e => e.resortId).withPrincipalKey(e => e.id);
+        entity.property(e => e.categoryId).hasType(integer('category_id'));
+        entity.hasOne(e => e.category, () => WidthCategory).withForeignKey(e => e.categoryId).withPrincipalKey(e => e.id);
       });
     }
   }
@@ -335,13 +335,13 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
     const db2 = new WidthTestDatabase(client);
 
     try {
-      expect(emittedSql(db2.widthResorts.where(r => flagHasNone(r.mode, 1)).select(r => ({ id: r.id }))))
+      expect(emittedSql(db2.widthCategories.where(r => flagHasNone(r.mode, 1)).select(r => ({ id: r.id }))))
         .toContain('& $1::smallint) = 0');
-      expect(emittedSql(db2.widthResorts.where(r => flagHas(r.mode, 1)).select(r => ({ id: r.id }))))
+      expect(emittedSql(db2.widthCategories.where(r => flagHas(r.mode, 1)).select(r => ({ id: r.id }))))
         .toContain('& $1::smallint) != 0');
-      expect(emittedSql(db2.widthResorts.where(r => flagHasAny(r.mode, 3)).select(r => ({ id: r.id }))))
+      expect(emittedSql(db2.widthCategories.where(r => flagHasAny(r.mode, 3)).select(r => ({ id: r.id }))))
         .toContain('& $1::smallint) != 0');
-      expect(emittedSql(db2.widthResorts.where(r => flagHasAll(r.mode, 3)).select(r => ({ id: r.id }))))
+      expect(emittedSql(db2.widthCategories.where(r => flagHasAll(r.mode, 3)).select(r => ({ id: r.id }))))
         .toContain('& $1::smallint) = $2::smallint');
     } finally {
       await db2.dispose();
@@ -354,7 +354,7 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
     const db2 = new WidthTestDatabase(client);
 
     try {
-      const sql = emittedSql(db2.widthResorts.where(r => flagHasNone(r.flags, 1)).select(r => ({ id: r.id })));
+      const sql = emittedSql(db2.widthCategories.where(r => flagHasNone(r.flags, 1)).select(r => ({ id: r.id })));
       expect(sql).toContain('& $1) = 0');
       expect(sql).not.toContain('::smallint');
       expect(sql).not.toContain('::bigint');
@@ -369,7 +369,7 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
     const db2 = new WidthTestDatabase(client);
 
     try {
-      expect(emittedSql(db2.widthResorts.where(r => flagHasNone(r.bigFlags, 1)).select(r => ({ id: r.id }))))
+      expect(emittedSql(db2.widthCategories.where(r => flagHasNone(r.bigFlags, 1)).select(r => ({ id: r.id }))))
         .toContain('& $1::bigint) = 0');
     } finally {
       await db2.dispose();
@@ -382,7 +382,7 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
     const db2 = new WidthTestDatabase(client);
 
     try {
-      const sql = emittedSql(db2.widthProducts.where(p => flagHasNone(p.resort.mode, 1)).select(p => ({ id: p.id })));
+      const sql = emittedSql(db2.widthProducts.where(p => flagHasNone(p.category.mode, 1)).select(p => ({ id: p.id })));
       expect(sql).toContain('"mode" & $1::smallint) = 0');
     } finally {
       await db2.dispose();
@@ -396,22 +396,22 @@ describe('Flag Operators — typed mask (column-width casts)', () => {
 
     try {
       await client.query('DROP TABLE IF EXISTS flag_width_product_test CASCADE');
-      await client.query('DROP TABLE IF EXISTS flag_width_resort_test CASCADE');
+      await client.query('DROP TABLE IF EXISTS flag_width_category_test CASCADE');
       await db2.getSchemaManager().ensureCreated();
 
-      await db2.widthResorts.insert({ name: 'both', mode: 1, flags: 1, bigFlags: 1 } as never);
-      await db2.widthResorts.insert({ name: 'none', mode: 4, flags: 4, bigFlags: 4 } as never);
+      await db2.widthCategories.insert({ name: 'both', mode: 1, flags: 1, bigFlags: 1 } as never);
+      await db2.widthCategories.insert({ name: 'none', mode: 4, flags: 4, bigFlags: 4 } as never);
 
-      const bySmall = await db2.widthResorts.where(r => flagHas(r.mode, 1)).select(r => ({ name: r.name })).toList();
-      const byInt = await db2.widthResorts.where(r => flagHasNone(r.flags, 1)).select(r => ({ name: r.name })).toList();
-      const byBig = await db2.widthResorts.where(r => flagHasAll(r.bigFlags, 1)).select(r => ({ name: r.name })).toList();
+      const bySmall = await db2.widthCategories.where(r => flagHas(r.mode, 1)).select(r => ({ name: r.name })).toList();
+      const byInt = await db2.widthCategories.where(r => flagHasNone(r.flags, 1)).select(r => ({ name: r.name })).toList();
+      const byBig = await db2.widthCategories.where(r => flagHasAll(r.bigFlags, 1)).select(r => ({ name: r.name })).toList();
 
       expect(bySmall.map(r => r.name)).toEqual(['both']);
       expect(byInt.map(r => r.name)).toEqual(['none']);
       expect(byBig.map(r => r.name)).toEqual(['both']);
     } finally {
       await client.query('DROP TABLE IF EXISTS flag_width_product_test CASCADE');
-      await client.query('DROP TABLE IF EXISTS flag_width_resort_test CASCADE');
+      await client.query('DROP TABLE IF EXISTS flag_width_category_test CASCADE');
       await db2.dispose();
     }
   });

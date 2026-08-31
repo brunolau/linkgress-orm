@@ -3,7 +3,7 @@ import { createCustomType, TypeMapper } from '../../src';
 /**
  * Timestamp column whose DRIVER value is the raw text-protocol string
  * ('YYYY-MM-DD HH:MM:SS[.ffffff]', parser passthrough) and whose application
- * value is the ISO 'T' form. Mirrors gopass-eshop's `pgTimestamp` extension
+ * value is the ISO 'T' form. Mirrors a Temporal-based `pgTimestamp` extension
  * (string → Temporal.PlainDateTime): a custom mapper on a DECLARED-timestamp
  * column doing string surgery on the driver text. `fromDriver` tolerates a
  * Date so contexts with default (Date-parsing) drivers remain unaffected.

@@ -98,8 +98,8 @@ interface MutationLeg {
  * @example
  * const batch = new MutationBatch();
  * batch.addBulkUpdate(db.orderItems, itemUpdates, 'items');
- * batch.addInsertBulk(db.cfOrderItemDdValues, ddRows, 'dd');
- * batch.addInsertBulk(db.orderItemAttributes, attrRows, 'attrs');
+ * batch.addInsertBulk(db.itemOptionValues, optionRows, 'options');
+ * batch.addInsertBulk(db.itemAttributes, attrRows, 'attrs');
  * await batch.executeBatch();            // ONE round trip (no-op when all legs were empty)
  * batch.getAffectedCount('items');       // rows the update leg matched
  */

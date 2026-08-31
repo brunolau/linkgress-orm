@@ -8,7 +8,7 @@ import { eq, sql } from '../../src';
  * (`pc.post`, `pc.order`) AND ALSO project a collection from that target
  * (`pc.post!.user!.posts.toList()`).
  *
- * This is the shape the GOBO-240 eshop refactor needs: each friend-side
+ * This is the shape a social-graph refactor needs: each friend-side
  * UNION leg sources from `db.userRelations` and projects fields + a `cards`
  * collection through `r.slave` / `r.parent`. The fix in Phase B + C enables
  * collection navigation in UNION legs in general; this test pins down the
@@ -57,7 +57,7 @@ describe('UNION ALL — navigation through intermediary table to a collection', 
       await seedTestData(db);
 
       // Walk: postComments → post (one) → user (one) → posts (many).
-      // This is the closest analogue to GOBO-240's userRelations → slave (one)
+      // This is the closest analogue to a userRelations → slave (one)
       // → cards (many) — an intermediary table whose nav target carries a
       // collection. We project the author's full posts list per comment.
       const left = db.postComments

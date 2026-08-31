@@ -9,7 +9,7 @@ import { gt } from '../../src';
  * that occurred when accessing collections through deep navigation chains.
  *
  * Example pattern that was failing:
- * orderItem.productPrice.product.resort.productIntegrationDefinitions
+ * loan.edition.book.category.formats
  *
  * The fix ensures:
  * - CTE strategy: Uses only selectorNavigationJoins (joins within the collection's selector)

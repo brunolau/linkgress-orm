@@ -266,19 +266,19 @@ abstract class BaseNavigationBuilder<TEntity extends DbEntity, TTarget extends D
    * from both sides but the FK only exists on one side.
    *
    * @example
-   * // UserEshopVerification has the FK to UserEshop
-   * model.entity(UserEshopVerification, entity => {
-   *   entity.hasOne(e => e.userEshop, () => UserEshop)
-   *     .withForeignKey(e => e.userEshopId)
+   * // MemberVerification has the FK to Member
+   * model.entity(MemberVerification, entity => {
+   *   entity.hasOne(e => e.member, () => Member)
+   *     .withForeignKey(e => e.memberId)
    *     .withPrincipalKey(e => e.id)
    *     .onDelete('cascade');
    * });
    *
-   * // UserEshop has inverse navigation (no FK created)
-   * model.entity(UserEshop, entity => {
-   *   entity.hasOne(e => e.userEshopVerification, () => UserEshopVerification)
+   * // Member has inverse navigation (no FK created)
+   * model.entity(Member, entity => {
+   *   entity.hasOne(e => e.memberVerification, () => MemberVerification)
    *     .withForeignKey(e => e.id)
-   *     .withPrincipalKey(e => e.userEshopId)
+   *     .withPrincipalKey(e => e.memberId)
    *     .isInverseNavigation();  // <-- No FK constraint created
    * });
    */
@@ -537,7 +537,7 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
    *
    * @example
    * // Univariate expression statistics (planner selectivity for a bitmask test):
-   * entity.hasStatistics('stx_resort_admin_visible_flags')
+   * entity.hasStatistics('stx_category_admin_visible_flags')
    *   .withExpression('("flags" & 1::smallint)');
    *
    * // Multivariate dependencies between two columns:

@@ -65,7 +65,7 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
    * like `__LIT:true`). Falls back to the legacy single-column form when the
    * navigation metadata doesn't carry the array form.
    *
-   * This is the load-bearing helper for the QA_GO-429 Bug D fix: navigation
+   * This is the load-bearing helper for the constant-FK projection fix: navigation
    * properties may declare additional literal predicates beyond the column
    * equality (e.g. `withForeignKey: [col, isCurrent], withPrincipalKey: [id, true]`)
    * that must fire on every projection. Without this helper, the strategy

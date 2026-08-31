@@ -4,8 +4,8 @@ import { expectToReject } from '../utils/expect-rejects';
 import { DbCteBuilder, and, eq, gt, sql } from '../../src';
 
 /**
- * Two CTE-visibility gaps, both surfaced by the gopass-eshop Discount Centre
- * badge (QA_AT-533), where the security-critical visibility gate had to be
+ * Two CTE-visibility gaps, both surfaced by a discount-badge read
+ * where the security-critical visibility gate had to be
  * evaluated ONCE behind a MATERIALIZED fence and then read by both legs of a
  * `unionAll(...).count()`:
  *

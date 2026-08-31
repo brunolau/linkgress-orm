@@ -1,5 +1,5 @@
 /**
- * Repro test for QA_GO-429 Bug D (linkgress-orm side):
+ * Repro test for the constant-FK projection bug:
  *   Navigation properties may declare CONSTANT FK predicates by extending the
  *   `withForeignKey` / `withPrincipalKey` arrays beyond the actual column
  *   equality. Example (from a real consumer codebase):

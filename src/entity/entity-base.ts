@@ -149,7 +149,7 @@ export function ixUnaccent<T>(ref: T): T {
  *
  * @example
  * // unique normalized lookup (btree)
- * entity.hasIndex('user_admin_query', e => [ixNormalized(e.email), e.hash]).isUnique();
+ * entity.hasIndex('member_login_query', e => [ixNormalized(e.email), e.hash]).isUnique();
  *
  * // fuzzy substring search (trigram GIN)
  * entity.hasIndex('user_name_search', e => [ixNormalized(e.username, { gin: true })]);

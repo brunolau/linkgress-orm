@@ -1466,7 +1466,21 @@ class JsonbArraySomeCondition extends WhereConditionBase {
     }
 
     const whereSql = this.innerCondition.buildSql(context);
-    return `EXISTS (SELECT 1 FROM jsonb_array_elements(${fieldSql}) AS __elem WHERE ${whereSql})`;
+
+    // `jsonb_array_elements` is strict about its input: an object raises
+    // "cannot extract elements from an object", a scalar "…from a scalar".
+    // JSONB columns are schema-less, so a single row holding `{}` or `"x"` —
+    // from a migration, a hand-fix, or a double-encoded write — would abort the
+    // whole statement instead of simply not matching. Feeding the function
+    // through CASE keeps it looking at an array on every row; non-arrays
+    // collapse to `[]` and contribute no elements, which is the same answer
+    // SQL NULL already produced. CASE is one of the constructs PostgreSQL
+    // guarantees to evaluate branch-wise, so the ELSE arm genuinely shields
+    // the call rather than relying on AND short-circuiting, which the planner
+    // is free to reorder.
+    const elementsSql = `CASE WHEN jsonb_typeof(${fieldSql}) = 'array' THEN ${fieldSql} ELSE '[]'::jsonb END`;
+
+    return `EXISTS (SELECT 1 FROM jsonb_array_elements(${elementsSql}) AS __elem WHERE ${whereSql})`;
   }
 }
 
@@ -1478,19 +1492,26 @@ class JsonbArraySomeCondition extends WhereConditionBase {
  * a JSONB path expression (using ->> for text extraction). Use standard
  * condition functions (eq, ne, like, isNotNull, etc.) on the proxy properties.
  *
+ * Rows whose column does not actually hold a JSON array (an object, a scalar,
+ * or SQL NULL) simply do not match — they never raise. See the emitted SQL
+ * below: the element source is guarded, because `jsonb_array_elements` would
+ * otherwise abort the entire statement on the first such row.
+ *
  * @example
  * ```typescript
- * // Check if integrationConfig array has an element with type 'VILLAPRO' and a token
- * db.products.where(p =>
- *   jsonbArraySome<IntegrationConfig>(p.integrationConfig, c =>
+ * // Shelves carrying a 'fiction' tag that also records a reference
+ * db.shelves.where(s =>
+ *   jsonbArraySome<ShelfTag>(s.tags, t =>
  *     and(
- *       eq(c.type, IntegrationType.VILLAPRO),
- *       isNotNull(c.config.villaproSystToken)
+ *       eq(t.kind, 'fiction'),
+ *       isNotNull(t.meta.ref)
  *     )
  *   )
  * )
- * // → WHERE EXISTS (SELECT 1 FROM jsonb_array_elements("product"."integration_config") AS __elem
- * //     WHERE (__elem->>'type' = $1 AND __elem->'config'->>'villaproSystToken' IS NOT NULL))
+ * // → WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(
+ * //       CASE WHEN jsonb_typeof("shelf"."tags") = 'array' THEN "shelf"."tags" ELSE '[]'::jsonb END
+ * //     ) AS __elem
+ * //     WHERE (__elem->>'kind' = $1 AND __elem->'meta'->>'ref' IS NOT NULL))
  * ```
  */
 export function jsonbArraySome<T>(
@@ -1508,8 +1529,9 @@ export function jsonbArraySome<T>(
  *
  * @example
  * ```typescript
- * jsonbArraySome<IntegrationConfig>(p.integrationConfig, c =>
- *   eq(c.type, jsonbConditionUnwrap(IntegrationType.VILLAPRO))
+ * // ShelfKind.Fiction is a numeric enum member; ->> yields text, so unwrap it
+ * jsonbArraySome<ShelfTag>(s.tags, t =>
+ *   eq(t.kind, jsonbConditionUnwrap(ShelfKind.Fiction))
  * )
  * ```
  */

@@ -200,10 +200,10 @@ describe('selectMany() with aggregations', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      expect(skiPass?.hasCapacityGroups).toBe(true);
+      expect(hardback?.hasCapacityGroups).toBe(true);
       expect(liftTicket?.hasCapacityGroups).toBe(true);
     });
   });
@@ -221,11 +221,11 @@ describe('selectMany() with aggregations', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      // Ski Pass: price1 has Adult+Child, price2 has Adult = 3 total
-      expect(skiPass?.capacityGroupCount).toBe(3);
+      // Hardback: price1 has Adult+Child, price2 has Adult = 3 total
+      expect(hardback?.capacityGroupCount).toBe(3);
       // Lift Ticket: price1 has Senior = 1 total
       expect(liftTicket?.capacityGroupCount).toBe(1);
     });
@@ -251,13 +251,13 @@ describe('selectMany() with select/toList', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      // Ski Pass: 3 capacity group links (Adult, Child, Adult)
-      expect(Array.isArray(skiPass?.capacityGroupLinks)).toBe(true);
-      expect(skiPass?.capacityGroupLinks).toHaveLength(3);
-      expect(skiPass?.capacityGroupLinks.every((item: any) => typeof item.id === 'number')).toBe(true);
+      // Hardback: 3 capacity group links (Adult, Child, Adult)
+      expect(Array.isArray(hardback?.capacityGroupLinks)).toBe(true);
+      expect(hardback?.capacityGroupLinks).toHaveLength(3);
+      expect(hardback?.capacityGroupLinks.every((item: any) => typeof item.id === 'number')).toBe(true);
 
       // Lift Ticket: 1 capacity group link (Senior)
       expect(liftTicket?.capacityGroupLinks).toHaveLength(1);
@@ -283,11 +283,11 @@ describe('selectMany() with select/toList', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
-      expect(skiPass?.links).toHaveLength(3);
+      const hardback = result.find(r => r.name === 'Hardback');
+      expect(hardback?.links).toHaveLength(3);
 
       // Each item should have both priceId and groupId
-      for (const link of skiPass?.links || []) {
+      for (const link of hardback?.links || []) {
         expect(typeof link.priceId).toBe('number');
         expect(typeof link.groupId).toBe('number');
       }
@@ -309,11 +309,11 @@ describe('selectMany() with select/toList', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
-      expect(skiPass?.capacityGroupLinks).toHaveLength(3);
+      const hardback = result.find(r => r.name === 'Hardback');
+      expect(hardback?.capacityGroupLinks).toHaveLength(3);
 
       // Full entities should have productPriceId and capacityGroupId
-      for (const link of skiPass?.capacityGroupLinks || []) {
+      for (const link of hardback?.capacityGroupLinks || []) {
         expect(link.productPriceId).toBeDefined();
         expect(link.capacityGroupId).toBeDefined();
       }
@@ -339,11 +339,11 @@ describe('selectMany() with where filter', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      // Ski Pass has Adult group (price1 + price2), Lift Ticket only has Senior
-      expect(skiPass?.hasAdultGroup).toBe(true);
+      // Hardback has Adult group (price1 + price2), Lift Ticket only has Senior
+      expect(hardback?.hasAdultGroup).toBe(true);
       expect(liftTicket?.hasAdultGroup).toBe(false);
     });
   });
@@ -364,11 +364,11 @@ describe('selectMany() with where filter', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      // Ski Pass: price1 has Adult, price2 has Adult = 2 adult links
-      expect(skiPass?.adultGroupCount).toBe(2);
+      // Hardback: price1 has Adult, price2 has Adult = 2 adult links
+      expect(hardback?.adultGroupCount).toBe(2);
       // Lift Ticket: no adult groups
       expect(liftTicket?.adultGroupCount).toBe(0);
     });
@@ -392,14 +392,14 @@ describe('selectMany() combined with other collection operations', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
+      const hardback = result.find(r => r.name === 'Hardback');
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
 
-      // Ski Pass: 2 prices, 3 capacity group links
-      expect(skiPass?.hasPrices).toBe(true);
-      expect(skiPass?.hasCapacityGroups).toBe(true);
-      expect(skiPass?.priceCount).toBe(2);
-      expect(skiPass?.capacityGroupCount).toBe(3);
+      // Hardback: 2 prices, 3 capacity group links
+      expect(hardback?.hasPrices).toBe(true);
+      expect(hardback?.hasCapacityGroups).toBe(true);
+      expect(hardback?.priceCount).toBe(2);
+      expect(hardback?.capacityGroupCount).toBe(3);
 
       // Lift Ticket: 1 price, 1 capacity group link
       expect(liftTicket?.hasPrices).toBe(true);
@@ -428,11 +428,11 @@ describe('selectMany() combined with other collection operations', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
-      expect(skiPass?.capacityGroups).toHaveLength(3);
+      const hardback = result.find(r => r.name === 'Hardback');
+      expect(hardback?.capacityGroups).toHaveLength(3);
 
       // Should contain Adult (x2) and Child (x1)
-      const groupNames = skiPass?.capacityGroups.map((g: any) => g.groupName).sort();
+      const groupNames = hardback?.capacityGroups.map((g: any) => g.groupName).sort();
       expect(groupNames).toEqual(['Adult', 'Adult', 'Child']);
 
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
@@ -445,7 +445,7 @@ describe('selectMany() combined with other collection operations', () => {
     await withDatabase(async (db) => {
       await seedTestData(db);
 
-      // Get distinct capacity group IDs per product (Ski Pass has Adult twice)
+      // Get distinct capacity group IDs per product (Hardback has Adult twice)
       const result = await db.products
         .select(p => ({
           name: p.name,
@@ -458,9 +458,9 @@ describe('selectMany() combined with other collection operations', () => {
 
       expect(result.length).toBe(2);
 
-      const skiPass = result.find(r => r.name === 'Ski Pass');
-      // Ski Pass has Adult (x2) + Child = 2 distinct group IDs
-      expect(skiPass?.distinctGroupIds).toHaveLength(2);
+      const hardback = result.find(r => r.name === 'Hardback');
+      // Hardback has Adult (x2) + Child = 2 distinct group IDs
+      expect(hardback?.distinctGroupIds).toHaveLength(2);
 
       const liftTicket = result.find(r => r.name === 'Lift Ticket');
       // Lift Ticket has only Senior = 1 distinct group ID

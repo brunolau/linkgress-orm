@@ -13,7 +13,7 @@ export class Post extends DbEntity {
   views!: DbColumn<number>;
   publishTime!: DbColumn<HourMinute>;
   customDate?: DbColumn<Date>; // Integer-based custom datetime
-  stringStampedAt?: DbColumn<string>; // Declared-timestamp column with a string-surgery mapper (gopass pgTimestamp shape)
+  stringStampedAt?: DbColumn<string>; // Declared-timestamp column with a string-surgery mapper (Temporal-style timestamp extension shape)
   category!: DbColumn<'tech' | 'lifestyle' | 'business' | 'entertainment'>;
 
   // Navigation properties

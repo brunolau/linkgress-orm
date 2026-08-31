@@ -59,7 +59,7 @@ export class CteCollectionStrategy implements ICollectionStrategy {
    *
    * Without this, the CTE strategy groups every target row by FK column with no
    * filtering, leaking historical / closed SCD2 rows into the projected
-   * collection — the exact QA_GO-429 Bug D symptom.
+   * collection — the exact constant-FK projection symptom.
    *
    * @param config              The aggregation config (carries `foreignKeys`/`matches`).
    * @param targetTable         Alias of the target table inside the CTE's inner SELECT.

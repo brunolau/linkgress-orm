@@ -7,8 +7,8 @@ import { eq, gt, inSubquery, isNull } from '../../src';
  *
  * Unlike innerJoin/leftJoin they take no selector: the entity/selection shape
  * is preserved, so scope-style predicates can hop across an N:1 FK inside ONE
- * query level (the gopass partner-scope shape: order_item ⋈
- * invoicing_partner_data ON fk AND partner IN (...)) and the builder stays
+ * query level (a partner-scope shape: loan ⋈
+ * borrower_data ON fk AND partner IN (...)) and the builder stays
  * composable (where/orderBy/limit/count/asSubquery).
  */
 describe('joinFilter / leftJoinFilter', () => {
@@ -98,7 +98,7 @@ describe('joinFilter / leftJoinFilter', () => {
 		});
 	});
 
-	test('filter-joined query composes as a standalone subquery (gopass scope-filter shape)', async () => {
+	test('filter-joined query composes as a standalone subquery (scope-filter shape)', async () => {
 		await withDatabase(async (db) => {
 			await seedTestData(db);
 

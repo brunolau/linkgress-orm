@@ -25,7 +25,7 @@ class BtreeNormDb extends DbContext {
   protected override setupModel(model: DbModelConfig): void {
     model.entity(NormUser, entity => {
       defineColumns(entity, 'users_norm_btree');
-      entity.hasIndex('user_admin_query', e => [ixNormalized(e.email), e.hash]).isUnique();
+      entity.hasIndex('member_login_query', e => [ixNormalized(e.email), e.hash]).isUnique();
     });
   }
 }
@@ -95,7 +95,7 @@ describe('ixNormalized / search_normalize support', () => {
 
       const indexResult = await client.query(`
         SELECT indexdef FROM pg_indexes
-        WHERE tablename = 'users_norm_btree' AND indexname = 'user_admin_query'
+        WHERE tablename = 'users_norm_btree' AND indexname = 'member_login_query'
       `);
       expect(indexResult.rows).toHaveLength(1);
       const def: string = indexResult.rows[0].indexdef;
@@ -133,7 +133,7 @@ describe('ixNormalized / search_normalize support', () => {
         ['JOSÉ000123']
       );
       const text = plan.rows.map((r: any) => r['QUERY PLAN']).join('\n');
-      expect(text).toContain('user_admin_query'); // the index is used
+      expect(text).toContain('member_login_query'); // the index is used
       expect(text).not.toContain('Seq Scan');
     } finally {
       await client.query(`DROP TABLE IF EXISTS users_norm_btree CASCADE`);

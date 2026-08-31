@@ -275,30 +275,30 @@ export async function seedTestData(db: AppDatabase) {
   ]).returning();
 
   // Create products with bulk insert
-  const [skiPass, liftTicket] = await db.products.insertBulk([
-    { name: 'Ski Pass', active: true },
+  const [hardback, liftTicket] = await db.products.insertBulk([
+    { name: 'Hardback', active: true },
     { name: 'Lift Ticket', active: true },
   ]).returning();
 
   // Create product prices with bulk insert
-  const [skiPassPrice1, skiPassPrice2, liftTicketPrice1] = await db.productPrices.insertBulk([
-    { productId: skiPass.id, seasonId: 1, price: 100.00 },
-    { productId: skiPass.id, seasonId: 2, price: 50.00 },
+  const [hardbackPrice1, hardbackPrice2, liftTicketPrice1] = await db.productPrices.insertBulk([
+    { productId: hardback.id, seasonId: 1, price: 100.00 },
+    { productId: hardback.id, seasonId: 2, price: 50.00 },
     { productId: liftTicket.id, seasonId: 1, price: 75.00 },
   ]).returning();
 
   // Create product price capacity groups with bulk insert
   await db.productPriceCapacityGroups.insertBulk([
-    { productPriceId: skiPassPrice1.id, capacityGroupId: adultGroup.id },
-    { productPriceId: skiPassPrice1.id, capacityGroupId: childGroup.id },
-    { productPriceId: skiPassPrice2.id, capacityGroupId: adultGroup.id },
+    { productPriceId: hardbackPrice1.id, capacityGroupId: adultGroup.id },
+    { productPriceId: hardbackPrice1.id, capacityGroupId: childGroup.id },
+    { productPriceId: hardbackPrice2.id, capacityGroupId: adultGroup.id },
     { productPriceId: liftTicketPrice1.id, capacityGroupId: seniorGroup.id },
   ]);
 
   // Create product tags with bulk insert
   await db.productTags.insertBulk([
-    { productId: skiPass.id, tagId: winterTag.id, sortOrder: 1 },
-    { productId: skiPass.id, tagId: familyTag.id, sortOrder: 2 },
+    { productId: hardback.id, tagId: winterTag.id, sortOrder: 1 },
+    { productId: hardback.id, tagId: familyTag.id, sortOrder: 2 },
     { productId: liftTicket.id, tagId: summerTag.id, sortOrder: 1 },
   ]);
 
@@ -321,9 +321,9 @@ export async function seedTestData(db: AppDatabase) {
 
   // Scoped products per discount (productId references existing Product IDs)
   await db.discountProducts.insertBulk([
-    { discountId: discountA.id, productId: skiPass.id },
+    { discountId: discountA.id, productId: hardback.id },
     { discountId: discountA.id, productId: liftTicket.id },
-    { discountId: discountB.id, productId: skiPass.id },
+    { discountId: discountB.id, productId: hardback.id },
   ]);
 
   // Carts with items and applied discount codes
@@ -334,9 +334,9 @@ export async function seedTestData(db: AppDatabase) {
 
   // Cart items (sibling list #1)
   const [cartItemA1, cartItemA2, cartItemB1] = await db.cartItems.insertBulk([
-    { cartId: cartA.id, productId: skiPass.id },
+    { cartId: cartA.id, productId: hardback.id },
     { cartId: cartA.id, productId: liftTicket.id },
-    { cartId: cartB.id, productId: skiPass.id },
+    { cartId: cartB.id, productId: hardback.id },
   ]).returning();
 
   // Applied discount codes (sibling list #2, the one that contains the deep toNumberList)
@@ -355,8 +355,8 @@ export async function seedTestData(db: AppDatabase) {
     postComments: { alicePostComment1, alicePostComment2, bobPostComment },
     tags: { summerTag, winterTag, familyTag },
     capacityGroups: { adultGroup, childGroup, seniorGroup },
-    products: { skiPass, liftTicket },
-    productPrices: { skiPassPrice1, skiPassPrice2, liftTicketPrice1 },
+    products: { hardback, liftTicket },
+    productPrices: { hardbackPrice1, hardbackPrice2, liftTicketPrice1 },
     discounts: { discountA, discountB },
     discountCodes: { codeA, codeB },
     carts: { cartA, cartB },
@@ -399,7 +399,7 @@ export async function withDatabase<T>(
  *   dropNmaTables,
  *   async (db, captured) => {
  *     await db.nmaOrders.select(...).toList();
- *     expect(captured.join('\n')).toContain('"product"."resort_id"');
+ *     expect(captured.join('\n')).toContain('"product"."category_id"');
  *   },
  * );
  */

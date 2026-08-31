@@ -8,7 +8,7 @@ import { buildCreateStatisticsStatement, buildDropStatisticsStatement } from '..
 // Test entity — a smallint bitmask column plus two correlated columns, the two
 // real-world shapes of extended statistics (expression stats for planner
 // selectivity of `(flags & N) = 0`; multivariate stats for column correlation).
-class Resort extends DbEntity {
+class Category extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
   flags!: DbColumn<number>;
@@ -19,22 +19,22 @@ class Resort extends DbEntity {
 
 // Univariate expression statistics via the raw-expression escape hatch.
 class ExpressionStatisticsTestDatabase extends DbContext {
-  get resorts(): DbEntityTable<Resort> {
-    return this.table(Resort);
+  get categories(): DbEntityTable<Category> {
+    return this.table(Category);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(Resort, entity => {
-      entity.toTable('resorts_stx_expr_test');
+    model.entity(Category, entity => {
+      entity.toTable('categories_stx_expr_test');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'resorts_stx_expr_test_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'categories_stx_expr_test_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
       entity.property(e => e.flags).hasType(smallint('flags').default(0));
       entity.property(e => e.city).hasType(varchar('city', 100));
       entity.property(e => e.zip).hasType(varchar('zip', 20));
       entity.property(e => e.active).hasType(pgBoolean('active').default(true));
 
-      entity.hasStatistics('stx_resorts_expr_flags_test')
+      entity.hasStatistics('stx_categories_expr_flags_test')
         .withExpression('("flags" & 1::smallint)');
     });
   }
@@ -42,22 +42,22 @@ class ExpressionStatisticsTestDatabase extends DbContext {
 
 // Multivariate statistics over plain columns from the selector, with kinds.
 class MultivariateStatisticsTestDatabase extends DbContext {
-  get resorts(): DbEntityTable<Resort> {
-    return this.table(Resort);
+  get categories(): DbEntityTable<Category> {
+    return this.table(Category);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(Resort, entity => {
-      entity.toTable('resorts_stx_multi_test');
+    model.entity(Category, entity => {
+      entity.toTable('categories_stx_multi_test');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'resorts_stx_multi_test_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'categories_stx_multi_test_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
       entity.property(e => e.flags).hasType(smallint('flags').default(0));
       entity.property(e => e.city).hasType(varchar('city', 100));
       entity.property(e => e.zip).hasType(varchar('zip', 20));
       entity.property(e => e.active).hasType(pgBoolean('active').default(true));
 
-      entity.hasStatistics('stx_resorts_city_zip_test', e => [e.city, e.zip])
+      entity.hasStatistics('stx_categories_city_zip_test', e => [e.city, e.zip])
         .withKinds('ndistinct', 'dependencies');
     });
   }
@@ -66,15 +66,15 @@ class MultivariateStatisticsTestDatabase extends DbContext {
 // Same table WITHOUT the statistics declaration — the "old model" for the
 // migrate() reconciliation test.
 class MigrateBaselineDatabase extends DbContext {
-  get resorts(): DbEntityTable<Resort> {
-    return this.table(Resort);
+  get categories(): DbEntityTable<Category> {
+    return this.table(Category);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(Resort, entity => {
-      entity.toTable('resorts_stx_migrate_test');
+    model.entity(Category, entity => {
+      entity.toTable('categories_stx_migrate_test');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'resorts_stx_migrate_test_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'categories_stx_migrate_test_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
       entity.property(e => e.flags).hasType(smallint('flags').default(0));
       entity.property(e => e.city).hasType(varchar('city', 100));
@@ -86,22 +86,22 @@ class MigrateBaselineDatabase extends DbContext {
 
 // The "new model" — same table, statistics added.
 class MigrateWithStatisticsDatabase extends DbContext {
-  get resorts(): DbEntityTable<Resort> {
-    return this.table(Resort);
+  get categories(): DbEntityTable<Category> {
+    return this.table(Category);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(Resort, entity => {
-      entity.toTable('resorts_stx_migrate_test');
+    model.entity(Category, entity => {
+      entity.toTable('categories_stx_migrate_test');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'resorts_stx_migrate_test_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'categories_stx_migrate_test_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
       entity.property(e => e.flags).hasType(smallint('flags').default(0));
       entity.property(e => e.city).hasType(varchar('city', 100));
       entity.property(e => e.zip).hasType(varchar('zip', 20));
       entity.property(e => e.active).hasType(pgBoolean('active').default(true));
 
-      entity.hasStatistics('stx_resorts_migrate_flags_test')
+      entity.hasStatistics('stx_categories_migrate_flags_test')
         .withExpression('("flags" & 1::smallint)');
     });
   }
@@ -110,22 +110,22 @@ class MigrateWithStatisticsDatabase extends DbContext {
 // Invalid: kinds on a single-expression declaration (PostgreSQL rejects it) —
 // the schema manager must fail fast with a clear error instead.
 class InvalidKindsStatisticsDatabase extends DbContext {
-  get resorts(): DbEntityTable<Resort> {
-    return this.table(Resort);
+  get categories(): DbEntityTable<Category> {
+    return this.table(Category);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(Resort, entity => {
-      entity.toTable('resorts_stx_invalid_test');
+    model.entity(Category, entity => {
+      entity.toTable('categories_stx_invalid_test');
 
-      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'resorts_stx_invalid_test_id_seq' }));
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'categories_stx_invalid_test_id_seq' }));
       entity.property(e => e.name).hasType(varchar('name', 200)).isRequired();
       entity.property(e => e.flags).hasType(smallint('flags').default(0));
       entity.property(e => e.city).hasType(varchar('city', 100));
       entity.property(e => e.zip).hasType(varchar('zip', 20));
       entity.property(e => e.active).hasType(pgBoolean('active').default(true));
 
-      entity.hasStatistics('stx_resorts_invalid_test')
+      entity.hasStatistics('stx_categories_invalid_test')
         .withExpression('("flags" & 1::smallint)')
         .withKinds('ndistinct');
     });
@@ -155,15 +155,15 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
     const db = new ExpressionStatisticsTestDatabase(client);
 
     try {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_expr_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_expr_test CASCADE`);
       await db.getSchemaManager().ensureCreated();
 
-      const row = await getStatisticsRow(client, 'resorts_stx_expr_test', 'stx_resorts_expr_flags_test');
+      const row = await getStatisticsRow(client, 'categories_stx_expr_test', 'stx_categories_expr_flags_test');
       expect(row).toBeDefined();
       // A single-expression declaration stores univariate expression stats ('e').
       expect(row.kinds).toContain('e');
     } finally {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_expr_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_expr_test CASCADE`);
       await db.dispose();
     }
   });
@@ -173,16 +173,16 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
     const db = new MultivariateStatisticsTestDatabase(client);
 
     try {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_multi_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_multi_test CASCADE`);
       await db.getSchemaManager().ensureCreated();
 
-      const row = await getStatisticsRow(client, 'resorts_stx_multi_test', 'stx_resorts_city_zip_test');
+      const row = await getStatisticsRow(client, 'categories_stx_multi_test', 'stx_categories_city_zip_test');
       expect(row).toBeDefined();
       expect(row.kinds).toContain('d'); // ndistinct
       expect(row.kinds).toContain('f'); // dependencies
       expect(row.kinds).not.toContain('m'); // mcv not requested
     } finally {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_multi_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_multi_test CASCADE`);
       await db.dispose();
     }
   });
@@ -192,7 +192,7 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
     const v1 = new MigrateBaselineDatabase(clientV1);
 
     try {
-      await clientV1.query(`DROP TABLE IF EXISTS resorts_stx_migrate_test CASCADE`);
+      await clientV1.query(`DROP TABLE IF EXISTS categories_stx_migrate_test CASCADE`);
       await v1.getSchemaManager().ensureCreated();
 
       // Model v2 declares the statistics on the already-existing table.
@@ -204,11 +204,11 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
         const plannedOps = await v2.getSchemaManager().analyze();
         const statsOps = plannedOps.filter(op => op.type === 'create_statistics');
         expect(statsOps).toHaveLength(1);
-        expect((statsOps[0] as any).statisticsName).toBe('stx_resorts_migrate_flags_test');
+        expect((statsOps[0] as any).statisticsName).toBe('stx_categories_migrate_flags_test');
 
         await v2.getSchemaManager().migrate();
 
-        const row = await getStatisticsRow(clientV2, 'resorts_stx_migrate_test', 'stx_resorts_migrate_flags_test');
+        const row = await getStatisticsRow(clientV2, 'categories_stx_migrate_test', 'stx_categories_migrate_flags_test');
         expect(row).toBeDefined();
         expect(row.kinds).toContain('e');
 
@@ -219,7 +219,7 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
         await v2.dispose();
       }
     } finally {
-      await clientV1.query(`DROP TABLE IF EXISTS resorts_stx_migrate_test CASCADE`);
+      await clientV1.query(`DROP TABLE IF EXISTS categories_stx_migrate_test CASCADE`);
       await v1.dispose();
     }
   });
@@ -229,17 +229,17 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
     const db = new InvalidKindsStatisticsDatabase(client);
 
     try {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_invalid_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_invalid_test CASCADE`);
       await expectToReject(db.getSchemaManager().ensureCreated());
     } finally {
-      await client.query(`DROP TABLE IF EXISTS resorts_stx_invalid_test CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS categories_stx_invalid_test CASCADE`);
       await db.dispose();
     }
   });
 
   test('hasStatistics captures metadata: quoted selector columns, appended expressions, kinds', () => {
     const model = new DbModelConfig();
-    model.entity(Resort, entity => {
+    model.entity(Category, entity => {
       entity.toTable('stx_metadata_test');
       entity.property(e => e.id).hasType(integer('id').primaryKey());
       entity.property(e => e.name).hasType(varchar('name', 200));
@@ -253,7 +253,7 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
         .withKinds('mcv');
     });
 
-    const metadata = EntityMetadataStore.getMetadata(Resort)!;
+    const metadata = EntityMetadataStore.getMetadata(Category)!;
     const stx = (metadata.statistics || []).find(s => s.name === 'stx_meta')!;
 
     expect(stx.expressions).toEqual(['"city"', '"zip"', '("flags" & 1::smallint)']);
@@ -263,14 +263,14 @@ describe('Extended Statistics Support (CREATE STATISTICS)', () => {
   test('statistics-sql builders emit canonical statements', () => {
     expect(buildCreateStatisticsStatement(
       { name: 'stx_x', expressions: ['("flags" & 1::smallint)'] },
-      '"public"."resort"',
+      '"public"."category"',
       { ifNotExists: true }
-    )).toBe('CREATE STATISTICS IF NOT EXISTS "stx_x" ON ("flags" & 1::smallint) FROM "public"."resort"');
+    )).toBe('CREATE STATISTICS IF NOT EXISTS "stx_x" ON ("flags" & 1::smallint) FROM "public"."category"');
 
     expect(buildCreateStatisticsStatement(
       { name: 'stx_y', expressions: ['"city"', '"zip"'], kinds: ['ndistinct', 'dependencies'] },
-      '"resort"'
-    )).toBe('CREATE STATISTICS "stx_y" (ndistinct, dependencies) ON "city", "zip" FROM "resort"');
+      '"category"'
+    )).toBe('CREATE STATISTICS "stx_y" (ndistinct, dependencies) ON "city", "zip" FROM "category"');
 
     expect(buildDropStatisticsStatement('"stx_x"', { ifExists: true })).toBe('DROP STATISTICS IF EXISTS "stx_x"');
   });

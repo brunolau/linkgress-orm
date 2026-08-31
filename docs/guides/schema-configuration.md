@@ -389,7 +389,7 @@ export class Order extends DbEntity {
 
 // DbContext configuration with composite keys
 model.entity(OrderItem, entity => {
-  entity.toTable('order_items');
+  entity.toTable('order_lines');
 
   // Define composite foreign key using arrays
   entity.hasOne(e => e.order, () => Order)
@@ -478,7 +478,7 @@ Use `ixLower` and `ixUnaccent` helpers inside the selector to create expression-
 ```typescript
 import { ixLower, ixUnaccent } from 'linkgress-orm';
 
-model.entity(UserEshop, entity => {
+model.entity(Member, entity => {
   // lower("name")
   entity.hasIndex('ix_name_lower', e => [ixLower(e.name)]);
 
@@ -512,7 +512,7 @@ import { ixNormalized } from 'linkgress-orm';
 
 model.entity(User, entity => {
   // Unique normalized lookup — btree expression index
-  entity.hasIndex('user_admin_query', e => [ixNormalized(e.email), e.hash]).isUnique();
+  entity.hasIndex('member_login_query', e => [ixNormalized(e.email), e.hash]).isUnique();
   // → CREATE UNIQUE INDEX ... (public.search_normalize(email), hash)
 
   // Fuzzy substring search — trigram GIN index (installs pg_trgm, defaults gin_trgm_ops)
@@ -655,8 +655,8 @@ CREATE COLLATION "nd_ci_ai" (provider = 'icu', locale = 'und-u-ks-level1', deter
 Attach a collation to a column with `.hasCollation()`:
 
 ```typescript
-model.entity(UserEshop, entity => {
-  entity.toTable('user_eshop');
+model.entity(Member, entity => {
+  entity.toTable('member');
 
   entity.property(e => e.name)
     .hasType(varchar('name', 200))

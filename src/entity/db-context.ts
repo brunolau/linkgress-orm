@@ -2174,7 +2174,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   /**
    * INNER JOIN used purely as a row FILTER — keeps the entity shape (no
    * selector), so scope-style predicates can hop across an N:1 FK in ONE
-   * query level (e.g. order_item ⋈ invoicing_partner_data). The optional
+   * query level (e.g. loan ⋈ borrower_data). The optional
    * third callback contributes an extra WHERE predicate with the same
    * (left, right) arguments. Only the right table's COLUMNS are addressable
    * (no navigations). Joining a 1:N side duplicates left rows — use
@@ -6544,7 +6544,7 @@ ${extraJoins}${joinClauses.join('\n')}${orderBy}`;
       const mapped: any = {};
 
       for (const [key, value] of Object.entries(row)) {
-        // Handle nested paths (e.g., "invoicingPartner.id" -> { invoicingPartner: { id: value } })
+        // Handle nested paths (e.g., "borrower.id" -> { borrower: { id: value } })
         if (key.includes('.')) {
           const parts = key.split('.');
           let current = mapped;

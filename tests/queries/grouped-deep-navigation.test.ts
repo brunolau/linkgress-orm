@@ -6,7 +6,7 @@ import { withDatabase, seedTestData } from '../utils/test-database';
  *
  * Bug: GroupedQueryBuilder and GroupedSelectQueryBuilder don't pass
  * schemaRegistry to ReferenceQueryBuilder, causing multi-level navigation
- * (e.g., p.product.resort.timezone) to fail with "cannot read property
+ * (e.g., p.product.category.timezone) to fail with "cannot read property
  * X of undefined" when the schema registry is needed to resolve
  * nested navigation targets.
  */
@@ -96,9 +96,9 @@ describe('Deep navigation in grouped queries', () => {
         .toList();
 
       expect(result.length).toBeGreaterThan(0);
-      const skiPass = result.find(r => r.productName === 'Ski Pass');
-      expect(skiPass).toBeDefined();
-      expect(skiPass?.minPrice).toBe(50);
+      const hardback = result.find(r => r.productName === 'Hardback');
+      expect(hardback).toBeDefined();
+      expect(hardback?.minPrice).toBe(50);
     });
   });
 });

@@ -373,7 +373,7 @@ describe('QueryBatch', () => {
     });
 
     test('timestamp column with a custom fromDriver mapper receives the driver text form, never a Date', async () => {
-      // gopass-eshop regression: the app configures postgres.js with timestamp
+      // Consumer regression: the app configures postgres.js with timestamp
       // parser PASSTHROUGH — the driver delivers 'YYYY-MM-DD HH:MM:SS' strings —
       // and a custom mapper turns that string into the app's date abstraction.
       // For mapper columns the batch reviver must reconstruct that text form;

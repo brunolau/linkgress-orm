@@ -11,7 +11,7 @@ const ndCiAi = pgCollation({
   deterministic: false,
 });
 
-class UserEshop extends DbEntity {
+class Member extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
   email!: DbColumn<string>;
@@ -19,12 +19,12 @@ class UserEshop extends DbEntity {
 
 // Database with collation on a column
 class CollationTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_collation_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_collation_test_id_seq' }));
@@ -62,14 +62,14 @@ describe('Collation Support', () => {
     });
 
     const model = new DbModelConfig();
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('test_col_config');
       entity.property(e => e.id).hasType(integer('id').primaryKey());
       entity.property(e => e.name).hasType(varchar('name', 200)).hasCollation(collation);
       entity.property(e => e.email).hasType(varchar('email', 255));
     });
 
-    const metadata = EntityMetadataStore.getMetadata(UserEshop)!;
+    const metadata = EntityMetadataStore.getMetadata(Member)!;
     const nameProp = metadata.properties.get('name' as any)!;
     expect(nameProp.columnBuilder.build().collation).toBe('my_collation');
 

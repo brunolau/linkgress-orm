@@ -5,7 +5,7 @@ import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, v
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 
 // Test entity
-class UserEshop extends DbEntity {
+class Member extends DbEntity {
   id!: DbColumn<number>;
   name!: DbColumn<string>;
   email!: DbColumn<string>;
@@ -14,12 +14,12 @@ class UserEshop extends DbEntity {
 
 // Expression index using selector helpers: lower("name")
 class ExpressionIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_expr_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_expr_idx_test_id_seq' }));
@@ -27,19 +27,19 @@ class ExpressionIndexTestDatabase extends DbContext {
       entity.property(e => e.email).hasType(varchar('email', 255)).isRequired();
       entity.property(e => e.active).hasType(pgBoolean('active').default(true));
 
-      entity.hasIndex('idx_user_eshop_name_lower', e => [ixLower(e.name)]);
+      entity.hasIndex('idx_member_name_lower', e => [ixLower(e.name)]);
     });
   }
 }
 
 // Multiple expression columns in single index
 class MultiExpressionIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_multi_expr_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_multi_expr_idx_test_id_seq' }));
@@ -54,12 +54,12 @@ class MultiExpressionIndexTestDatabase extends DbContext {
 
 // Mixed: plain column + expression in same index
 class MixedIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_mixed_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_mixed_idx_test_id_seq' }));
@@ -75,12 +75,12 @@ class MixedIndexTestDatabase extends DbContext {
 
 // Partial index with WHERE
 class PartialIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_partial_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_partial_idx_test_id_seq' }));
@@ -97,12 +97,12 @@ class PartialIndexTestDatabase extends DbContext {
 
 // Combined: expression + WHERE
 class CombinedIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_combined_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_combined_idx_test_id_seq' }));
@@ -118,12 +118,12 @@ class CombinedIndexTestDatabase extends DbContext {
 
 // Raw expression via withExpression (escape hatch)
 class RawExpressionIndexTestDatabase extends DbContext {
-  get users(): DbEntityTable<UserEshop> {
-    return this.table(UserEshop);
+  get users(): DbEntityTable<Member> {
+    return this.table(Member);
   }
 
   protected override setupModel(model: DbModelConfig): void {
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('users_rawexpr_idx_test');
 
       entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'users_rawexpr_idx_test_id_seq' }));
@@ -155,7 +155,7 @@ describe('Expression & Partial Index Support', () => {
         SELECT indexname, indexdef
         FROM pg_indexes
         WHERE tablename = 'users_expr_idx_test'
-        AND indexname = 'idx_user_eshop_name_lower'
+        AND indexname = 'idx_member_name_lower'
       `);
 
       expect(indexResult.rows).toHaveLength(1);
@@ -317,7 +317,7 @@ describe('Expression & Partial Index Support', () => {
 
   test('ixLower and ixUnaccent compose correctly in metadata', () => {
     const model = new DbModelConfig();
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('test_compose');
       entity.property(e => e.id).hasType(integer('id').primaryKey());
       entity.property(e => e.name).hasType(varchar('name', 200));
@@ -327,7 +327,7 @@ describe('Expression & Partial Index Support', () => {
       entity.hasIndex('idx_compose', e => [ixLower(ixUnaccent(e.name))]);
     });
 
-    const metadata = EntityMetadataStore.getMetadata(UserEshop)!;
+    const metadata = EntityMetadataStore.getMetadata(Member)!;
     const idx = metadata.indexes.find(i => i.name === 'idx_compose')!;
 
     expect(idx.columns).toEqual(['name']);
@@ -336,7 +336,7 @@ describe('Expression & Partial Index Support', () => {
 
   test('plain columns produce no expressions in metadata', () => {
     const model = new DbModelConfig();
-    model.entity(UserEshop, entity => {
+    model.entity(Member, entity => {
       entity.toTable('test_plain');
       entity.property(e => e.id).hasType(integer('id').primaryKey());
       entity.property(e => e.name).hasType(varchar('name', 200));
@@ -346,7 +346,7 @@ describe('Expression & Partial Index Support', () => {
       entity.hasIndex('idx_plain', e => [e.name, e.email]);
     });
 
-    const metadata = EntityMetadataStore.getMetadata(UserEshop)!;
+    const metadata = EntityMetadataStore.getMetadata(Member)!;
     const idx = metadata.indexes.find(i => i.name === 'idx_plain')!;
 
     expect(idx.columns).toEqual(['name', 'email']);
