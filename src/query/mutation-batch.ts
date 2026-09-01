@@ -1,5 +1,6 @@
 import type { DatabaseClient } from '../database/database-client.interface';
 import { renumberPlaceholders } from './query-batch';
+import { hasBarePlaceholder } from './sql-utils';
 
 const POSTGRES_MAX_PARAMS = 65535;
 
@@ -20,6 +21,10 @@ interface MutationCapableTable {
     data: Record<string, any>[],
     overridingSystemValue?: boolean,
     onConflictDoNothing?: boolean
+  ): { sql: string; params: any[] } | null;
+  _buildGuardedInsertBulkStatement(
+    data: Record<string, any>[],
+    guardPredicate: string
   ): { sql: string; params: any[] } | null;
   _buildBulkUpdateStatement(data: Record<string, any>[], primaryKeys: string[]): { sql: string; params: any[] };
   _buildDeleteWhereInStatement(field: string, values: any[]): { sql: string; params: any[] } | null;
@@ -111,12 +116,29 @@ export class MutationBatch {
   /**
    * Register a bulk INSERT leg. Returns null (and registers nothing) for an
    * empty row array or rows resolving to zero insertable columns.
+   *
+   * `options.rowGuard` turns the leg into a ROW-GUARDED insert — `INSERT ..
+   * SELECT .. FROM (VALUES ..) AS v(..) WHERE <guard>` — so each candidate row
+   * is written only when the predicate holds for it; blocked rows insert
+   * nothing and show up as a short {@link getAffectedCount}. The predicate is
+   * raw SQL evaluated per candidate row with the row exposed as `v` — refer to
+   * a cell as `v."<db_column_name>"` — and takes no parameters of its own (a
+   * bare `$N` in the guard throws at registration; cross-leg renumbering would
+   * silently rebind it). It cannot see the leg's own inserted rows (PostgreSQL
+   * snapshot rules), so guard only batches whose rows are mutually
+   * independent. Nor is the guard a cross-transaction race arbiter: it judges
+   * only rows committed before the statement's snapshot (READ COMMITTED), so
+   * two CONCURRENT transactions can both pass a count-based guard. Callers
+   * must serialize concurrent writers first (e.g. an exclusive row or advisory
+   * lock taken earlier in the same transaction) — the blocked transaction's
+   * later statement then re-snapshots and the guard is effective. Mutually
+   * exclusive with `onConflictDoNothing`.
    */
   addInsertBulk(
     table: MutationCapableTable,
     rows: Record<string, any>[],
     id: string,
-    options?: { overridingSystemValue?: boolean; onConflictDoNothing?: boolean }
+    options?: { overridingSystemValue?: boolean; onConflictDoNothing?: boolean; rowGuard?: string }
   ): MutationBatchKey | null {
     if (rows.length === 0) {
       return null;
@@ -125,7 +147,21 @@ export class MutationBatch {
     this.assertRegisterable(id);
     MutationBatch.assertSingleStatementBudget(rows, id);
 
-    const built = table._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
+    if (options?.rowGuard != null && (options.onConflictDoNothing || options.overridingSystemValue)) {
+      throw new Error(`MutationBatch: leg "${id}" combines rowGuard with onConflictDoNothing/overridingSystemValue — the guarded insert compiles to INSERT .. SELECT and supports neither`);
+    }
+
+    if (options?.rowGuard != null && options.rowGuard.trim() === '') {
+      throw new Error(`MutationBatch: leg "${id}" has a blank rowGuard — pass a predicate or omit the option`);
+    }
+
+    if (options?.rowGuard != null && hasBarePlaceholder(options.rowGuard)) {
+      throw new Error(`MutationBatch: leg "${id}" rowGuard contains a bare $N placeholder — guards take no parameters (values must come from v."col" or joins), and cross-leg renumbering would silently rebind it`);
+    }
+
+    const built = options?.rowGuard != null
+      ? table._buildGuardedInsertBulkStatement(rows, options.rowGuard)
+      : table._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
 
     if (!built) {
       return null;
