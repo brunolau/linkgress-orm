@@ -2,16 +2,30 @@ import type { TableSchema } from '../schema/table-builder';
 
 /**
  * Quoted SQL segments (single-quoted literals with '' escaping, double-quoted
- * identifiers with "" escaping) pass through verbatim; only bare $N
- * placeholders outside them are renumbered. Without this, a leg at a nonzero
- * offset would corrupt dollar-digit sequences INSIDE string literals
- * (`'price: $1'` → `'price: $8'`). Shared by QueryBatch, MutationBatch and
- * insertWithChildren for cross-leg parameter renumbering.
+ * identifiers with "" escaping) and COMMENTS (`--` line comments and
+ * slash-star block comments) pass through verbatim; only bare $N placeholders
+ * outside them are renumbered. Without this, a leg at a nonzero offset would
+ * corrupt dollar-digit sequences INSIDE string literals
+ * (`'price: $1'` → `'price: $8'`) or inside comments.
+ *
+ * Comments MUST be a recognized token class of their own: an apostrophe inside
+ * a `--` comment (`-- the user's own orders`) otherwise opens what the
+ * string-literal arm believes is a literal, which then runs to the NEXT
+ * apostrophe anywhere later in the statement — swallowing every real
+ * placeholder in between verbatim (unrenumbered). In a MutationBatch that
+ * manifests as the spliced fragment's `$N` keeping its standalone numbers,
+ * colliding with the preceding legs' bindings (`operator does not exist:
+ * integer = jsonb` against a leg's jsonb payload param) and decomposing the
+ * whole fused batch. `$N` sequences inside comments are likewise left alone —
+ * they are prose, not parameters.
+ *
+ * Shared by QueryBatch, MutationBatch and insertWithChildren for cross-leg
+ * parameter renumbering.
  */
-const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|\$(\d+)/g;
+const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|(--[^\n]*)|(\/\*[\s\S]*?\*\/)|\$(\d+)/g;
 
 export const renumberPlaceholders = (sqlText: string, offset: number): string =>
-  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, digits) =>
+  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, _lineComment, _blockComment, digits) =>
     digits !== undefined ? `$${Number(digits) + offset}` : match
   );
 
