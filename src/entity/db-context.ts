@@ -213,6 +213,16 @@ export interface QueryOptions {
    * `.expectedExecutionTime(ms)`. Default: 10000 (10s).
    */
   longRunningQueryThreshold?: number;
+  /**
+   * How many stack frames to capture per query for the slow-query report
+   * (`SlowQueryInfo.stack`). The capture happens on EVERY query while slow-query
+   * detection is active — it is the price of knowing the caller when one turns out
+   * slow — and its cost grows with the depth captured (~1 ms per 50 queries at the
+   * default depth on a deep async call chain). Lower it on hot paths, or set `0` to
+   * skip the capture entirely (the callback still fires, with an empty stack).
+   * Default: 50.
+   */
+  slowQueryStackTraceLimit?: number;
 }
 
 /**
@@ -295,10 +305,10 @@ function stackFrameFile(line: string): string | undefined {
  * user's frames are present. Temporarily raises the capture depth so deep user
  * frames survive the internal frames sitting above them.
  */
-function captureStackHolder(): { stack?: string } {
+function captureStackHolder(stackTraceLimit: number): { stack?: string } {
   const holder: { stack?: string } = {};
   const previousLimit = Error.stackTraceLimit;
-  Error.stackTraceLimit = 50;
+  Error.stackTraceLimit = stackTraceLimit;
   if (typeof Error.captureStackTrace === 'function') {
     Error.captureStackTrace(holder, captureStackHolder);
   } else {
@@ -596,7 +606,8 @@ export class QueryExecutor {
     if (!this.options.logExecutionTime && !this.slowQueryEnabled) {
       return undefined;
     }
-    const stackHolder = this.slowQueryEnabled ? captureStackHolder() : undefined;
+    const stackTraceLimit = this.options.slowQueryStackTraceLimit ?? 50;
+    const stackHolder = this.slowQueryEnabled && stackTraceLimit > 0 ? captureStackHolder(stackTraceLimit) : undefined;
     return { startTime: performance.now(), stackHolder };
   }
 
