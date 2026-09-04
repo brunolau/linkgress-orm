@@ -76,4 +76,63 @@ describe('MockRowCache static switch', () => {
 			expect(MockRowCache.diagnostics().entries).toBe(0);
 		});
 	});
+
+	test('cache ON: rows of one signature share a prototype but keep their own state slots', async () => {
+		await withDatabase(async (db) => {
+			await seedTestData(db);
+
+			const captured: any[] = [];
+			const runQuery = () => db.posts
+				.select(p => {
+					captured.push(p.user);
+
+					return { title: p.title, authorName: p.user!.username };
+				})
+				.toList();
+
+			MockRowCache.setEnabled(true);
+			await runQuery();
+			await runQuery();
+
+			expect(captured.length).toBeGreaterThanOrEqual(2);
+			const [first, second] = captured;
+
+			// The getters are inherited from ONE shared prototype per signature …
+			expect(first).not.toBe(second);
+			expect(Object.getPrototypeOf(first)).toBe(Object.getPrototypeOf(second));
+			expect(Object.getPrototypeOf(first)).not.toBe(Object.prototype);
+			// … which is why own-property APIs see no columns on the row itself …
+			expect(Object.keys(first)).toEqual([]);
+			// … while normal access and enumeration still behave like a plain mock row.
+			expect('username' in first).toBe(true);
+			expect(first.username.__fieldName).toBe('username');
+			expect(Object.keys(Object.getPrototypeOf(first))).toContain('username');
+			// Per-row state stays per row: the FieldRef built on `first` is not `second`'s.
+			expect(first.username).not.toBe(second.username);
+		});
+	});
+
+	test('whole-reference selection (`author: p.user`) is identical with the cache OFF and ON', async () => {
+		await withDatabase(async (db) => {
+			await seedTestData(db);
+
+			const runQuery = () => db.posts
+				.select(p => ({
+					title: p.title,
+					author: p.user,
+				}))
+				.orderBy(p => p.title)
+				.toList();
+
+			MockRowCache.setEnabled(false);
+			const off = await runQuery();
+
+			MockRowCache.setEnabled(true);
+			const on = await runQuery();
+
+			expect(off.length).toBeGreaterThan(0);
+			expect(off[0].author).toBeTruthy();
+			expect(on).toEqual(off);
+		});
+	});
 });
