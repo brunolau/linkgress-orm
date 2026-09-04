@@ -88,6 +88,48 @@ const navigationPathSignature = (path: NavigationJoin[]): string => path
   .join('>');
 
 /**
+ * Whether `value` is a reference mock row minted by `ReferenceQueryBuilder.createMockTargetRow`.
+ * Those rows INHERIT their column/relation getters from a shared prototype (see MockRowCache),
+ * so `Object.getPrototypeOf(row) !== Object.prototype` and own-property APIs see no columns —
+ * the row's own state slots are the reliable marker.
+ */
+const isReferenceMockRow = (value: unknown): boolean =>
+  value != null && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, MOCK_ROW_FIELD_REFS);
+
+/** `Object.getOwnPropertyDescriptor` that walks the prototype chain (stops before Object.prototype). */
+const findPropertyDescriptor = (value: object, key: string): PropertyDescriptor | undefined => {
+  let current: object | null = value;
+
+  while (current != null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+
+    if (descriptor) {
+      return descriptor;
+    }
+
+    current = Object.getPrototypeOf(current);
+  }
+
+  return undefined;
+};
+
+/**
+ * First enumerable key (own or inherited) backed by a getter — the "is this a mock row" probe
+ * shared by the selection resolvers. Root mocks define their getters as own properties,
+ * reference mocks inherit them; column getters are enumerable on both, so the first
+ * enumerable getter is always a column and `row[key]` yields its FieldRef.
+ */
+const findFirstGetterKey = (value: object): string | undefined => {
+  for (const key in value) {
+    if (findPropertyDescriptor(value, key)?.get != null) {
+      return key;
+    }
+  }
+
+  return undefined;
+};
+
+/**
  * Performance utility: Get target schema for a relation, using cached version if available
  */
 export function getTargetSchemaForRelation(schema: TableSchema, relName: string, relConfig: { targetTableBuilder?: { build(): TableSchema } }): TableSchema | undefined {
@@ -2398,7 +2440,10 @@ export class SelectQueryBuilder<TSelection> {
       // Subquery) and collection-result markers must not be walked.
       const proto = Object.getPrototypeOf(value);
 
-      if ((proto === Object.prototype || proto === null) && !('__collectionResult' in value)) {
+      // Reference mock rows inherit their getters from a shared prototype (see
+      // createMockTargetRow) yet must keep being walked exactly like the plain-object mocks
+      // they replaced.
+      if ((proto === Object.prototype || proto === null || isReferenceMockRow(value)) && !('__collectionResult' in value)) {
         this.collectJsonRowRevivals(
           value,
           pathPrefix ? `${pathPrefix}__${key}` : `__nested__${key}`,
@@ -5234,20 +5279,16 @@ ${joinClauses.join('\n')}`;
                 continue;
               }
             }
-            // Check if it's a mock object with property descriptors (navigation property mock)
-            const props = Object.getOwnPropertyNames(value);
-            if (props.length > 0) {
-              const firstProp = props[0];
-              const descriptor = Object.getOwnPropertyDescriptor(value, firstProp);
-              if (descriptor && descriptor.get) {
+            // Check if it's a mock object with getter-backed properties (navigation property
+            // mock). The getters may be OWN (root mocks) or INHERITED from the shared
+            // prototype (reference mocks) — findFirstGetterKey walks both.
+            {
+              const tableAlias = findFirstGetterKey(value);
+              if (tableAlias) {
                 // This object has getter properties - likely a navigation mock
                 // Try to determine if this is a reference navigation by checking the schema relations
-                const tableAlias = Object.keys(value).find(k => {
-                  const desc = Object.getOwnPropertyDescriptor(value, k);
-                  return desc && desc.get && typeof desc.get === 'function';
-                });
 
-                if (tableAlias) {
+                {
                   // Try to get the first property to check if it has __tableAlias
                   try {
                     const firstValue = (value as any)[tableAlias];
@@ -5943,15 +5984,12 @@ ${joinClauses.join('\n')}`;
       // These are treated as SIMPLE because the actual value comes from json_build_object in the row
       // The navigation mock is just a placeholder - actual data processing happens via FieldType.SIMPLE
       if (value && typeof value === 'object' && !('__dbColumnName' in value) && !('__fieldName' in value) && !('__collectionResult' in value) && !('__isAggregationArray' in value)) {
-        const props = Object.getOwnPropertyNames(value);
-        if (props.length > 0) {
-          const descriptor = Object.getOwnPropertyDescriptor(value, props[0]);
-          if (descriptor && descriptor.get) {
-            // Navigation mock - treat as simple, data will come from row via json_build_object
-            // If row has no data, convertValue will return undefined
-            fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
-            continue;
-          }
+        // Getter-backed row (own getters on a root mock, inherited ones on a reference mock).
+        if (findFirstGetterKey(value) != null) {
+          // Navigation mock - treat as simple, data will come from row via json_build_object
+          // If row has no data, convertValue will return undefined
+          fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
+          continue;
         }
       }
 
@@ -6958,25 +6996,28 @@ export class ReferenceQueryBuilder<TItem = any> {
    */
   createMockTargetRow(): any {
     if (this.targetTableSchema) {
-      // Descriptor-level cache — see MockRowCache's doc. Everything the descriptors close
-      // over is fully determined by (target schema object identity, relationName,
-      // sourceAlias, navigation-path content), so rows with the same signature can share
-      // one prebuilt PropertyDescriptorMap. The cross-row cache is OPT-IN via the static
-      // switch (MockRowCache.setEnabled — the host app flips it from its own config):
-      // with it off, each row gets a FRESH descriptor set (the pre-0.4.66 memory profile
-      // — nothing retained beyond the row's lifetime), while the per-row FieldRef and
-      // navigation slots below stay enabled either way (they are row-scoped).
-      const descriptors = MockRowCache.getOrBuild(
+      // Prototype-level cache — see MockRowCache's doc. Everything the getters close over
+      // is fully determined by (target schema object identity, relationName, sourceAlias,
+      // navigation-path content), so rows with the same signature can share one prebuilt
+      // PROTOTYPE carrying every column/relation getter; a new row is then `Object.create`
+      // plus its two own state slots — O(1) instead of one property definition per column.
+      // The cross-row cache is OPT-IN via the static switch (MockRowCache.setEnabled — the
+      // host app flips it from its own config): with it off, each row gets a FRESH
+      // prototype (the pre-0.4.66 memory profile — nothing retained beyond the row's
+      // lifetime), while the per-row FieldRef and navigation slots stay row-scoped either
+      // way (the shared getters read them through `this`).
+      //
+      // Consumers must not probe these rows with OWN-property APIs (`Object.keys`,
+      // `getOwnPropertyNames`, `getOwnPropertyDescriptor` on the row itself) — the getters
+      // are inherited. Use `isReferenceMockRow` / `findFirstGetterKey` instead.
+      const prototype = MockRowCache.getOrBuild(
         `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`,
-        () => this.buildMockRowDescriptors(),
+        () => Object.defineProperties({}, this.buildMockRowDescriptors()),
       );
 
-      const mock: any = {
-        [MOCK_ROW_FIELD_REFS]: {},
-        [MOCK_ROW_NAV_CACHE]: {},
-      };
-
-      Object.defineProperties(mock, descriptors);
+      const mock: any = Object.create(prototype);
+      mock[MOCK_ROW_FIELD_REFS] = {};
+      mock[MOCK_ROW_NAV_CACHE] = {};
 
       return mock;
     } else {
