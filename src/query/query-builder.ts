@@ -14,6 +14,7 @@ import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } from './future-query';
 import type { ColumnConfig } from '../schema/column-builder';
 import { MockRowCache } from './mock-row-cache';
+import { NavigationPathCache } from './navigation-path-cache';
 import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere } from './join-utils';
 
 /**
@@ -8104,6 +8105,29 @@ export class CollectionQueryBuilder<TItem = any> {
     targetAlias: string,
     joinedSchemas: Map<string, TableSchema>,
     _startSchema: TableSchema
+  ): Array<{ alias: string; relation: any; sourceAlias: string }> {
+    if (!this.schemaRegistry) {
+      return [];
+    }
+
+    // Memoised per registry — the BFS below depends only on the target alias and the ORDERED
+    // joined alias→table pairs (order decides which of several equal-length paths wins), so
+    // the same query shape resolves to the same path on every build. See NavigationPathCache.
+    const signature = `${targetAlias}|${[...joinedSchemas]
+      .map(([alias, schema]) => `${alias}:${schema.schema ?? ''}.${schema.name}`)
+      .join(',')}`;
+
+    return NavigationPathCache.getOrBuild(
+      this.schemaRegistry,
+      signature,
+      () => this.computeNavigationPath(targetAlias, joinedSchemas),
+    );
+  }
+
+  /** The uncached BFS behind {@link findNavigationPath}. */
+  private computeNavigationPath(
+    targetAlias: string,
+    joinedSchemas: Map<string, TableSchema>
   ): Array<{ alias: string; relation: any; sourceAlias: string }> {
     if (!this.schemaRegistry) {
       return [];

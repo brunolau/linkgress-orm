@@ -59,6 +59,7 @@ export {
 
 // Static feature switches
 export { MockRowCache } from './query/mock-row-cache';
+export { NavigationPathCache } from './query/navigation-path-cache';
 
 // Union query builder
 export {
