@@ -57,6 +57,9 @@ export {
   CollectionQueryBuilder,
 } from './query/query-builder';
 
+// Static feature switches
+export { MockRowCache } from './query/mock-row-cache';
+
 // Union query builder
 export {
   UnionQueryBuilder,

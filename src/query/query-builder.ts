@@ -13,6 +13,7 @@ import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from 
 import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } from './future-query';
 import type { ColumnConfig } from '../schema/column-builder';
+import { MockRowCache } from './mock-row-cache';
 import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere } from './join-utils';
 
 /**
@@ -57,6 +58,34 @@ export function getRelationEntriesForSchema(schema: TableSchema): Array<[string,
   // Fallback: build the array (for schemas that weren't built with the new TableBuilder)
   return Object.entries(schema.relations);
 }
+
+/**
+ * Mock-row descriptor cache for {@link ReferenceQueryBuilder.createMockTargetRow}.
+ *
+ * Building a reference mock row costs O(columns + relations) `Object.defineProperty`
+ * calls plus fresh closures per row — and deep selectors (cart → items → product →
+ * price → …) rebuild that graph from scratch on EVERY query build. All of it is
+ * deterministic in (target schema, relation alias, navigation path), so the property
+ * descriptors are built once per signature and reused: each new mock row is a bare
+ * object + one `Object.defineProperties` call with the shared descriptor map.
+ *
+ * Per-instance state (the lazy FieldRef cache and the memoized navigation rows)
+ * lives in symbol-keyed slots read by the shared getters through `this`, so sharing
+ * descriptors across rows is safe. The navigation-path arrays captured at build
+ * time are shared by content — nothing downstream mutates them (they are always
+ * spread-copied when extended).
+ */
+const MOCK_ROW_FIELD_REFS = Symbol('linkgressMockFieldRefs');
+const MOCK_ROW_NAV_CACHE = Symbol('linkgressMockNavCache');
+
+type MockRowSlots = {
+  [MOCK_ROW_FIELD_REFS]?: Record<string, any>;
+  [MOCK_ROW_NAV_CACHE]?: Record<string, any>;
+};
+
+const navigationPathSignature = (path: NavigationJoin[]): string => path
+  .map(step => `${step.alias}:${step.targetTable}:${(step.foreignKeys ?? []).join('+')}:${(step.matches ?? []).join('+')}:${step.isMandatory ? 1 : 0}:${step.sourceAlias ?? ''}`)
+  .join('>');
 
 /**
  * Performance utility: Get target schema for a relation, using cached version if available
@@ -6929,112 +6958,164 @@ export class ReferenceQueryBuilder<TItem = any> {
    */
   createMockTargetRow(): any {
     if (this.targetTableSchema) {
-      const mock: any = {};
-      // Add columns - use pre-computed column name map if available
-      const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
+      // Descriptor-level cache — see MockRowCache's doc. Everything the descriptors close
+      // over is fully determined by (target schema object identity, relationName,
+      // sourceAlias, navigation-path content), so rows with the same signature can share
+      // one prebuilt PropertyDescriptorMap. The cross-row cache is OPT-IN via the static
+      // switch (MockRowCache.setEnabled — the host app flips it from its own config):
+      // with it off, each row gets a FRESH descriptor set (the pre-0.4.66 memory profile
+      // — nothing retained beyond the row's lifetime), while the per-row FieldRef and
+      // navigation slots below stay enabled either way (they are row-scoped).
+      const descriptors = MockRowCache.getOrBuild(
+        `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`,
+        () => this.buildMockRowDescriptors(),
+      );
 
-      // Performance: Lazy-cache FieldRef objects
-      const fieldRefCache: Record<string, any> = {};
-      const tableAlias = this.relationName;
+      const mock: any = {
+        [MOCK_ROW_FIELD_REFS]: {},
+        [MOCK_ROW_NAV_CACHE]: {},
+      };
 
-      // Build a mapper lookup for columns (only when needed)
-      const columnMappers: Record<string, any> = {};
-      const columnSqlTypes: Record<string, string> = {};
-      for (const [colName, colBuilder] of Object.entries(this.targetTableSchema.columns)) {
-        const config = (colBuilder as any).build();
-        if (config.mapper) {
-          columnMappers[colName] = config.mapper;
-        }
-        if (config.type) {
-          columnSqlTypes[colName] = config.type;
-        }
+      Object.defineProperties(mock, descriptors);
+
+      return mock;
+    } else {
+      // Fallback: use the shared nested proxy that supports deep property access
+      return createNestedFieldRefProxy(this.relationName);
+    }
+  }
+
+  /**
+   * Builds the shared property-descriptor map for {@link createMockTargetRow}'s cached path.
+   * The getters read per-row state through `this`-bound symbol slots, so one descriptor
+   * map serves every row of the same signature.
+   */
+  private buildMockRowDescriptors(): PropertyDescriptorMap {
+    // Add columns - use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema!);
+    const tableAlias = this.relationName;
+
+    // Build a mapper lookup for columns (only when needed)
+    const columnMappers: Record<string, any> = {};
+    const columnSqlTypes: Record<string, string> = {};
+    for (const [colName, colBuilder] of Object.entries(this.targetTableSchema!.columns)) {
+      const config = (colBuilder as any).build();
+      if (config.mapper) {
+        columnMappers[colName] = config.mapper;
       }
-
-      const sourceTable = this.targetTable;  // Actual table name for schema lookup
-      // Collect all navigation aliases from the path leading to this reference
-      // This is needed for WHERE conditions that use multi-level navigation (e.g., task.level.name)
-      const navigationAliases = this.navigationPath.map(nav => nav.alias);
-
-      for (const [colName, dbColumnName] of columnNameMap) {
-        const mapper = columnMappers[colName];
-        Object.defineProperty(mock, colName, {
-          get() {
-            let cached = fieldRefCache[colName];
-            if (!cached) {
-              cached = fieldRefCache[colName] = {
-                __fieldName: colName,
-                __dbColumnName: dbColumnName,
-                __tableAlias: tableAlias,  // Alias for SQL generation
-                __sourceTable: sourceTable,  // Actual table name for mapper lookup
-                __mapper: mapper,  // Include mapper for toDriver transformation in conditions
-                __sqlType: columnSqlTypes[colName],  // Column SQL type — lets flag* emit width-exact mask casts
-                __navigationAliases: navigationAliases,  // All intermediate navigation aliases for JOIN resolution
-              };
-            }
-            return cached;
-          },
-          enumerable: true,
-          configurable: true,
-        });
+      if (config.type) {
+        columnSqlTypes[colName] = config.type;
       }
+    }
 
-      // Build extended navigation path for nested collections
-      // Only build navigation path if we have a sourceAlias (meaning we're inside a collection's selector)
-      // If sourceAlias is empty, we're in the main query and references are joined in the FROM clause
-      let extendedNavPath: NavigationJoin[] = [];
-      if (this.sourceAlias) {
-        // Build the current navigation step to include in path for nested collections
-        // This represents the join from sourceAlias to this.relationName (this.targetTable)
-        const currentNavStep: NavigationJoin = {
-          alias: this.relationName,
-          targetTable: this.targetTable,
-          foreignKeys: this.foreignKeys,
-          matches: this.matches.length > 0 ? this.matches : ['id'],  // Default to 'id' if not specified
-          isMandatory: this.isMandatory,
-          sourceAlias: this.sourceAlias,
-        };
-        extendedNavPath = [...this.navigationPath, currentNavStep];
-      }
+    const sourceTable = this.targetTable;  // Actual table name for schema lookup
+    // Collect all navigation aliases from the path leading to this reference
+    // This is needed for WHERE conditions that use multi-level navigation (e.g., task.level.name)
+    const navigationAliases = this.navigationPath.map(nav => nav.alias);
 
-      // Add navigation properties (both collections and references)
-      if (this.targetTableSchema.relations) {
-        for (const [relName, relConfig] of Object.entries(this.targetTableSchema.relations)) {
-          // Try to get target schema from registry (preferred, has full relations) or targetTableBuilder
-          let nestedTargetSchema: TableSchema | undefined;
-          if (this.schemaRegistry) {
-            nestedTargetSchema = this.schemaRegistry.get(relConfig.targetTable);
+    const descriptors: PropertyDescriptorMap = {};
+
+    for (const [colName, dbColumnName] of columnNameMap) {
+      const mapper = columnMappers[colName];
+      descriptors[colName] = {
+        get(this: any) {
+          const slots: MockRowSlots = this;
+          const fieldRefCache = slots[MOCK_ROW_FIELD_REFS] ??= {};
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,  // Alias for SQL generation
+              __sourceTable: sourceTable,  // Actual table name for mapper lookup
+              __mapper: mapper,  // Include mapper for toDriver transformation in conditions
+              __sqlType: columnSqlTypes[colName],  // Column SQL type — lets flag* emit width-exact mask casts
+              __navigationAliases: navigationAliases,  // All intermediate navigation aliases for JOIN resolution
+            };
           }
-          if (!nestedTargetSchema && relConfig.targetTableBuilder) {
-            nestedTargetSchema = relConfig.targetTableBuilder.build();
-          }
+          return cached;
+        },
+        enumerable: true,
+        configurable: true,
+      };
+    }
 
-          if (relConfig.type === 'many') {
-            // Collection navigation
-            // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-            Object.defineProperty(mock, relName, {
-              get: () => {
+    // Build extended navigation path for nested collections
+    // Only build navigation path if we have a sourceAlias (meaning we're inside a collection's selector)
+    // If sourceAlias is empty, we're in the main query and references are joined in the FROM clause
+    let extendedNavPath: NavigationJoin[] = [];
+    if (this.sourceAlias) {
+      // Build the current navigation step to include in path for nested collections
+      // This represents the join from sourceAlias to this.relationName (this.targetTable)
+      const currentNavStep: NavigationJoin = {
+        alias: this.relationName,
+        targetTable: this.targetTable,
+        foreignKeys: this.foreignKeys,
+        matches: this.matches.length > 0 ? this.matches : ['id'],  // Default to 'id' if not specified
+        isMandatory: this.isMandatory,
+        sourceAlias: this.sourceAlias,
+      };
+      extendedNavPath = [...this.navigationPath, currentNavStep];
+    }
+
+    // Values captured at descriptor-build time — identical for every row of this
+    // signature (the registry is the process-wide schema registry; `sourceAlias`
+    // determines whether nested references track their join path).
+    const schemaRegistry = this.schemaRegistry;
+    const parentSourceAlias = this.sourceAlias;
+
+    // Add navigation properties (both collections and references)
+    if (this.targetTableSchema!.relations) {
+      for (const [relName, relConfig] of Object.entries(this.targetTableSchema!.relations)) {
+        // Try to get target schema from registry (preferred, has full relations) or targetTableBuilder
+        let nestedTargetSchema: TableSchema | undefined;
+        if (this.schemaRegistry) {
+          nestedTargetSchema = this.schemaRegistry.get(relConfig.targetTable);
+        }
+        if (!nestedTargetSchema && relConfig.targetTableBuilder) {
+          nestedTargetSchema = relConfig.targetTableBuilder.build();
+        }
+
+        if (relConfig.type === 'many') {
+          // Collection navigation
+          // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+          descriptors[relName] = {
+            get(this: any) {
+              const slots: MockRowSlots = this;
+              const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+              // Memoize per row: selectors revisit the same navigation repeatedly
+              // (aggregates, predicates), and each fresh visit used to rebuild the
+              // whole sub-graph.
+              let cached = navCache[relName];
+              if (cached === undefined) {
                 const fk = relConfig.foreignKey || relConfig.foreignKeys?.[0] || '';
-                return new CollectionQueryBuilder(
+                cached = navCache[relName] = new CollectionQueryBuilder(
                   relName,
                   relConfig.targetTable,
                   fk,
-                  this.relationName,  // Use alias (relationName) for correlation in lateral joins
+                  tableAlias,  // Use alias (relationName) for correlation in lateral joins
                   nestedTargetSchema,  // Pass the target schema directly
-                  this.schemaRegistry,  // Pass schema registry for nested resolution
+                  schemaRegistry,  // Pass schema registry for nested resolution
                   extendedNavPath,  // Pass navigation path for intermediate joins (empty if main query)
                   relConfig.foreignKeys,  // Propagate composite FK / literal predicates
                   relConfig.matches
                 );
-              },
-              enumerable: false,
-              configurable: true,
-            });
-          } else {
-            // Reference navigation
-            // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
-            // with circular relations like User->Posts->User)
-            Object.defineProperty(mock, relName, {
-              get: () => {
+              }
+              return cached;
+            },
+            enumerable: false,
+            configurable: true,
+          };
+        } else {
+          // Reference navigation
+          // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
+          // with circular relations like User->Posts->User)
+          descriptors[relName] = {
+            get(this: any) {
+              const slots: MockRowSlots = this;
+              const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+              let cached = navCache[relName];
+              if (cached === undefined) {
                 const refBuilder = new ReferenceQueryBuilder(
                   relName,
                   relConfig.targetTable,
@@ -7042,24 +7123,22 @@ export class ReferenceQueryBuilder<TItem = any> {
                   relConfig.matches || [],
                   relConfig.isMandatory ?? false,
                   nestedTargetSchema,  // Pass the target schema directly
-                  this.schemaRegistry,  // Pass schema registry for nested resolution
+                  schemaRegistry,  // Pass schema registry for nested resolution
                   extendedNavPath,  // Pass navigation path for nested collections
-                  this.sourceAlias ? this.relationName : ''  // Only set source if tracking path
+                  parentSourceAlias ? tableAlias : ''  // Only set source if tracking path
                 );
-                return refBuilder.createMockTargetRow();
-              },
-              enumerable: false,
-              configurable: true,
-            });
-          }
+                cached = navCache[relName] = refBuilder.createMockTargetRow();
+              }
+              return cached;
+            },
+            enumerable: false,
+            configurable: true,
+          };
         }
       }
-
-      return mock;
-    } else {
-      // Fallback: use the shared nested proxy that supports deep property access
-      return createNestedFieldRefProxy(this.relationName);
     }
+
+    return descriptors;
   }
 }
 
