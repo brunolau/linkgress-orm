@@ -763,6 +763,7 @@ export class SelectQueryBuilder<TSelection> {
   private whereCond?: Condition;
   private limitValue?: number;
   private offsetValue?: number;
+  private lockClause?: string;
   private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
@@ -1061,6 +1062,42 @@ export class SelectQueryBuilder<TSelection> {
    */
   offset(count: number): this {
     this.offsetValue = count;
+    return this;
+  }
+
+  /**
+   * Append a row-level lock clause to the final SELECT — `FOR UPDATE` (with the
+   * optional `SKIP LOCKED` / `NOWAIT` modifiers). The lock is taken on the rows
+   * the statement reads, making a following check+write in the SAME transaction
+   * (or a later CTE leg of a fused statement) atomic against every other
+   * `forUpdate` reader of those rows — the DB-side replacement for app-level
+   * distributed locks around read-then-write sequences (TOCTOU).
+   *
+   * Always pair with `.orderBy(...)` for a deterministic lock ORDER (lock
+   * multi-row sets in a stable order — e.g. ascending id — to avoid deadlocks).
+   *
+   * Execution paths: toList()/firstOrDefault() emit the clause; UNION builds and
+   * nested-collection CTE legs intentionally drop it (a lock on a lateral join
+   * leg is meaningless). A query used as a Subquery/CTE leg through
+   * `asSubquery()` carries it verbatim — that is the fused-conditional-INSERT
+   * pattern's lock leg.
+   *
+   * @example
+   * .orderBy(g => g.id)
+   * .forUpdate()
+   * .toList()
+   */
+  forUpdate(options?: { skipLocked?: boolean; noWait?: boolean }): this {
+    if (options?.skipLocked && options?.noWait) {
+      throw new Error('forUpdate: skipLocked and noWait are mutually exclusive');
+    }
+
+    this.lockClause = options?.skipLocked
+      ? 'FOR UPDATE SKIP LOCKED'
+      : options?.noWait
+        ? 'FOR UPDATE NOWAIT'
+        : 'FOR UPDATE';
+
     return this;
   }
 
@@ -5467,7 +5504,12 @@ ${joinClauses.join('\n')}`;
 
     // Add DISTINCT if needed
     const distinctClause = this.isDistinct ? 'DISTINCT ' : '';
-    finalQuery += `SELECT ${distinctClause}${selectParts.join(', ')}\n${fromClause}\n${whereClause}\n${orderByClause}\n${limitClause}`.trim();
+    // Row-level lock clause (forUpdate) — emitted only on the TOP-LEVEL statement:
+    // nested-collection CTE legs run as lateral joins where a lock is meaningless
+    // (and would be a syntax error inside some leg shapes), so the flag is read
+    // ONLY here at the final assembly point.
+    const lockClause = this.lockClause ? `\n${this.lockClause}` : '';
+    finalQuery += `SELECT ${distinctClause}${selectParts.join(', ')}\n${fromClause}\n${whereClause}\n${orderByClause}\n${limitClause}${lockClause}`.trim();
 
     return {
       sql: finalQuery,

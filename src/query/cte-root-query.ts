@@ -158,6 +158,7 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   private orderByFields: Array<{ table: string; field: string; direction: 'ASC' | 'DESC' }> = [];
   private limitValue?: number;
   private offsetValue?: number;
+  private lockClause?: string;
 
   constructor(
     protected rootCte: DbCte<TRootColumns>,
@@ -289,6 +290,31 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     return this;
   }
 
+  /**
+   * Append `FOR UPDATE` (optionally `SKIP LOCKED` / `NOWAIT`) to this CTE-rooted
+   * SELECT. Locks the rows the ROOT CTE's body read (the join legs are CTEs and
+   * lock nothing themselves). This is the atomic guard leg of the
+   * fused-conditional-INSERT pattern: put `FOR UPDATE` on the leg that reads the
+   * guard rows (e.g. `capacity_group`), then a data-modifying leg conditioned on
+   * it — check + write in one statement, no app-level lock, no TOCTOU.
+   *
+   * Pair with `.orderBy(...)` on a stable key (ascending id) when locking
+   * multiple rows, so concurrent fused statements cannot deadlock each other.
+   */
+  forUpdate(options?: { skipLocked?: boolean; noWait?: boolean }): this {
+    if (options?.skipLocked && options?.noWait) {
+      throw new Error('forUpdate: skipLocked and noWait are mutually exclusive');
+    }
+
+    this.lockClause = options?.skipLocked
+      ? 'FOR UPDATE SKIP LOCKED'
+      : options?.noWait
+        ? 'FOR UPDATE NOWAIT'
+        : 'FOR UPDATE';
+
+    return this;
+  }
+
   private addJoin<TRight extends Record<string, any>>(
     type: CteJoinType,
     cte: DbCte<TRight>,
@@ -372,9 +398,12 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
       limitClause += `\nOFFSET ${this.offsetValue}`;
     }
 
+    // Row-level lock clause (forUpdate) — after LIMIT/OFFSET per SQL grammar.
+    const lockClause = this.lockClause ? `\n${this.lockClause}` : '';
+
     const sqlText =
       `WITH ${cteDecls.join(', ')}\n` +
-      `SELECT ${selectParts.join(', ')}\n${fromClause}${orderByClause}${limitClause}`;
+      `SELECT ${selectParts.join(', ')}\n${fromClause}${orderByClause}${limitClause}${lockClause}`;
 
     return { sql: sqlText, params: ctx.params };
   }

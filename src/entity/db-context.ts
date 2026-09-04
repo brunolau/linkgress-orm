@@ -2431,6 +2431,16 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
 
   offset(count: number): EntitySelectQueryBuilder<TEntity, TSelection>;
 
+  /**
+   * Append `FOR UPDATE` (optionally `SKIP LOCKED` / `NOWAIT`) to the built
+   * SELECT — a row-level lock making a following check+write in the SAME
+   * transaction atomic against every other `forUpdate` reader of those rows
+   * (DB-side TOCTOU guard; see SelectQueryBuilder.forUpdate for the full
+   * contract). Pair with `.orderBy(...)` on a stable key when locking
+   * multiple rows, to avoid deadlocks between concurrent lockers.
+   */
+  forUpdate(options?: { skipLocked?: boolean; noWait?: boolean }): EntitySelectQueryBuilder<TEntity, TSelection>;
+
   count(): Promise<number>;
 
   countOver(): Promise<{ data: ResolveCollectionResults<TSelection>[]; totalCount: number }>;
