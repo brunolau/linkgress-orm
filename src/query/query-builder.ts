@@ -61,6 +61,32 @@ export function getRelationEntriesForSchema(schema: TableSchema): Array<[string,
 }
 
 /**
+ * Performance utility: per-schema column metadata (mapper + SQL type), computed once per
+ * schema object. `_createMockRow` and the collection mock-item builder both used to call
+ * `colBuilder.build()` for EVERY column on EVERY query build — pure waste for an immutable
+ * schema. WeakMap keyed by schema identity so schemas can be garbage-collected with their
+ * DbContext.
+ */
+const schemaColumnMetaCache = new WeakMap<TableSchema, Map<string, { mapper?: any; type?: string; name?: string; primaryKey?: boolean }>>();
+
+export function getSchemaColumnMeta(schema: TableSchema): Map<string, { mapper?: any; type?: string; name?: string; primaryKey?: boolean }> {
+  let meta = schemaColumnMetaCache.get(schema);
+
+  if (meta == null) {
+    meta = new Map();
+
+    for (const [colName, colBuilder] of Object.entries(schema.columns)) {
+      const config = (colBuilder as any).build();
+      meta.set(colName, { mapper: config.mapper, type: config.type, name: config.name, primaryKey: config.primaryKey });
+    }
+
+    schemaColumnMetaCache.set(schema, meta);
+  }
+
+  return meta;
+}
+
+/**
  * Mock-row descriptor cache for {@link ReferenceQueryBuilder.createMockTargetRow}.
  *
  * Building a reference mock row costs O(columns + relations) `Object.defineProperty`
@@ -434,13 +460,17 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
     const columnSqlTypes: Record<string, string> = {};
-    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
-      const config = (colBuilder as any).build();
-      if (config.mapper) {
-        columnMappers[colName] = config.mapper;
+    // Per-schema mapper/type lookup, computed once — `colBuilder.build()` per column
+    // per row was measurable CPU under load (every query build walks every column
+    // twice: once here, once in the descriptors). Keyed by schema identity.
+    const schemaColumnMeta = getSchemaColumnMeta(this.schema);
+    for (const [colName, meta] of schemaColumnMeta) {
+      if (meta.mapper) {
+        columnMappers[colName] = meta.mapper;
       }
-      if (config.type) {
-        columnSqlTypes[colName] = config.type;
+
+      if (meta.type) {
+        columnSqlTypes[colName] = meta.type;
       }
     }
 
@@ -2920,10 +2950,9 @@ export class SelectQueryBuilder<TSelection> {
           // Find primary key column from schema, fallback to "id" if not found
           let pkColumn: string = null as any;
           if (targetSchema) {
-            for (const colBuilder of Object.values(targetSchema.columns)) {
-              const config = (colBuilder as any).build();
-              if (config.primaryKey) {
-                pkColumn = config.name;
+            for (const meta of getSchemaColumnMeta(targetSchema).values()) {
+              if (meta.primaryKey && meta.name != null) {
+                pkColumn = meta.name;
                 break;
               }
             }
@@ -3923,12 +3952,14 @@ export class SelectQueryBuilder<TSelection> {
   ): any[] {
     if (returning === true) {
       // Full entity mapping - apply fromDriver mappers
+      // getSchemaColumnMeta: `colBuilder.build()` per column PER ROW was pure waste for an
+      // immutable schema — the per-schema meta map is computed once.
+      const columnMeta = getSchemaColumnMeta(this.schema);
       return rows.map(row => {
         const mapped: any = {};
-        for (const [propName, colBuilder] of Object.entries(this.schema.columns)) {
-          const config = (colBuilder as any).build();
-          const dbValue = row[config.name];
-          mapped[propName] = config.mapper ? config.mapper.fromDriver(dbValue) : dbValue;
+        for (const [propName, meta] of columnMeta) {
+          const dbValue = row[meta.name!];
+          mapped[propName] = meta.mapper ? meta.mapper.fromDriver(dbValue) : dbValue;
         }
         return mapped;
       });
@@ -3946,16 +3977,14 @@ export class SelectQueryBuilder<TSelection> {
         }
 
         // Try to find column by alias or name
-        const colEntry = Object.entries(this.schema.columns).find(([propName, col]) => {
-          const config = (col as any).build();
-          return propName === key || config.name === key;
+        const colEntry = [...getSchemaColumnMeta(this.schema)].find(([propName, meta]) => {
+          return propName === key || meta.name === key;
         });
 
         if (colEntry) {
-          const [, col] = colEntry;
-          const config = (col as any).build();
+          const [, meta] = colEntry;
           // Apply fromDriver mapper if present
-          mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
+          mapped[key] = meta.mapper ? meta.mapper.fromDriver(value) : value;
         } else {
           mapped[key] = value;
         }
@@ -4413,15 +4442,14 @@ ${joinClauses.join('\n')}`;
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
     const columnSqlTypes: Record<string, string> = {};
-    for (const [colName, colBuilder] of Object.entries(this.schema.columns)) {
-      const config = (colBuilder as any).build();
-      if (config.mapper) {
-        columnMappers[colName] = config.mapper;
+    for (const [colName, meta] of getSchemaColumnMeta(this.schema)) {
+      if (meta.mapper) {
+        columnMappers[colName] = meta.mapper;
       }
-      if (config.type) {
-        columnSqlTypes[colName] = config.type;
+      if (meta.type) {
+        columnSqlTypes[colName] = meta.type;
       }
-    }
+      }
 
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
@@ -7040,15 +7068,14 @@ export class ReferenceQueryBuilder<TItem = any> {
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
     const columnSqlTypes: Record<string, string> = {};
-    for (const [colName, colBuilder] of Object.entries(this.targetTableSchema!.columns)) {
-      const config = (colBuilder as any).build();
-      if (config.mapper) {
-        columnMappers[colName] = config.mapper;
+    for (const [colName, meta] of getSchemaColumnMeta(this.targetTableSchema!)) {
+      if (meta.mapper) {
+        columnMappers[colName] = meta.mapper;
       }
-      if (config.type) {
-        columnSqlTypes[colName] = config.type;
+      if (meta.type) {
+        columnSqlTypes[colName] = meta.type;
       }
-    }
+      }
 
     const sourceTable = this.targetTable;  // Actual table name for schema lookup
     // Collect all navigation aliases from the path leading to this reference
@@ -8451,9 +8478,8 @@ export class CollectionQueryBuilder<TItem = any> {
       let dbToPropertyMap: Map<string, string> | null = null;
       if (this.targetTableSchema) {
         dbToPropertyMap = new Map();
-        for (const [propName, colBuilder] of Object.entries(this.targetTableSchema.columns)) {
-          const config = (colBuilder as any).build();
-          dbToPropertyMap.set(config.name, propName);
+        for (const [propName, meta] of getSchemaColumnMeta(this.targetTableSchema!)) {
+          dbToPropertyMap.set(meta.name!, propName);
         }
       }
 
