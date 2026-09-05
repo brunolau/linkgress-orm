@@ -322,7 +322,7 @@ const usersWithAge = await db.users
   .toList();
 ```
 
-**Available Operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `and`, `or`, `not`, `like`, `ilike`, `inArray`, `isNull`, `isNotNull`, `coalesce`, `jsonbSelect`, `jsonbSelectText`, `flagHas`, `flagHasAll`, `flagHasAny`, `flagHasNone`
+**Available Operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `and`, `or`, `not`, `like`, `ilike`, `inArray`, `notInArray`, `eqAny`, `neAll`, `isNull`, `isNotNull`, `coalesce`, `jsonbSelect`, `jsonbSelectText`, `flagHas`, `flagHasAll`, `flagHasAny`, `flagHasNone`
 
 ## Next Steps
 

@@ -70,11 +70,55 @@ const users = await db.users
 - Logical: `and`, `or`, `not`
 - Pattern matching: `like`, `ilike`, `startsWith`
 - Regex: `regexMatches`, `regexMatchesCaseInsensitive`, `regexNoMatch`, `regexNoMatchCaseInsensitive`
-- Array: `inArray`, `notInArray`
+- Array: `inArray`, `notInArray`, `eqAny`, `neAll`
 - Null checking: `isNull`, `isNotNull`
 - JSONB: `jsonbSelect`, `jsonbSelectText`
 - Utility: `coalesce`
 - Bitmask/Flags: `flagHas`, `flagHasAll`, `flagHasAny`, `flagHasNone`
+
+### Matching a List of Values
+
+Two forms, differing only in how the list reaches the server.
+
+`inArray` / `notInArray` render one placeholder per element:
+
+```typescript
+db.orderItems.where(oi => inArray(oi.productPriceId, priceIds));
+// "oi"."product_price_id" IN ($1, $2, $3)
+```
+
+`eqAny` / `neAll` bind the whole list as a **single** parameter, cast to the
+column's declared element type:
+
+```typescript
+db.orderItems.where(oi => eqAny(oi.productPriceId, priceIds));
+// "oi"."product_price_id" = ANY($1::integer[])
+
+db.orderItems.where(oi => neAll(oi.productPriceId, excludedIds));
+// "oi"."product_price_id" <> ALL($1::integer[])
+```
+
+The cast is resolved from the column itself, including through custom mappers —
+a `uuid` column yields `::uuid[]`, an enum column `::order_status[]`, a
+`serial` column `::integer[]`, and a `char(n)` column `::bpchar[]` (a literal
+`char[]` would truncate every value to one character). Columns whose refs carry
+no type information, such as CTE columns, stay uncast; PostgreSQL infers the
+array type from context there.
+
+Semantics are identical to `inArray` / `notInArray` in every case, empty lists
+and NULLs included. **Choose on planning:**
+
+| | `inArray` / `notInArray` | `eqAny` / `neAll` |
+|---|---|---|
+| Parameters | one per element | always one |
+| Statement text | changes with list length | fixed |
+| Planner estimate | exact row count from the literal list | default selectivity |
+
+So `eqAny` is the better fit for hot lookups whose list length varies and for
+lists long enough that the parameter count is itself a cost — it is what makes
+such a query reusable as a prepared statement (see
+[`preparedStatements`](../database-clients.md)). Keep `inArray` for short lists
+in queries you have hand-tuned around the planner's exact estimate.
 
 ### Ordering Results
 

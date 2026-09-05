@@ -155,6 +155,8 @@ export {
   regexNoMatchCaseInsensitive,
   inArray,
   notInArray,
+  eqAny,
+  neAll,
   isNull,
   isNotNull,
   between,

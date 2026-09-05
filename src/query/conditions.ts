@@ -1,5 +1,6 @@
 import type { DbColumn } from '../entity/db-column';
 import type { Subquery } from './subquery';
+import { toPgArrayLiteral } from '../types/custom-types';
 
 /**
  * SQL condition types
@@ -875,6 +876,117 @@ export function notInArray<T extends string, V>(
   values: V[]
 ): Condition {
   return new NotInComparison<V>(field!, values);
+}
+
+// ============================================================================
+// ANY / ALL array operators
+// ============================================================================
+
+/**
+ * Column types with no usable array form of their own.
+ *
+ * The serial pseudo-types exist only in DDL — the column is stored as, and must
+ * be compared as, the integer type behind them. `char` is remapped because
+ * `char[]` means `character(1)[]`, which truncates every element to its first
+ * character and then silently matches nothing; the internal name `bpchar`
+ * carries no length limit.
+ */
+const ARRAY_ELEMENT_TYPE_OVERRIDES: Record<string, string> = {
+  serial: 'integer',
+  smallserial: 'smallint',
+  bigserial: 'bigint',
+  char: 'bpchar',
+};
+
+/**
+ * The `::type[]` suffix for a value list bound against `column`, or ''.
+ *
+ * Resolved from the column FieldRef's `__sqlType` (attached by the schema-aware
+ * mock builders) exactly like {@link flagMaskCast}, including for custom-mapped
+ * columns — `mapWith()` overwrites the declared type with the mapper's own
+ * `dataType()`, so an enum or vector column reports its real PostgreSQL type.
+ *
+ * Semantically the cast is optional: `col = ANY($1)` already resolves `$1` to
+ * the column's array type by context. Spelling it out keeps the expression tree
+ * deterministic across every way the statement is reproduced. Refs carrying no
+ * type info (CTE columns, post-select shapes) and the element-less `array`
+ * column type therefore stay bare rather than guess.
+ */
+function arrayElementCast(column: unknown): string {
+  const sqlType = (column as { __sqlType?: string } | null)?.__sqlType;
+  if (!sqlType || sqlType === 'array') return '';
+  return `::${ARRAY_ELEMENT_TYPE_OVERRIDES[sqlType] ?? sqlType}[]`;
+}
+
+/**
+ * Serialize `values` into the single array-literal parameter both operators bind,
+ * applying the column's `toDriver` mapper per element first (as `inArray` does).
+ */
+function toArrayParameter<V>(column: unknown, values: readonly V[]): string {
+  const mapper = getValueMapper(column);
+  return toPgArrayLiteral(
+    mapper ? values.map(value => applyToDriverMapper(value, mapper)) : values
+  );
+}
+
+/**
+ * `column = ANY($1::type[])` — membership against a list bound as ONE parameter.
+ *
+ * The array-form counterpart to {@link inArray}. `inArray` renders one
+ * placeholder per element, so its statement text changes with the list length;
+ * this binds the whole list as a single PostgreSQL array literal cast to the
+ * column's declared element type, giving one statement text for every length.
+ * That is what makes it reusable as a prepared statement — see
+ * `QueryOptions.preparedStatements`, whose bounded-cache caveat about
+ * `IN ($1, $2, …)` lists this operator exists to remove.
+ *
+ * The trade-off is planning, not correctness: a literal `IN` list tells the
+ * planner exactly how many values it will see, while a parameter array falls
+ * back to a default selectivity estimate. Prefer `inArray` for short lists in
+ * queries you have hand-tuned; prefer `eqAny` for hot lookups whose list length
+ * varies, and for lists large enough that the parameter count itself is a cost.
+ *
+ * An empty list yields `= ANY('{}')`, which is FALSE — the same result as
+ * `inArray`'s `1=0`, without a second statement text.
+ *
+ * @example
+ * db.orderItems.where(oi => eqAny(oi.productPriceId, boundPriceIds))
+ * // "oi"."product_price_id" = ANY($1::integer[])
+ *
+ * @example
+ * // Navigation properties resolve their JOIN like any other condition
+ * db.orderTasks.where(ot => eqAny(ot.task!.level!.id, levelIds))
+ */
+export function eqAny<V>(
+  column: FieldLike<V> | DbColumn<V> | undefined,
+  values: readonly V[]
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['', ' = ANY(', `${arrayElementCast(column)})`],
+    [column!, toArrayParameter(column, values)]
+  );
+}
+
+/**
+ * `column <> ALL($1::type[])` — the negation of {@link eqAny}, and the array-form
+ * counterpart to {@link notInArray}.
+ *
+ * NULL semantics match `NOT IN` exactly: a NULL column, or a NULL anywhere in
+ * the list, yields NULL and the row is filtered out. An empty list yields
+ * `<> ALL('{}')`, which is TRUE — the same result as `notInArray`'s `1=1`.
+ *
+ * @example
+ * db.orderItems.where(oi => neAll(oi.productPriceId, excludedPriceIds))
+ * // "oi"."product_price_id" <> ALL($1::integer[])
+ */
+export function neAll<V>(
+  column: FieldLike<V> | DbColumn<V> | undefined,
+  values: readonly V[]
+): SqlFragment<boolean> {
+  return new SqlFragment<boolean>(
+    ['', ' <> ALL(', `${arrayElementCast(column)})`],
+    [column!, toArrayParameter(column, values)]
+  );
 }
 
 export function isNull<T extends string, V>(

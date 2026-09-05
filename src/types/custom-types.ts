@@ -87,7 +87,16 @@ export const json = <T = any>() =>
  * '{"a","b"}', nested arrays recursively). Strings are quoted with
  * backslash/quote escaping; null/undefined elements become NULL.
  */
-const toPgArrayLiteral = (values: readonly any[]): string => {
+/**
+ * Serialize a JS array into a PostgreSQL array LITERAL string (`{1,2,3}`).
+ *
+ * Exported because it is the one array encoding every supported driver accepts:
+ * pg and postgres.js serialize raw JS arrays themselves, but Bun's SQL client
+ * sends them as JSON (binary mode: protocol error 08P01; text mode: "1,2,3"
+ * without braces). Bound as a single text parameter, the server parses it into
+ * whatever array type the statement asks for.
+ */
+export const toPgArrayLiteral = (values: readonly any[]): string => {
   const parts = values.map((value) => {
     if (value === null || value === undefined) {
       return 'NULL';
