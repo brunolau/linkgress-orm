@@ -157,6 +157,14 @@ export interface QueryOptions {
   logExecutionTime?: boolean;
   /** Log query parameters */
   logParameters?: boolean;
+  /**
+   * Report FAILED statements through the logger's `'error'` section — the driver's
+   * message followed by the statement text (plus the parameters when {@link logParameters}
+   * is on) — independently of {@link logQueries}. Lets a production context keep the
+   * per-statement `'sql'`/`'params'` output off while every statement that fails is still
+   * recorded. Default: the value of `logQueries`, so existing configurations are unchanged.
+   */
+  logFailedQueries?: boolean;
   /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: CollectionStrategyType;
   /**
@@ -650,9 +658,7 @@ export class QueryExecutor {
       this.finishTiming(timing, logger, sql, params);
       return result;
     } catch (error) {
-      if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
-      }
+      this.logFailure(logger, error, sql, params);
       throw error;
     }
   }
@@ -681,9 +687,7 @@ export class QueryExecutor {
       this.finishTiming(timing, logger, sql);
       return result;
     } catch (error) {
-      if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
-      }
+      this.logFailure(logger, error, sql);
       throw error;
     }
   }
@@ -711,11 +715,38 @@ export class QueryExecutor {
         throw new Error('querySimpleMulti not supported by this client');
       }
     } catch (error) {
-      if (this.options.logQueries) {
-        logger(`[SQL Error] ${error instanceof Error ? error.message : String(error)}`, 'error');
-      }
+      this.logFailure(logger, error, sql);
       throw error;
     }
+  }
+
+  /**
+   * Whether these options call for an executor at all — any logging, failure reporting,
+   * timing or slow-query duty. A context without any of them talks to the client directly.
+   */
+  static isNeeded(options?: QueryOptions): boolean {
+    return !!options && !!(options.logQueries || options.logFailedQueries || options.logExecutionTime || options.onQueryTakingTooLong);
+  }
+
+  /**
+   * The `[SQL Error]` line for a failed statement: the driver's message, the statement text
+   * and — only while `logParameters` is on — the parameters. Gated on `logFailedQueries`,
+   * which defaults to `logQueries` (see {@link QueryOptions.logFailedQueries}).
+   */
+  private logFailure(
+    logger: (message: string, section?: LogSection) => void,
+    error: unknown,
+    sql: string,
+    params?: any[]
+  ): void {
+    if (!(this.options.logFailedQueries ?? this.options.logQueries)) {
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const parameters = this.options.logParameters && params && params.length > 0
+      ? `\n[Parameters] ${JSON.stringify(params)}`
+      : '';
+    logger(`[SQL Error] ${message}\n${sql.trim()}${parameters}`, 'error');
   }
 
   /**
@@ -1169,7 +1200,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
 
     // Create new executor if logging options are provided
     let newExecutor = this.executor;
-    if (options.logQueries || options.logExecutionTime || options.onQueryTakingTooLong) {
+    if (QueryExecutor.isNeeded(options)) {
       newExecutor = new QueryExecutor(this.client, {
         ...options,
         collectionStrategy: mergedStrategy,
@@ -1657,7 +1688,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     this.queryOptions = queryOptions;
 
     // Create executor if logging is enabled
-    if (queryOptions?.logQueries || queryOptions?.logExecutionTime || queryOptions?.onQueryTakingTooLong) {
+    if (QueryExecutor.isNeeded(queryOptions)) {
       this.executor = new QueryExecutor(client, queryOptions);
     }
 
@@ -1845,7 +1876,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     (txContext as any).queryOptions = effectiveOptions;
 
     // Create executor for the transactional client if logging is enabled
-    if (effectiveOptions?.logQueries || effectiveOptions?.logExecutionTime || effectiveOptions?.onQueryTakingTooLong) {
+    if (QueryExecutor.isNeeded(effectiveOptions)) {
       (txContext as any).executor = new QueryExecutor(txClient, effectiveOptions);
     }
 
@@ -2953,7 +2984,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
 
     // Create new executor if logging options are provided
     let newExecutor = (originalContext as any).executor;
-    if (mergedOptions.logQueries || mergedOptions.logExecutionTime || mergedOptions.onQueryTakingTooLong) {
+    if (QueryExecutor.isNeeded(mergedOptions)) {
       newExecutor = new QueryExecutor(
         (originalContext as any).client,
         mergedOptions

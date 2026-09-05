@@ -1,13 +1,14 @@
 /**
- * Static switch + storage for the reference mock-row prototype cache (see
- * `ReferenceQueryBuilder.createMockTargetRow`).
+ * Static switch + storage for the mock-row prototype cache — shared by
+ * `ReferenceQueryBuilder.createMockTargetRow`, `SelectQueryBuilder._createMockRow`
+ * and `CollectionQueryBuilder.createMockItem`.
  *
- * The cache is a pure optimization: the column/relation getters of a reference mock row are
- * built once per (schema, alias, navigation-path) signature onto a shared PROTOTYPE object,
- * and every mock row of that signature is `Object.create(prototype)` plus its own two
- * symbol-keyed state slots. Semantics are identical either way; with the switch OFF every row
- * still gets a fresh prototype (built and discarded per row — the pre-0.4.66 memory profile,
- * nothing retained beyond a row's lifetime).
+ * The cache is a pure optimization: the column/relation getters of a mock row are
+ * built once per signature onto a shared PROTOTYPE object, and every mock row of that
+ * signature is `Object.create(prototype)` plus its own symbol-keyed state slots.
+ * Semantics are identical either way; with the switch OFF every row still gets a fresh
+ * prototype (built and discarded per row — the pre-0.4.66 memory profile, nothing
+ * retained beyond a row's lifetime).
  *
  * Why a prototype and not a shared descriptor map (0.4.66): applying a shared map still cost
  * one `Object.defineProperties` per row — `O(columns + relations)` property definitions —

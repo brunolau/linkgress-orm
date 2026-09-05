@@ -4,6 +4,7 @@ import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy } from './query-utils';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
+import { materializeMockSelection } from './query-builder';
 import { FutureQuery } from './future-query';
 import { Subquery } from './subquery';
 import type { DbCte } from './cte-builder';
@@ -310,7 +311,7 @@ export class UnionQueryBuilder<TSelection> {
   getSelectionMetadata(): Record<string, any> {
     const firstLeg = this.components[0]?.ownerBuilder as any;
     if (firstLeg && typeof firstLeg._createMockRow === 'function' && typeof firstLeg.selector === 'function') {
-      return firstLeg.selector(firstLeg._createMockRow());
+      return materializeMockSelection(firstLeg.selector(firstLeg._createMockRow()));
     }
     return {};
   }

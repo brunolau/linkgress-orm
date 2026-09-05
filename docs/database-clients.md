@@ -199,6 +199,21 @@ const db = new DbContext(client, schema, {
 });
 ```
 
+A production context usually wants the opposite: no per-statement output, but every statement
+that FAILS (and, via `onQueryTakingTooLong`, every slow one) still recorded:
+
+```typescript
+const db = new DbContext(client, schema, {
+  logQueries: false,        // no '[SQL Query]' / '[Parameters]' lines
+  logFailedQueries: true,   // '[SQL Error] <message>\n<statement>' on the 'error' section
+  logParameters: false,     // keep parameter values out of the failure line too
+  logger: (message, section) => myLogger.route(message, section),
+});
+```
+
+`logFailedQueries` defaults to the value of `logQueries`, so contexts that never set it behave
+as before.
+
 ## Internal Changes
 
 All internal components now use the abstract `DatabaseClient` instead of `Pool`:

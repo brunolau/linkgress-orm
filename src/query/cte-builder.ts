@@ -1,5 +1,5 @@
 import { DatabaseClient } from '../database/database-client.interface';
-import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults } from './query-builder';
+import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materializeMockSelection } from './query-builder';
 import { SqlBuildContext, FieldRef, UnwrapSelection, SqlFragment } from './conditions';
 import { renumberPlaceholders } from './query-batch';
 
@@ -274,7 +274,7 @@ export class DbCteBuilder {
     } else {
       // Standard SelectQueryBuilder — render via mock row + selector.
       const mockRow = (query as any)._createMockRow();
-      selectionResult = (query as any).selector(mockRow);
+      selectionResult = materializeMockSelection((query as any).selector(mockRow));
       sql = (query as any).buildQuery(selectionResult, queryContext).sql;
     }
 
@@ -533,7 +533,7 @@ export class DbCteBuilder {
     // Standard SelectQueryBuilder - uses _createMockRow and selector
     else if (typeof query._createMockRow === 'function' && typeof query.selector === 'function') {
       const mockRow = query._createMockRow();
-      const selectionResult = query.selector(mockRow);
+      const selectionResult = materializeMockSelection(query.selector(mockRow));
       const result = query.buildQuery(selectionResult, queryContext);
       context.paramCounter = queryContext.paramCounter;
       sql = result.sql;

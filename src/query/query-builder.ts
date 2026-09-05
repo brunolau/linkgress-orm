@@ -104,10 +104,12 @@ export function getSchemaColumnMeta(schema: TableSchema): Map<string, { mapper?:
  */
 const MOCK_ROW_FIELD_REFS = Symbol('linkgressMockFieldRefs');
 const MOCK_ROW_NAV_CACHE = Symbol('linkgressMockNavCache');
+const MOCK_ROW_CHAIN_ID = Symbol('linkgressMockChainId');
 
 type MockRowSlots = {
   [MOCK_ROW_FIELD_REFS]?: Record<string, any>;
   [MOCK_ROW_NAV_CACHE]?: Record<string, any>;
+  [MOCK_ROW_CHAIN_ID]?: string | number;
 };
 
 const navigationPathSignature = (path: NavigationJoin[]): string => path
@@ -115,10 +117,13 @@ const navigationPathSignature = (path: NavigationJoin[]): string => path
   .join('>');
 
 /**
- * Whether `value` is a reference mock row minted by `ReferenceQueryBuilder.createMockTargetRow`.
- * Those rows INHERIT their column/relation getters from a shared prototype (see MockRowCache),
- * so `Object.getPrototypeOf(row) !== Object.prototype` and own-property APIs see no columns —
- * the row's own state slots are the reliable marker.
+ * Whether `value` is a mock row minted by the query builders (`createMockTargetRow`,
+ * `SelectQueryBuilder._createMockRow`, `CollectionQueryBuilder.createMockItem`). Every
+ * such row INHERITS its column/relation getters from a shared prototype (see MockRowCache),
+ * so `Object.getPrototypeOf(row) !== Object.prototype` and own-property APIs (`Object.keys`,
+ * `{...row}`) see no columns — the row's own state slots are the reliable marker. Callers
+ * must treat a mock row like the plain-object mock it replaced (walk it for revivals,
+ * read properties directly) but never enumerate it with own-property APIs.
  */
 const isReferenceMockRow = (value: unknown): boolean =>
   value != null && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, MOCK_ROW_FIELD_REFS);
@@ -141,9 +146,34 @@ const findPropertyDescriptor = (value: object, key: string): PropertyDescriptor 
 };
 
 /**
+ * Materializes a selector RESULT that is itself a mock row (identity selectors like
+ * `.select(p => p)` or `(l, r) => l`): such rows inherit their columns from the shared
+ * prototype, so own-property walkers (`Object.entries` / `keys` / `values`) would see
+ * NOTHING and silently project zero columns. Reading every enumerable column getter
+ * once into a plain object restores exactly what the pre-prototype mocks exposed (their
+ * own enumerable getters) — non-enumerable relation getters stay out, as before. No-op
+ * for every other result shape (FieldRef, SqlFragment, builder, plain object, array).
+ */
+export const materializeMockSelection = (result: any): any => {
+  if (!isReferenceMockRow(result)) {
+    return result;
+  }
+
+  const out: any = {};
+
+  for (const key in result) {
+    if (findPropertyDescriptor(result, key)?.get != null) {
+      out[key] = result[key];
+    }
+  }
+
+  return out;
+};
+
+/**
  * First enumerable key (own or inherited) backed by a getter — the "is this a mock row" probe
- * shared by the selection resolvers. Root mocks define their getters as own properties,
- * reference mocks inherit them; column getters are enumerable on both, so the first
+ * shared by the selection resolvers. All mock rows (root, collection-item, reference)
+ * inherit their getters from a shared prototype; column getters are enumerable, so the first
  * enumerable getter is always a column and `row[key]` yields its FieldRef.
  */
 const findFirstGetterKey = (value: object): string | undefined => {
@@ -447,15 +477,44 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       return this._cachedMockRow;
     }
 
-    const mock: any = {};
+    // Prototype-level cache — same pattern as ReferenceQueryBuilder.createMockTargetRow
+    // (see MockRowCache): every getter of a root mock row is fully determined by the
+    // schema object, so every query over the same table can share ONE prebuilt prototype
+    // carrying all column/relation getters; a new row is `Object.create` plus its own
+    // state slots — O(1) instead of one property definition per column+relation per
+    // query (measurable CPU under load: the root-mock walk was the ORM's largest
+    // per-query-build item after 0.4.69). Per-query state (`chainId`, the FieldRef
+    // cache) lives in symbol-keyed slots read through `this`; relation getters still
+    // construct FRESH builders per access (memoizing would fuse repeated
+    // `.where()` chains). Opt-in via the same static switch; OFF = fresh prototype
+    // per row (the pre-0.4.70 behaviour). Consumers must not probe mock rows with
+    // OWN-property APIs (`Object.keys`, `{...row}`) — see `isReferenceMockRow`.
+    const prototype = MockRowCache.getOrBuild(
+      `select|${this.schema.name}`,
+      () => Object.defineProperties({}, this.buildRootMockDescriptors()),
+    );
+
+    const mock: any = Object.create(prototype);
+    mock[MOCK_ROW_FIELD_REFS] = {};
+    mock[MOCK_ROW_CHAIN_ID] = this.chainId;
+
+    // Cache the mock for reuse
+    this._cachedMockRow = mock;
+    return mock;
+  }
+
+  /**
+   * Builds the shared property-descriptor map for {@link _createMockRow}'s cached path.
+   * The getters read per-row state through `this`-bound symbol slots, so one descriptor
+   * map serves every root mock row of the same schema. Values captured at build time
+   * (column mappers/types, target schemas, the registry) are schema-constants identical
+   * for every row of the signature.
+   */
+  private buildRootMockDescriptors(): PropertyDescriptorMap {
     const tableAlias = this.schema.name;
-    const chainId = this.chainId;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
-
-    // Performance: Lazy-cache FieldRef objects - only create when first accessed
-    const fieldRefCache: Record<string, any> = {};
 
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
@@ -474,18 +533,22 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       }
     }
 
+    const descriptors: PropertyDescriptorMap = {};
+
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
       const mapper = columnMappers[colName];
-      Object.defineProperty(mock, colName, {
-        get() {
+      descriptors[colName] = {
+        get(this: any) {
+          const slots: MockRowSlots = this;
+          const fieldRefCache = slots[MOCK_ROW_FIELD_REFS] ??= {};
           let cached = fieldRefCache[colName];
           if (!cached) {
             cached = fieldRefCache[colName] = {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
-              __chainId: chainId,
+              __chainId: slots[MOCK_ROW_CHAIN_ID],
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
               // Column SQL type — lets flag* emit width-exact mask casts
@@ -496,31 +559,36 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         },
         enumerable: true,
         configurable: true,
-      });
+      };
     }
 
     // Performance: Use pre-computed relation entries and cached schemas
     const relationEntries = getRelationEntriesForSchema(this.schema);
 
+    // Values captured at descriptor-build time — identical for every row of this
+    // signature (the registry is the process-wide schema registry).
+    const schemaRegistry = this.schemaRegistry;
+    const sourceTableName = this.schema.name;
+
     // Add relations (both collections and single references)
     for (const [relName, relConfig] of relationEntries) {
       // Performance: Use cached target schema, but prefer registry lookup for full relations
-      let targetSchema = this.schemaRegistry?.get(relConfig.targetTable);
+      let targetSchema = schemaRegistry?.get(relConfig.targetTable);
       if (!targetSchema) {
         targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
       }
 
       if (relConfig.type === 'many') {
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
+        descriptors[relName] = {
           get: () => {
             return new CollectionQueryBuilder(
               relName,
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              this.schema.name,
+              sourceTableName,
               targetSchema,
-              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              schemaRegistry,  // Pass schema registry for nested navigation resolution
               undefined,
               relConfig.foreignKeys,  // Propagate composite FK / literal predicates
               relConfig.matches
@@ -528,12 +596,12 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
           },
           enumerable: false,
           configurable: true,
-        });
+        };
       } else {
         // Single reference navigation (many-to-one, one-to-one)
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
         // with circular relations like User->Posts->User)
-        Object.defineProperty(mock, relName, {
+        descriptors[relName] = {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
               relName,
@@ -542,21 +610,19 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
               targetSchema,
-              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
+              schemaRegistry,  // Pass schema registry for nested navigation resolution
               [],  // Empty navigation path for first level navigation
-              this.schema.name  // Pass source table name for lateral join correlation
+              sourceTableName  // Pass source table name for lateral join correlation
             );
             return refBuilder.createMockTargetRow();
           },
           enumerable: false,
           configurable: true,
-        });
+        };
       }
     }
 
-    // Cache the mock for reuse
-    this._cachedMockRow = mock;
-    return mock;
+    return descriptors;
   }
 
   /**
@@ -624,7 +690,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       // Create fresh mocks for the selector invocation
       const freshMockLeft = createLeftMock();
       const freshMockRight = createRightMock();
-      return selector(freshMockLeft as TRow, freshMockRight as TRight);
+      return materializeMockSelection(selector(freshMockLeft as TRow, freshMockRight as TRight));
     };
 
     return new SelectQueryBuilder(
@@ -711,7 +777,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       // Create fresh mocks for the selector invocation
       const freshMockLeft = createLeftMock();
       const freshMockRight = createRightMock();
-      return selector(freshMockLeft as TRow, freshMockRight as TRight);
+      return materializeMockSelection(selector(freshMockLeft as TRow, freshMockRight as TRight));
     };
 
     return new SelectQueryBuilder(
@@ -847,7 +913,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   orderBy<T>(selector: (row: TRow) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (row: TRow) => OrderByResult<T>): this {
     const mockRow = this._createMockRow();
-    const result = selector(mockRow);
+    const result = materializeMockSelection(selector(mockRow));
     parseOrderBy(result, this.orderByFields);
     return this;
   }
@@ -950,7 +1016,7 @@ export class SelectQueryBuilder<TSelection> {
   select<TNewSelection>(selector: (row: TSelection) => TNewSelection): SelectQueryBuilder<UnwrapSelection<TNewSelection>> {
     // Create a composed selector that applies both transformations
     const composedSelector = (row: any) => {
-      const firstResult = this.selector(row);
+      const firstResult = materializeMockSelection(this.selector(row));
       return selector(firstResult);
     };
 
@@ -1038,7 +1104,7 @@ export class SelectQueryBuilder<TSelection> {
     this.joinCounter = this.joinCounter + 1;
 
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     const leftMock = this.createFieldRefProxy(selectedMock, true);
     const rightMock = this.createMockRowForTable(rightSchema, rightAlias);
 
@@ -1076,7 +1142,7 @@ export class SelectQueryBuilder<TSelection> {
     filter?: (left: any, right: TRight) => Condition
   ): this {
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     const leftMock = this.createFieldRefProxy(selectedMock, true);
     const rightMock = this.createMockRowForCte(cte as DbCte<any>);
 
@@ -1108,7 +1174,7 @@ export class SelectQueryBuilder<TSelection> {
   where(condition: (row: any) => Condition): this {
     const mockRow = this._createMockRow();
     // Apply the selector to get the selected shape that the user sees in the WHERE condition
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     // Wrap in proxy - for WHERE, we preserve original column names
     const fieldRefProxy = this.createFieldRefProxy(selectedMock, true);
     const newCondition = condition(fieldRefProxy);
@@ -1215,7 +1281,7 @@ export class SelectQueryBuilder<TSelection> {
   orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     // Wrap selectedMock in a proxy that returns FieldRefs for property access
     const fieldRefProxy = this.createFieldRefProxy(selectedMock);
     const result = selector(fieldRefProxy);
@@ -1269,7 +1335,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create mock for the current selection (left side)
     const mockRow = this._createMockRow();
-    const mockLeftSelection = this.selector(mockRow);
+    const mockLeftSelection = materializeMockSelection(this.selector(mockRow));
 
     // Create mock for the subquery result (right side)
     // For subqueries, we create a mock based on the result type
@@ -1291,7 +1357,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create a new selector
     const composedSelector = (row: any) => {
-      const leftResult = this.selector(row);
+      const leftResult = materializeMockSelection(this.selector(row));
       const freshMockRight = this.createMockRowForSubquery<TSubqueryResult>(alias, subquery);
       return selector(leftResult as TSelection, freshMockRight);
     };
@@ -1368,7 +1434,7 @@ export class SelectQueryBuilder<TSelection> {
     // Create mock for the current selection (left side)
     // IMPORTANT: We call the selector with the mock row to get a result that contains FieldRef objects
     const mockRow = this._createMockRow();
-    const mockLeftSelection = this.selector(mockRow);
+    const mockLeftSelection = materializeMockSelection(this.selector(mockRow));
 
     // The mockLeftSelection now contains FieldRef objects (with __fieldName, __dbColumnName, __tableAlias)
     // These FieldRef objects preserve the table context
@@ -1391,7 +1457,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create a new selector that first applies the current selector, then the new selector
     const composedSelector = (row: any) => {
-      const leftResult = this.selector(row);
+      const leftResult = materializeMockSelection(this.selector(row));
       const freshMockRight = this.createMockRowForTable(rightSchema, rightAlias);
       return selector(leftResult as TSelection, freshMockRight as TRight);
     };
@@ -1427,7 +1493,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create mock for the current selection (left side)
     const mockRow = this._createMockRow();
-    const mockLeftSelection = this.selector(mockRow);
+    const mockLeftSelection = materializeMockSelection(this.selector(mockRow));
 
     // Create mock for the CTE columns (right side)
     const mockRight = this.createMockRowForCte(cte);
@@ -1447,7 +1513,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create a new selector
     const composedSelector = (row: any) => {
-      const leftResult = this.selector(row);
+      const leftResult = materializeMockSelection(this.selector(row));
       const freshMockRight = this.createMockRowForCte(cte);
       return selector(leftResult as TSelection, freshMockRight as TRight);
     };
@@ -1488,7 +1554,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create mock for the current selection (left side)
     const mockRow = this._createMockRow();
-    const mockLeftSelection = this.selector(mockRow);
+    const mockLeftSelection = materializeMockSelection(this.selector(mockRow));
 
     // Create mock for the subquery result (right side)
     const mockRight = this.createMockRowForSubquery<TSubqueryResult>(alias, subquery);
@@ -1509,7 +1575,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create a new selector
     const composedSelector = (row: any) => {
-      const leftResult = this.selector(row);
+      const leftResult = materializeMockSelection(this.selector(row));
       const freshMockRight = this.createMockRowForSubquery<TSubqueryResult>(alias, subquery);
       return selector(leftResult as TSelection, freshMockRight);
     };
@@ -1559,7 +1625,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create mock for the current selection (left side)
     const mockRow = this._createMockRow();
-    const mockLeftSelection = this.selector(mockRow);
+    const mockLeftSelection = materializeMockSelection(this.selector(mockRow));
 
     // Create mock for the right table
     const mockRight = this.createMockRowForTable(rightSchema, rightAlias);
@@ -1578,7 +1644,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Create a new selector that first applies the current selector, then the new selector
     const composedSelector = (row: any) => {
-      const leftResult = this.selector(row);
+      const leftResult = materializeMockSelection(this.selector(row));
       const freshMockRight = this.createMockRowForTable(rightSchema, rightAlias);
       return selector(leftResult as TSelection, freshMockRight as TRight);
     };
@@ -1808,7 +1874,7 @@ export class SelectQueryBuilder<TSelection> {
    */
   selectDistinct<TNewSelection>(selector: (row: TSelection) => TNewSelection): SelectQueryBuilder<TNewSelection> {
     const composedSelector = (row: any) => {
-      const firstResult = this.selector(row);
+      const firstResult = materializeMockSelection(this.selector(row));
       return selector(firstResult);
     };
 
@@ -1848,12 +1914,12 @@ export class SelectQueryBuilder<TSelection> {
     let fieldToAggregate: any;
     if (selector) {
       const mockRow = this._createMockRow();
-      const mockSelection = this.selector(mockRow);
+      const mockSelection = materializeMockSelection(this.selector(mockRow));
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
       const mockRow = this._createMockRow();
-      fieldToAggregate = this.selector(mockRow);
+      fieldToAggregate = materializeMockSelection(this.selector(mockRow));
     }
 
     // Build aggregation query
@@ -1884,12 +1950,12 @@ export class SelectQueryBuilder<TSelection> {
     let fieldToAggregate: any;
     if (selector) {
       const mockRow = this._createMockRow();
-      const mockSelection = this.selector(mockRow);
+      const mockSelection = materializeMockSelection(this.selector(mockRow));
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
       const mockRow = this._createMockRow();
-      fieldToAggregate = this.selector(mockRow);
+      fieldToAggregate = materializeMockSelection(this.selector(mockRow));
     }
 
     // Build aggregation query
@@ -1920,12 +1986,12 @@ export class SelectQueryBuilder<TSelection> {
     let fieldToAggregate: any;
     if (selector) {
       const mockRow = this._createMockRow();
-      const mockSelection = this.selector(mockRow);
+      const mockSelection = materializeMockSelection(this.selector(mockRow));
       fieldToAggregate = selector(mockSelection as TSelection);
     } else {
       // No selector - use the current selection
       const mockRow = this._createMockRow();
-      fieldToAggregate = this.selector(mockRow);
+      fieldToAggregate = materializeMockSelection(this.selector(mockRow));
     }
 
     // Build aggregation query
@@ -1984,7 +2050,7 @@ export class SelectQueryBuilder<TSelection> {
       }));
 
       const mockRow = tracer.trace('createMockRow', () => this._createMockRow());
-      const selectionResult = tracer.trace('evaluateSelector', () => this.selector(mockRow));
+      const selectionResult = tracer.trace('evaluateSelector', () => materializeMockSelection(this.selector(mockRow)));
 
       const { sql, params, nestedPaths } = tracer.trace('buildQuery', () => this.buildQuery(selectionResult, context));
       tracer.endPhase();
@@ -2117,7 +2183,7 @@ export class SelectQueryBuilder<TSelection> {
     };
 
     const mockRow = this._createMockRow();
-    const selectionResult = this.selector(mockRow);
+    const selectionResult = materializeMockSelection(this.selector(mockRow));
 
     // Build query without ORDER BY, LIMIT, OFFSET for union component
     const { sql, nestedPaths } = this.buildQueryCore(selectionResult, queryContext, false);
@@ -2204,7 +2270,7 @@ export class SelectQueryBuilder<TSelection> {
     };
 
     const mockRow = this._createMockRow();
-    const selectionResult = this.selector(mockRow);
+    const selectionResult = materializeMockSelection(this.selector(mockRow));
     const { sql, params, nestedPaths } = this.buildQuery(selectionResult, context);
 
     // Create transform function that captures current state
@@ -2264,7 +2330,7 @@ export class SelectQueryBuilder<TSelection> {
     };
 
     const mockRow = this._createMockRow();
-    const selectionResult = this.selector(mockRow);
+    const selectionResult = materializeMockSelection(this.selector(mockRow));
     const { sql, params, nestedPaths } = this.buildQuery(selectionResult, context);
 
     // Restore original limit
@@ -2545,7 +2611,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Analyze the selector to extract nested queries
     const mockRow = tracer.trace('createMockRow', () => this._createMockRow());
-    const selectionResult = tracer.trace('evaluateSelector', () => this.selector(mockRow));
+    const selectionResult = tracer.trace('evaluateSelector', () => materializeMockSelection(this.selector(mockRow)));
 
     // Check if we're using temp table strategy and have collections
     const collections = tracer.trace('detectCollections', () => this.detectCollections(selectionResult));
@@ -2869,7 +2935,7 @@ export class SelectQueryBuilder<TSelection> {
     ]);
 
     try {
-      const selected = b.selector(b.createMockItem());
+      const selected = materializeMockSelection(b.selector(b.createMockItem()));
 
       for (const value of Object.values(selected)) {
         if (!(value && typeof value === 'object' && '__dbColumnName' in (value as any))) {
@@ -3388,7 +3454,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Analyze the selector to extract nested queries
     const mockRow = this._createMockRow();
-    const selectionResult = this.selector(mockRow);
+    const selectionResult = materializeMockSelection(this.selector(mockRow));
 
     // Build the query - this populates context.placeholders
     const { sql, nestedPaths } = this.buildQuery(selectionResult, context);
@@ -3901,7 +3967,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Selector function - extract selected columns
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     const selection = returning(selectedMock as TSelection);
 
     if (typeof selection === 'object' && selection !== null) {
@@ -4015,7 +4081,7 @@ export class SelectQueryBuilder<TSelection> {
 
     // Analyze the returning selector
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     const selection = returning(selectedMock as TSelection);
 
     if (typeof selection !== 'object' || selection === null) {
@@ -4120,7 +4186,7 @@ export class SelectQueryBuilder<TSelection> {
     const selectParts: string[] = [];
     const nestedPaths = new Set<string>();
     const mockRow = this._createMockRow();
-    const selectedMock = this.selector(mockRow);
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
     const selection = (returning as Function)(selectedMock as TSelection);
 
     // Helper to get FK db column name from a schema
@@ -4429,15 +4495,43 @@ ${joinClauses.join('\n')}`;
    * @internal
    */
   _createMockRow(): any {
-    const mock: any = {};
+    // Prototype-level cache — same pattern as the SelectQueryBuilder mock (see
+    // MockRowCache). The signature includes the manual-join shape because join
+    // sub-objects are part of the mock's surface; joined queries carry a per-query
+    // alias counter, so their signatures are effectively unique and they degrade to
+    // the uncached cost (built and discarded per row), while the far more common
+    // join-less `qb|<table>` signature hits the shared prototype. Per-query state
+    // (`chainId`, FieldRef cache, join sub-objects) lives in symbol-keyed slots read
+    // through `this`. Opt-in via the same static switch; OFF = fresh prototype per row
+    // (the pre-0.4.70 behaviour).
+    const joinSig = this.manualJoins
+      .filter(j => !(j as any).isSubquery && j.schema)
+      .map(j => `${j.alias}:${j.schema!.name}`)
+      .join('+');
+
+    const prototype = MockRowCache.getOrBuild(
+      `qb|${this.schema.name}|${joinSig}`,
+      () => Object.defineProperties({}, this.buildRootMockDescriptors()),
+    );
+
+    const mock: any = Object.create(prototype);
+    mock[MOCK_ROW_FIELD_REFS] = {};
+    mock[MOCK_ROW_NAV_CACHE] = {};
+    mock[MOCK_ROW_CHAIN_ID] = this.chainId;
+
+    return mock;
+  }
+
+  /**
+   * Builds the shared property-descriptor map for {@link _createMockRow}'s cached path.
+   * The getters read per-row state through `this`-bound symbol slots; values captured at
+   * build time are signature-constants identical for every row of the signature.
+   */
+  private buildRootMockDescriptors(): PropertyDescriptorMap {
     const tableAlias = this.schema.name;
-    const chainId = this.chainId;
 
     // Performance: Use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
-
-    // Performance: Lazy-cache FieldRef objects
-    const fieldRefCache: Record<string, any> = {};
 
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
@@ -4449,20 +4543,24 @@ ${joinClauses.join('\n')}`;
       if (meta.type) {
         columnSqlTypes[colName] = meta.type;
       }
-      }
+    }
+
+    const descriptors: PropertyDescriptorMap = {};
 
     // Add columns as FieldRef objects - type-safe with property name and database column name
     for (const [colName, dbColumnName] of columnNameMap) {
       const mapper = columnMappers[colName];
-      Object.defineProperty(mock, colName, {
-        get() {
+      descriptors[colName] = {
+        get(this: any) {
+          const slots: MockRowSlots = this;
+          const fieldRefCache = slots[MOCK_ROW_FIELD_REFS] ??= {};
           let cached = fieldRefCache[colName];
           if (!cached) {
             cached = fieldRefCache[colName] = {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
-              __chainId: chainId,
+              __chainId: slots[MOCK_ROW_CHAIN_ID],
               // Include mapper for toDriver transformation in conditions
               __mapper: mapper,
               // Column SQL type — lets flag* emit width-exact mask casts
@@ -4473,53 +4571,72 @@ ${joinClauses.join('\n')}`;
         },
         enumerable: true,
         configurable: true,
-      });
+      };
     }
 
+    // Captured at descriptor-build time — identical for every row of this signature.
+    const manualJoins = this.manualJoins;
+
     // Add columns from manually joined tables
-    for (const join of this.manualJoins) {
+    for (const join of manualJoins) {
       // Skip subquery joins (they don't have a schema)
       if ((join as any).isSubquery || !join.schema) {
         continue;
       }
 
-      // Performance: Use pre-computed column name map for joined schema
-      const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
-      if (!mock[join.alias]) {
-        mock[join.alias] = {};
-      }
-
-      // Lazy-cache for joined table
-      const joinFieldRefCache: Record<string, any> = {};
+      // The join sub-object is built lazily per row (its FieldRef cache and identity are
+      // row-scoped, exactly as the pre-prototype own-property sub-object was) and
+      // memoized in the row's navigation slot so repeated accesses share one object.
+      const joinSchema = join.schema;
       const joinAlias = join.alias;
-      for (const [colName, dbColumnName] of joinColumnNameMap) {
-        Object.defineProperty(mock[join.alias], colName, {
-          get() {
-            let cached = joinFieldRefCache[colName];
-            if (!cached) {
-              cached = joinFieldRefCache[colName] = {
-                __fieldName: colName,
-                __dbColumnName: dbColumnName,
-                __tableAlias: joinAlias,
-              };
+      descriptors[joinAlias] = {
+        get(this: any) {
+          const slots: MockRowSlots = this;
+          const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+          let sub = navCache[joinAlias];
+          if (sub === undefined) {
+            sub = navCache[joinAlias] = {};
+            const joinColumnNameMap = getColumnNameMapForSchema(joinSchema);
+            const joinFieldRefCache: Record<string, any> = {};
+            for (const [colName, dbColumnName] of joinColumnNameMap) {
+              Object.defineProperty(sub, colName, {
+                get() {
+                  let cached = joinFieldRefCache[colName];
+                  if (!cached) {
+                    cached = joinFieldRefCache[colName] = {
+                      __fieldName: colName,
+                      __dbColumnName: dbColumnName,
+                      __tableAlias: joinAlias,
+                    };
+                  }
+                  return cached;
+                },
+                enumerable: true,
+                configurable: true,
+              });
             }
-            return cached;
-          },
-          enumerable: true,
-          configurable: true,
-        });
-      }
+          }
+          return sub;
+        },
+        enumerable: true,
+        configurable: true,
+      };
     }
 
     // Performance: Use pre-computed relation entries
     const relationEntries = getRelationEntriesForSchema(this.schema);
 
+    // Values captured at descriptor-build time — identical for every row of this
+    // signature (the registry is the process-wide schema registry).
+    const schemaRegistry = this.schemaRegistry;
+    const sourceTableName = this.schema.name;
+
     // Add relations as CollectionQueryBuilder or ReferenceQueryBuilder
     for (const [relName, relConfig] of relationEntries) {
       // Try to get target schema from registry (preferred, has full relations) or cached schema
       let targetSchema: TableSchema | undefined;
-      if (this.schemaRegistry) {
-        targetSchema = this.schemaRegistry.get(relConfig.targetTable);
+      if (schemaRegistry) {
+        targetSchema = schemaRegistry.get(relConfig.targetTable);
       }
       if (!targetSchema) {
         // Performance: Use cached target schema
@@ -4528,15 +4645,15 @@ ${joinClauses.join('\n')}`;
 
       if (relConfig.type === 'many') {
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
+        descriptors[relName] = {
           get: () => {
             return new CollectionQueryBuilder(
               relName,
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              this.schema.name,
+              sourceTableName,
               targetSchema,  // Pass the target schema directly
-              this.schemaRegistry,  // Pass schema registry for nested resolution
+              schemaRegistry,  // Pass schema registry for nested resolution
               undefined,
               relConfig.foreignKeys,  // Propagate composite FK / literal predicates
               relConfig.matches
@@ -4544,11 +4661,11 @@ ${joinClauses.join('\n')}`;
           },
           enumerable: false,
           configurable: true,
-        });
+        };
       } else {
         // For single reference (many-to-one), create a ReferenceQueryBuilder
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
+        descriptors[relName] = {
           get: () => {
             const refBuilder = new ReferenceQueryBuilder(
               relName,
@@ -4557,20 +4674,20 @@ ${joinClauses.join('\n')}`;
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
               targetSchema,  // Pass the target schema directly
-              this.schemaRegistry,  // Pass schema registry for nested resolution
+              schemaRegistry,  // Pass schema registry for nested resolution
               [],  // Empty navigation path for first level navigation
-              this.schema.name  // Pass source table name for lateral join correlation
+              sourceTableName  // Pass source table name for lateral join correlation
             );
             // Return a mock object that exposes the target table's columns
             return refBuilder.createMockTargetRow();
           },
           enumerable: false,
           configurable: true,
-        });
+        };
       }
     }
 
-    return mock;
+    return descriptors;
   }
 
   /**
@@ -6768,7 +6885,7 @@ ${joinClauses.join('\n')}`;
 
       // Analyze the selector to extract nested queries
       const mockRow = this._createMockRow();
-      const selectionResult = this.selector(mockRow);
+      const selectionResult = materializeMockSelection(this.selector(mockRow));
 
       // Build the query
       const { sql } = this.buildQuery(selectionResult, context);
@@ -7353,90 +7470,20 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     if (this.targetTableSchema) {
-      // If we have schema information, create a properly typed mock
-      const mock: any = {};
+      // Prototype-level cache — same pattern as the root mock and
+      // ReferenceQueryBuilder.createMockTargetRow (see MockRowCache): the getters are
+      // fully determined by the target schema, so every collection item mock of the same
+      // table shares one prebuilt prototype and a new item is `Object.create` plus its
+      // FieldRef slot — O(1) instead of one property definition per column+relation per
+      // `.where()`/`.select()`/`.orderBy()` call. Opt-in via the same static switch; OFF
+      // = fresh prototype per item (the pre-0.4.70 behaviour).
+      const prototype = MockRowCache.getOrBuild(
+        `citem|${this.targetTable}`,
+        () => Object.defineProperties({}, this.buildMockItemDescriptors()),
+      );
 
-      // Performance: Use pre-computed column name map if available
-      const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema);
-
-      // Performance: Lazy-cache FieldRef objects
-      const fieldRefCache: Record<string, any> = {};
-
-      // Add columns - include tableAlias for unambiguous column references in WHERE clauses
-      // Use a special marker alias for the collection's own table that can be rewritten later
-      // This allows distinguishing between outer table references and inner collection references
-      // when both target the same table (e.g., post.user.posts where both are "posts" table)
-      const tableAlias = `__collection_${this.targetTable}__`;
-      for (const [colName, dbColumnName] of columnNameMap) {
-        Object.defineProperty(mock, colName, {
-          get() {
-            let cached = fieldRefCache[colName];
-            if (!cached) {
-              cached = fieldRefCache[colName] = {
-                __fieldName: colName,
-                __dbColumnName: dbColumnName,
-                __tableAlias: tableAlias,  // Include table alias for unambiguous references
-              };
-            }
-            return cached;
-          },
-          enumerable: true,
-          configurable: true,
-        });
-      }
-
-      // Add navigation properties (both collections and references)
-      if (this.targetTableSchema.relations) {
-        for (const [relName, relConfig] of Object.entries(this.targetTableSchema.relations)) {
-          if (relConfig.type === 'many') {
-            // Collection navigation
-            // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-            Object.defineProperty(mock, relName, {
-              get: () => {
-                // Don't call build() - it returns schema without relations
-                const fk = relConfig.foreignKey || relConfig.foreignKeys?.[0] || '';
-                return new CollectionQueryBuilder(
-                  relName,
-                  relConfig.targetTable,
-                  fk,
-                  this.targetTable,
-                  undefined,  // Don't pass schema, force registry lookup
-                  this.schemaRegistry,  // Pass schema registry for nested resolution
-                  // No navigation path needed here - direct collection access from parent
-                  undefined,
-                  relConfig.foreignKeys,  // Propagate composite FK / literal predicates
-                  relConfig.matches
-                );
-              },
-              enumerable: false,
-              configurable: true,
-            });
-          } else {
-            // Reference navigation
-            // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-            Object.defineProperty(mock, relName, {
-              get: () => {
-                // Don't call build() - it returns schema without relations
-                // Instead, pass undefined and let ReferenceQueryBuilder look it up from registry
-                const refBuilder = new ReferenceQueryBuilder(
-                  relName,
-                  relConfig.targetTable,
-                  relConfig.foreignKeys || [relConfig.foreignKey || ''],
-                  relConfig.matches || [],
-                  relConfig.isMandatory ?? false,
-                  undefined,  // Don't pass schema, force registry lookup
-                  this.schemaRegistry,  // Pass schema registry for nested resolution
-                  [],  // Empty navigation path - this is the first reference in the chain
-                  this.targetTable  // Source alias is this collection's target table
-                );
-                return refBuilder.createMockTargetRow();
-              },
-              enumerable: false,
-              configurable: true,
-            });
-          }
-        }
-      }
+      const mock: any = Object.create(prototype);
+      mock[MOCK_ROW_FIELD_REFS] = {};
 
       // Cache the mock for reuse
       this._cachedMockItem = mock;
@@ -7445,6 +7492,103 @@ export class CollectionQueryBuilder<TItem = any> {
       // Fallback: use the shared nested proxy that supports deep property access
       return createNestedFieldRefProxy(this.targetTable);
     }
+  }
+
+  /**
+   * Builds the shared property-descriptor map for {@link createMockItem}'s cached path.
+   * The getters read per-row state through `this`-bound symbol slots; values captured at
+   * build time are signature-constants identical for every item mock of the table.
+   */
+  private buildMockItemDescriptors(): PropertyDescriptorMap {
+    // Performance: Use pre-computed column name map if available
+    const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema!);
+
+    // Add columns - include tableAlias for unambiguous column references in WHERE clauses
+    // Use a special marker alias for the collection's own table that can be rewritten later
+    // This allows distinguishing between outer table references and inner collection references
+    // when both target the same table (e.g., post.user.posts where both are "posts" table)
+    const tableAlias = `__collection_${this.targetTable}__`;
+
+    const descriptors: PropertyDescriptorMap = {};
+    for (const [colName, dbColumnName] of columnNameMap) {
+      descriptors[colName] = {
+        get(this: any) {
+          const slots: MockRowSlots = this;
+          const fieldRefCache = slots[MOCK_ROW_FIELD_REFS] ??= {};
+          let cached = fieldRefCache[colName];
+          if (!cached) {
+            cached = fieldRefCache[colName] = {
+              __fieldName: colName,
+              __dbColumnName: dbColumnName,
+              __tableAlias: tableAlias,  // Include table alias for unambiguous references
+            };
+          }
+          return cached;
+        },
+        enumerable: true,
+        configurable: true,
+      };
+    }
+
+    // Values captured at descriptor-build time — identical for every item of this
+    // signature (the registry is the process-wide schema registry).
+    const targetTable = this.targetTable;
+    const schemaRegistry = this.schemaRegistry;
+
+    // Add navigation properties (both collections and references)
+    if (this.targetTableSchema!.relations) {
+      for (const [relName, relConfig] of Object.entries(this.targetTableSchema!.relations)) {
+        if (relConfig.type === 'many') {
+          // Collection navigation
+          // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+          descriptors[relName] = {
+            get: () => {
+              // Don't call build() - it returns schema without relations
+              const fk = relConfig.foreignKey || relConfig.foreignKeys?.[0] || '';
+              return new CollectionQueryBuilder(
+                relName,
+                relConfig.targetTable,
+                fk,
+                targetTable,
+                undefined,  // Don't pass schema, force registry lookup
+                schemaRegistry,  // Pass schema registry for nested resolution
+                // No navigation path needed here - direct collection access from parent
+                undefined,
+                relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+                relConfig.matches
+              );
+            },
+            enumerable: false,
+            configurable: true,
+          };
+        } else {
+          // Reference navigation
+          // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+          descriptors[relName] = {
+            get: () => {
+              // Don't call build() - it returns schema without relations
+              // Instead, pass undefined and let ReferenceQueryBuilder look it up from registry
+              const refBuilder = new ReferenceQueryBuilder(
+                relName,
+                relConfig.targetTable,
+                relConfig.foreignKeys || [relConfig.foreignKey || ''],
+                relConfig.matches || [],
+                relConfig.isMandatory ?? false,
+                undefined,  // Don't pass schema, force registry lookup
+                schemaRegistry,  // Pass schema registry for nested resolution
+                [],  // Empty navigation path - this is the first reference in the chain
+                targetTable  // Source alias is this collection's target table
+              );
+              return refBuilder.createMockTargetRow();
+            },
+            enumerable: false,
+            configurable: true,
+          };
+        }
+      }
+    }
+
+    return descriptors;
   }
 
   /**
@@ -8400,7 +8544,7 @@ export class CollectionQueryBuilder<TItem = any> {
     // (field collection, aggregate-expression discovery, navigation-join detection) all
     // need to walk the same selection, and re-invoking the selector is expensive
     // (rebuilds proxy mocks and any nested CollectionQueryBuilder instances).
-    const selectorResult = this.selector ? this.selector(this.createMockItem()) : undefined;
+    const selectorResult = this.selector ? materializeMockSelection(this.selector(this.createMockItem())) : undefined;
 
     // Step 1: Build field selection configuration
     if (this.selector) {

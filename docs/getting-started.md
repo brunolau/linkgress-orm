@@ -188,6 +188,7 @@ const client = new PostgresClient({
 const db = new AppDatabase(client, {
   logQueries: true,  // Optional: log SQL queries
   logParameters: true,  // Optional: log query parameters
+  logFailedQueries: true,  // Optional: report failed statements even when logQueries is off
 });
 
 // Create database schema

@@ -523,6 +523,8 @@ interface QueryOptions {
   logExecutionTime?: boolean;
   /** Log query parameters */
   logParameters?: boolean;
+  /** Report failed statements (with their SQL) even when logQueries is off (default: logQueries) */
+  logFailedQueries?: boolean;
   /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: 'cte' | 'lateral' | 'temptable';
 }
