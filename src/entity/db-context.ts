@@ -165,6 +165,24 @@ export interface QueryOptions {
    * recorded. Default: the value of `logQueries`, so existing configurations are unchanged.
    */
   logFailedQueries?: boolean;
+  /**
+   * Run parameterised statements as NAMED server-side prepared statements (postgres.js
+   * driver only): one statement per distinct SQL text per connection, parsed and planned
+   * once, then reused — later executions skip planning and the describe round trip every
+   * unnamed statement pays. Default: `false` (unnamed statements, today's behaviour).
+   *
+   * Opt in deliberately and measure: after five executions PostgreSQL may switch to a
+   * GENERIC plan (`plan_cache_mode = auto`), which is right for OLTP statements whose
+   * parameters have uniform selectivity and wrong for some wide analytical queries — a
+   * 19 KB catalogue query measured slower prepared than unprepared. Override per query
+   * with `.withPreparedStatements(false)` (or opt single hot queries IN on an unprepared
+   * context with `.withPreparedStatements(true)`). Statements whose text changes per call
+   * (`IN ($1, $2, …)` lists of varying length, VALUES lists) are cached per variant and
+   * rarely reused; the bulk-insert legs (`insertWithChildren`, `insertBulkWithChildren`,
+   * `MutationBatch`) therefore stay unnamed regardless of this option. Pair it with a
+   * connection `max_lifetime` so per-connection statement caches are recycled.
+   */
+  preparedStatements?: boolean;
   /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: CollectionStrategyType;
   /**
@@ -559,20 +577,29 @@ export class QueryExecutor {
      * `.expectedExecutionTime()`. If the query runs longer than this,
      * `onQueryTakingTooLong` fires. `undefined` means use the context default.
      */
-    private overrideExpectedMs?: number
+    private overrideExpectedMs?: number,
+    /**
+     * Per-query prepared-statement override set via `.withPreparedStatements()`.
+     * `undefined` means use the context's `preparedStatements` default.
+     */
+    private overridePrepare?: boolean
   ) {}
 
   /**
-   * Build the per-query execution options (binary protocol + timeout override),
-   * or `undefined` when neither is set so the driver takes its fast path.
+   * Build the per-query execution options (binary protocol, timeout override, prepared
+   * statement), or `undefined` when none is set so the driver takes its fast path.
+   * `execution` is a per-call override a caller passes when it knows the statement's
+   * text is unique to this call (see {@link QueryOptions.preparedStatements}).
    */
-  private buildExecutionOptions(): QueryExecutionOptions | undefined {
-    if (!this.options.useBinaryProtocol && this.overrideTimeoutMs === undefined) {
+  private buildExecutionOptions(execution?: Pick<QueryExecutionOptions, 'prepare'>): QueryExecutionOptions | undefined {
+    const prepare = execution?.prepare ?? this.overridePrepare ?? this.options.preparedStatements;
+    if (!this.options.useBinaryProtocol && this.overrideTimeoutMs === undefined && prepare !== true) {
       return undefined;
     }
     return {
       useBinaryProtocol: this.options.useBinaryProtocol,
       timeoutMs: this.overrideTimeoutMs,
+      ...(prepare === true ? { prepare: true } : {}),
     };
   }
 
@@ -582,7 +609,7 @@ export class QueryExecutor {
    * the derived executor. Used by `.withTimeout()` on the query builders.
    */
   withTimeout(timeoutMs: number): QueryExecutor {
-    return new QueryExecutor(this.client, this.options, timeoutMs, this.overrideExpectedMs);
+    return new QueryExecutor(this.client, this.options, timeoutMs, this.overrideExpectedMs, this.overridePrepare);
   }
 
   /**
@@ -591,7 +618,17 @@ export class QueryExecutor {
    * `.expectedExecutionTime()` on the query builders.
    */
   withExpectedExecutionTime(expectedMs: number): QueryExecutor {
-    return new QueryExecutor(this.client, this.options, this.overrideTimeoutMs, expectedMs);
+    return new QueryExecutor(this.client, this.options, this.overrideTimeoutMs, expectedMs, this.overridePrepare);
+  }
+
+  /**
+   * Return a new executor that runs its statements as named server-side prepared
+   * statements (`true`) or as unnamed statements (`false`), overriding the context's
+   * `preparedStatements` default. Used by `.withPreparedStatements()` on tables and
+   * accessors.
+   */
+  withPreparedStatements(prepare: boolean): QueryExecutor {
+    return new QueryExecutor(this.client, this.options, this.overrideTimeoutMs, this.overrideExpectedMs, prepare);
   }
 
   /** Whether slow-query detection is active (a callback is configured). */
@@ -640,7 +677,7 @@ export class QueryExecutor {
     }
   }
 
-  async query(sql: string, params?: any[]): Promise<QueryResult> {
+  async query(sql: string, params?: any[], execution?: Pick<QueryExecutionOptions, 'prepare'>): Promise<QueryResult> {
     const logger = this.options.logger || defaultLogger;
     const timing = this.beginTiming();
 
@@ -654,7 +691,7 @@ export class QueryExecutor {
     }
 
     try {
-      const result = await this.client.query(sql, params, this.buildExecutionOptions());
+      const result = await this.client.query(sql, params, this.buildExecutionOptions(execution));
       this.finishTiming(timing, logger, sql, params);
       return result;
     } catch (error) {
@@ -725,7 +762,13 @@ export class QueryExecutor {
    * timing or slow-query duty. A context without any of them talks to the client directly.
    */
   static isNeeded(options?: QueryOptions): boolean {
-    return !!options && !!(options.logQueries || options.logFailedQueries || options.logExecutionTime || options.onQueryTakingTooLong);
+    return !!options && !!(
+      options.logQueries
+      || options.logFailedQueries
+      || options.logExecutionTime
+      || options.onQueryTakingTooLong
+      || options.preparedStatements
+    );
   }
 
   /**
@@ -1230,6 +1273,27 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     const newExecutor = this.executor
       ? this.executor.withTimeout(timeoutMs)
       : new QueryExecutor(this.client, undefined, timeoutMs);
+    return new TableAccessor(
+      this.tableBuilder,
+      this.client,
+      this.schemaRegistry,
+      newExecutor,
+      this.collectionStrategy
+    );
+  }
+
+  /**
+   * Run every query started from the returned accessor as a named server-side prepared
+   * statement (`true`) or as an unnamed statement (`false`), overriding the context's
+   * `preparedStatements` default. See {@link QueryOptions.preparedStatements}.
+   *
+   * @example
+   * await db.users.withPreparedStatements(false).where(u => gt(u.id, 0)).toList();
+   */
+  withPreparedStatements(prepare: boolean): TableAccessor<TBuilder> {
+    const newExecutor = this.executor
+      ? this.executor.withPreparedStatements(prepare)
+      : new QueryExecutor(this.client, undefined, undefined, undefined, prepare);
     return new TableAccessor(
       this.tableBuilder,
       this.client,
@@ -3050,6 +3114,22 @@ export class DbEntityTable<TEntity extends DbEntity> {
   }
 
   /**
+   * Run every query and CRUD operation started from the returned table as a named
+   * server-side prepared statement (`true`) or as an unnamed statement (`false`),
+   * overriding the context's `preparedStatements` default. Use `false` to keep a wide
+   * analytical query on custom plans inside a prepared context, `true` to prepare a
+   * single hot lookup on an unprepared one. See {@link QueryOptions.preparedStatements}.
+   *
+   * @example
+   * await db.products.withPreparedStatements(false).where(p => eq(p.active, true)).toList();
+   */
+  withPreparedStatements(prepare: boolean): DbEntityTable<TEntity> {
+    return this._deriveWithExecutor((current, client) =>
+      current ? current.withPreparedStatements(prepare) : new QueryExecutor(client, undefined, undefined, undefined, prepare)
+    );
+  }
+
+  /**
    * Mark queries started from the returned table as expected to finish within
    * `expectedMs` (ms). If a query runs longer, the context's
    * `onQueryTakingTooLong` callback fires — the query is NOT cancelled (use
@@ -3968,7 +4048,8 @@ ${parentSql}
           ]]),
         }
       );
-      const result = executor ? await executor.query(built.sql, built.params) : await client.query(built.sql, built.params);
+      // Per-call VALUES list ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
+      const result = executor ? await executor.query(built.sql, built.params, { prepare: false }) : await client.query(built.sql, built.params);
       rawRows = result.rows;
       mapChildren = stripped => (childTable as any).mapReturningResultsWithNavigation(stripped, navigationInfo.navigationFields, built.nestedPaths);
     } else {
@@ -3983,7 +4064,8 @@ RETURNING ${returningClause.sql}${pkExtra}
 SELECT "__mutation__".*, ${extraSelects.join(', ')}
 FROM "__mutation__"
 ${extraJoins.join('\n')}${orderBy}`;
-      const result = executor ? await executor.query(sql, params) : await client.query(sql, params);
+      // Per-call VALUES list ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
+      const result = executor ? await executor.query(sql, params, { prepare: false }) : await client.query(sql, params);
       rawRows = result.rows;
       mapChildren = stripped => (childTable as any).mapReturningResults(
         stripped.map(({ __iwc_child_pk__: _pk, ...rest }: Record<string, any>) => rest),
@@ -4220,7 +4302,8 @@ FROM "__mutation__"
 JOIN "__ibwc_pord__" "__ibwc_pj__" ON "__ibwc_pj__"."${parentPkDbName}" = "__mutation__"."__ibwc_child_fk__"
 ORDER BY "__mutation__"."__ibwc_child_pk__"`;
 
-    const result = executor ? await executor.query(sql, params) : await client.query(sql, params);
+    // Per-call VALUES lists ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
+    const result = executor ? await executor.query(sql, params, { prepare: false }) : await client.query(sql, params);
     const rawRows: any[] = result.rows;
 
     const parentsByOrd = new Map<number, any>();

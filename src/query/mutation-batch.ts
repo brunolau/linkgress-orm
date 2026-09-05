@@ -52,7 +52,7 @@ interface MutationLeg {
   sql: string;
   params: any[];
   client: DatabaseClient;
-  executor: { query: (sql: string, params: any[]) => Promise<any> } | undefined;
+  executor: { query: (sql: string, params: any[], execution?: { prepare?: boolean }) => Promise<any> } | undefined;
   /** Explicit RETURNING list for this leg's CTE (default legs return the bare `1`). */
   returningSql?: string;
   /** When set, the leg's RETURNING rows are read back via json_agg → {@link MutationBatch.getLegRows}. */
@@ -470,7 +470,9 @@ export class MutationBatch {
     });
 
     const sql = `WITH ${cteParts.join(',\n')}\nSELECT ${selectParts.join(', ')}`;
-    const result = first.executor ? await first.executor.query(sql, params) : await first.client.query(sql, params);
+    // The fused statement's text follows this batch's legs and their VALUES lists — unique per
+    // call, so a prepared statement would be cached and never reused (see QueryOptions.preparedStatements).
+    const result = first.executor ? await first.executor.query(sql, params, { prepare: false }) : await first.client.query(sql, params);
 
     const row = result.rows[0] ?? {};
     const counts = new Map<string, number>();

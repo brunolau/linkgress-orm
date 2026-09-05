@@ -33,6 +33,19 @@ export interface QueryExecutionOptions {
    * driver). `PgClient` and `BunClient` ignore it.
    */
   timeoutMs?: number;
+
+  /**
+   * Run this parameterised statement as a NAMED server-side prepared statement: the
+   * server parses and plans it once per connection, and every later execution of the
+   * same text skips parsing, planning and the describe round trip an unnamed statement
+   * pays. Set from the context's `preparedStatements` option or per query via
+   * `.withPreparedStatements()`; absent/`false` keeps the unnamed statement (the default).
+   *
+   * Only honored by `PostgresClient`; `PgClient` and `BunClient` ignore it (Bun.SQL has
+   * its own instance-level `prepare`). The postgres.js instance must allow prepared
+   * statements (its default) — an instance created with `prepare: false` ignores this.
+   */
+  prepare?: boolean;
 }
 
 /**

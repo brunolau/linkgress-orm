@@ -214,6 +214,29 @@ const db = new DbContext(client, schema, {
 `logFailedQueries` defaults to the value of `logQueries`, so contexts that never set it behave
 as before.
 
+### Prepared statements (PostgresClient)
+
+postgres.js sends `unsafe()` statements UNNAMED by default: parsed, described (an extra round
+trip) and planned on every execution. `preparedStatements: true` names them, so each distinct
+statement text is planned once per connection and reused:
+
+```typescript
+const db = new DbContext(client, schema, {
+  preparedStatements: true,   // opt-in; default false
+});
+
+// Per-query override in either direction — mirrors .withTimeout():
+await db.products.withPreparedStatements(false).where(p => eq(p.active, true)).toList(); // wide analytical query: keep custom plans
+await db.tokens.withPreparedStatements(true).where(t => eq(t.id, id)).firstOrDefault();  // hot lookup on an unprepared context
+```
+
+Measure before enabling: after five executions PostgreSQL may switch to a generic plan, which
+suits uniform-selectivity OLTP statements and can slow down wide analytical ones. Statements
+whose text varies per call (`IN` lists of varying length, VALUES lists) are cached per variant;
+the bulk-insert legs (`insertWithChildren`, `insertBulkWithChildren`, `MutationBatch`) stay
+unnamed regardless of the option. Only `PostgresClient` honors it, and only when the postgres.js
+instance was not created with `prepare: false`.
+
 ## Internal Changes
 
 All internal components now use the abstract `DatabaseClient` instead of `Pool`:

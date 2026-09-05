@@ -70,16 +70,30 @@ function asTimeoutError(error: any, timeoutMs: number | undefined, sql: string):
  *
  * A statement-timeout cancellation is surfaced as a {@link QueryTimeoutError}.
  */
+/**
+ * Send one parameterised statement. postgres.js hard-codes `prepare: false` on `unsafe()`
+ * (an UNNAMED statement: parsed, described in an extra round trip and planned on every
+ * execution); `prepare === true` asks for a NAMED server-side prepared statement instead,
+ * which the driver caches per connection after its first execution. Anything else keeps
+ * the exact call shape linkgress has always used.
+ */
+function sendStatement(target: Sql, sql: string, params: any[] | undefined, prepare: boolean | undefined) {
+  return prepare === true
+    ? target.unsafe(sql, params || [], { prepare: true })
+    : target.unsafe(sql, params || []);
+}
+
 async function runStatement(
   sqlInstance: Sql,
   sql: string,
   params: any[] | undefined,
   timeoutMs: number | undefined,
-  defaultTimeoutMs: number | undefined
+  defaultTimeoutMs: number | undefined,
+  prepare?: boolean
 ): Promise<QueryResult> {
   if (timeoutMs === undefined) {
     try {
-      const result = await sqlInstance.unsafe(sql, params || []);
+      const result = await sendStatement(sqlInstance, sql, params, prepare);
       return { rows: result, rowCount: result.count ?? null };
     } catch (error) {
       throw asTimeoutError(error, defaultTimeoutMs, sql);
@@ -90,7 +104,7 @@ async function runStatement(
   try {
     return await sqlInstance.begin(async (tx: Sql) => {
       await tx.unsafe(`SET LOCAL statement_timeout = ${normalizeTimeoutMs(timeoutMs)}`);
-      const result = await tx.unsafe(sql, params || []);
+      const result = await sendStatement(tx, sql, params, prepare);
       return { rows: result, rowCount: result.count ?? null };
     });
   } catch (error) {
@@ -121,11 +135,12 @@ async function runTxStatement(
   sql: string,
   params: any[] | undefined,
   timeoutMs: number | undefined,
-  defaultTimeoutMs: number | undefined
+  defaultTimeoutMs: number | undefined,
+  prepare?: boolean
 ): Promise<QueryResult> {
   if (timeoutMs === undefined) {
     try {
-      const result = await txSql.unsafe(sql, params || []);
+      const result = await sendStatement(txSql, sql, params, prepare);
       return { rows: result, rowCount: result.count ?? null };
     } catch (error) {
       throw asTimeoutError(error, defaultTimeoutMs, sql);
@@ -143,7 +158,7 @@ async function runTxStatement(
 
   await txSql.unsafe(`SET LOCAL statement_timeout = ${normalizeTimeoutMs(timeoutMs)}`);
   try {
-    const result = await txSql.unsafe(sql, params || []);
+    const result = await sendStatement(txSql, sql, params, prepare);
     return { rows: result, rowCount: result.count ?? null };
   } catch (error) {
     throw asTimeoutError(error, timeoutMs, sql);
@@ -175,7 +190,7 @@ class PostgresPooledConnection implements PooledConnection {
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // postgres library doesn't have explicit binary protocol toggle
     // It automatically uses the most efficient protocol based on data types.
-    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout) as QueryResult<T>;
+    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout, options?.prepare) as QueryResult<T>;
   }
 
   release(): void {
@@ -276,7 +291,7 @@ export class PostgresClient extends DatabaseClient {
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // postgres library doesn't have explicit binary protocol toggle
     // It automatically uses the most efficient protocol based on data types.
-    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout) as QueryResult<T>;
+    return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout, options?.prepare) as QueryResult<T>;
   }
 
   async connect(): Promise<PooledConnection> {
@@ -385,7 +400,7 @@ export class PostgresClient extends DatabaseClient {
       const queryFn = async (sqlStr: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult> => {
         // Honor a per-statement `.withTimeout()` override inside the transaction.
         // `runTxStatement` scopes `SET LOCAL statement_timeout` to this statement.
-        return await runTxStatement(sql, sqlStr, params, options?.timeoutMs, this.defaultStatementTimeout);
+        return await runTxStatement(sql, sqlStr, params, options?.timeoutMs, this.defaultStatementTimeout, options?.prepare);
       };
 
       return await callback(queryFn);
