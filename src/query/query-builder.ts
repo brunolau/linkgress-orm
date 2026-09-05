@@ -3612,6 +3612,65 @@ export class SelectQueryBuilder<TSelection> {
       return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
     };
 
+    /**
+     * Compile the DELETE into `{ sql, params }` WITHOUT executing — the
+     * standard-path assembly (same WHERE/USING semantics as execution,
+     * fragment-capable RETURNING included; navigation RETURNING is not
+     * supported here — the execute path's CTE machinery is statement-bound).
+     * Used to ride the statement as a data-modifying CTE
+     * (`DbCteBuilder.withMutation`), the delete sibling of the update CAS gate.
+     */
+    const compileDelete = (returning?: undefined | true | ((row: TSelection) => any)): { sql: string; params: any[] } => {
+      if (!queryBuilder.whereCond) {
+        throw new Error('Delete requires a WHERE condition. Use where() before delete().');
+      }
+
+      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
+
+      const condBuilder = new ConditionBuilder();
+      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, 1);
+
+      const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
+
+      let usingClause = '';
+      const joinConditions: string[] = [];
+      for (const join of whereJoins) {
+        const sourceTable = join.sourceAlias || queryBuilder.schema.name;
+        const joinTableName = queryBuilder.getQualifiedTableName(join.targetTable, join.targetSchema);
+
+        usingClause = usingClause ? `${usingClause}, ${joinTableName} AS "${join.alias}"` : `USING ${joinTableName} AS "${join.alias}"`;
+
+        for (let i = 0; i < join.foreignKeys.length; i++) {
+          joinConditions.push(`${formatJoinValue(sourceTable, join.foreignKeys[i])} = ${formatJoinValue(join.alias, join.matches[i])}`);
+        }
+      }
+
+      const fullWhereClause = joinConditions.length > 0
+        ? `${joinConditions.join(' AND ')} AND ${whereSql}`
+        : whereSql;
+
+      if (returning && returning !== true && queryBuilder.detectNavigationInReturning(returning)) {
+        throw new Error('toStatement(): navigation RETURNING is not supported in compiled DELETE statements — select plain or fragment columns only.');
+      }
+
+      // Qualify columns with table name when using USING clause to avoid ambiguity.
+      const returningClause = returning
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: whereParams.length + 1, params: whereParams })
+        : null;
+
+      let sql = `DELETE FROM ${qualifiedTableName}`;
+      if (usingClause) {
+        sql += ` ${usingClause}`;
+      }
+      sql += ` WHERE ${fullWhereClause}`;
+      if (returningClause) {
+        sql += ` RETURNING ${returningClause.sql}`;
+      }
+
+      return { sql, params: whereParams };
+    };
+
     return {
       then<TResult1 = void, TResult2 = never>(
         onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
@@ -3628,6 +3687,9 @@ export class SelectQueryBuilder<TSelection> {
             return executeDelete('count').then(onfulfilled, onrejected);
           }
         };
+      },
+      toStatement(selector?: (row: TSelection) => any) {
+        return compileDelete(selector);
       },
       returning<TResult>(selector?: (row: TSelection) => TResult) {
         const returningConfig = selector ?? true;

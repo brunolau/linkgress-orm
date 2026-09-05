@@ -979,6 +979,17 @@ export interface FluentDelete<TSelection> extends PromiseLike<void> {
   returning(): PromiseLike<TSelection[]>;
   /** Return selected columns from the deleted rows (SqlFragment fields unwrap to their value type) */
   returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  /**
+   * Compile this DELETE into `{ sql, params }` WITHOUT executing it — same
+   * WHERE/USING semantics as execution (navigation joins in the WHERE become
+   * `DELETE … USING`, fragment-capable RETURNING included; navigation RETURNING
+   * is not supported here). Attach the result as a data-modifying CTE via
+   * {@link DbCteBuilder.withMutation}.
+   */
+  toStatement<TResult>(selector?: (row: TSelection) => TResult): {
+    sql: string;
+    params: any[];
+  };
 }
 
 /**
@@ -6035,6 +6046,14 @@ WHERE ${whereClause}`.trim();
             return executeDelete('count').then(resolve, reject);
           }
         };
+      },
+      toStatement: (selector?: (row: UnwrapDbColumns<TEntity>) => any) => {
+        // The bare-table delete has no WHERE — compile is the base text plus
+        // RETURNING when a selector asks for one.
+        const returningClause = selector ? table.buildReturningClause(selector as any) : null;
+        const stmtSql = returningClause ? `${baseSql} RETURNING ${returningClause.sql}` : baseSql;
+
+        return { sql: stmtSql, params: [] };
       },
       returning: ((selector?: (row: UnwrapDbColumns<TEntity>) => any) => {
         const returningConfig = selector ?? true;
