@@ -8119,7 +8119,13 @@ export class CollectionQueryBuilder<TItem = any> {
       }
 
       // Handle object with multiple fields
-      for (const [_key, value] of Object.entries(sel)) {
+      // Own enumerable keys only (the set Object.entries walks), without allocating the pairs:
+      // a wide collection projection runs this for every field on every build.
+      for (const key in sel) {
+        if (!Object.prototype.hasOwnProperty.call(sel, key)) {
+          continue;
+        }
+        const value = sel[key];
         if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
           // This is a FieldRef with a table alias
           this.addNavigationJoinForFieldRef(value, joins, currentSourceAlias, currentSchema, allTableAliases);
@@ -8266,6 +8272,19 @@ export class CollectionQueryBuilder<TItem = any> {
     startSchema: TableSchema
   ): void {
     // Keep resolving until we've resolved all aliases or can't make progress
+    // Fast path: every referenced alias is already joined (direct relations of the target table
+    // were added while the field refs were collected) — the loop below would only mark them.
+    let allJoined = true;
+    for (const alias of allTableAliases) {
+      if (!joins.some(j => j.alias === alias)) {
+        allJoined = false;
+        break;
+      }
+    }
+    if (allJoined) {
+      return;
+    }
+
     let resolved = new Set<string>();
     let lastResolvedCount = -1;
     let maxIterations = 100; // Prevent infinite loops
@@ -8499,6 +8518,7 @@ export class CollectionQueryBuilder<TItem = any> {
     };
 
     // Helper function to recursively process fields and build SelectedField structures
+    const collectionMarkerAlias = `__collection_${this.targetTable}__`;
     const processField = (alias: string, field: any): SelectedField => {
       if (field instanceof SqlFragment) {
         // SQL Fragment - build the SQL expression
@@ -8612,8 +8632,7 @@ export class CollectionQueryBuilder<TItem = any> {
         const sourceTable = (field as any).__sourceTable;  // Actual table name for schema lookup
         // If tableAlias differs from the target table (or its collection marker), it's a navigation property reference
         // The collection marker is `__collection_tableName__` and should be treated as the target table
-        const collectionMarker = `__collection_${this.targetTable}__`;
-        if (tableAlias && tableAlias !== this.targetTable && tableAlias !== collectionMarker) {
+        if (tableAlias && tableAlias !== this.targetTable && tableAlias !== collectionMarkerAlias) {
           return { alias, expression: `"${tableAlias}"."${dbColumnName}"`, propertyName: fieldName, sourceTable };
         }
         return { alias, expression: `"${dbColumnName}"`, propertyName: fieldName };
@@ -8623,8 +8642,10 @@ export class CollectionQueryBuilder<TItem = any> {
       } else if (isPlainObject(field)) {
         // Nested object - recursively process its fields
         const nestedFields: SelectedField[] = [];
-        for (const [nestedAlias, nestedField] of Object.entries(field)) {
-          nestedFields.push(processField(nestedAlias, nestedField));
+        for (const nestedAlias in field) {
+          if (Object.prototype.hasOwnProperty.call(field, nestedAlias)) {
+            nestedFields.push(processField(nestedAlias, field[nestedAlias]));
+          }
         }
         return { alias, nested: nestedFields };
       } else {
@@ -8662,8 +8683,11 @@ export class CollectionQueryBuilder<TItem = any> {
         // No per-column fields to collect — the aggregate argument lives on aggregateExpression.
       } else {
         // Object selection - extract each field (with support for nested objects)
-        for (const [alias, field] of Object.entries(selectedFields)) {
-          selectedFieldConfigs.push(processField(alias, field));
+        // Own enumerable keys, without allocating the entry pairs (this runs per field per build)
+        for (const alias in selectedFields) {
+          if (Object.prototype.hasOwnProperty.call(selectedFields, alias)) {
+            selectedFieldConfigs.push(processField(alias, selectedFields[alias]));
+          }
         }
       }
     } else {
