@@ -22,12 +22,33 @@ import type { TableSchema } from '../schema/table-builder';
  * Shared by QueryBatch, MutationBatch and insertWithChildren for cross-leg
  * parameter renumbering.
  */
-const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|(--[^\n]*)|(\/\*[\s\S]*?\*\/)|\$(\d+)/g;
+const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|(--[^\n]*)|(\/\*[\s\S]*?\*\/)|\$(?<digits>\d+)/g;
 
 export const renumberPlaceholders = (sqlText: string, offset: number): string =>
   sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, _lineComment, _blockComment, digits) =>
     digits !== undefined ? `$${Number(digits) + offset}` : match
   );
+
+/**
+ * True when the SQL fragment contains a bare `$N` placeholder OUTSIDE quoted
+ * segments and comments — i.e. one {@link renumberPlaceholders} would rebind.
+ * Same quote/comment-aware scan, so `'literal $1 inside quotes'` and a `$1`
+ * sitting in a `--` comment stay invisible.
+ *
+ * Reads the regex's NAMED `digits` group rather than a positional index: the
+ * token classes of QUOTED_OR_PLACEHOLDER have grown before (comments were
+ * added after the literals), and a positional check silently points at the
+ * wrong group when that happens.
+ */
+export const hasBarePlaceholder = (sqlText: string): boolean => {
+  for (const match of sqlText.matchAll(QUOTED_OR_PLACEHOLDER)) {
+    if (match.groups?.digits !== undefined) {
+      return true;
+    }
+  }
+
+  return false;
+};
 
 /**
  * Column configuration extracted from schema
