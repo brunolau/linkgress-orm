@@ -88,6 +88,29 @@ export function getSchemaColumnMeta(schema: TableSchema): Map<string, { mapper?:
 }
 
 /**
+ * Reverse of the column-name map — db column name → property name — cached per schema.
+ * An ordered collection needs it on every build to render the alias form of its ORDER BY;
+ * rebuilding it walked every column of the schema per build.
+ */
+const schemaDbToPropertyMapCache = new WeakMap<TableSchema, Map<string, string>>();
+
+export function getDbToPropertyMapForSchema(schema: TableSchema): Map<string, string> {
+  let map = schemaDbToPropertyMapCache.get(schema);
+
+  if (map == null) {
+    map = new Map();
+
+    for (const [propName, meta] of getSchemaColumnMeta(schema)) {
+      map.set(meta.name!, propName);
+    }
+
+    schemaDbToPropertyMapCache.set(schema, map);
+  }
+
+  return map;
+}
+
+/**
  * Mock-row descriptor cache for {@link ReferenceQueryBuilder.createMockTargetRow}.
  *
  * Building a reference mock row costs O(columns + relations) `Object.defineProperty`
@@ -116,6 +139,29 @@ type MockRowSlots = {
 const navigationPathSignature = (path: NavigationJoin[]): string => path
   .map(step => `${step.alias}:${step.targetTable}:${(step.foreignKeys ?? []).join('+')}:${(step.matches ?? []).join('+')}:${step.isMandatory ? 1 : 0}:${step.sourceAlias ?? ''}`)
   .join('>');
+
+/** A reference mock row: `Object.create(prototype)` plus its two own state slots. */
+const mintReferenceMockRow = (prototype: object): any => {
+  const mock: any = Object.create(prototype);
+  mock[MOCK_ROW_FIELD_REFS] = {};
+  mock[MOCK_ROW_NAV_CACHE] = {};
+
+  return mock;
+};
+
+/**
+ * Per-getter memo of the prototype a reference navigation's mock rows share.
+ *
+ * The per-row navigation slot (MOCK_ROW_NAV_CACHE) makes repeated reads of `p.user` on one row
+ * free; the FIRST read on every row still constructed a `ReferenceQueryBuilder`, concatenated
+ * its MockRowCache key (navigation-path signature included) and looked the prototype up — a
+ * fresh, unhashed string per row. One holder lives in each reference-getter closure, and that
+ * closure is itself per (schema, relation, navigation path) — exactly the cache signature — so
+ * once filled, minting a row is one property read plus `Object.create`: no builder, no key, no
+ * lookup. Filled only while the switch is on and read only while it is on, so switching it off
+ * still yields a fresh prototype per row, as before.
+ */
+type MockPrototypeHolder = { prototype?: object };
 
 /**
  * Whether `value` is a mock row minted by the query builders (`createMockTargetRow`,
@@ -624,8 +670,20 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         // Single reference navigation (many-to-one, one-to-one)
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
         // with circular relations like User->Posts->User)
+        const holder: MockPrototypeHolder = {};
         descriptors[relName] = {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
+            if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
+              return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -637,7 +695,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               sourceTableName  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow(holder));
           },
           enumerable: false,
           configurable: true,
@@ -885,7 +943,15 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         // Single reference navigation
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
         Object.defineProperty(mock, relName, {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -897,7 +963,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -1765,7 +1831,15 @@ export class SelectQueryBuilder<TSelection> {
         // Single reference navigation
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
         Object.defineProperty(mock, relName, {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -1777,7 +1851,7 @@ export class SelectQueryBuilder<TSelection> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -4761,8 +4835,20 @@ ${joinClauses.join('\n')}`;
       } else {
         // For single reference (many-to-one), create a ReferenceQueryBuilder
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+        const holder: MockPrototypeHolder = {};
         descriptors[relName] = {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
+            if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
+              return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -4775,7 +4861,7 @@ ${joinClauses.join('\n')}`;
               sourceTableName  // Pass source table name for lateral join correlation
             );
             // Return a mock object that exposes the target table's columns
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow(holder));
           },
           enumerable: false,
           configurable: true,
@@ -5389,7 +5475,11 @@ ${joinClauses.join('\n')}`;
       throw new Error('Cannot use CollectionQueryBuilder directly as selection');
     } else {
       // Process selection object properties
-      for (const [key, value] of Object.entries(selection)) {
+      for (const key in selection) {
+        if (!Object.prototype.hasOwnProperty.call(selection, key)) {
+          continue;
+        }
+        const value = selection[key];
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
           // Handle collection - delegate to strategy pattern via buildCTE
           // The strategy handles CTE/LATERAL specifics and returns necessary info
@@ -5887,7 +5977,11 @@ ${joinClauses.join('\n')}`;
       //   - collections hit an explicit `continue` and were never emitted.
       // Both regressions are now covered by union-nested-select.test.ts and
       // union-collection-nav.test.ts.
-      for (const [key, value] of Object.entries(selection)) {
+      for (const key in selection) {
+        if (!Object.prototype.hasOwnProperty.call(selection, key)) {
+          continue;
+        }
+        const value = selection[key];
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
           // Collection projection inside a UNION leg — delegate to the
           // collection strategy (LATERAL by default) and emit per-row
@@ -7236,7 +7330,7 @@ export class ReferenceQueryBuilder<TItem = any> {
    * Create a mock object that exposes the target table's columns
    * This allows accessing related fields like: p.user.username
    */
-  createMockTargetRow(): any {
+  createMockTargetRow(holder?: MockPrototypeHolder): any {
     if (this.targetTableSchema) {
       // Prototype-level cache — see MockRowCache's doc. Everything the getters close over
       // is fully determined by (target schema object identity, relationName, sourceAlias,
@@ -7252,16 +7346,24 @@ export class ReferenceQueryBuilder<TItem = any> {
       // Consumers must not probe these rows with OWN-property APIs (`Object.keys`,
       // `getOwnPropertyNames`, `getOwnPropertyDescriptor` on the row itself) — the getters
       // are inherited. Use `isReferenceMockRow` / `findFirstGetterKey` instead.
-      const prototype = MockRowCache.getOrBuild(
-        `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`,
-        () => Object.defineProperties({}, this.buildMockRowDescriptors()),
-      );
+      //
+      // The getter that minted this builder may hand in its MockPrototypeHolder: a filled holder
+      // short-circuits the key build and the lookup, and a miss fills it (switch on only).
+      const enabled = MockRowCache.isEnabled();
+      let prototype = enabled ? holder?.prototype : undefined;
 
-      const mock: any = Object.create(prototype);
-      mock[MOCK_ROW_FIELD_REFS] = {};
-      mock[MOCK_ROW_NAV_CACHE] = {};
+      if (prototype === undefined) {
+        prototype = MockRowCache.getOrBuild(
+          enabled ? `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}` : '',
+          () => Object.defineProperties({}, this.buildMockRowDescriptors()),
+        );
 
-      return mock;
+        if (enabled && holder !== undefined) {
+          holder.prototype = prototype;
+        }
+      }
+
+      return mintReferenceMockRow(prototype);
     } else {
       // Fallback: use the shared nested proxy that supports deep property access
       return createNestedFieldRefProxy(this.relationName);
@@ -7392,24 +7494,29 @@ export class ReferenceQueryBuilder<TItem = any> {
           // Reference navigation
           // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
           // with circular relations like User->Posts->User)
+          const holder: MockPrototypeHolder = {};
           descriptors[relName] = {
             get(this: any) {
               const slots: MockRowSlots = this;
               const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
               let cached = navCache[relName];
               if (cached === undefined) {
-                const refBuilder = new ReferenceQueryBuilder(
-                  relName,
-                  relConfig.targetTable,
-                  relConfig.foreignKeys || [relConfig.foreignKey || ''],
-                  relConfig.matches || [],
-                  relConfig.isMandatory ?? false,
-                  nestedTargetSchema,  // Pass the target schema directly
-                  schemaRegistry,  // Pass schema registry for nested resolution
-                  extendedNavPath,  // Pass navigation path for nested collections
-                  parentSourceAlias ? tableAlias : ''  // Only set source if tracking path
-                );
-                cached = navCache[relName] = refBuilder.createMockTargetRow();
+                if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
+                  cached = navCache[relName] = mintReferenceMockRow(holder.prototype);
+                } else {
+                  const refBuilder = new ReferenceQueryBuilder(
+                    relName,
+                    relConfig.targetTable,
+                    relConfig.foreignKeys || [relConfig.foreignKey || ''],
+                    relConfig.matches || [],
+                    relConfig.isMandatory ?? false,
+                    nestedTargetSchema,  // Pass the target schema directly
+                    schemaRegistry,  // Pass schema registry for nested resolution
+                    extendedNavPath,  // Pass navigation path for nested collections
+                    parentSourceAlias ? tableAlias : ''  // Only set source if tracking path
+                  );
+                  cached = navCache[relName] = refBuilder.createMockTargetRow(holder);
+                }
               }
               return cached;
             },
@@ -7660,10 +7767,22 @@ export class CollectionQueryBuilder<TItem = any> {
         } else {
           // Reference navigation
           // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+          const holder: MockPrototypeHolder = {};
           descriptors[relName] = {
-            get: () => {
+            get(this: any) {
               // Don't call build() - it returns schema without relations
               // Instead, pass undefined and let ReferenceQueryBuilder look it up from registry
+              // One mock target row per ITEM row and relation: a selector that reads
+              // `it.product.*` fifteen times used to mint fifteen builders and rows.
+              const slots: MockRowSlots = this;
+              const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+              const cachedRow = navCache[relName];
+              if (cachedRow !== undefined) {
+                return cachedRow;
+              }
+              if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
+                return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+              }
               const refBuilder = new ReferenceQueryBuilder(
                 relName,
                 relConfig.targetTable,
@@ -7675,7 +7794,7 @@ export class CollectionQueryBuilder<TItem = any> {
                 [],  // Empty navigation path - this is the first reference in the chain
                 targetTable  // Source alias is this collection's target table
               );
-              return refBuilder.createMockTargetRow();
+              return (navCache[relName] = refBuilder.createMockTargetRow(holder));
             },
             enumerable: false,
             configurable: true,
@@ -8105,6 +8224,12 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Collect all table aliases referenced in the selection
     const allTableAliases = new Set<string>();
+    // Aliases already joined — kept in step with `joins` so membership is O(1) instead of a
+    // `joins.some(...)` scan per field ref (a wide projection asks this for every field)
+    const joinedAliases = new Set<string>();
+    for (const join of joins) {
+      joinedAliases.add(join.alias);
+    }
 
     // Helper to collect from a single selection
     const collectFromSelection = (sel: any): void => {
@@ -8114,20 +8239,26 @@ export class CollectionQueryBuilder<TItem = any> {
 
       // Handle single FieldRef
       if ('__tableAlias' in sel && '__dbColumnName' in sel) {
-        this.addNavigationJoinForFieldRef(sel, joins, currentSourceAlias, currentSchema, allTableAliases);
+        this.addNavigationJoinForFieldRef(sel, joins, currentSourceAlias, currentSchema, allTableAliases, joinedAliases);
         return;
       }
 
       // Handle object with multiple fields
-      for (const [_key, value] of Object.entries(sel)) {
+      // Own enumerable keys only (the set Object.entries walks), without allocating the pairs:
+      // a wide collection projection runs this for every field on every build.
+      for (const key in sel) {
+        if (!Object.prototype.hasOwnProperty.call(sel, key)) {
+          continue;
+        }
+        const value = sel[key];
         if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
           // This is a FieldRef with a table alias
-          this.addNavigationJoinForFieldRef(value, joins, currentSourceAlias, currentSchema, allTableAliases);
+          this.addNavigationJoinForFieldRef(value, joins, currentSourceAlias, currentSchema, allTableAliases, joinedAliases);
         } else if (value instanceof SqlFragment) {
           // SqlFragment may contain navigation property references
           const fieldRefs = value.getFieldRefs();
           for (const fieldRef of fieldRefs) {
-            this.addNavigationJoinForFieldRef(fieldRef, joins, currentSourceAlias, currentSchema, allTableAliases);
+            this.addNavigationJoinForFieldRef(fieldRef, joins, currentSourceAlias, currentSchema, allTableAliases, joinedAliases);
           }
         } else if (value instanceof CollectionQueryBuilder) {
           // A nested collection that was reached via a reference chain (e.g.
@@ -8137,8 +8268,9 @@ export class CollectionQueryBuilder<TItem = any> {
           // in its own FROM for the correlation to resolve.
           const nestedPath = value.getNavigationPath();
           for (const step of nestedPath) {
-            if (!joins.some(j => j.alias === step.alias)) {
+            if (!joinedAliases.has(step.alias)) {
               joins.push(step);
+              joinedAliases.add(step.alias);
             }
           }
         } else if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -8153,7 +8285,7 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Second pass: resolve all navigation joins by finding the correct path through schemas
     if (allTableAliases.size > 0) {
-      this.resolveNavigationJoins(allTableAliases, joins, currentSchema);
+      this.resolveNavigationJoins(allTableAliases, joins, currentSchema, joinedAliases);
     }
   }
 
@@ -8166,7 +8298,8 @@ export class CollectionQueryBuilder<TItem = any> {
     joins: NavigationJoin[],
     sourceAlias: string,
     sourceSchema: TableSchema,
-    allTableAliases: Set<string>
+    allTableAliases: Set<string>,
+    joinedAliases?: Set<string>
   ): void {
     if (!fieldRef || typeof fieldRef !== 'object' || !('__tableAlias' in fieldRef)) {
       return;
@@ -8201,14 +8334,14 @@ export class CollectionQueryBuilder<TItem = any> {
     allTableAliases.add(tableAlias);
 
     // Check if we already have this join
-    if (joins.some(j => j.alias === tableAlias)) {
+    if (joinedAliases !== undefined ? joinedAliases.has(tableAlias) : joins.some(j => j.alias === tableAlias)) {
       return;
     }
 
     // Find the relation in the current schema
     const relation = sourceSchema.relations?.[tableAlias];
     if (relation && relation.type === 'one') {
-      this.addNavigationJoin(tableAlias, relation, joins, sourceAlias);
+      this.addNavigationJoin(tableAlias, relation, joins, sourceAlias, joinedAliases);
     }
   }
 
@@ -8219,12 +8352,14 @@ export class CollectionQueryBuilder<TItem = any> {
     alias: string,
     relation: any,
     joins: NavigationJoin[],
-    sourceAlias: string
+    sourceAlias: string,
+    joinedAliases?: Set<string>
   ): TableSchema | undefined {
     // Check if already added
-    if (joins.some(j => j.alias === alias)) {
+    if (joinedAliases !== undefined ? joinedAliases.has(alias) : joins.some(j => j.alias === alias)) {
       return undefined;
     }
+    joinedAliases?.add(alias);
 
     // Get the target table schema
     let targetSchema: TableSchema | undefined;
@@ -8263,9 +8398,32 @@ export class CollectionQueryBuilder<TItem = any> {
   private resolveNavigationJoins(
     allTableAliases: Set<string>,
     joins: NavigationJoin[],
-    startSchema: TableSchema
+    startSchema: TableSchema,
+    joinedAliases?: Set<string>
   ): void {
+    // Aliases already joined, kept in step with `joins` (O(1) membership; the caller may hand
+    // in the set it maintained while collecting the field refs)
+    if (joinedAliases === undefined) {
+      joinedAliases = new Set<string>();
+      for (const join of joins) {
+        joinedAliases.add(join.alias);
+      }
+    }
+
     // Keep resolving until we've resolved all aliases or can't make progress
+    // Fast path: every referenced alias is already joined (direct relations of the target table
+    // were added while the field refs were collected) — the loop below would only mark them.
+    let allJoined = true;
+    for (const alias of allTableAliases) {
+      if (!joinedAliases.has(alias)) {
+        allJoined = false;
+        break;
+      }
+    }
+    if (allJoined) {
+      return;
+    }
+
     let resolved = new Set<string>();
     let lastResolvedCount = -1;
     let maxIterations = 100; // Prevent infinite loops
@@ -8310,7 +8468,7 @@ export class CollectionQueryBuilder<TItem = any> {
             continue;
           }
 
-          if (joins.some(j => j.alias === alias)) {
+          if (joinedAliases.has(alias)) {
             resolved.add(alias);
             continue;
           }
@@ -8322,7 +8480,7 @@ export class CollectionQueryBuilder<TItem = any> {
               continue;
             }
 
-            const targetSchema = this.addNavigationJoin(alias, relation, joins, schemaAlias);
+            const targetSchema = this.addNavigationJoin(alias, relation, joins, schemaAlias, joinedAliases);
             if (targetSchema) {
               // Keep the anchor map current so the alias we just joined can serve as the
               // source for further direct lookups in the next fixpoint round
@@ -8351,8 +8509,8 @@ export class CollectionQueryBuilder<TItem = any> {
 
         // Add all intermediate joins
         for (const step of path) {
-          if (!joins.some(j => j.alias === step.alias)) {
-            const stepSchema = this.addNavigationJoin(step.alias, step.relation, joins, step.sourceAlias);
+          if (!joinedAliases.has(step.alias)) {
+            const stepSchema = this.addNavigationJoin(step.alias, step.relation, joins, step.sourceAlias, joinedAliases);
             if (stepSchema) {
               joinedSchemas.set(step.alias, stepSchema);
             }
@@ -8380,9 +8538,12 @@ export class CollectionQueryBuilder<TItem = any> {
     // Memoised per registry — the BFS below depends only on the target alias and the ORDERED
     // joined alias→table pairs (order decides which of several equal-length paths wins), so
     // the same query shape resolves to the same path on every build. See NavigationPathCache.
-    const signature = `${targetAlias}|${[...joinedSchemas]
-      .map(([alias, schema]) => `${alias}:${schema.schema ?? ''}.${schema.name}`)
-      .join(',')}`;
+    // Built by concatenation over the map (no spread / map / join allocations — this runs on every
+    // build of every projection that reaches an alias through a second hop)
+    let signature = targetAlias + '|';
+    for (const [alias, schema] of joinedSchemas) {
+      signature += alias + ':' + (schema.schema ?? '') + '.' + schema.name + ',';
+    }
 
     return NavigationPathCache.getOrBuild(
       this.schemaRegistry,
@@ -8457,7 +8618,7 @@ export class CollectionQueryBuilder<TItem = any> {
    * Now delegates to collection strategy pattern
    * Returns full CollectionAggregationResult for strategies that need special handling (like LATERAL)
    */
-  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string } {
+  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string; memoId?: number } {
     // Determine strategy type - default to 'lateral' if not specified
     const strategyType: CollectionStrategyType = context.collectionStrategy || 'lateral';
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);
@@ -8499,6 +8660,7 @@ export class CollectionQueryBuilder<TItem = any> {
     };
 
     // Helper function to recursively process fields and build SelectedField structures
+    const collectionMarkerAlias = `__collection_${this.targetTable}__`;
     const processField = (alias: string, field: any): SelectedField => {
       if (field instanceof SqlFragment) {
         // SQL Fragment - build the SQL expression
@@ -8568,6 +8730,7 @@ export class CollectionQueryBuilder<TItem = any> {
             nestedCteJoin: {
               cteName: nestedResult.tableName,
               joinClause: nestedJoinClause,
+              memoId: nestedResult.memoId,
             },
             // Store nested collection info for recursive mapper transformation
             nestedCollectionInfo: {
@@ -8612,19 +8775,20 @@ export class CollectionQueryBuilder<TItem = any> {
         const sourceTable = (field as any).__sourceTable;  // Actual table name for schema lookup
         // If tableAlias differs from the target table (or its collection marker), it's a navigation property reference
         // The collection marker is `__collection_tableName__` and should be treated as the target table
-        const collectionMarker = `__collection_${this.targetTable}__`;
-        if (tableAlias && tableAlias !== this.targetTable && tableAlias !== collectionMarker) {
+        if (tableAlias && tableAlias !== this.targetTable && tableAlias !== collectionMarkerAlias) {
           return { alias, expression: `"${tableAlias}"."${dbColumnName}"`, propertyName: fieldName, sourceTable };
         }
-        return { alias, expression: `"${dbColumnName}"`, propertyName: fieldName };
+        return { alias, expression: `"${dbColumnName}"`, propertyName: fieldName, isColumn: true };
       } else if (typeof field === 'string') {
         // Simple string reference (for backward compatibility)
         return { alias, expression: `"${field}"` };
       } else if (isPlainObject(field)) {
         // Nested object - recursively process its fields
         const nestedFields: SelectedField[] = [];
-        for (const [nestedAlias, nestedField] of Object.entries(field)) {
-          nestedFields.push(processField(nestedAlias, nestedField));
+        for (const nestedAlias in field) {
+          if (Object.prototype.hasOwnProperty.call(field, nestedAlias)) {
+            nestedFields.push(processField(nestedAlias, field[nestedAlias]));
+          }
         }
         return { alias, nested: nestedFields };
       } else {
@@ -8656,14 +8820,18 @@ export class CollectionQueryBuilder<TItem = any> {
           alias: dbColumnName,
           expression: `"${dbColumnName}"`,
           propertyName: fieldName,
+          isColumn: true,
         });
       } else if (selectedFields instanceof CollectionQueryBuilder || selectedFields instanceof SqlFragment) {
         // Selector returns a scalar subquery (e.g. .sum(row => other.count())) or a raw fragment.
         // No per-column fields to collect — the aggregate argument lives on aggregateExpression.
       } else {
         // Object selection - extract each field (with support for nested objects)
-        for (const [alias, field] of Object.entries(selectedFields)) {
-          selectedFieldConfigs.push(processField(alias, field));
+        // Own enumerable keys, without allocating the entry pairs (this runs per field per build)
+        for (const alias in selectedFields) {
+          if (Object.prototype.hasOwnProperty.call(selectedFields, alias)) {
+            selectedFieldConfigs.push(processField(alias, selectedFields[alias]));
+          }
         }
       }
     } else {
@@ -8676,6 +8844,7 @@ export class CollectionQueryBuilder<TItem = any> {
             alias: colName,
             expression: `"${dbColumnName}"`,
             propertyName: colName,  // Same as alias when selecting all fields
+            isColumn: true,
           });
         }
       } else {
@@ -8715,13 +8884,7 @@ export class CollectionQueryBuilder<TItem = any> {
     let orderByClauseAlias: string | undefined;
     if (this.orderByFields.length > 0) {
       // Build reverse lookup: db column name -> property name
-      let dbToPropertyMap: Map<string, string> | null = null;
-      if (this.targetTableSchema) {
-        dbToPropertyMap = new Map();
-        for (const [propName, meta] of getSchemaColumnMeta(this.targetTableSchema!)) {
-          dbToPropertyMap.set(meta.name!, propName);
-        }
-      }
+      const dbToPropertyMap = this.targetTableSchema ? getDbToPropertyMapForSchema(this.targetTableSchema) : null;
 
       const orderPartsDb = this.orderByFields.map(({ field, direction }) => {
         // field is already the database column name
@@ -8813,8 +8976,14 @@ export class CollectionQueryBuilder<TItem = any> {
     // which must be included in the lateral subquery for correlation
     // Include selectMany joins in both all and selector navigation joins
     // selectMany joins are structural (from flattening) and needed by both CTE and LATERAL
-    const allNavigationJoins: NavigationJoin[] = [...this.navigationPath, ...this.selectManyJoins, ...navigationJoins];
-    const allSelectorJoins: NavigationJoin[] = [...this.selectManyJoins, ...navigationJoins];
+    // (the common case — no navigation path, no selectMany — reuses the detected array instead of
+    // spreading it twice; strategies only read these lists)
+    const allNavigationJoins: NavigationJoin[] = this.navigationPath.length === 0 && this.selectManyJoins.length === 0
+      ? navigationJoins
+      : [...this.navigationPath, ...this.selectManyJoins, ...navigationJoins];
+    const allSelectorJoins: NavigationJoin[] = this.selectManyJoins.length === 0
+      ? navigationJoins
+      : [...this.selectManyJoins, ...navigationJoins];
 
     // Step 6: Build CollectionAggregationConfig object
     const config: CollectionAggregationConfig = {
@@ -8883,6 +9052,7 @@ export class CollectionQueryBuilder<TItem = any> {
       joinClause: result.joinClause,
       selectExpression: result.selectExpression,
       tableName: result.tableName,
+      memoId: result.memoId,
     };
   }
 }

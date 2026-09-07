@@ -10,6 +10,12 @@ export interface SelectedField {
   expression?: string;  // SQL expression (for leaf fields)
   nested?: SelectedField[];  // Nested fields (for object structures)
   /**
+   * True when `expression` is exactly one unqualified, quoted column name of the collection's
+   * own table (`"column"`), stamped by the builder that knows it. Strategies qualify such a
+   * field with the inner table alias without re-parsing the expression text.
+   */
+  isColumn?: boolean;
+  /**
    * The original property name from the schema (for mapper lookup).
    * When alias differs from the schema property name, this allows
    * the transformation to find the correct mapper.
@@ -28,6 +34,8 @@ export interface SelectedField {
   nestedCteJoin?: {
     cteName: string;
     joinClause: string;  // e.g., 'LEFT JOIN "cte_0" ON "orders"."id" = "cte_0".parent_id'
+    /** Set when the nested lateral came out of the LateralSqlCache — the enclosing shape keys on it instead of the text. */
+    memoId?: number;
   };
   /**
    * When this field is a nested collection (CollectionQueryBuilder),
@@ -99,6 +107,13 @@ export interface CollectionAggregationResult {
    * Map of parent_id -> aggregated data
    */
   data?: Map<number, any>;
+
+  /**
+   * Lateral strategy only: the LateralSqlCache entry id this result was served from or stored
+   * under (absent when the cache is off or full). Lets an enclosing collection key its own
+   * shape on the id instead of the nested join-clause text.
+   */
+  memoId?: number;
 }
 
 /**

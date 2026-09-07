@@ -1,0 +1,38 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`query-build shape caches — regression guards a collection ordered by a column whose property name differs from its db name keeps both ORDER BY forms (CTE strategy) 1`] = `
+"WITH "cte_0" AS (SELECT
+  "__fk_user_id" as parent_id,
+  json_agg(
+    json_build_object('id', "id", 'userId', "userId") ORDER BY "userId" DESC
+  ) as data
+FROM (
+  SELECT "lsc_posts"."user_id" as "__fk_user_id", "id", "user_id" as "userId"
+  FROM "lsc_posts"
+  
+  
+  
+  ORDER BY "user_id" DESC
+) sub
+GROUP BY "__fk_user_id")
+SELECT "lsc_users"."id" as "id", COALESCE("cte_0".data, '[]'::json) as "posts"
+FROM "lsc_users"
+LEFT JOIN "cte_0" ON "cte_0".parent_id = "lsc_users".id"
+`;
+
+exports[`query-build shape caches — regression guards the same ordered collection under the lateral strategy 1`] = `
+"SELECT "lsc_users"."id" as "id", COALESCE("lateral_0".data, '[]'::json) as "posts"
+FROM "lsc_users"
+LEFT JOIN LATERAL (SELECT json_agg(
+  json_build_object('id', "id", 'userId', "userId")
+) as data
+FROM (
+  SELECT "lateral_0_posts"."id" as "id", "lateral_0_posts"."user_id" as "userId"
+  FROM "lsc_posts" "lateral_0_posts"
+  
+  
+  WHERE "lateral_0_posts"."user_id" = "lsc_users"."id"
+  ORDER BY "user_id" DESC
+  
+) sub) "lateral_0" ON true"
+`;

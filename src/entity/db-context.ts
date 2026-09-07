@@ -92,6 +92,9 @@ function getSelectAllRelationPrototype(schema: any): object {
  * A select-all row over `schema` reading through the mock row `source` — see
  * {@link getSelectAllRelationPrototype} for the shape and why navigations are inherited.
  */
+/** Column property names per schema — `Object.keys(schema.columns)` allocated a fresh array per row. */
+const selectAllColumnNames = new WeakMap<object, string[]>();
+
 function createSelectAllRow(schema: any, source: any): any {
   const result: any = Object.create(getSelectAllRelationPrototype(schema));
 
@@ -101,7 +104,13 @@ function createSelectAllRow(schema: any, source: any): any {
     configurable: true,
   });
 
-  for (const colName of Object.keys(schema.columns)) {
+  let columnNames = selectAllColumnNames.get(schema);
+  if (columnNames === undefined) {
+    columnNames = Object.keys(schema.columns);
+    selectAllColumnNames.set(schema, columnNames);
+  }
+  for (let i = 0; i < columnNames.length; i++) {
+    const colName = columnNames[i];
     result[colName] = source[colName];
   }
 
