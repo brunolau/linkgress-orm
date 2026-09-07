@@ -280,6 +280,15 @@ export interface QueryOptions {
    * `inArrayOptThreshold` — see `LinkgressConfig.inArrayPadBuckets` for the rung trade-off.
    */
   inArrayPadBuckets?: readonly number[] | null;
+  /**
+   * Whether the plain `inArray` / `notInArray` render what `inArrayOpt` / `notInArrayOpt`
+   * render (the `IN (…)` list up to the threshold, `= ANY($1::type[])` above it). Default
+   * `false` — `inArray` stays the exact-length operator. Turn it on to get the
+   * statement-text economy across a codebase that already calls `inArray` everywhere; the
+   * rows are identical either way. PROCESS-WIDE for the same reason as
+   * `inArrayOptThreshold` — see `LinkgressConfig.inArrayUsesOpt`.
+   */
+  inArrayUsesOpt?: boolean;
   /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: CollectionStrategyType;
   /**
@@ -1871,6 +1880,10 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
     if (queryOptions?.inArrayPadBuckets !== undefined) {
       LinkgressConfig.inArrayPadBuckets = queryOptions.inArrayPadBuckets;
+    }
+
+    if (queryOptions?.inArrayUsesOpt !== undefined) {
+      LinkgressConfig.inArrayUsesOpt = queryOptions.inArrayUsesOpt;
     }
 
     this.initializeSchema(schema);

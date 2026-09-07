@@ -41,6 +41,7 @@ context's options for that chain only.
 | `preparedStatements` | `false` | **Opt-in.** Run parameterised statements as NAMED server-side prepared statements (postgres.js only) |
 | `inArrayOptThreshold` | `8` | List length up to which `inArrayOpt` renders `IN (…)`. **Process-wide** — see [LinkgressConfig](#process-wide-settings--linkgressconfig) |
 | `inArrayPadBuckets` | `null` | **Opt-in.** Bucket ladder collapsing the sub-threshold band. **Process-wide** |
+| `inArrayUsesOpt` | `false` | **Opt-in.** Make plain `inArray` / `notInArray` render what `inArrayOpt` renders. **Process-wide** |
 | `collectionStrategy` | `'lateral'` | `'cte' \| 'lateral' \| 'temptable'` — see [Collection Strategies](../collection-strategies.md) |
 | `disableMappers` | `false` | Skip `fromDriver` / `toDriver` transformations; raw driver values are returned |
 | `rawResult` | `false` | Return the driver's raw rows with no ORM shaping at all |
@@ -180,8 +181,8 @@ Checklist before and after enabling:
 ## Statement-text economy
 
 Under `preparedStatements` every distinct statement text is a cached plan in every pooled
-connection, so it is worth bounding how many texts one query family produces. Two settings do
-that, both process-wide, both covered in depth in the
+connection, so it is worth bounding how many texts one query family produces. Three settings do
+that, all process-wide, all covered in depth in the
 [Querying guide](./querying.md#matching-a-list-of-values):
 
 ```typescript
@@ -189,6 +190,7 @@ import { LinkgressConfig, inArrayOpt } from 'linkgress-orm';
 
 LinkgressConfig.inArrayOptThreshold = 8;         // default: IN (…) up to 8, = ANY($1::int[]) above
 LinkgressConfig.inArrayPadBuckets = [1, 2, 8];   // opt-in: collapse the band BELOW the threshold
+LinkgressConfig.inArrayUsesOpt = true;           // opt-in: plain inArray renders the same way
 
 db.products.where(p => inArrayOpt(p.id, productIds));
 ```
@@ -200,6 +202,9 @@ db.products.where(p => inArrayOpt(p.id, productIds));
   last element, so a whole band of lengths shares one text. Same rows either way; it costs a
   slightly wider row estimate, which is free from three elements up and about 32 % / 26 % on one-
   and two-element lists — so keep the low rungs tight.
+- `inArrayUsesOpt` applies the two above to the plain `inArray` / `notInArray` as well, so a
+  codebase that never adopted the opt operators gets the same economy without a rewrite. Off by
+  default; results are identical either way, only the statement text changes.
 - `eqAny` / `neAll` are the unconditional array forms, when you want to decide at the call site.
 
 ## Result handling and diagnostics
@@ -255,6 +260,7 @@ import { LinkgressConfig } from 'linkgress-orm';
 
 LinkgressConfig.inArrayOptThreshold = 12;                  // property setter
 LinkgressConfig.inArrayPadBuckets = [1, 2, 8];             // opt-in ladder; null switches it off
+LinkgressConfig.inArrayUsesOpt = true;                     // opt-in; plain inArray renders as inArrayOpt
 LinkgressConfig.configure({ inArrayOptThreshold: 12 });    // several settings at once
 LinkgressConfig.inArrayOptThreshold;                       // -> 12
 LinkgressConfig.resetToDefaults();                         // test isolation
@@ -266,13 +272,19 @@ LinkgressConfig.DEFAULT_IN_ARRAY_PAD_BUCKETS;              // [1, 4, 8] — a la
 Constructing a context with the matching `QueryOptions` keys writes the same process-wide values:
 
 ```typescript
-new AppDatabase(client, { inArrayOptThreshold: 12, inArrayPadBuckets: [1, 2, 8] });
+new AppDatabase(client, { inArrayOptThreshold: 12, inArrayPadBuckets: [1, 2, 8], inArrayUsesOpt: true });
 ```
 
 The last write wins, whichever path it came through. Invalid values throw and leave the current
-setting in place: the threshold must be a non-negative integer, and the ladder must be positive
-integers in strictly ascending order. The stored ladder is a frozen copy, so mutating the array
-you passed cannot change it afterwards.
+setting in place: the threshold must be a non-negative integer, the ladder must be positive
+integers in strictly ascending order, and `inArrayUsesOpt` must be a boolean. The stored ladder is
+a frozen copy, so mutating the array you passed cannot change it afterwards.
+
+`inArrayUsesOpt` is the one setting here that changes the SQL a call site you did not touch emits:
+with it on, `inArray` / `notInArray` render exactly what `inArrayOpt` / `notInArrayOpt` render.
+The rows are identical — see
+[Applying it to plain `inArray`](./querying.md#applying-it-to-plain-inarray-inarrayusesopt-opt-in) for
+when to reach for it.
 
 ## Query-build caches (opt-in)
 
@@ -319,6 +331,7 @@ LinkgressConfig.inArrayPadBuckets = [1, 2, 8];
 const db = new AppDatabase(client, {
   preparedStatements: true,
   inArrayOptThreshold: 8,
+  inArrayUsesOpt: true,     // existing inArray call sites get the same treatment
 });
 
 // …and opt the variable-text queries back out where they are built:

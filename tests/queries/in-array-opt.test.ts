@@ -174,6 +174,114 @@ describe('inArrayOpt / notInArrayOpt', () => {
     });
   });
 
+  describe('inArrayUsesOpt — plain inArray routed through the opt rendering', () => {
+    const nine = Array.from({ length: 9 }, (_, i) => i + 1);
+
+    test('it is off by default, so inArray keeps its exact-length IN list', () => {
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(false);
+      expect(inArray(ref('integer'), nine).buildSql(makeContext()))
+        .toBe('"p"."product_id" IN ($1, $2, $3, $4, $5, $6, $7, $8, $9)');
+      expect(notInArray(ref('integer'), nine).buildSql(makeContext()))
+        .toBe('"p"."product_id" NOT IN ($1, $2, $3, $4, $5, $6, $7, $8, $9)');
+    });
+
+    test('switched on, inArray renders exactly what inArrayOpt renders at every length', () => {
+      LinkgressConfig.inArrayUsesOpt = true;
+
+      const lists = [[], [1], [1, 2, 3], [1, 2, 3, 4, 5, 6, 7, 8], nine, Array.from({ length: 40 }, (_, i) => i)];
+
+      for (const values of lists) {
+        const viaPlain = makeContext();
+        const viaOpt = makeContext();
+
+        expect(inArray(ref('integer'), values).buildSql(viaPlain))
+          .toBe(inArrayOpt(ref('integer'), values).buildSql(viaOpt));
+        expect(viaPlain.params).toEqual(viaOpt.params);
+
+        const negPlain = makeContext();
+        const negOpt = makeContext();
+
+        expect(notInArray(ref('integer'), values).buildSql(negPlain))
+          .toBe(notInArrayOpt(ref('integer'), values).buildSql(negOpt));
+        expect(negPlain.params).toEqual(negOpt.params);
+      }
+    });
+
+    test('switched on, a long list binds as one array parameter with the column cast', () => {
+      LinkgressConfig.inArrayUsesOpt = true;
+      const ctx = makeContext();
+
+      expect(inArray(ref('integer'), nine).buildSql(ctx)).toBe('"p"."product_id" = ANY($1::integer[])');
+      expect(ctx.params).toEqual(['{1,2,3,4,5,6,7,8,9}']);
+      expect(notInArray(ref('integer'), nine).buildSql(makeContext()))
+        .toBe('"p"."product_id" <> ALL($1::integer[])');
+    });
+
+    test('the threshold and the pad ladder apply to the routed inArray as well', () => {
+      LinkgressConfig.configure({ inArrayUsesOpt: true, inArrayOptThreshold: 4, inArrayPadBuckets: [1, 4] });
+
+      expect(inArray(ref('integer'), [1]).buildSql(makeContext())).toBe('"p"."product_id" IN ($1)');
+      expect(inArray(ref('integer'), [1, 2]).buildSql(makeContext())).toBe('"p"."product_id" IN ($1, $2, $3, $4)');
+      expect(inArray(ref('integer'), [1, 2, 3, 4, 5]).buildSql(makeContext())).toBe('"p"."product_id" = ANY($1::integer[])');
+    });
+
+    test('padding repeats the last element, so the routed inArray still selects the same rows', () => {
+      LinkgressConfig.configure({ inArrayUsesOpt: true, inArrayPadBuckets: [4] });
+      const ctx = makeContext();
+
+      expect(inArray(ref('integer'), [7, 9]).buildSql(ctx)).toBe('"p"."product_id" IN ($1, $2, $3, $4)');
+      expect(ctx.params).toEqual([7, 9, 9, 9]);
+    });
+
+    test('the empty list and a non-array value keep their constants with the switch on', () => {
+      LinkgressConfig.inArrayUsesOpt = true;
+
+      expect(inArray(ref('integer'), []).buildSql(makeContext())).toBe('1=0');
+      expect(notInArray(ref('integer'), []).buildSql(makeContext())).toBe('1=1');
+      expect(inArray(ref('integer'), undefined as any).buildSql(makeContext())).toBe('1=0');
+      expect(notInArray(ref('integer'), undefined as any).buildSql(makeContext())).toBe('1=1');
+    });
+
+    test('inArray and inArrayOpt do not recurse into each other — a short list is one flat call', () => {
+      // The regression this guards: routing inArray through the PUBLIC inArrayOpt (which used to
+      // call inArray for the sub-threshold branch) makes the pair mutually recursive and blows the
+      // stack on the very first short list. Both now bottom out in a private renderer instead.
+      LinkgressConfig.inArrayUsesOpt = true;
+
+      expect(() => inArray(ref('integer'), [1, 2, 3]).buildSql(makeContext())).not.toThrow();
+      expect(() => notInArray(ref('integer'), [1, 2, 3]).buildSql(makeContext())).not.toThrow();
+      expect(() => inArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).not.toThrow();
+      expect(() => notInArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).not.toThrow();
+
+      // …and it holds from a stack already deep, where the handful of frames a flat call adds is
+      // survivable but an unbounded mutual recursion would not be.
+      const deep = (depth: number): string =>
+        depth === 0
+          ? inArray(ref('integer'), [1, 2, 3]).buildSql(makeContext())
+          : deep(depth - 1);
+
+      expect(deep(500)).toBe('"p"."product_id" IN ($1, $2, $3)');
+    });
+
+    test('resetToDefaults() and configure() move the switch, and it rejects a non-boolean', () => {
+      LinkgressConfig.inArrayUsesOpt = true;
+      LinkgressConfig.resetToDefaults();
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(false);
+
+      LinkgressConfig.configure({ inArrayUsesOpt: true });
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(true);
+
+      LinkgressConfig.configure({});
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(true);
+
+      expect(() => { (LinkgressConfig as any).inArrayUsesOpt = 'yes'; }).toThrow(/must be a boolean/);
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(true);
+
+      expect('setInArrayUsesOpt' in linkgress).toBe(false);
+      expect('getInArrayUsesOpt' in linkgress).toBe(false);
+    });
+  });
+
   describe('against PostgreSQL', () => {
     let db: InArrayOptTestDatabase;
     let client: DatabaseClient;
@@ -256,6 +364,44 @@ describe('inArrayOpt / notInArrayOpt', () => {
 
       expect((await textsFor([9, 10, 11])).size).toBe(1);
       expect((await textsFor([1, 2, 3])).size).toBe(3);
+    });
+
+    test('inArrayUsesOpt makes a plain inArray query emit the array form and return the same rows', async () => {
+      LinkgressConfig.resetToDefaults();
+      const long = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+      const exact = labelsOf(await db.optItems.where(i => inArray(i.rank, long)).toList());
+
+      LinkgressConfig.inArrayUsesOpt = true;
+      captured.length = 0;
+
+      const routed = labelsOf(await db.optItems.where(i => inArray(i.rank, long)).toList());
+
+      expect(routed).toEqual(exact);
+      expect(routed).toHaveLength(11);
+      expect(captured.some(msg => msg.includes('= ANY($1::integer[])'))).toBe(true);
+
+      // …and NOT IN mirrors it, NULL-ranked item-12 dropped by both forms.
+      captured.length = 0;
+      expect(labelsOf(await db.optItems.where(i => notInArray(i.rank, [1, 2, 3, 4, 5, 6, 7, 8, 9])).toList()))
+        .toEqual(['item-10', 'item-11']);
+      expect(captured.some(msg => msg.includes('<> ALL($1::integer[])'))).toBe(true);
+    });
+
+    test('the context option writes the switch process-wide, like the other two', async () => {
+      LinkgressConfig.resetToDefaults();
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(false);
+
+      // A second context on the SAME client: never dispose() it — that would end the shared pool.
+      const other = new InArrayOptTestDatabase(client, { inArrayUsesOpt: true });
+
+      expect(other).toBeDefined();
+      expect(LinkgressConfig.inArrayUsesOpt).toBe(true);
+
+      captured.length = 0;
+      await db.optItems.where(i => inArray(i.rank, [1, 2, 3, 4, 5, 6, 7, 8, 9])).toList();
+
+      expect(captured.some(msg => msg.includes('= ANY($1::integer[])'))).toBe(true);
     });
   });
 });

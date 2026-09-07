@@ -864,18 +864,40 @@ export function normalizedStartsWith<T extends string>(
   );
 }
 
+/**
+ * `column IN ($1, $2, …)` — one placeholder per element.
+ *
+ * Renders the exact-length list, unless `LinkgressConfig.inArrayUsesOpt` is on: then
+ * it renders whatever {@link inArrayOpt} would — the same `IN` list up to the
+ * threshold, `= ANY($1::type[])` above it, and the configured pad-bucket widths in
+ * between. Identical rows either way; only the statement text differs.
+ *
+ * The switch exists because `inArray` is the call a codebase already has everywhere,
+ * and the statement-text economy is worth more applied to all of them than waiting on
+ * a rewrite to `inArrayOpt`. Leave it off (the default) and this stays the literal
+ * exact-length operator it has always been.
+ */
 export function inArray<T extends string, V>(
   field: FieldLike<V> | T | undefined,
   values: V[]
 ): Condition {
-  return new InComparison<V>(field!, values);
+  return inArrayUsesOpt
+    ? renderInArrayOpt<T, V>(field, values)
+    : new InComparison<V>(field!, values);
 }
 
+/**
+ * `column NOT IN ($1, $2, …)`, and the negated counterpart of {@link inArray} in
+ * every respect — including obeying `LinkgressConfig.inArrayUsesOpt`, which routes it
+ * through {@link notInArrayOpt}'s rendering.
+ */
 export function notInArray<T extends string, V>(
   field: FieldLike<V> | T | undefined,
   values: V[]
 ): Condition {
-  return new NotInComparison<V>(field!, values);
+  return inArrayUsesOpt
+    ? renderNotInArrayOpt<T, V>(field, values)
+    : new NotInComparison<V>(field!, values);
 }
 
 // ============================================================================
@@ -1040,6 +1062,36 @@ export function getInArrayOptThreshold(): number {
   return inArrayOptThreshold;
 }
 
+let inArrayUsesOpt = false;
+
+/**
+ * INTERNAL write path behind `LinkgressConfig.inArrayUsesOpt` (and the
+ * `QueryOptions.inArrayUsesOpt` hook). Not part of the package surface.
+ *
+ * `true` makes the plain {@link inArray} / {@link notInArray} render exactly what
+ * {@link inArrayOpt} / {@link notInArrayOpt} render, so a codebase that never adopted
+ * the opt operators still gets one statement text per family. Default `false`, which
+ * leaves both operators at the exact-length `IN` list they have always emitted.
+ *
+ * @internal
+ */
+export function setInArrayUsesOpt(enabled: boolean): void {
+  if (typeof enabled !== 'boolean') {
+    throw new Error(`inArrayUsesOpt must be a boolean, got ${String(enabled)}`);
+  }
+
+  inArrayUsesOpt = enabled;
+}
+
+/**
+ * INTERNAL read path behind `LinkgressConfig.inArrayUsesOpt`.
+ *
+ * @internal
+ */
+export function getInArrayUsesOpt(): boolean {
+  return inArrayUsesOpt;
+}
+
 /**
  * A ladder a consumer may install to collapse the sub-threshold band further.
  *
@@ -1141,6 +1193,46 @@ function padToInArrayBucket<V>(values: readonly V[]): readonly V[] {
 }
 
 /**
+ * The `inArrayOpt` rendering itself, kept as a private function so that no caller of
+ * it has to go through a public operator to reach it.
+ *
+ * Every path bottoms out here: {@link inArrayOpt} always, and {@link inArray} when
+ * `inArrayUsesOpt` is on. Building the `InComparison` directly, rather than calling
+ * `inArray` the way `inArrayOpt` used to, is what makes that switch safe — routed
+ * through the public operator it would be `inArray` → `inArrayOpt` → `inArray` → …,
+ * blowing the stack on the first short list. The duplication is one `new` expression
+ * and it is deliberate; keep it that way.
+ */
+function renderInArrayOpt<T extends string, V>(
+  column: FieldLike<V> | DbColumn<V> | T | undefined,
+  values: readonly V[]
+): Condition {
+  if (!Array.isArray(values) || values.length <= inArrayOptThreshold) {
+    return new InComparison<V>(
+      (column as FieldLike<V> | T | undefined)!,
+      padToInArrayBucket(values) as V[]
+    );
+  }
+
+  return eqAny(column as FieldLike<V> | DbColumn<V> | undefined, values);
+}
+
+/** The `notInArrayOpt` rendering; {@link renderInArrayOpt} negated, and non-recursive for the same reason. */
+function renderNotInArrayOpt<T extends string, V>(
+  column: FieldLike<V> | DbColumn<V> | T | undefined,
+  values: readonly V[]
+): Condition {
+  if (!Array.isArray(values) || values.length <= inArrayOptThreshold) {
+    return new NotInComparison<V>(
+      (column as FieldLike<V> | T | undefined)!,
+      padToInArrayBucket(values) as V[]
+    );
+  }
+
+  return neAll(column as FieldLike<V> | DbColumn<V> | undefined, values);
+}
+
+/**
  * List membership that picks the rendering by list length: {@link inArray}'s
  * `IN ($1, $2, …)` for lists up to the configured threshold, {@link eqAny}'s
  * `= ANY($1::type[])` above it. Same results as `inArray` for every list,
@@ -1162,11 +1254,7 @@ export function inArrayOpt<T extends string, V>(
   column: FieldLike<V> | DbColumn<V> | T | undefined,
   values: readonly V[]
 ): Condition {
-  if (!Array.isArray(values) || values.length <= inArrayOptThreshold) {
-    return inArray(column as FieldLike<V> | T | undefined, padToInArrayBucket(values) as V[]);
-  }
-
-  return eqAny(column as FieldLike<V> | DbColumn<V> | undefined, values);
+  return renderInArrayOpt<T, V>(column, values);
 }
 
 /**
@@ -1179,11 +1267,7 @@ export function notInArrayOpt<T extends string, V>(
   column: FieldLike<V> | DbColumn<V> | T | undefined,
   values: readonly V[]
 ): Condition {
-  if (!Array.isArray(values) || values.length <= inArrayOptThreshold) {
-    return notInArray(column as FieldLike<V> | T | undefined, padToInArrayBucket(values) as V[]);
-  }
-
-  return neAll(column as FieldLike<V> | DbColumn<V> | undefined, values);
+  return renderNotInArrayOpt<T, V>(column, values);
 }
 
 export function isNull<T extends string, V>(

@@ -34,9 +34,12 @@ an option):
   `.expectedExecutionTime()`. Precedence in `QueryExecutor.buildExecutionOptions()`:
   per-call → builder override → context option
 - **Process-wide** — `LinkgressConfig` (`src/config/linkgress-config.ts`) is the ONLY exported
-  way to set `inArrayOptThreshold` / `inArrayPadBuckets`; the underlying setters live next to
-  the operators in `src/query/conditions.ts` and are not exported from the package.
-  `QueryOptions` keys of the same name write the same process-wide values at context construction
+  way to set `inArrayOptThreshold` / `inArrayPadBuckets` / `inArrayUsesOpt`; the underlying
+  setters live next to the operators in `src/query/conditions.ts` and are not exported from the
+  package. `QueryOptions` keys of the same name write the same process-wide values at context
+  construction. `inArrayUsesOpt` (default off) routes plain `inArray`/`notInArray` through the
+  `inArrayOpt` rendering — both paths bottom out in the private `renderInArrayOpt`/
+  `renderNotInArrayOpt`, NEVER in each other, or the pair becomes mutually recursive
 - **Opt-in query-build caches** — `MockRowCache.setEnabled(true)` also gates `NavigationPathCache`
 
 ## Conventions

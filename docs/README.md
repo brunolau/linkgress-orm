@@ -67,7 +67,7 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Context options (`QueryOptions`) with defaults
   - Logging in production (`logFailedQueries`) and slow-query detection
   - Server-side prepared statements (`preparedStatements`, `.withPreparedStatements()`)
-  - Statement-text economy (`inArrayOptThreshold`, `inArrayPadBuckets`)
+  - Statement-text economy (`inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt`)
   - Per-query overrides (`.withQueryOptions()`, `.withTimeout()`, `.expectedExecutionTime()`)
   - Process-wide settings (`LinkgressConfig`) and opt-in query-build caches
 

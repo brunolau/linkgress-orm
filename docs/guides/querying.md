@@ -189,6 +189,42 @@ An empty list keeps its constant, since there is no element to repeat, and a
 list longer than the top rung is widened to the threshold — raising the
 threshold extends the ladder instead of dropping lengths out of it.
 
+#### Applying it to plain `inArray`: `inArrayUsesOpt` (opt-in)
+
+Everything above only reaches the call sites that were written as `inArrayOpt`.
+In a codebase that already calls `inArray` in hundreds of places, that is a
+rewrite standing between you and the statement-text economy — and a rewrite that
+never quite finishes, because the next feature branch reaches for `inArray`
+again.
+
+One switch closes that gap:
+
+```typescript
+LinkgressConfig.inArrayUsesOpt = true;               // off by default
+
+db.widgets.where(w => inArray(w.slotId, slotIds));   // plain inArray…
+// slotIds.length <= threshold:  "w"."slot_id" IN ($1, $2, $3)
+// slotIds.length  > threshold:  "w"."slot_id" = ANY($1::integer[])
+```
+
+With it on, `inArray` and `notInArray` render exactly what `inArrayOpt` and
+`notInArrayOpt` render — same threshold, same bucket ladder, same array form
+above it. The rows a query returns never change; only its statement text does,
+which is why this is safe to flip for a whole process rather than per call site.
+
+Leave it off when hand-tuned queries depend on the planner seeing an exact-length
+`IN` list — with the switch off, `inArray` is the literal exact-length operator
+it has always been, and explicit `inArrayOpt` calls keep working either way. The
+two operators stay distinct in the source, so a query you want pinned to exact
+placeholders can be moved back by turning the switch off and adopting
+`inArrayOpt` per call site instead.
+
+```typescript
+LinkgressConfig.inArrayUsesOpt;                          // -> true
+LinkgressConfig.configure({ inArrayUsesOpt: true });     // or several settings at once
+new AppDatabase(client, { inArrayUsesOpt: true });       // QueryOptions writes the same value
+```
+
 ### Ordering Results
 
 Sort results using `orderBy()`:
