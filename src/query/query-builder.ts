@@ -625,7 +625,15 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow
         // with circular relations like User->Posts->User)
         descriptors[relName] = {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -637,7 +645,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               sourceTableName  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -885,7 +893,15 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         // Single reference navigation
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
         Object.defineProperty(mock, relName, {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -897,7 +913,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -1765,7 +1781,15 @@ export class SelectQueryBuilder<TSelection> {
         // Single reference navigation
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
         Object.defineProperty(mock, relName, {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -1777,7 +1801,7 @@ export class SelectQueryBuilder<TSelection> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -4762,7 +4786,15 @@ ${joinClauses.join('\n')}`;
         // For single reference (many-to-one), create a ReferenceQueryBuilder
         // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
         descriptors[relName] = {
-          get: () => {
+          get(this: any) {
+            // One mock target row per row and relation (a selector reading `p.user.*` several
+            // times used to mint a builder and a row per access)
+            const slots: MockRowSlots = this;
+            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+            const cachedRow = navCache[relName];
+            if (cachedRow !== undefined) {
+              return cachedRow;
+            }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
               relConfig.targetTable,
@@ -4775,7 +4807,7 @@ ${joinClauses.join('\n')}`;
               sourceTableName  // Pass source table name for lateral join correlation
             );
             // Return a mock object that exposes the target table's columns
-            return refBuilder.createMockTargetRow();
+            return (navCache[relName] = refBuilder.createMockTargetRow());
           },
           enumerable: false,
           configurable: true,
@@ -5389,7 +5421,11 @@ ${joinClauses.join('\n')}`;
       throw new Error('Cannot use CollectionQueryBuilder directly as selection');
     } else {
       // Process selection object properties
-      for (const [key, value] of Object.entries(selection)) {
+      for (const key in selection) {
+        if (!Object.prototype.hasOwnProperty.call(selection, key)) {
+          continue;
+        }
+        const value = selection[key];
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
           // Handle collection - delegate to strategy pattern via buildCTE
           // The strategy handles CTE/LATERAL specifics and returns necessary info
@@ -5887,7 +5923,11 @@ ${joinClauses.join('\n')}`;
       //   - collections hit an explicit `continue` and were never emitted.
       // Both regressions are now covered by union-nested-select.test.ts and
       // union-collection-nav.test.ts.
-      for (const [key, value] of Object.entries(selection)) {
+      for (const key in selection) {
+        if (!Object.prototype.hasOwnProperty.call(selection, key)) {
+          continue;
+        }
+        const value = selection[key];
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
           // Collection projection inside a UNION leg — delegate to the
           // collection strategy (LATERAL by default) and emit per-row
@@ -7661,9 +7701,17 @@ export class CollectionQueryBuilder<TItem = any> {
           // Reference navigation
           // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
           descriptors[relName] = {
-            get: () => {
+            get(this: any) {
               // Don't call build() - it returns schema without relations
               // Instead, pass undefined and let ReferenceQueryBuilder look it up from registry
+              // One mock target row per ITEM row and relation: a selector that reads
+              // `it.product.*` fifteen times used to mint fifteen builders and rows.
+              const slots: MockRowSlots = this;
+              const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+              const cachedRow = navCache[relName];
+              if (cachedRow !== undefined) {
+                return cachedRow;
+              }
               const refBuilder = new ReferenceQueryBuilder(
                 relName,
                 relConfig.targetTable,
@@ -7675,7 +7723,7 @@ export class CollectionQueryBuilder<TItem = any> {
                 [],  // Empty navigation path - this is the first reference in the chain
                 targetTable  // Source alias is this collection's target table
               );
-              return refBuilder.createMockTargetRow();
+              return (navCache[relName] = refBuilder.createMockTargetRow());
             },
             enumerable: false,
             configurable: true,

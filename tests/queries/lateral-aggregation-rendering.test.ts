@@ -200,6 +200,57 @@ describe('lateral aggregation rendering', () => {
     expect(rows.map(r => r.owners.length)).toEqual([1, 1, 0]);
   });
 
+  test('a hasOne navigation read several times from one mock row is one mock target row (root and collection item)', async () => {
+    const rootReads: any[] = [];
+    const itemReads: any[] = [];
+    const rows = byId(await lateralDb.posts
+      .select(p => {
+        rootReads.push(p.user, p.user);
+        return {
+          id: p.id,
+          author: p.user!.username,
+          email: p.user!.email,
+          comments: p.postComments!.select(c => {
+            itemReads.push(c.post, c.post);
+            return { text: c.comment, postTitle: c.post!.title, postViews: c.post!.views };
+          }).toList('comments'),
+        };
+      })
+      .toList());
+    const statement = lastSql();
+
+    // the same row, read twice, yields the same navigation row — not a new builder + row per access
+    expect(rootReads[0]).toBe(rootReads[1]);
+    expect(itemReads[0]).toBe(itemReads[1]);
+    // … and the join is still emitted once per level
+    expect(statement.split('JOIN "users" AS "user"').length - 1).toBe(1);   // root-level navigation join
+    expect(statement.split('JOIN "posts" "post"').length - 1).toBe(1);      // navigation join inside the lateral
+    expect(rows[0]).toEqual({
+      id: rows[0].id,
+      author: 'alice',
+      email: 'alice@test.com',
+      comments: [{ text: 'Related to order', postTitle: 'Alice Post 1', postViews: 100 }],
+    });
+  });
+
+  test('navigation rows are per mock row: two builds do not share them, and a hasMany read stays a fresh builder', async () => {
+    const reads: any[] = [];
+    const runQuery = () => lateralDb.posts
+      .select(p => {
+        reads.push({ user: p.user, comments: p.postComments, commentsAgain: p.postComments });
+        return { id: p.id, author: p.user!.username };
+      })
+      .toList();
+    await runQuery();
+    await runQuery();
+
+    expect(reads).toHaveLength(2);
+    expect(reads[0].user).not.toBe(reads[1].user);
+    expect(reads[0].user.username.__fieldName).toBe('username');
+    // a collection navigation is a builder with its own where/select state: one per access, as before
+    expect(reads[0].comments).not.toBe(reads[0].commentsAgain);
+  });
+
   test('lateral and cte strategies return identical rows for a projection that uses every rendered form', async () => {
     const projection = (db: AppDatabase) => db.users
       .select(u => ({
