@@ -10,6 +10,71 @@ import {
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
 import { formatJoinValue, buildCollectionCorrelationWhere } from '../join-utils';
+import { LateralSqlCache } from '../lateral-sql-cache';
+
+/** Key-part separator: a control character no alias, column name or SQL text contains. */
+const KEY_SEP = String.fromCharCode(1);
+
+/** A column list as one key part; the one-column case (nearly every FK) needs no join allocation. */
+const listKey = (list: string[] | undefined): string => (list === undefined ? '' : list.length === 1 ? list[0] : list.join(','));
+
+/** Appends what `buildNavigationJoinsWithAlias` reads from each join, including the alias-map resolution of its source. */
+const appendNavigationJoinsKey = (key: string, joins: NavigationJoin[] | undefined, aliasMap: Map<string, string> | undefined): string => {
+  if (!joins) {
+    return key + '-' + KEY_SEP;
+  }
+
+  key += joins.length + KEY_SEP;
+
+  for (const join of joins) {
+    key += join.alias + KEY_SEP + join.targetTable + KEY_SEP + (join.targetSchema ?? '') + KEY_SEP
+      + listKey(join.foreignKeys) + KEY_SEP + listKey(join.matches) + KEY_SEP + (join.isMandatory ? 'I' : 'L') + KEY_SEP
+      + join.sourceAlias + KEY_SEP + (aliasMap?.get(join.sourceAlias) ?? '') + KEY_SEP;
+  }
+
+  return key;
+};
+
+/** Appends the projection: aliases, expressions, nesting, and nested laterals by memo id (or by text when not memoised). */
+const appendFieldsKey = (key: string, fields: SelectedField[]): string => {
+  key += '[' + fields.length + KEY_SEP;
+
+  for (const field of fields) {
+    key += field.alias + KEY_SEP + (field.expression ?? '') + KEY_SEP + (field.isColumn === true ? 'c' : 'e') + KEY_SEP;
+
+    if (field.nestedCteJoin) {
+      key += field.nestedCteJoin.cteName + KEY_SEP + (field.nestedCteJoin.memoId ? '#' + field.nestedCteJoin.memoId : field.nestedCteJoin.joinClause) + KEY_SEP;
+    }
+
+    key = field.nested ? appendFieldsKey(key, field.nested) : key + '-' + KEY_SEP;
+  }
+
+  return key + ']' + KEY_SEP;
+};
+
+/**
+ * The LateralSqlCache key of an aggregation: every input `LateralCollectionStrategy.render` and
+ * its helpers read, in order — the alias inputs (counter, relation, tables), the correlation
+ * columns, the clause TEXT (which already carries the `$n` placeholder numbering), the scalar
+ * flags and limits, both navigation-join lists with their alias-map resolution, and the
+ * projection. Parameter VALUES never enter the strategy and never enter the key. Built by plain
+ * concatenation (a rope V8 flattens once, on the lookup) — cheaper than an array join.
+ */
+export const lateralShapeKey = (config: CollectionAggregationConfig, context: QueryContext): string => {
+  const aliasMap = context.lateralTableAliasMap;
+  let key = config.counter + KEY_SEP + config.relationName + KEY_SEP + config.targetTable + KEY_SEP + config.foreignKey + KEY_SEP
+    + listKey(config.foreignKeys) + KEY_SEP + listKey(config.matches) + KEY_SEP + (config.foreignKeyTableAlias ?? '') + KEY_SEP
+    + config.sourceTable + KEY_SEP + (aliasMap?.get(config.sourceTable) ?? '') + KEY_SEP
+    + (config.whereClause ?? '') + KEY_SEP + (config.orderByClause ?? '') + KEY_SEP + (config.orderByClauseAlias ?? '') + KEY_SEP
+    + (config.limitValue ?? '') + KEY_SEP + (config.offsetValue ?? '') + KEY_SEP
+    + (config.isDistinct === true ? 'D' : '') + (config.isSingleResult === true ? 'S' : '') + (config.useJsonArrayAggregation === true ? 'J' : '') + KEY_SEP
+    + config.aggregationType + KEY_SEP + (config.aggregateField ?? '') + KEY_SEP + (config.aggregateExpression ?? '') + KEY_SEP
+    + (config.arrayField ?? '') + KEY_SEP + config.defaultValue + KEY_SEP;
+  key = appendNavigationJoinsKey(key, config.navigationJoins, aliasMap);
+  key = appendNavigationJoinsKey(key, config.selectorNavigationJoins, aliasMap);
+
+  return appendFieldsKey(key, config.selectedFields);
+};
 
 /**
  * LATERAL JOIN-based collection strategy
@@ -87,6 +152,47 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
   }
 
   buildAggregation(
+    config: CollectionAggregationConfig,
+    context: QueryContext
+  ): CollectionAggregationResult {
+    // Memoised per shape (see LateralSqlCache): the rendering below reads nothing but the
+    // config and the enclosing alias map, and mutates neither, so a hit is a pure lookup.
+    if (!LateralSqlCache.isEnabled()) {
+      return this.render(config, context);
+    }
+
+    const key = lateralShapeKey(config, context);
+    const hit = LateralSqlCache.get(key);
+
+    if (hit) {
+      return {
+        sql: hit.sql,
+        params: context.allParams,
+        tableName: hit.tableName,
+        joinClause: hit.joinClause,
+        selectExpression: hit.selectExpression,
+        isCTE: false,
+        memoId: hit.id,
+      };
+    }
+
+    const rendered = this.render(config, context);
+    const entry = LateralSqlCache.store(key, {
+      sql: rendered.sql,
+      joinClause: rendered.joinClause,
+      selectExpression: rendered.selectExpression,
+      tableName: rendered.tableName,
+    });
+
+    if (entry.id > 0) {
+      rendered.memoId = entry.id;
+    }
+
+    return rendered;
+  }
+
+  /** The uncached rendering behind {@link buildAggregation}. */
+  private render(
     config: CollectionAggregationConfig,
     context: QueryContext
   ): CollectionAggregationResult {

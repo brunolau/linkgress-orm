@@ -60,6 +60,7 @@ export {
 // Static feature switches
 export { MockRowCache } from './query/mock-row-cache';
 export { NavigationPathCache } from './query/navigation-path-cache';
+export { LateralSqlCache } from './query/lateral-sql-cache';
 
 // Process-wide settings (inArrayOpt threshold, …) — the public configuration surface
 export { LinkgressConfig } from './config/linkgress-config';
