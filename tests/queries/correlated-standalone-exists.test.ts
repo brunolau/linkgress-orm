@@ -117,6 +117,11 @@ describe('Correlated standalone subqueries in exists()', () => {
 			// Sanity cross-check of the two shapes on the same predicate
 			// (posts of active users): correlated EXISTS vs uncorrelated
 			// IN-subquery must agree.
+			//
+			// NOTE: this case does NOT discriminate. Every seeded post belongs to an
+			// ACTIVE user, so the expected list is also what a predicate that matched
+			// everything would return. The test below is the one that actually pins the
+			// correlation on this shape — do not treat this one as coverage for it.
 			const viaExists = await db.posts
 				.where(p => exists(db.users
 					.where(u => and(eq(u.id, p.userId), eq(u.isActive, true)))
@@ -131,6 +136,72 @@ describe('Correlated standalone subqueries in exists()', () => {
 				'Alice Post 2',
 				'Bob Post',
 			]);
+		});
+	});
+
+	test('correlation survives when the INNER table declares a relation NAMED like the OUTER table', async () => {
+		await withDatabase(async (db) => {
+			await seedTestData(db);
+
+			// The outer table's alias here is "posts", and the inner table "users"
+			// declares a hasMany relation whose PROPERTY NAME is also "posts". The
+			// outer-ref detector classified a ref as "mine" whenever its alias matched
+			// one of the inner schema's relation names, so it read `p.userId` as its own
+			// navigation: the ref was dropped from the correlation and a second copy of
+			// "posts" was joined into the subquery. The predicate then compared the inner
+			// row with itself, was true for every row, and the EXISTS silently stopped
+			// filtering — no SQL error, no type error.
+			//
+			// The collision needs the child's navigation property to be named exactly
+			// like the parent's table, which a plural-table/singular-nav schema
+			// ("users" + `user`) never produces — which is why every other case in this
+			// file kept passing. Singular table names produce it constantly.
+			//
+			// charlie is seeded INACTIVE and with no posts. Giving them one is what makes
+			// this assertion discriminating: without a post whose author fails the inner
+			// predicate, a working correlation and a no-op return the same rows.
+			const charlie = await db.users
+				.where(u => eq(u.username, 'charlie'))
+				.select(u => ({ id: u.id }))
+				.firstOrDefault();
+
+			await db.posts.insert({
+				title: 'Charlie Post',
+				content: 'Content from Charlie',
+				userId: charlie!.id,
+				views: 10,
+				customDate: new Date('2024-01-17T10:00:00Z'),
+				publishTime: { hour: 8, minute: 0 },
+			});
+
+			const viaExists = await db.posts
+				.where(p => exists(db.users
+					.where(u => and(eq(u.id, p.userId), eq(u.isActive, true)))
+					.select(u => ({ id: u.id }))
+					.asSubquery()))
+				.select(p => ({ title: p.title }))
+				.orderBy(p => p.title)
+				.toList();
+
+			// Charlie's post must be gone: its author is inactive.
+			expect(viaExists.map(r => r.title)).toEqual([
+				'Alice Post 1',
+				'Alice Post 2',
+				'Bob Post',
+			]);
+
+			// The complement, so a "fix" that drops the predicate the other way (or
+			// correlates to the wrong row) cannot satisfy both assertions at once.
+			const viaNotExists = await db.posts
+				.where(p => notExists(db.users
+					.where(u => and(eq(u.id, p.userId), eq(u.isActive, true)))
+					.select(u => ({ id: u.id }))
+					.asSubquery()))
+				.select(p => ({ title: p.title }))
+				.orderBy(p => p.title)
+				.toList();
+
+			expect(viaNotExists.map(r => r.title)).toEqual(['Charlie Post']);
 		});
 	});
 });

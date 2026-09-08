@@ -269,6 +269,31 @@ const usersWithPosts = await db.users
   .toList();
 ```
 
+### Alias collisions in correlated subqueries
+
+A correlation is resolved by chain identity, not by name, so a subquery may correlate to an
+outer table even when its own navigation happens to carry the same name — common with singular
+table names, where a child's `library` navigation points at a table also called `library`.
+
+Two shapes cannot be rendered and are refused at build time rather than returning wrong rows:
+
+```typescript
+// 1. Same-table self-correlation — inner and outer FROM would share the alias.
+db.posts.where(p => exists(db.posts
+  .where(p2 => and(eq(p2.userId, p.userId), gt(p2.views, p.views)))
+  .select(p2 => ({ id: p2.id }))
+  .asSubquery()));                       // throws: references the same table
+
+// 2. Correlating to an outer table AND traversing a navigation of the same name.
+db.libraries.where(l => exists(db.shelves
+  .where(s => and(eq(s.libraryId, l.id), eq(s.library!.name, 'Central')))
+  .select(s => ({ id: s.id }))
+  .asSubquery()));                       // throws: inner join would shadow the outer table
+```
+
+For the second, traverse the navigation in the outer query, correlate on a plain key column, or
+rename the navigation property.
+
 ## Type Safety
 
 ### Full Type Inference

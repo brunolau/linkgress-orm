@@ -376,12 +376,31 @@ const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
  */
 /**
  * Monotonic sequence for query-chain identities. Every root builder gets a
- * fresh id; derived builders inherit it. Field refs bake the id so a
- * standalone subquery can detect same-table refs leaking in from an OUTER
- * chain (alias collision → the correlation would silently bind to the inner
- * row — see extractOuterFieldRefs).
+ * fresh id; derived builders inherit it (navigation sub-builders are handed the
+ * parent's id, so a nav ref shares its root's chain). Field refs bake the id so a
+ * standalone subquery can tell its OWN refs from ones leaking in from an OUTER
+ * chain — see isForeignChainRef.
  */
 let chainIdSeq = 0;
+
+/**
+ * Whether `ref` was minted by a query chain OTHER than `chainId` — i.e. it is a
+ * correlation to an enclosing query rather than something this builder owns.
+ *
+ * Alias identity alone cannot answer this. A subquery's own navigation aliases are its
+ * relation NAMES, and a relation name may coincide with an outer table's alias: a child
+ * with a `library` navigation, correlated against a parent table also called `library`.
+ * Resolving such a ref by name makes the builder join a second, inner copy of the parent
+ * and bind the correlation to it, which turns the predicate into a comparison of the inner
+ * row with itself — true for every row, no SQL error, no type error. Singular table names
+ * (`library` + `shelf.library`) produce that collision as a matter of course; the
+ * plural-table/singular-nav convention (`users` + `post.user`) hides it.
+ *
+ * Returns false when either side lacks an id, so refs from paths that do not stamp one keep
+ * their previous, name-based treatment.
+ */
+const isForeignChainRef = (ref: any, chainId: number | undefined): boolean =>
+  ref?.__chainId != null && chainId != null && ref.__chainId !== chainId;
 
 export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   /** @internal Chain identity — see chainIdSeq. */
@@ -5411,9 +5430,21 @@ ${joinClauses.join('\n')}`;
 
     // Collect all table aliases from the condition
     const allTableAliases = new Set<string>();
+    const correlatedAliases = new Set<string>();
     const fieldRefs = condition.getFieldRefs();
 
     for (const fieldRef of fieldRefs) {
+      // A ref minted by a DIFFERENT chain belongs to an enclosing query: it is a
+      // CORRELATION, not one of our navigations, and the outer query already has that
+      // table in scope. Joining it here would resolve the alias against OUR relations and
+      // pull in a second, inner copy of the outer table — see isForeignChainRef.
+      if (isForeignChainRef(fieldRef, this.chainId)) {
+        if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
+          correlatedAliases.add(fieldRef.__tableAlias as string);
+        }
+        continue;
+      }
+
       if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
         const tableAlias = fieldRef.__tableAlias as string;
         if (tableAlias !== this.schema.name) {
@@ -5428,6 +5459,21 @@ ${joinClauses.join('\n')}`;
             allTableAliases.add(navAlias);
           }
         }
+      }
+    }
+
+    // A correlation whose alias is ALSO one of our own navigation aliases cannot be
+    // rendered: both would occupy the same identifier in one scope, our join would shadow
+    // the outer table, and the correlation predicate would bind to the inner row — the
+    // silent wrong answer this whole path exists to prevent. Same contract as the
+    // same-table guard in extractOuterFieldRefs: refuse loudly rather than misbind.
+    for (const alias of correlatedAliases) {
+      if (allTableAliases.has(alias)) {
+        throw new Error(
+          `Correlated subquery over table "${this.schema.name}" both correlates to an outer "${alias}" and joins its own "${alias}" navigation. `
+          + `Both would use the alias "${alias}", so the inner join would shadow the outer table and the correlation would silently bind to the inner row. `
+          + `Traverse the navigation in the OUTER query, correlate on a plain key column instead of the navigation, or rename the navigation property.`
+        );
       }
     }
 
@@ -7121,7 +7167,14 @@ ${joinClauses.join('\n')}`;
         // If the table alias doesn't match our current schema, it's from an outer query
         // Also check if it's not a navigation property of this table (which would be in schema.relations)
         // and not one of our own manual-join aliases (filter-joins qualify refs by join alias).
-        if (tableAlias !== currentTableName && !this.schema.relations[tableAlias]) {
+        //
+        // Chain identity outranks both name checks: a ref stamped by another chain is a
+        // correlation whatever it is called, and reading it as our own navigation (because a
+        // relation happens to carry the same name) is what silently misbinds the predicate.
+        // See isForeignChainRef.
+        if (tableAlias !== currentTableName && isForeignChainRef(ref, this.chainId)) {
+          outerRefs.push(ref);
+        } else if (tableAlias !== currentTableName && !this.schema.relations[tableAlias]) {
           if (!this.manualJoins.some(j => j.alias === tableAlias)) {
             outerRefs.push(ref);
           }
