@@ -3,7 +3,7 @@ import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { OrderDirection } from '../entity/db-context';
 import { QueryExecutor } from '../entity/db-context';
-import { parseOrderBy, getQualifiedFieldName } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, isForeignChainRef, parseOrderBy, getQualifiedFieldName } from './query-utils';
 import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
 import { CollectionQueryBuilder, ReferenceQueryBuilder, getColumnNameMapForSchema, getRelationEntriesForSchema, getTargetSchemaForRelation } from './query-builder';
@@ -179,6 +179,8 @@ function createAggregateFieldRef<T>(
  * Provides type-safe access to grouping keys and aggregate functions
  */
 export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
+  /** @internal Chain identity of the query this grouping came from — see isForeignChainRef. */
+  public chainId?: number;
   private schema: TableSchema;
   private client: DatabaseClient;
   private originalSelector: (row: any) => any;
@@ -202,7 +204,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
-    schemaRegistry?: Map<string, TableSchema>
+    schemaRegistry?: Map<string, TableSchema>,
+    chainId?: number
   ) {
     this.schema = schema;
     this.client = client;
@@ -213,6 +216,7 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     this.manualJoins = manualJoins || [];
     this.joinCounter = joinCounter || 0;
     this.schemaRegistry = schemaRegistry;
+    this.chainId = chainId;
   }
 
   /**
@@ -260,7 +264,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       this.executor,
       this.manualJoins,
       this.joinCounter,
-      this.schemaRegistry
+      this.schemaRegistry,
+      this.chainId
     );
   }
 
@@ -430,6 +435,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
  * Grouped select query builder - result of calling select() on a GroupedQueryBuilder
  */
 export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
+  /** @internal Chain identity inherited from the query this grouping came from. */
+  public chainId?: number;
   private schema: TableSchema;
   private client: DatabaseClient;
   private originalSelector: (row: any) => any;
@@ -459,8 +466,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
-    schemaRegistry?: Map<string, TableSchema>
+    schemaRegistry?: Map<string, TableSchema>,
+    chainId?: number
   ) {
+    this.chainId = chainId;
     this.schema = schema;
     this.client = client;
     this.originalSelector = originalSelector;
@@ -1579,7 +1588,19 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const allTableAliases = new Set<string>();
     const fieldRefs = condition.getFieldRefs();
 
+    const correlatedAliases = new Set<string>();
+
     for (const fieldRef of fieldRefs) {
+      // A ref from another chain is a correlation to an enclosing query, which already has
+      // that table in scope; resolving its alias against OUR relations would join a second
+      // copy of it into this grouping. See isForeignChainRef.
+      if (isForeignChainRef(fieldRef, this.chainId)) {
+        if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
+          correlatedAliases.add(fieldRef.__tableAlias as string);
+        }
+        continue;
+      }
+
       if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
         const tableAlias = fieldRef.__tableAlias as string;
         if (tableAlias && tableAlias !== this.schema.name) {
@@ -1587,6 +1608,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         }
       }
     }
+
+    // `.groupBy()` must not become a quiet bypass of the refusal the standalone path enforces.
+    assertNoCorrelatedAliasShadowing(this.schema.name, correlatedAliases, allTableAliases);
 
     // Resolve all joins through the schema graph (handles multi-level)
     this.resolveJoinsForTableAliases(allTableAliases, joins);
@@ -1620,6 +1644,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     }
 
     for (const [, value] of Object.entries(selection)) {
+      // Correlations to an enclosing query are not ours to join — see isForeignChainRef.
+      if (isForeignChainRef(value, this.chainId)) {
+        continue;
+      }
+
       if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
         const tableAlias = value.__tableAlias as string;
         if (tableAlias && tableAlias !== this.schema.name) {
@@ -1636,6 +1665,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       } else if (value instanceof SqlFragment) {
         const fieldRefs = value.getFieldRefs();
         for (const fieldRef of fieldRefs) {
+          // The top-level check above sees the FRAGMENT, which carries no chain id of its own,
+          // so the refs INSIDE it have to be screened here or a correlation written as
+          // sql`upper(${l.name})` slips through unguarded. Mirrors the same branch in
+          // `SelectQueryBuilder.collectTableAliasesFromSelection`.
+          if (isForeignChainRef(fieldRef, this.chainId)) {
+            continue;
+          }
+
           if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
             const tableAlias = fieldRef.__tableAlias as string;
             if (tableAlias && tableAlias !== this.schema.name) {

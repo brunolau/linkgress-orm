@@ -140,3 +140,66 @@ export function collectionMarkerPattern(targetTable: string, withDot: boolean): 
   }
   return pattern;
 }
+
+/**
+ * Whether `ref` was minted by a query chain OTHER than `ownChainId` — i.e. it is a
+ * correlation to an enclosing query rather than something this builder owns.
+ *
+ * Alias identity alone cannot answer this. A subquery's own navigation aliases are its
+ * relation NAMES, and a relation name may coincide with an outer table's alias: a child with
+ * a `library` navigation, correlated against a parent table also called `library`. Resolving
+ * such a ref by name makes the builder join a second, inner copy of the parent and bind the
+ * correlation to it, which turns the predicate into a comparison of the inner row with
+ * itself — true for every row, no SQL error, no type error. Singular table names
+ * (`library` + `shelf.library`) produce that collision as a matter of course; the
+ * plural-table/singular-navigation convention (`users` + `post.user`) hides it.
+ *
+ * The builder families stamp identity differently, and both are handled here:
+ *
+ * - `QueryBuilder` / `SelectQueryBuilder` / `GroupedQueryBuilder` carry their own chain id,
+ *   so a ref is foreign when its id differs from `ownChainId`.
+ * - `CollectionQueryBuilder` stamps nothing: the refs IT mints — plain columns under the
+ *   `__collection_<table>__` marker AND navigation traversals under the relation name — all
+ *   carry no id, while a reference to the enclosing row carries that query's id. Callers
+ *   there pass `ownChainId: undefined`, for which "has an id at all" is exactly the right
+ *   test. That is what lets `s.library.name` (inner navigation) be told apart from `l.name`
+ *   (outer row) when both render under the alias `library`.
+ *
+ * A ref with no id is never foreign: paths that do not stamp identity keep their previous,
+ * name-based treatment.
+ */
+export function isForeignChainRef(ref: any, ownChainId: number | undefined): boolean {
+  if (ref?.__chainId == null) {
+    return false;
+  }
+
+  return ownChainId == null || ref.__chainId !== ownChainId;
+}
+
+/**
+ * Refuse a subquery that correlates to an outer table AND joins a navigation of its own under
+ * the same alias.
+ *
+ * Both want one identifier in one scope. The inner join wins, so it shadows the outer table and
+ * the correlation predicate silently rebinds to the inner row — true for every row, no SQL
+ * error. There is no correct SQL to emit for this shape, so it is refused at build time; the
+ * message names the alias and the three ways out.
+ *
+ * Shared by every builder that resolves aliases into joins, so `.groupBy()` and the collection
+ * path cannot become quiet bypasses of a rule the standalone path enforces loudly.
+ */
+export function assertNoCorrelatedAliasShadowing(
+  tableName: string,
+  correlatedAliases: Iterable<string>,
+  ownJoinAliases: ReadonlySet<string>
+): void {
+  for (const alias of correlatedAliases) {
+    if (ownJoinAliases.has(alias)) {
+      throw new Error(
+        `Correlated subquery over table "${tableName}" both correlates to an outer "${alias}" and joins its own "${alias}" navigation. `
+        + `Both would use the alias "${alias}", so the inner join would shadow the outer table and the correlation would silently bind to the inner row. `
+        + `Traverse the navigation in the OUTER query, correlate on a plain key column instead of the navigation, or rename the navigation property.`
+      );
+    }
+  }
+}

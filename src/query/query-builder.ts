@@ -4,7 +4,7 @@ import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
 import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
 import { TimeTracer, QueryExecutor } from '../entity/db-context';
-import { parseOrderBy } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, isForeignChainRef, parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
@@ -140,11 +140,22 @@ const navigationPathSignature = (path: NavigationJoin[]): string => path
   .map(step => `${step.alias}:${step.targetTable}:${(step.foreignKeys ?? []).join('+')}:${(step.matches ?? []).join('+')}:${step.isMandatory ? 1 : 0}:${step.sourceAlias ?? ''}`)
   .join('>');
 
-/** A reference mock row: `Object.create(prototype)` plus its two own state slots. */
-const mintReferenceMockRow = (prototype: object): any => {
+/**
+ * A reference mock row: `Object.create(prototype)` plus its own state slots.
+ *
+ * `chainId` is the identity of the row this navigation hangs off, and it is propagated so the
+ * field refs minted from the nav row answer "which query do I belong to?" the same way a plain
+ * column ref does. Without it a navigation ref is anonymous, and an outer correlation written
+ * THROUGH a navigation (`l.city!.name`) is indistinguishable from the inner table's own
+ * navigation of the same name — which is precisely the misbinding isForeignChainRef exists to
+ * catch. Undefined stays undefined: rows minted outside a chain (collection mocks) keep the
+ * anonymity their own callers rely on.
+ */
+const mintReferenceMockRow = (prototype: object, chainId?: string | number): any => {
   const mock: any = Object.create(prototype);
   mock[MOCK_ROW_FIELD_REFS] = {};
   mock[MOCK_ROW_NAV_CACHE] = {};
+  mock[MOCK_ROW_CHAIN_ID] = chainId;
 
   return mock;
 };
@@ -375,32 +386,21 @@ const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
  * Query builder for a table
  */
 /**
- * Monotonic sequence for query-chain identities. Every root builder gets a
- * fresh id; derived builders inherit it (navigation sub-builders are handed the
- * parent's id, so a nav ref shares its root's chain). Field refs bake the id so a
- * standalone subquery can tell its OWN refs from ones leaking in from an OUTER
- * chain — see isForeignChainRef.
+ * Monotonic sequence for query-chain identities. Every root builder gets a fresh id and
+ * derived builders inherit it, so every field ref can say which query it belongs to — which is
+ * what lets a subquery tell its OWN refs from ones leaking in from an OUTER chain (see
+ * isForeignChainRef).
+ *
+ * Navigation rows inherit the id of the row they hang off (`mintReferenceMockRow`), so
+ * `outer.nav.col` carries the OUTER chain while `inner.nav.col` carries the inner one even
+ * when both render under the same alias. That propagation is load-bearing: without it a
+ * correlation written through a navigation is anonymous and indistinguishable from the inner
+ * table's own navigation of the same name.
+ *
+ * `CollectionQueryBuilder` deliberately stamps nothing — its refs are anonymous by design, so
+ * "carries an id at all" is what marks a correlation on that path.
  */
 let chainIdSeq = 0;
-
-/**
- * Whether `ref` was minted by a query chain OTHER than `chainId` — i.e. it is a
- * correlation to an enclosing query rather than something this builder owns.
- *
- * Alias identity alone cannot answer this. A subquery's own navigation aliases are its
- * relation NAMES, and a relation name may coincide with an outer table's alias: a child
- * with a `library` navigation, correlated against a parent table also called `library`.
- * Resolving such a ref by name makes the builder join a second, inner copy of the parent
- * and bind the correlation to it, which turns the predicate into a comparison of the inner
- * row with itself — true for every row, no SQL error, no type error. Singular table names
- * (`library` + `shelf.library`) produce that collision as a matter of course; the
- * plural-table/singular-nav convention (`users` + `post.user`) hides it.
- *
- * Returns false when either side lacks an id, so refs from paths that do not stamp one keep
- * their previous, name-based treatment.
- */
-const isForeignChainRef = (ref: any, chainId: number | undefined): boolean =>
-  ref?.__chainId != null && chainId != null && ref.__chainId !== chainId;
 
 export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   /** @internal Chain identity — see chainIdSeq. */
@@ -701,7 +701,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               return cachedRow;
             }
             if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
-              return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+              return (navCache[relName] = mintReferenceMockRow(holder.prototype, slots[MOCK_ROW_CHAIN_ID]));
             }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
@@ -714,7 +714,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               sourceTableName  // Pass source table name for lateral join correlation
             );
-            return (navCache[relName] = refBuilder.createMockTargetRow(holder));
+            return (navCache[relName] = refBuilder.createMockTargetRow(holder, slots[MOCK_ROW_CHAIN_ID]));
           },
           enumerable: false,
           configurable: true,
@@ -982,7 +982,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return (navCache[relName] = refBuilder.createMockTargetRow());
+            return (navCache[relName] = refBuilder.createMockTargetRow(undefined, slots[MOCK_ROW_CHAIN_ID]));
           },
           enumerable: false,
           configurable: true,
@@ -1033,6 +1033,11 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 export class SelectQueryBuilder<TSelection> {
   /** @internal Chain identity — see chainIdSeq. */
   public chainId: number;
+  /**
+   * @internal Aliases the WHERE correlated on, recorded by `detectAndAddJoinsFromCondition`
+   * so the shadow check can be re-run after the SELECT list has contributed its joins.
+   */
+  private correlatedAliasesFromCondition: Set<string> = new Set();
   private schema: TableSchema;
   private client: DatabaseClient;
   private selector: (row: any) => TSelection;
@@ -1433,7 +1438,8 @@ export class SelectQueryBuilder<TSelection> {
       this.executor,
       this.manualJoins,
       this.joinCounter,
-      this.schemaRegistry
+      this.schemaRegistry,
+      this.chainId
     );
   }
 
@@ -1870,7 +1876,7 @@ export class SelectQueryBuilder<TSelection> {
               [],  // Empty navigation path for first level navigation
               schema.name  // Pass source table name for lateral join correlation
             );
-            return (navCache[relName] = refBuilder.createMockTargetRow());
+            return (navCache[relName] = refBuilder.createMockTargetRow(undefined, slots[MOCK_ROW_CHAIN_ID]));
           },
           enumerable: false,
           configurable: true,
@@ -4866,7 +4872,7 @@ ${joinClauses.join('\n')}`;
               return cachedRow;
             }
             if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
-              return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+              return (navCache[relName] = mintReferenceMockRow(holder.prototype, slots[MOCK_ROW_CHAIN_ID]));
             }
             const refBuilder = new ReferenceQueryBuilder(
               relName,
@@ -4880,7 +4886,7 @@ ${joinClauses.join('\n')}`;
               sourceTableName  // Pass source table name for lateral join correlation
             );
             // Return a mock object that exposes the target table's columns
-            return (navCache[relName] = refBuilder.createMockTargetRow(holder));
+            return (navCache[relName] = refBuilder.createMockTargetRow(holder, slots[MOCK_ROW_CHAIN_ID]));
           },
           enumerable: false,
           configurable: true,
@@ -5055,7 +5061,7 @@ ${joinClauses.join('\n')}`;
 
         // Add JOIN if needed for navigation fields
         if (tableAlias !== this.schema.name) {
-          const relConfig = this.schema.relations[tableAlias];
+          const relConfig = this.relationForRef(nestedValue, tableAlias);
           if (relConfig && !joins.find(j => j.alias === tableAlias)) {
             let targetSchema: string | undefined;
             if (relConfig.targetTableBuilder) {
@@ -5218,7 +5224,7 @@ ${joinClauses.join('\n')}`;
 
         // Add JOIN if needed for navigation fields
         if (tableAlias !== this.schema.name) {
-          const relConfig = this.schema.relations[tableAlias];
+          const relConfig = this.relationForRef(nestedValue, tableAlias);
           if (relConfig && !joins.find(j => j.alias === tableAlias)) {
             let targetSchema: string | undefined;
             if (relConfig.targetTableBuilder) {
@@ -5272,6 +5278,13 @@ ${joinClauses.join('\n')}`;
     }
 
     for (const [_key, value] of Object.entries(selection)) {
+      // A ref from another chain is a correlation to an enclosing query, which already has
+      // that table in scope — resolving it here would join a second copy of it into this
+      // subquery. Same rule as the WHERE path; see isForeignChainRef.
+      if (isForeignChainRef(value, this.chainId)) {
+        continue;
+      }
+
       if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
         // This is a FieldRef with a table alias
         const tableAlias = value.__tableAlias as string;
@@ -5290,6 +5303,10 @@ ${joinClauses.join('\n')}`;
         // SqlFragment may contain navigation property references
         const fieldRefs = value.getFieldRefs();
         for (const fieldRef of fieldRefs) {
+          if (isForeignChainRef(fieldRef, this.chainId)) {
+            continue;
+          }
+
           if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
             const tableAlias = fieldRef.__tableAlias as string;
             if (tableAlias && tableAlias !== this.schema.name) {
@@ -5310,6 +5327,27 @@ ${joinClauses.join('\n')}`;
         this.collectTableAliasesFromSelection(value, allTableAliases);
       }
     }
+  }
+
+  /**
+   * The relation `ref` navigates, or `undefined` when `ref` does not belong to this query.
+   *
+   * Every inline "field ref -> relation -> JOIN" site routes through here instead of reading
+   * `this.schema.relations[alias]` directly, because the alias alone cannot tell a navigation
+   * of OURS from a correlation to an enclosing query: a relation name may equal an outer
+   * table's alias (a child's `library` navigation against a parent table also called
+   * `library`). Joining on that name pulls a second copy of the outer table into this query
+   * and rebinds the correlation to it — the predicate then compares the inner row with
+   * itself and is true for every row, with no SQL error and no type error to show for it.
+   *
+   * See isForeignChainRef for how the two are told apart.
+   */
+  private relationForRef(ref: any, tableAlias: string): any {
+    if (isForeignChainRef(ref, this.chainId)) {
+      return undefined;
+    }
+
+    return this.schema.relations[tableAlias];
   }
 
   /**
@@ -5398,7 +5436,7 @@ ${joinClauses.join('\n')}`;
     const tableAlias = fieldRef.__tableAlias as string;
     if (tableAlias && tableAlias !== this.schema.name && !joins.some(j => j.alias === tableAlias)) {
       // This references a related table - find the relation and add a JOIN
-      const relation = this.schema.relations[tableAlias];
+      const relation = this.relationForRef(fieldRef, tableAlias);
       if (relation && relation.type === 'one') {
         // Get target schema from targetTableBuilder if available
         let targetSchema: string | undefined;
@@ -5462,20 +5500,12 @@ ${joinClauses.join('\n')}`;
       }
     }
 
-    // A correlation whose alias is ALSO one of our own navigation aliases cannot be
-    // rendered: both would occupy the same identifier in one scope, our join would shadow
-    // the outer table, and the correlation predicate would bind to the inner row — the
-    // silent wrong answer this whole path exists to prevent. Same contract as the
-    // same-table guard in extractOuterFieldRefs: refuse loudly rather than misbind.
-    for (const alias of correlatedAliases) {
-      if (allTableAliases.has(alias)) {
-        throw new Error(
-          `Correlated subquery over table "${this.schema.name}" both correlates to an outer "${alias}" and joins its own "${alias}" navigation. `
-          + `Both would use the alias "${alias}", so the inner join would shadow the outer table and the correlation would silently bind to the inner row. `
-          + `Traverse the navigation in the OUTER query, correlate on a plain key column instead of the navigation, or rename the navigation property.`
-        );
-      }
-    }
+    // Kept for the second, wider check once the SELECT list has added its own joins: the
+    // colliding navigation can be named ONLY in the projection, which this method never sees.
+    this.correlatedAliasesFromCondition = correlatedAliases;
+
+    // Refuse the one shape that cannot be rendered — see assertNoCorrelatedAliasShadowing.
+    assertNoCorrelatedAliasShadowing(this.schema.name, correlatedAliases, allTableAliases);
 
     // Resolve all joins through the schema graph
     this.resolveJoinsForTableAliases(allTableAliases, joins);
@@ -5501,6 +5531,15 @@ ${joinClauses.join('\n')}`;
 
     // Scan WHERE condition for navigation property references and add JOINs
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
+
+    // Repeat the shadow check now that the SELECT list has contributed its joins: the colliding
+    // navigation can be named ONLY in the projection, where the WHERE-time check cannot see it.
+    // EXISTS ignores the select list, so nothing else would catch that shape.
+    assertNoCorrelatedAliasShadowing(
+      this.schema.name,
+      this.correlatedAliasesFromCondition,
+      new Set(joins.map(join => join.alias))
+    );
 
     // Handle case where selection is a single value (not an object with properties)
     if (selection instanceof SqlFragment) {
@@ -5569,7 +5608,7 @@ ${joinClauses.join('\n')}`;
             const columnName = value.__dbColumnName as string;
 
             // Find the relation config for this navigation
-            const relConfig = this.schema.relations[tableAlias];
+            const relConfig = this.relationForRef(value, tableAlias);
             if (relConfig) {
               // Add JOIN if not already added
               if (!joins.find(j => j.alias === tableAlias)) {
@@ -5672,7 +5711,7 @@ ${joinClauses.join('\n')}`;
                     const firstValue = (value as any)[tableAlias];
                     if (firstValue && typeof firstValue === 'object' && '__tableAlias' in firstValue) {
                       const alias = firstValue.__tableAlias as string;
-                      const relConfig = this.schema.relations[alias];
+                      const relConfig = this.relationForRef(firstValue, alias);
 
                       if (relConfig && relConfig.type === 'one') {
                         // This is a reference navigation - select all fields from the target table
@@ -5996,6 +6035,15 @@ ${joinClauses.join('\n')}`;
     // Scan WHERE condition for navigation property references and add JOINs
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
 
+    // Repeat the shadow check now that the SELECT list has contributed its joins: the colliding
+    // navigation can be named ONLY in the projection, where the WHERE-time check cannot see it.
+    // EXISTS ignores the select list, so nothing else would catch that shape.
+    assertNoCorrelatedAliasShadowing(
+      this.schema.name,
+      this.correlatedAliasesFromCondition,
+      new Set(joins.map(join => join.alias))
+    );
+
     // Handle case where selection is a single value (not an object with properties)
     if (selection instanceof SqlFragment) {
       const sqlBuildContext = {
@@ -6066,7 +6114,7 @@ ${joinClauses.join('\n')}`;
             const tableAlias = value.__tableAlias as string;
             const columnName = value.__dbColumnName as string;
 
-            const relConfig = this.schema.relations[tableAlias];
+            const relConfig = this.relationForRef(value, tableAlias);
             if (relConfig && !joins.find(j => j.alias === tableAlias)) {
               let targetSchema: string | undefined;
               if (relConfig.targetTableBuilder) {
@@ -7383,7 +7431,7 @@ export class ReferenceQueryBuilder<TItem = any> {
    * Create a mock object that exposes the target table's columns
    * This allows accessing related fields like: p.user.username
    */
-  createMockTargetRow(holder?: MockPrototypeHolder): any {
+  createMockTargetRow(holder?: MockPrototypeHolder, chainId?: string | number): any {
     if (this.targetTableSchema) {
       // Prototype-level cache — see MockRowCache's doc. Everything the getters close over
       // is fully determined by (target schema object identity, relationName, sourceAlias,
@@ -7416,7 +7464,7 @@ export class ReferenceQueryBuilder<TItem = any> {
         }
       }
 
-      return mintReferenceMockRow(prototype);
+      return mintReferenceMockRow(prototype, chainId);
     } else {
       // Fallback: use the shared nested proxy that supports deep property access
       return createNestedFieldRefProxy(this.relationName);
@@ -7464,6 +7512,8 @@ export class ReferenceQueryBuilder<TItem = any> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,  // Alias for SQL generation
+              // Identity of the query this navigation hangs off — see mintReferenceMockRow.
+              __chainId: slots[MOCK_ROW_CHAIN_ID],
               __sourceTable: sourceTable,  // Actual table name for mapper lookup
               __mapper: mapper,  // Include mapper for toDriver transformation in conditions
               __sqlType: columnSqlTypes[colName],  // Column SQL type — lets flag* emit width-exact mask casts
@@ -7555,7 +7605,7 @@ export class ReferenceQueryBuilder<TItem = any> {
               let cached = navCache[relName];
               if (cached === undefined) {
                 if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
-                  cached = navCache[relName] = mintReferenceMockRow(holder.prototype);
+                  cached = navCache[relName] = mintReferenceMockRow(holder.prototype, slots[MOCK_ROW_CHAIN_ID]);
                 } else {
                   const refBuilder = new ReferenceQueryBuilder(
                     relName,
@@ -7568,7 +7618,7 @@ export class ReferenceQueryBuilder<TItem = any> {
                     extendedNavPath,  // Pass navigation path for nested collections
                     parentSourceAlias ? tableAlias : ''  // Only set source if tracking path
                   );
-                  cached = navCache[relName] = refBuilder.createMockTargetRow(holder);
+                  cached = navCache[relName] = refBuilder.createMockTargetRow(holder, slots[MOCK_ROW_CHAIN_ID]);
                 }
               }
               return cached;
@@ -7834,7 +7884,7 @@ export class CollectionQueryBuilder<TItem = any> {
                 return cachedRow;
               }
               if (holder.prototype !== undefined && MockRowCache.isEnabled()) {
-                return (navCache[relName] = mintReferenceMockRow(holder.prototype));
+                return (navCache[relName] = mintReferenceMockRow(holder.prototype, slots[MOCK_ROW_CHAIN_ID]));
               }
               const refBuilder = new ReferenceQueryBuilder(
                 relName,
@@ -7847,7 +7897,7 @@ export class CollectionQueryBuilder<TItem = any> {
                 [],  // Empty navigation path - this is the first reference in the chain
                 targetTable  // Source alias is this collection's target table
               );
-              return (navCache[relName] = refBuilder.createMockTargetRow(holder));
+              return (navCache[relName] = refBuilder.createMockTargetRow(holder, slots[MOCK_ROW_CHAIN_ID]));
             },
             enumerable: false,
             configurable: true,
@@ -8123,11 +8173,23 @@ export class CollectionQueryBuilder<TItem = any> {
 
   /**
    * Get field references from this condition.
-   * Returns empty since EXISTS subqueries are self-contained correlated subqueries.
-   * Required for duck-typing compatibility with Condition interface when used in WHERE clauses.
+   *
+   * Only the ones belonging to an ENCLOSING query are surfaced. Those are correlations, and
+   * the outer query has to have their tables in scope for the subquery to reference them: a
+   * lambda saying `l.city!.name` needs the OUTER query to join `city`, or the emitted
+   * `"city"."name"` has no FROM-clause entry to bind to. Reporting them here is what lets the
+   * parent's join detection see the requirement.
+   *
+   * Our OWN refs stay hidden, as they always were — they are emitted inside this subquery and
+   * must not drag joins into the parent. Required for duck-typing compatibility with the
+   * Condition interface when used in WHERE clauses.
    */
   getFieldRefs(): FieldRef[] {
-    return [];
+    if (!this.whereCond) {
+      return [];
+    }
+
+    return this.whereCond.getFieldRefs().filter(ref => isForeignChainRef(ref, undefined));
   }
 
   /**
@@ -8181,43 +8243,11 @@ export class CollectionQueryBuilder<TItem = any> {
     // the statement failed with `missing FROM-clause entry for table "<alias>"`.
     // Reuses the selector path's machinery: seed aliases + chains from the
     // condition's FieldRefs, then resolve multi-hop paths against the target schema.
-    if (this.whereCond) {
-      const joinedAliases = new Set<string>([
-        ...this.navigationPath.map(nav => nav.alias),
-        ...this.selectManyJoins.map(nav => nav.alias),
-      ]);
-      const targetSchema = this.schemaRegistry?.get(targetTable);
-
-      if (targetSchema) {
-        const whereJoins: NavigationJoin[] = [];
-        const whereAliases = new Set<string>();
-
-        for (const ref of this.whereCond.getFieldRefs()) {
-          const refAlias = (ref as any)?.__tableAlias as string | undefined;
-
-          // Direct columns of the target arrive under the `__collection_<table>__`
-          // marker (rewritten below) or the bare table name — neither needs a join.
-          if (!refAlias || refAlias === targetTable || refAlias.startsWith('__collection_') || joinedAliases.has(refAlias)) {
-            continue;
-          }
-          this.addNavigationJoinForFieldRef(ref, whereJoins, targetTable, targetSchema, whereAliases);
-        }
-
-        if (whereAliases.size > 0) {
-          this.resolveNavigationJoins(whereAliases, whereJoins, targetSchema);
-        }
-
-        for (const nav of whereJoins) {
-          if (joinedAliases.has(nav.alias)) {
-            continue;
-          }
-          joinedAliases.add(nav.alias);
-          const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
-          const fk = nav.foreignKeys[0];
-          const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-          allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
-        }
-      }
+    for (const nav of this.resolveWhereNavigationJoins(sourceTable)) {
+      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
+      const fk = nav.foreignKeys[0];
+      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
+      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     const navJoinsSQL = allJoins.join('\n');
@@ -8346,6 +8376,64 @@ export class CollectionQueryBuilder<TItem = any> {
    * Add a navigation JOIN for a FieldRef if it references a related table
    * Handles multi-level navigation by recursively resolving the join chain
    */
+  /**
+   * The joins required by REFERENCE navigations inside this collection's OWN where-condition,
+   * e.g. `shelves.where(s => eq(s.city!.name, 'Rural'))`.
+   *
+   * Navigation joins used to be derived from SELECTORS only, which left a where-navigated
+   * alias unjoined. Both collection render paths need this and neither can rely on the other:
+   * an `exists()` aggregation has no selector at all, and a collection in a PROJECTION has one
+   * that says nothing about the where-clause. Emitting it in one place is what keeps the two
+   * paths answering the same question — the projection path previously bound such an alias to
+   * whatever the OUTER query happened to have joined under that name (silently wrong under
+   * `lateral`) or failed with `missing FROM-clause entry` when it had not.
+   *
+   * `correlationAlias` is the parent's alias in the collection's implicit correlation; a
+   * navigation of ours named the same would shadow it, which cannot be rendered.
+   */
+  private resolveWhereNavigationJoins(correlationAlias: string): NavigationJoin[] {
+    if (!this.whereCond) {
+      return [];
+    }
+
+    const targetSchema = this.schemaRegistry?.get(this.targetTable);
+
+    if (!targetSchema) {
+      return [];
+    }
+
+    const alreadyJoined = new Set<string>([
+      ...this.navigationPath.map(nav => nav.alias),
+      ...this.selectManyJoins.map(nav => nav.alias),
+    ]);
+    const whereJoins: NavigationJoin[] = [];
+    const whereAliases = new Set<string>();
+
+    for (const ref of this.whereCond.getFieldRefs()) {
+      const refAlias = (ref as any)?.__tableAlias as string | undefined;
+
+      // Correlations to the enclosing row are filtered inside `addNavigationJoinForFieldRef` —
+      // the choke point shared with the selector loops. Direct columns of the target arrive
+      // under the `__collection_<table>__` marker or the bare table name; neither needs a join.
+      if (!refAlias || refAlias === this.targetTable || refAlias.startsWith('__collection_') || alreadyJoined.has(refAlias)) {
+        continue;
+      }
+      this.addNavigationJoinForFieldRef(ref, whereJoins, this.targetTable, targetSchema, whereAliases);
+    }
+
+    if (whereAliases.size > 0) {
+      this.resolveNavigationJoins(whereAliases, whereJoins, targetSchema);
+    }
+
+    // A collection's correlation to its parent is implicit and always present, so an own
+    // navigation named like the parent shadows it every time. Refuse it for the same reason
+    // the standalone path does, or the identical logical query throws on one path and
+    // misbinds on the other.
+    assertNoCorrelatedAliasShadowing(this.targetTable, [correlationAlias], new Set(whereJoins.map(nav => nav.alias)));
+
+    return whereJoins.filter(nav => !alreadyJoined.has(nav.alias));
+  }
+
   private addNavigationJoinForFieldRef(
     fieldRef: any,
     joins: NavigationJoin[],
@@ -8355,6 +8443,21 @@ export class CollectionQueryBuilder<TItem = any> {
     joinedAliases?: Set<string>
   ): void {
     if (!fieldRef || typeof fieldRef !== 'object' || !('__tableAlias' in fieldRef)) {
+      return;
+    }
+
+    // A ref carrying a chain id was minted by the ENCLOSING query, not by this collection:
+    // it is a correlation to the outer row, which the outer query already has in scope.
+    // Refs this builder mints carry none — marker-aliased columns AND navigation traversals
+    // alike — so this separates `s.library.name` (ours: join it) from `l.name` (outer: leave
+    // it) even though both render under the alias `library`. Joining the latter pulls a
+    // second copy of the outer table into the subquery and binds the correlation to it,
+    // which silently makes the predicate compare the inner row with itself.
+    //
+    // Guarded HERE rather than at each caller because this method is the single choke point
+    // through which the WHERE loop and all three selector loops resolve a ref into a join.
+    // See isForeignChainRef.
+    if (isForeignChainRef(fieldRef, undefined)) {
       return;
     }
 
@@ -9019,6 +9122,15 @@ export class CollectionQueryBuilder<TItem = any> {
       // as if they were fields and produce nothing useful. Skip the walk in that case.
       if (!(selectorResult instanceof CollectionQueryBuilder)) {
         this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema);
+      }
+    }
+
+    // The selector says nothing about the collection's own WHERE, so a navigation used only
+    // there would render unjoined — and then bind to whatever the OUTER query has under that
+    // alias instead of failing. Same resolution the inline EXISTS path uses.
+    for (const nav of this.resolveWhereNavigationJoins(this.sourceTable)) {
+      if (!navigationJoins.some(existing => existing.alias === nav.alias)) {
+        navigationJoins.push(nav);
       }
     }
 
