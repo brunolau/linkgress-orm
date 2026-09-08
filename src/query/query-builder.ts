@@ -8425,13 +8425,36 @@ export class CollectionQueryBuilder<TItem = any> {
       this.resolveNavigationJoins(whereAliases, whereJoins, targetSchema);
     }
 
-    // A collection's correlation to its parent is implicit and always present, so an own
-    // navigation named like the parent shadows it every time. Refuse it for the same reason
-    // the standalone path does, or the identical logical query throws on one path and
-    // misbinds on the other.
-    assertNoCorrelatedAliasShadowing(this.targetTable, [correlationAlias], new Set(whereJoins.map(nav => nav.alias)));
+    // A navigation of ours named like the collection's PARENT needs care: the collection's
+    // correlation to that parent is implicit and always present, so both want one alias.
+    //
+    // Whether that is a problem depends on whether the navigation is the INVERSE of the
+    // collection's own foreign key:
+    //
+    // - Same key pair (`userEshop.cards` correlating on `card.user_id = user_eshop.id`, and
+    //   the card's own `userEshop` navigation joining on exactly that) — the navigation IS
+    //   the parent row. The join would be the identity, so it is dropped and the alias keeps
+    //   denoting the parent, which is what the reference meant. Rendering the join instead
+    //   would shadow the correlation and detach every child from its parent.
+    // - A DIFFERENT key pair — the navigation points at another row of the parent's table, so
+    //   the alias would have to mean two things at once. That cannot be rendered; refuse it.
+    const sameKeys = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean => {
+      const left = a ?? [];
+      const right = b ?? [];
 
-    return whereJoins.filter(nav => !alreadyJoined.has(nav.alias));
+      return left.length === right.length && left.every((key, index) => key === right[index]);
+    };
+    const inverseOfCollectionKey = (nav: NavigationJoin): boolean =>
+      sameKeys(nav.foreignKeys, this.foreignKeys) && sameKeys(nav.matches, this.matches);
+
+    const clashing = whereJoins.filter(nav => nav.alias === correlationAlias);
+    assertNoCorrelatedAliasShadowing(
+      this.targetTable,
+      [correlationAlias],
+      new Set(clashing.filter(nav => !inverseOfCollectionKey(nav)).map(nav => nav.alias))
+    );
+
+    return whereJoins.filter(nav => !alreadyJoined.has(nav.alias) && nav.alias !== correlationAlias);
   }
 
   private addNavigationJoinForFieldRef(

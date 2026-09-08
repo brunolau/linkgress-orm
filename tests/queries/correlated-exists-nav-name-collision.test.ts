@@ -294,16 +294,24 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 			.toThrow(/would shadow the outer table/i);
 	});
 
-	test('the shadow clash is refused in a COLLECTION lambda too', async () => {
-		// A collection's correlation is implicit (`shelf.library_id = library.id`), so it is
-		// ALWAYS present — traversing an own navigation named like the parent shadows it every
-		// time. The same logical query must not throw on the standalone path and misbind here.
-		await expect(db.libraries
+	test('a collection lambda traversing the INVERSE navigation resolves to its own parent', async () => {
+		// `shelf.library` is the inverse of the `library.shelves` collection — same key pair — so
+		// the navigation IS the parent row and joining it would be the identity. The join is
+		// dropped and the alias keeps denoting the parent, which makes this ask "does this
+		// library own any shelf, and is this library called Central?".
+		//
+		// Rendering the join instead shadows the correlation and detaches every shelf from its
+		// library (that is what returned all three). Refusing it would be wrong too: this is an
+		// ordinary query — `userEshop.cards.where(c => …c.userEshop…)` is the same shape and sits
+		// on the cart-loading path.
+		const result = await db.libraries
 			.where(l => exists(l.shelves!.where(s => eq(s.library!.name, 'Central'))))
 			.select(l => ({ name: l.name }))
-			.toList())
-			.rejects
-			.toThrow(/would shadow the outer table/i);
+			.orderBy(l => l.name)
+			.toList();
+
+		// Central is the only library that is both named 'Central' and owns any shelf.
+		expect(result.map(r => r.name)).toEqual(['Central']);
 	});
 
 	test('the shadow clash is refused when the own navigation appears only in the SELECT list', async () => {
