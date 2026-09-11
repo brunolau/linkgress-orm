@@ -668,7 +668,8 @@ The `DbSchemaManager` analyzes and generates the following migration operations:
   type: 'create_index',
   tableName: 'users',
   indexName: 'ix_users_email',
-  columns: ['email']
+  columns: ['email'],
+  include: ['display_name'] // optional: INCLUDE (covering) columns, set by .include()
 }
 {
   type: 'drop_index',

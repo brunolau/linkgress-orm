@@ -478,6 +478,7 @@ export class MigrationScaffold {
       expressions: op.expressions,
       where: op.where,
       nullsNotDistinct: op.nullsNotDistinct,
+      include: op.include,
     };
 
     return [

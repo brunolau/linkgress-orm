@@ -57,6 +57,11 @@ export interface IndexDefinition {
    */
   nullsNotDistinct?: boolean;
   /**
+   * Non-key (covering) columns — `INCLUDE (...)` — by DB column name. Stored in
+   * the index but not part of its key. Only btree, GiST and SP-GiST support it.
+   */
+  include?: string[];
+  /**
    * Set when the index contains an `ixNormalized` expression. Tells the schema
    * manager to create the `unaccent` extension + `search_normalize` function
    * (and `pg_trgm` when `using === 'gin'`) before building the index.

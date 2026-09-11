@@ -852,6 +852,53 @@ export class IndexBuilder<TEntity extends DbEntity> {
     this.indexMetadata.nullsNotDistinct = true;
     return this;
   }
+
+  /**
+   * Add non-key (covering) columns: `CREATE INDEX … (keys) INCLUDE (cols)`.
+   *
+   * INCLUDE columns are stored in the index entries but are not part of the key:
+   * they cannot be searched or sorted through the index and take no part in a
+   * UNIQUE check. They let a query that filters on the key columns read them from
+   * the index alone (an index-only scan) without making them usable as index
+   * conditions — unlike extra key columns, which the planner may combine into a
+   * bitmap scan that has to visit the table (e.g. for an `OR` over them).
+   *
+   * Plain columns only — PostgreSQL does not allow expressions as INCLUDE
+   * columns — and only on btree, GiST and SP-GiST indexes.
+   *
+   * @example
+   * entity.hasIndex('ix_loan_book', e => [e.bookId, e.isActive])
+   *   .include(e => [e.loanedAt, e.returnedAt, e.readerId])
+   */
+  include(selector: (entity: TEntity) => Array<TEntity[keyof TEntity]>): this {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+    const proxy = new Proxy({} as TEntity, {
+      get: (_target, prop) => {
+        if (typeof prop === 'string') {
+          const propMetadata = metadata.properties.get(prop as keyof TEntity);
+          if (propMetadata) {
+            return { __indexColumn: true, columnName: propMetadata.columnName } as IndexColumnRef;
+          }
+        }
+        return undefined;
+      }
+    });
+
+    const columns: string[] = [];
+    for (const item of selector(proxy)) {
+      const ref = item as unknown as IndexColumnRef;
+      if (!ref || !ref.__indexColumn || ref.expression) {
+        throw new Error(
+          `Index "${this.indexMetadata.name}": include() accepts plain column references only ` +
+          '(e.g. `e => [e.createdAt, e.total]`); PostgreSQL does not allow expressions as INCLUDE columns.'
+        );
+      }
+      columns.push(ref.columnName);
+    }
+
+    this.indexMetadata.include = columns;
+    return this;
+  }
 }
 
 /**

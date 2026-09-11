@@ -26,6 +26,12 @@ export interface IndexSqlSpec {
    * the SQL builder emits the clause only when `isUnique` is also set.
    */
   nullsNotDistinct?: boolean;
+  /**
+   * Non-key (covering) columns, rendered as `INCLUDE (...)` after the key list.
+   * They are stored in the index but are not part of its key: not searchable or
+   * sortable through it and not part of a UNIQUE check. Plain column names only.
+   */
+  include?: string[];
 }
 
 /**
@@ -43,6 +49,15 @@ export function buildIndexColumnList(spec: IndexSqlSpec): string {
 }
 
 /**
+ * Build the `INCLUDE` column list (quoted, comma-separated), or an empty string
+ * when the index has no covering columns. Shared by the SQL builder and the
+ * model signature so the two can never disagree about it.
+ */
+export function buildIndexIncludeList(spec: IndexSqlSpec): string {
+  return (spec.include ?? []).map(col => `"${col}"`).join(', ');
+}
+
+/**
  * Build a `CREATE INDEX` statement. `qualifiedTable` must already be quoted /
  * schema-qualified by the caller (e.g. `"public"."t"`).
  */
@@ -56,13 +71,15 @@ export function buildCreateIndexStatement(
   const ifNotExistsStr = opts?.ifNotExists ? 'IF NOT EXISTS ' : '';
   const usingStr = spec.using ? ` USING ${spec.using}` : '';
   // PostgreSQL grammar: `(cols) [INCLUDE ...] [NULLS NOT DISTINCT] [WITH ...] [WHERE ...]`.
+  const includeList = buildIndexIncludeList(spec);
+  const includeStr = includeList ? ` INCLUDE (${includeList})` : '';
   // Emit only on UNIQUE indexes — PostgreSQL rejects `NULLS NOT DISTINCT` on a
   // non-unique index, so the `isUnique` guard keeps the statement valid even if a
   // model sets the flag without `.isUnique()`.
   const nullsNotDistinctStr = spec.isUnique && spec.nullsNotDistinct ? ' NULLS NOT DISTINCT' : '';
   const whereStr = spec.where ? ` WHERE ${spec.where}` : '';
   const columnList = buildIndexColumnList(spec);
-  return `CREATE ${uniqueStr}INDEX ${concurrentStr}${ifNotExistsStr}"${spec.name}" ON ${qualifiedTable}${usingStr} (${columnList})${nullsNotDistinctStr}${whereStr}`;
+  return `CREATE ${uniqueStr}INDEX ${concurrentStr}${ifNotExistsStr}"${spec.name}" ON ${qualifiedTable}${usingStr} (${columnList})${includeStr}${nullsNotDistinctStr}${whereStr}`;
 }
 
 /**
@@ -89,6 +106,8 @@ export interface IndexSignature {
   method: string;
   /** Normalized column / expression list. */
   columns: string;
+  /** Normalized `INCLUDE` (covering) column list (empty string when none). */
+  include: string;
   /** Normalized partial-index predicate (empty string when none). */
   where: string;
   /**
@@ -201,6 +220,7 @@ export function modelIndexSignature(spec: IndexSqlSpec): IndexSignature {
     isUnique: !!spec.isUnique,
     method: (spec.using || 'btree').toLowerCase(),
     columns: normalizeIndexFragment(buildIndexColumnList(spec)),
+    include: normalizeIndexFragment(buildIndexIncludeList(spec)),
     where: normalizeIndexPredicate(spec.where),
     // Mirror the SQL builder's `isUnique` guard: the clause is only emitted (and
     // only valid) on a unique index, so a non-unique spec normalizes to `false`.
@@ -209,12 +229,29 @@ export function modelIndexSignature(spec: IndexSqlSpec): IndexSignature {
 }
 
 /**
+ * Index of the `)` that closes the `(` at `openParenIdx`, or -1 when the group is
+ * unbalanced. Nested parens (function calls, casts) are skipped over.
+ */
+function findClosingParen(text: string, openParenIdx: number): number {
+  let depth = 0;
+  for (let i = openParenIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
  * Parse PostgreSQL's canonical index definition
  * (`pg_get_indexdef(oid, 0, true)`) into a normalized signature.
  *
  * Returns `null` when the definition cannot be parsed or carries a clause the
- * model cannot express (e.g. `INCLUDE`), in which case the caller treats the
- * index as unchanged to avoid pointless rebuilds.
+ * model cannot express (`WITH (...)` storage parameters, `TABLESPACE`), in which
+ * case the caller treats the index as unchanged to avoid pointless rebuilds.
  */
 export function parseDbIndexSignature(canonicalDef: string): IndexSignature | null {
   const head = /^CREATE (UNIQUE )?INDEX .+? ON .+? USING (\w+) \(/i.exec(canonicalDef);
@@ -226,25 +263,25 @@ export function parseDbIndexSignature(canonicalDef: string): IndexSignature | nu
   // The column list is the balanced-paren group that opens at the end of the
   // header match. Walk it so nested function-call parens don't end it early.
   const openParenIdx = head.index + head[0].length - 1;
-  let depth = 0;
-  let closeParenIdx = -1;
-  for (let i = openParenIdx; i < canonicalDef.length; i++) {
-    const ch = canonicalDef[i];
-    if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) { closeParenIdx = i; break; }
-    }
-  }
+  const closeParenIdx = findClosingParen(canonicalDef, openParenIdx);
   if (closeParenIdx === -1) return null;
 
   const columns = canonicalDef.slice(openParenIdx + 1, closeParenIdx);
   let rest = canonicalDef.slice(closeParenIdx + 1).trim();
 
   // PostgreSQL deparses `(cols) [INCLUDE ...] [NULLS NOT DISTINCT] [WITH ...] [WHERE ...]`.
-  // Strip a leading `NULLS NOT DISTINCT` (PG15+, unique indexes) before the WHERE
-  // check so a NND index no longer collapses to `null`; what remains is then
-  // either empty or a `WHERE …` predicate, exactly as before.
+  // Take the clauses the model expresses off the front in that order; what
+  // remains is then either empty or a `WHERE …` predicate.
+  let include = '';
+  const includeMatch = /^INCLUDE\s*\(/i.exec(rest);
+  if (includeMatch) {
+    const includeOpenIdx = includeMatch[0].length - 1;
+    const includeCloseIdx = findClosingParen(rest, includeOpenIdx);
+    if (includeCloseIdx === -1) return null;
+    include = rest.slice(includeOpenIdx + 1, includeCloseIdx);
+    rest = rest.slice(includeCloseIdx + 1).trim();
+  }
+
   let nullsNotDistinct = false;
   const nndMatch = /^NULLS\s+NOT\s+DISTINCT\b/i.exec(rest);
   if (nndMatch) {
@@ -258,7 +295,7 @@ export function parseDbIndexSignature(canonicalDef: string): IndexSignature | nu
     if (whereMatch) {
       where = whereMatch[1];
     } else {
-      // Trailing clause the model can't represent (INCLUDE, WITH, TABLESPACE...).
+      // Trailing clause the model can't represent (WITH, TABLESPACE...).
       // Be conservative: signal "unknown" so we don't rebuild on every run.
       return null;
     }
@@ -268,6 +305,7 @@ export function parseDbIndexSignature(canonicalDef: string): IndexSignature | nu
     isUnique,
     method,
     columns: normalizeIndexFragment(columns),
+    include: normalizeIndexFragment(include),
     where: normalizeIndexPredicate(where),
     nullsNotDistinct,
   };
@@ -308,6 +346,9 @@ export function compareIndexDefinition(
   if (modelSignature.columns !== dbSignature.columns) {
     diffs.push(`columns (${dbSignature.columns}) -> (${modelSignature.columns})`);
   }
+  if (modelSignature.include !== dbSignature.include) {
+    diffs.push(`include (${dbSignature.include || 'none'}) -> (${modelSignature.include || 'none'})`);
+  }
   if (modelSignature.where !== dbSignature.where) {
     diffs.push(`where (${dbSignature.where || 'none'}) -> (${modelSignature.where || 'none'})`);
   }
@@ -337,9 +378,10 @@ export function compareIndexDefinition(
 /**
  * Reduce a canonical `pg_get_indexdef()` string to the parts that define the
  * index's shape: its uniqueness and everything from `USING <method>` onward
- * (access method, column/expression list with operator classes, and the partial
- * predicate). The index name and table reference — which differ between the real
- * index and its temp-table rebuild — are deliberately excluded.
+ * (access method, column/expression list with operator classes, the INCLUDE
+ * list, and the partial predicate). The index name and table reference — which
+ * differ between the real index and its temp-table rebuild — are deliberately
+ * excluded.
  */
 export function indexCanonicalSignature(canonicalDef: string): { isUnique: boolean; body: string } {
   const trimmed = canonicalDef.trim();

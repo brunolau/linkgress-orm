@@ -549,6 +549,39 @@ model.entity(User, entity => {
 });
 ```
 
+### Covering Indexes (INCLUDE)
+
+Use `.include()` to add non-key columns to an index. They are stored in the index entries but
+are not part of the key, so a query that filters on the key columns can read them without
+touching the table (an index-only scan):
+
+```typescript
+model.entity(Loan, entity => {
+  // Key: (book_id, is_active). Covering: the loan window and the reader.
+  entity.hasIndex('ix_loans_book', e => [e.bookId, e.isActive])
+    .include(e => [e.loanedAt, e.returnedAt, e.readerId]);
+  // → CREATE INDEX ... ("book_id", "is_active") INCLUDE ("loaned_at", "returned_at", "reader_id")
+
+  // One active loan per book; the reader rides along without joining the unique key.
+  entity.hasIndex('uq_loans_active_book', e => [e.bookId])
+    .isUnique()
+    .include(e => [e.readerId])
+    .where('is_active');
+});
+```
+
+- Prefer `.include()` over extra key columns for columns a query only reads, or filters on after
+  the seek. Key columns become usable as index conditions (PostgreSQL 18's skip scan reaches past a
+  low-cardinality column), and the planner may then combine them — for example to answer an `OR`
+  — into a bitmap scan, which always visits the table. INCLUDE columns can only be filtered, so
+  the index-only scan stays the plan.
+- On a unique index, INCLUDE columns take no part in the uniqueness check.
+- Plain columns only (no expressions), and only on `btree`, `gist` and `spgist` indexes; `gin`,
+  `hash` and `brin` are rejected with an error.
+- The INCLUDE list is part of the definition the migrator compares (see
+  [Changing an Index](#changing-an-index-same-name-different-definition)): adding, removing or
+  changing it recreates the index.
+
 ### GIN/GiST Indexes
 
 Use `.using()` to set the index method and `.withOperatorClass()` for operator classes:
@@ -577,8 +610,9 @@ Supported index methods: `btree`, `gin`, `gist`, `hash`, `brin`, `spgist`.
 
 Automatic migration (`migrate()`) compares the **full definition** of each index
 against what PostgreSQL actually stores. If you change *how* a column is indexed
-— operator class, expression, method (`btree`→`gin`), uniqueness, columns, or the
-partial `where` predicate — while keeping the **same index name**, the migrator
+— operator class, expression, method (`btree`→`gin`), uniqueness, columns, the
+`.include()` list, or the partial `where` predicate — while keeping the **same index
+name**, the migrator
 drops and recreates it so the change takes effect:
 
 ```typescript

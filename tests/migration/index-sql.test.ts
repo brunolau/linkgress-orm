@@ -157,8 +157,10 @@ describe('index-sql: genuine signature changes ARE detected', () => {
 });
 
 describe('index-sql: conservative handling of unparseable / unsupported definitions', () => {
-  it('returns null signature and changed=false for an INCLUDE (covering) index', () => {
-    const db = 'CREATE INDEX ix ON t USING btree (a) INCLUDE (b)';
+  // INCLUDE was the example here until INCLUDE became a modelled clause
+  // (`.include()`); it is now parsed and compared — see index-include.test.ts.
+  it('returns null signature and changed=false for a clause the model cannot express (WITH storage parameters)', () => {
+    const db = 'CREATE INDEX ix ON t USING btree (a) WITH (fillfactor=70)';
     const result = compareIndexDefinition(db, { name: 'ix', columns: ['a'] });
     expect(result.dbSignature).toBeNull();
     expect(result.changed).toBe(false);

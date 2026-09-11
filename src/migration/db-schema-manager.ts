@@ -69,8 +69,8 @@ export type MigrationOperation =
   | { type: 'add_column'; tableName: string; schema?: string; columnName: string; config: ColumnConfig }
   | { type: 'drop_column'; tableName: string; schema?: string; columnName: string }
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
-  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean }
-  | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; reason?: string; previousDef?: string }
+  | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[] }
+  | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[]; reason?: string; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_statistics'; tableName: string; schema?: string; statisticsName: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> }
   | { type: 'create_check_constraint'; tableName: string; schema?: string; constraintName: string; expression: string }
@@ -1133,6 +1133,7 @@ $$`;
               expressions: modelIndex.expressions,
               where: modelIndex.where,
               nullsNotDistinct: modelIndex.nullsNotDistinct,
+              include: modelIndex.include,
             });
           } else if (this.recreateChangedIndexes) {
             const comparison = compareIndexDefinition(dbIndex.canonical_def, modelIndex);
@@ -1164,6 +1165,7 @@ $$`;
               expressions: cand.modelIndex.expressions,
               where: cand.modelIndex.where,
               nullsNotDistinct: cand.modelIndex.nullsNotDistinct,
+              include: cand.modelIndex.include,
               reason: cand.reason,
               previousDef: cand.dbDef,
             });
@@ -1336,6 +1338,7 @@ $$`;
               expressions: index.expressions,
               where: index.where,
               nullsNotDistinct: index.nullsNotDistinct,
+              include: index.include,
             });
           }
 
@@ -1470,6 +1473,7 @@ $$`;
           expressions: operation.expressions,
           where: operation.where,
           nullsNotDistinct: operation.nullsNotDistinct,
+          include: operation.include,
         }, operation.schema);
         break;
 
@@ -1717,8 +1721,13 @@ $$`;
    */
   private static readonly VALID_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gin', 'gist', 'hash', 'brin', 'spgist']);
   private static readonly VALID_OPERATOR_CLASS = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  /** Access methods whose indexes can store INCLUDE (non-key) columns. */
+  private static readonly INCLUDE_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gist', 'spgist']);
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean }, schema?: string): Promise<void> {
+  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[] }, schema?: string): Promise<void> {
+    if (index.include && index.include.length > 0 && index.using && !DbSchemaManager.INCLUDE_INDEX_METHODS.has(index.using)) {
+      throw new Error(`Index "${index.name}" cannot use INCLUDE with USING ${index.using}: PostgreSQL stores INCLUDE columns only in ${[...DbSchemaManager.INCLUDE_INDEX_METHODS].join(', ')} indexes. Drop .include() or pick one of those methods.`);
+    }
     if (index.using && !DbSchemaManager.VALID_INDEX_METHODS.has(index.using)) {
       throw new Error(`Invalid index method: "${index.using}". Must be one of: ${[...DbSchemaManager.VALID_INDEX_METHODS].join(', ')}`);
     }
@@ -1780,6 +1789,7 @@ $$`;
       expressions: operation.expressions,
       where: operation.where,
       nullsNotDistinct: operation.nullsNotDistinct,
+      include: operation.include,
     }, operation.schema);
   }
 
@@ -2362,8 +2372,11 @@ $$`;
         const idxCols = operation.expressions && operation.expressions.length > 0
           ? operation.expressions.join(', ')
           : operation.columns.join(', ');
+        const includeDesc = operation.include && operation.include.length > 0
+          ? ` INCLUDE (${operation.include.join(', ')})`
+          : '';
         const whereDesc = operation.where ? ` WHERE ${operation.where}` : '';
-        return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${whereDesc}`;
+        return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${includeDesc}${whereDesc}`;
       case 'recreate_index':
         return `Recreate index "${operation.indexName}" on "${operation.tableName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}`;
       case 'drop_index':
