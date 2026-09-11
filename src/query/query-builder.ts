@@ -148,8 +148,8 @@ const navigationPathSignature = (path: NavigationJoin[]): string => path
  * column ref does. Without it a navigation ref is anonymous, and an outer correlation written
  * THROUGH a navigation (`l.city!.name`) is indistinguishable from the inner table's own
  * navigation of the same name — which is precisely the misbinding isForeignChainRef exists to
- * catch. Undefined stays undefined: rows minted outside a chain (collection mocks) keep the
- * anonymity their own callers rely on.
+ * catch. Undefined stays undefined: a row minted outside any chain stays anonymous and keeps
+ * the name-based treatment isForeignChainRef gives such refs.
  */
 const mintReferenceMockRow = (prototype: object, chainId?: string | number): any => {
   const mock: any = Object.create(prototype);
@@ -397,8 +397,11 @@ const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
  * correlation written through a navigation is anonymous and indistinguishable from the inner
  * table's own navigation of the same name.
  *
- * `CollectionQueryBuilder` deliberately stamps nothing — its refs are anonymous by design, so
- * "carries an id at all" is what marks a correlation on that path.
+ * `CollectionQueryBuilder` carries one too and stamps it on its item rows. It used to stamp
+ * nothing, reading "carries an id at all" as the mark of a correlation — which holds only while
+ * every enclosing query is a stamped one. Inside another COLLECTION the enclosing item was as
+ * anonymous as the inner collection's own rows, so a correlation written through it passed for
+ * the inner collection's own navigation.
  */
 let chainIdSeq = 0;
 
@@ -7676,6 +7679,16 @@ export class CollectionQueryBuilder<TItem = any> {
   // Cache selected field configs for mapper lookup during transformation
   private _selectedFieldConfigs?: SelectedField[];
 
+  /**
+   * @internal Chain identity — see chainIdSeq. Stamped on every row this collection mints (its
+   * item rows and the navigation rows reached through them), so a ref can be told apart from one
+   * minted by an ENCLOSING query — including an enclosing COLLECTION, whose rows used to carry no
+   * identity at all and therefore looked exactly like this collection's own. Every builder derived
+   * from this one (`select`, `selectMany`) keeps the id: a `where` built before the `select`
+   * must stay this collection's own.
+   */
+  public chainId: number = ++chainIdSeq;
+
   constructor(
     relationName: string,
     targetTable: string,
@@ -7738,6 +7751,7 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.isDistinct = this.isDistinct;
     newBuilder.selectManyJoins = this.selectManyJoins;
     newBuilder.foreignKeyTableAlias = this.foreignKeyTableAlias;
+    newBuilder.chainId = this.chainId;
     return newBuilder;
   }
 
@@ -7790,6 +7804,7 @@ export class CollectionQueryBuilder<TItem = any> {
 
       const mock: any = Object.create(prototype);
       mock[MOCK_ROW_FIELD_REFS] = {};
+      mock[MOCK_ROW_CHAIN_ID] = this.chainId;
 
       // Cache the mock for reuse
       this._cachedMockItem = mock;
@@ -7827,6 +7842,7 @@ export class CollectionQueryBuilder<TItem = any> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,  // Include table alias for unambiguous references
+              __chainId: slots[MOCK_ROW_CHAIN_ID],  // This collection's identity — see chainId
             };
           }
           return cached;
@@ -8040,8 +8056,10 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.selectManyJoins = [navJoin];
     newBuilder.foreignKeyTableAlias = this.targetTable;
 
-    // Carry over where condition from outer collection if any
+    // Carry over where condition from outer collection if any. It was built on this
+    // collection's item rows, so the flattened builder keeps this chain's identity.
     newBuilder.whereCond = this.whereCond;
+    newBuilder.chainId = this.chainId;
 
     return newBuilder;
   }
@@ -8174,11 +8192,11 @@ export class CollectionQueryBuilder<TItem = any> {
   /**
    * Get field references from this condition.
    *
-   * Only the ones belonging to an ENCLOSING query are surfaced. Those are correlations, and
-   * the outer query has to have their tables in scope for the subquery to reference them: a
-   * lambda saying `l.city!.name` needs the OUTER query to join `city`, or the emitted
-   * `"city"."name"` has no FROM-clause entry to bind to. Reporting them here is what lets the
-   * parent's join detection see the requirement.
+   * Only the ones belonging to an ENCLOSING query — the root, or an enclosing collection — are
+   * surfaced. Those are correlations, and the outer query has to have their tables in scope for
+   * the subquery to reference them: a lambda saying `l.city!.name` needs the OUTER query to join
+   * `city`, or the emitted `"city"."name"` has no FROM-clause entry to bind to. Reporting them
+   * here is what lets the parent's join detection see the requirement.
    *
    * Our OWN refs stay hidden, as they always were — they are emitted inside this subquery and
    * must not drag joins into the parent. Required for duck-typing compatibility with the
@@ -8189,7 +8207,7 @@ export class CollectionQueryBuilder<TItem = any> {
       return [];
     }
 
-    return this.whereCond.getFieldRefs().filter(ref => isForeignChainRef(ref, undefined));
+    return this.whereCond.getFieldRefs().filter(ref => isForeignChainRef(ref, this.chainId));
   }
 
   /**
@@ -8299,7 +8317,8 @@ export class CollectionQueryBuilder<TItem = any> {
     selection: any,
     joins: NavigationJoin[],
     currentSourceAlias: string,
-    currentSchema: TableSchema
+    currentSchema: TableSchema,
+    nestedCorrelationRefs?: FieldRef[]
   ): void {
     if (!selection || typeof selection !== 'object') {
       return;
@@ -8356,6 +8375,12 @@ export class CollectionQueryBuilder<TItem = any> {
               joinedAliases.add(step.alias);
             }
           }
+          // Its WHERE may also correlate to OUR item through one of our navigations
+          // (`line.reader.passes.where(p => eq(line.book.genre.lendable, true))`): that subquery
+          // renders `"genre"."lendable"`, leaves the ref to us as foreign, and relies on this FROM
+          // to bind it. getFieldRefs() reports exactly its foreign refs; the caller resolves the
+          // ones that are ours under the same rules as our own WHERE.
+          nestedCorrelationRefs?.push(...value.getFieldRefs());
         } else if (value && typeof value === 'object' && !Array.isArray(value)) {
           // Recursively check nested objects
           collectFromSelection(value);
@@ -8396,6 +8421,21 @@ export class CollectionQueryBuilder<TItem = any> {
       return [];
     }
 
+    return this.resolveRefNavigationJoins(this.whereCond.getFieldRefs(), correlationAlias);
+  }
+
+  /**
+   * The joins THIS collection's FROM needs for `refs`: the reference navigations of ours they
+   * traverse. Serves our own WHERE and the correlations by which collections nested in our
+   * selector reach our item (see detectNavigationJoins) — those subqueries leave such refs to us
+   * as foreign, so without this the alias renders unjoined. One resolver, so both obey the same
+   * alias rules below.
+   */
+  private resolveRefNavigationJoins(refs: readonly FieldRef[], correlationAlias: string): NavigationJoin[] {
+    if (refs.length === 0) {
+      return [];
+    }
+
     const targetSchema = this.schemaRegistry?.get(this.targetTable);
 
     if (!targetSchema) {
@@ -8409,7 +8449,7 @@ export class CollectionQueryBuilder<TItem = any> {
     const whereJoins: NavigationJoin[] = [];
     const whereAliases = new Set<string>();
 
-    for (const ref of this.whereCond.getFieldRefs()) {
+    for (const ref of refs) {
       const refAlias = (ref as any)?.__tableAlias as string | undefined;
 
       // Correlations to the enclosing row are filtered inside `addNavigationJoinForFieldRef` —
@@ -8469,18 +8509,20 @@ export class CollectionQueryBuilder<TItem = any> {
       return;
     }
 
-    // A ref carrying a chain id was minted by the ENCLOSING query, not by this collection:
-    // it is a correlation to the outer row, which the outer query already has in scope.
-    // Refs this builder mints carry none — marker-aliased columns AND navigation traversals
-    // alike — so this separates `s.library.name` (ours: join it) from `l.name` (outer: leave
-    // it) even though both render under the alias `library`. Joining the latter pulls a
-    // second copy of the outer table into the subquery and binds the correlation to it,
-    // which silently makes the predicate compare the inner row with itself.
+    // A ref stamped by ANOTHER chain was minted by an enclosing query — the root, or an
+    // enclosing collection — not by this collection: it is a correlation to the outer row,
+    // which the outer query already has in scope. Refs this builder mints carry OUR chain id
+    // (marker-aliased columns AND navigation traversals alike), so this separates
+    // `s.library.name` (ours: join it) from `l.name` (outer: leave it) even though both render
+    // under the alias `library`. Joining the latter pulls a second copy of the outer table
+    // into the subquery and binds the correlation to it, which silently compares the wrong row.
+    // Collection rows used to carry NO id, which made a ref reached through an enclosing
+    // COLLECTION's item look like ours — see chainId.
     //
     // Guarded HERE rather than at each caller because this method is the single choke point
     // through which the WHERE loop and all three selector loops resolve a ref into a join.
     // See isForeignChainRef.
-    if (isForeignChainRef(fieldRef, undefined)) {
+    if (isForeignChainRef(fieldRef, this.chainId)) {
       return;
     }
 
@@ -9139,19 +9181,28 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Step 5: Detect navigation joins from the selected fields
     const navigationJoins: NavigationJoin[] = [];
+    // Refs by which collections nested in the selector correlate to OUR item — resolved below
+    // under the same rules as our own WHERE (see detectNavigationJoins).
+    const nestedCorrelationRefs: FieldRef[] = [];
     if (this.selector && this.targetTableSchema && selectorResult !== undefined) {
       // A CollectionQueryBuilder summand already had its navigation joins built via the
       // recursive buildCTE above; detectNavigationJoins would iterate its own properties
       // as if they were fields and produce nothing useful. Skip the walk in that case.
       if (!(selectorResult instanceof CollectionQueryBuilder)) {
-        this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema);
+        this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema, nestedCorrelationRefs);
       }
     }
 
     // The selector says nothing about the collection's own WHERE, so a navigation used only
     // there would render unjoined — and then bind to whatever the OUTER query has under that
-    // alias instead of failing. Same resolution the inline EXISTS path uses.
-    for (const nav of this.resolveWhereNavigationJoins(this.sourceTable)) {
+    // alias instead of failing. Same resolution the inline EXISTS path uses. A nested
+    // collection correlating through one of our navigations is in the same position: its
+    // subquery leaves that ref to us, so the navigation must be joined HERE.
+    const refNavigationJoins = [
+      ...this.resolveWhereNavigationJoins(this.sourceTable),
+      ...this.resolveRefNavigationJoins(nestedCorrelationRefs, this.sourceTable),
+    ];
+    for (const nav of refNavigationJoins) {
       if (!navigationJoins.some(existing => existing.alias === nav.alias)) {
         navigationJoins.push(nav);
       }

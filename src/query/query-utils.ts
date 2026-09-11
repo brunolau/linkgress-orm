@@ -154,19 +154,22 @@ export function collectionMarkerPattern(targetTable: string, withDot: boolean): 
  * (`library` + `shelf.library`) produce that collision as a matter of course; the
  * plural-table/singular-navigation convention (`users` + `post.user`) hides it.
  *
- * The builder families stamp identity differently, and both are handled here:
+ * Every builder family carries a chain id, so a ref is foreign when its id differs from
+ * `ownChainId`:
  *
- * - `QueryBuilder` / `SelectQueryBuilder` / `GroupedQueryBuilder` carry their own chain id,
- *   so a ref is foreign when its id differs from `ownChainId`.
- * - `CollectionQueryBuilder` stamps nothing: the refs IT mints — plain columns under the
- *   `__collection_<table>__` marker AND navigation traversals under the relation name — all
- *   carry no id, while a reference to the enclosing row carries that query's id. Callers
- *   there pass `ownChainId: undefined`, for which "has an id at all" is exactly the right
- *   test. That is what lets `s.library.name` (inner navigation) be told apart from `l.name`
- *   (outer row) when both render under the alias `library`.
+ * - `QueryBuilder` / `SelectQueryBuilder` / `GroupedQueryBuilder` carry their own.
+ * - `CollectionQueryBuilder` carries one too — shared by every builder derived from it
+ *   (`select`, `selectMany`) — and stamps it on the rows it mints: plain columns under the
+ *   `__collection_<table>__` marker AND navigation traversals under the relation name. That is
+ *   what lets `s.library.name` (inner navigation) be told apart from `l.name` (outer row) when
+ *   both render under the alias `library` — and from `line.book.genre` reached through an
+ *   ENCLOSING collection's item. Collections used to stamp nothing and pass
+ *   `ownChainId: undefined`, reading "has an id at all" as foreign; an enclosing collection's
+ *   item was then as anonymous as the inner collection's own rows and passed for them.
  *
- * A ref with no id is never foreign: paths that do not stamp identity keep their previous,
- * name-based treatment.
+ * A builder without an id of its own (`ownChainId` undefined) treats every stamped ref as
+ * foreign. A ref with no id is never foreign: paths that do not stamp identity keep their
+ * previous, name-based treatment.
  */
 export function isForeignChainRef(ref: any, ownChainId: number | undefined): boolean {
   if (ref?.__chainId == null) {
