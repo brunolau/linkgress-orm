@@ -35,6 +35,27 @@ export interface Migration {
    * @param db - The DataContext instance for executing queries
    */
   down(db: DatabaseContext): Promise<void>;
+
+  /**
+   * When true, this migration is EXECUTED — not just recorded — when up()
+   * baselines a fresh database (no journal table found, schema built from
+   * the model).
+   *
+   * Use it for migrations whose effects the schema model cannot represent:
+   * storage parameters (e.g. per-table autovacuum reloptions), data
+   * backfills, seeded/config rows. Such migrations must be safe to run on a
+   * freshly model-built schema.
+   *
+   * On the baseline path these migrations run in journal order after the
+   * model build completes and are recorded with `baselined = false` because
+   * they really ran. A failing runOnBaseline migration stops the run exactly
+   * like a normal migration failure (result.failed is set, later
+   * runOnBaseline migrations stay pending). On a non-fresh database the flag
+   * has no effect — the migration runs through the normal pending path.
+   *
+   * @default false
+   */
+  runOnBaseline?: boolean;
 }
 
 /**
@@ -82,6 +103,13 @@ export interface MigrationJournalEntry {
   filename: string;
   /** Timestamp when the migration was applied */
   applied_at: Date;
+  /**
+   * True when the migration was recorded by the fresh-database baseline
+   * shortcut WITHOUT being executed (its effects came from the model-built
+   * schema). False when the migration's up() really ran — including
+   * runOnBaseline migrations executed during a baseline.
+   */
+  baselined: boolean;
 }
 
 /**
@@ -106,6 +134,14 @@ export interface MigrationRunResult {
   applied: string[];
   /** List of skipped migration filenames (already applied) */
   skipped: string[];
+  /**
+   * Filenames recorded during a fresh-database baseline without being
+   * executed (their effects are covered by the model-built schema). Only
+   * present when up() took the fresh-database baseline path; baselined
+   * migrations are also listed in `skipped`. Executed runOnBaseline
+   * migrations appear in `applied` instead.
+   */
+  baselined?: string[];
   /** If a migration failed, contains the filename and error */
   failed?: {
     filename: string;

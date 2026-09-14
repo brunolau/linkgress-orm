@@ -307,7 +307,29 @@ export class AppDatabase extends DbContext {
 - It runs **outside** the per-file migration transaction, so statements that cannot run inside a transaction (e.g. `CREATE INDEX CONCURRENTLY`) are allowed.
 - Errors thrown in the hook abort the migration before any schema change is made.
 
-> **Note:** Naming a migration file to "sort first" does **not** guarantee it runs first on a fresh database. On a fresh DB the runner builds the schema from the model via auto-migration and records all existing migration files as already applied **without executing them**. Use `onMigrationStart` for "run this before everything" logic.
+> **Note:** Naming a migration file to "sort first" does **not** guarantee it runs first on a fresh database. On a fresh DB the runner builds the schema from the model via auto-migration and records all existing migration files as already applied **without executing them** (marked `baselined = true` in the journal). Use `onMigrationStart` for "run this before everything" logic, or `runOnBaseline: true` for a migration whose effects the schema model cannot represent (see below).
+
+### Migrations the model cannot represent (`runOnBaseline`)
+
+The fresh-database baseline shortcut means any migration effect NOT captured by the schema model — storage parameters (e.g. per-table autovacuum reloptions), data backfills, seeded/config rows — never exists on a freshly built database. Declare `runOnBaseline: true` on such a migration to have the baseline path **execute** it instead of just recording it:
+
+```typescript
+export default class implements Migration {
+  // Executed even when up() baselines a fresh database, because the seed row
+  // is not part of the schema model.
+  runOnBaseline = true;
+
+  async up(db: AppDatabase): Promise<void> {
+    await db.query(`INSERT INTO config (key, value) VALUES ('featureX', 'on')`);
+  }
+
+  async down(db: AppDatabase): Promise<void> {
+    await db.query(`DELETE FROM config WHERE key = 'featureX'`);
+  }
+}
+```
+
+On the baseline path these migrations run in journal order **after** the model build completes, each in its own transaction, and are recorded with `baselined = false` (they really ran). A failure stops the run exactly like a normal migration failure — the failed and following `runOnBaseline` migrations stay pending and are retried by the next `up()` through the normal path. On a non-fresh database the flag has no effect. Migrations with the flag must be safe to run against a freshly model-built schema.
 
 ## Post-Migration Hooks
 
@@ -1054,9 +1076,12 @@ The migration journal is stored in a database table (default: `__migrations`):
 CREATE TABLE "__migrations" (
   id SERIAL PRIMARY KEY,
   filename VARCHAR(255) NOT NULL UNIQUE,
-  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  baselined BOOLEAN NOT NULL DEFAULT FALSE
 );
 ```
+
+`baselined` is true for rows recorded by the fresh-database baseline shortcut without being executed (their effects came from the model-built schema); it is false for migrations whose `up()` really ran — including `runOnBaseline` migrations executed during a baseline. Read it via `MigrationJournal.getApplied()` or `MigrationRunner.status()`. Journals created before the column existed are upgraded automatically (idempotent `ADD COLUMN IF NOT EXISTS`; pre-existing rows keep the default false).
 
 The table is created automatically when you first run migrations. You can customize the table name and schema:
 

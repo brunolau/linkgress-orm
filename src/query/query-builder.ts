@@ -7575,9 +7575,18 @@ export class ReferenceQueryBuilder<TItem = any> {
               const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
               // Memoize per row: selectors revisit the same navigation repeatedly
               // (aggregates, predicates), and each fresh visit used to rebuild the
-              // whole sub-graph.
+              // whole sub-graph. BUT never hand a builder out again once an in-place
+              // op (`.where()` / `.orderBy()` / `.limit()` / `.offset()`) has written
+              // to it: that instance is a query root some already-captured condition
+              // owns, and sharing it fuses independent predicates — the two-leg gate
+              // `or(notExists(row.nav), exists(row.nav.where(P)))` used to compile
+              // both legs from ONE object and emit `NOT EXISTS(P) OR EXISTS(P)`
+              // ≡ TRUE (valid SQL, silently wrong rows). Re-minting restores the
+              // invariant the root mock's relation getters keep by never memoizing
+              // at all (see _createMockRow: "memoizing would fuse repeated .where()
+              // chains"); repeated PURE reads still share one builder.
               let cached = navCache[relName];
-              if (cached === undefined) {
+              if (cached === undefined || cached.hasInPlaceWrites()) {
                 const fk = relConfig.foreignKey || relConfig.foreignKeys?.[0] || '';
                 cached = navCache[relName] = new CollectionQueryBuilder(
                   relName,
@@ -7689,6 +7698,18 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   public chainId: number = ++chainIdSeq;
 
+  /**
+   * True once an in-place chainable op (`where`, `orderBy`, `limit`, `offset`) has written
+   * state into this instance. Read through {@link hasInPlaceWrites} by the memoized
+   * collection-navigation getter (ReferenceQueryBuilder.buildMockRowDescriptors), which
+   * re-mints instead of handing a written builder out again — a written instance is a query
+   * root some captured condition already owns, and sharing it would fuse independent
+   * predicates. Terminal reads (`exists()`, `count()`, `min()`/`max()`/`sum()`, the
+   * `toList()` family) do NOT set this: they snapshot instead of writing
+   * (see {@link captureSnapshot}).
+   */
+  private writtenInPlace: boolean = false;
+
   constructor(
     relationName: string,
     targetTable: string,
@@ -7746,13 +7767,80 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.whereCond = this.whereCond;
     newBuilder.limitValue = this.limitValue;
     newBuilder.offsetValue = this.offsetValue;
-    newBuilder.orderByFields = this.orderByFields;
+    // Copy, not alias: `orderBy()` PUSHES into this array, so sharing it would let an
+    // orderBy on the derived builder write through into this one (or vice versa) — this
+    // instance may be the per-row memoized navigation node other conditions still read.
+    newBuilder.orderByFields = [...this.orderByFields];
     newBuilder.asName = this.asName;
     newBuilder.isDistinct = this.isDistinct;
     newBuilder.selectManyJoins = this.selectManyJoins;
     newBuilder.foreignKeyTableAlias = this.foreignKeyTableAlias;
     newBuilder.chainId = this.chainId;
     return newBuilder;
+  }
+
+  /**
+   * Full-state copy of this builder onto a fresh instance (same chain identity).
+   *
+   * Terminal reads — `exists()`, `count()`, `min()`/`max()`/`sum()`, `toList()` and its
+   * variants, `firstOrDefault()` — return this snapshot instead of writing their result
+   * shape into `this`. The instance they are called on may be the per-row MEMOIZED
+   * navigation node (see ReferenceQueryBuilder.buildMockRowDescriptors), which every
+   * access of `row.nav` inside one lambda hands out again, or a node the caller captured
+   * in a variable and reuses. A terminal that mutated `this` made the captured
+   * condition share live state with every later use of the node:
+   * `or(notExists(row.nav), exists(row.nav.where(P)))` compiled both legs from ONE
+   * object and emitted `NOT EXISTS(P) OR EXISTS(P)` ≡ TRUE — valid SQL, silently wrong
+   * rows. Snapshotting at capture time makes every captured leg independent, for the
+   * re-retrieved and the variable-captured form alike, and keeps condition resolution
+   * (ExistsConditionBase calling `.exists()`) a true read that persists nothing.
+   *
+   * `chainId` is carried over so conditions built against this builder's item rows stay
+   * "own" refs of the snapshot; `_cachedMockItem` is shared deliberately — its FieldRefs
+   * are stamped with that same chainId, so the snapshot answers identity questions
+   * identically. `_selectedFieldConfigs` stays behind: it is resolution-phase output
+   * written to the CAPTURED object after the build, not carried-forward build state.
+   * `writtenInPlace` intentionally resets: the snapshot is unshared until it is written.
+   */
+  private captureSnapshot(): CollectionQueryBuilder<TItem> {
+    // A terminal read runs once per selector/condition evaluation, so this stays lean:
+    // `new` keeps the hidden class identical to every other builder (downstream reads
+    // stay monomorphic), while passing `undefined` for the registry skips the
+    // constructor's Map lookup — this instance already carries the resolved schema and
+    // normalized foreignKeys/matches, so they copy through unchanged.
+    const snapshot = new CollectionQueryBuilder<TItem>(
+      this.relationName,
+      this.targetTable,
+      this.foreignKey,
+      this.sourceTable,
+      this.targetTableSchema,
+      undefined,  // registry set below — skips the constructor's lookup
+      this.navigationPath,
+      this.foreignKeys,
+      this.matches
+    );
+    snapshot.schemaRegistry = this.schemaRegistry;
+    snapshot.selector = this.selector;
+    snapshot.whereCond = this.whereCond;
+    snapshot.limitValue = this.limitValue;
+    snapshot.offsetValue = this.offsetValue;
+    snapshot.orderByFields = this.orderByFields.length > 0 ? [...this.orderByFields] : [];
+    snapshot.asName = this.asName;
+    snapshot.isMarkedAsList = this.isMarkedAsList;
+    snapshot.isDistinct = this.isDistinct;
+    snapshot.aggregationType = this.aggregationType;
+    snapshot.flattenResultType = this.flattenResultType;
+    snapshot.selectManyJoins = this.selectManyJoins;
+    snapshot.foreignKeyTableAlias = this.foreignKeyTableAlias;
+    snapshot.chainId = this.chainId;
+    snapshot._cachedMockItem = this._cachedMockItem;
+
+    return snapshot;
+  }
+
+  /** @internal See {@link writtenInPlace} — read by the memoized collection-navigation getter. */
+  hasInPlaceWrites(): boolean {
+    return this.writtenInPlace;
   }
 
   /**
@@ -7769,6 +7857,10 @@ export class CollectionQueryBuilder<TItem = any> {
    * Multiple where() calls are chained with AND logic
    */
   where(condition: (item: TItem) => Condition): this {
+    // In place by contract (statement-style accumulation, documented AND chaining) — but
+    // flagged, so the memoized navigation getter never hands this instance out again
+    // (see writtenInPlace).
+    this.writtenInPlace = true;
     // Create mock item with proper schema if available
     const mockItem = this.createMockItem();
     const newCondition = condition(mockItem);
@@ -7929,6 +8021,7 @@ export class CollectionQueryBuilder<TItem = any> {
    * Limit collection items
    */
   limit(count: number): this {
+    this.writtenInPlace = true;
     this.limitValue = count;
     return this;
   }
@@ -7937,6 +8030,7 @@ export class CollectionQueryBuilder<TItem = any> {
    * Offset collection items
    */
   offset(count: number): this {
+    this.writtenInPlace = true;
     this.offsetValue = count;
     return this;
   }
@@ -7952,6 +8046,7 @@ export class CollectionQueryBuilder<TItem = any> {
   orderBy<T>(selector: (item: TItem) => T[]): this;
   orderBy<T>(selector: (item: TItem) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (item: TItem) => T | T[] | Array<[T, OrderDirection]>): this {
+    this.writtenInPlace = true;
     const mockItem = this.createMockItem();
     const result = selector(mockItem);
     parseOrderBy(result, this.orderByFields);
@@ -7960,62 +8055,75 @@ export class CollectionQueryBuilder<TItem = any> {
 
   /**
    * Get minimum value (supports magic SQL in selector)
-   */
-  /**
-   * Get minimum value (supports magic SQL in selector)
-   * Returns SqlFragment for automatic type resolution in selectors
+   * Returns SqlFragment for automatic type resolution in selectors.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   min<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
-    if (selector && !this.selector) {
-      const mockItem = this.createMockItem();
-      this.selector = selector as any;
+    const snapshot = this.captureSnapshot();
+    if (selector && !snapshot.selector) {
+      snapshot.selector = selector as any;
     }
-    this.aggregationType = 'MIN';
-    return this as unknown as SqlFragment<number | null>;
+    snapshot.aggregationType = 'MIN';
+    return snapshot as unknown as SqlFragment<number | null>;
   }
 
   /**
    * Get maximum value (supports magic SQL in selector)
-   * Returns SqlFragment for automatic type resolution in selectors
+   * Returns SqlFragment for automatic type resolution in selectors.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   max<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
-    if (selector && !this.selector) {
-      const mockItem = this.createMockItem();
-      this.selector = selector as any;
+    const snapshot = this.captureSnapshot();
+    if (selector && !snapshot.selector) {
+      snapshot.selector = selector as any;
     }
-    this.aggregationType = 'MAX';
-    return this as unknown as SqlFragment<number | null>;
+    snapshot.aggregationType = 'MAX';
+    return snapshot as unknown as SqlFragment<number | null>;
   }
 
   /**
    * Get sum value (supports magic SQL in selector)
-   * Returns SqlFragment for automatic type resolution in selectors
+   * Returns SqlFragment for automatic type resolution in selectors.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   sum<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
-    if (selector && !this.selector) {
-      const mockItem = this.createMockItem();
-      this.selector = selector as any;
+    const snapshot = this.captureSnapshot();
+    if (selector && !snapshot.selector) {
+      snapshot.selector = selector as any;
     }
-    this.aggregationType = 'SUM';
-    return this as unknown as SqlFragment<number | null>;
+    snapshot.aggregationType = 'SUM';
+    return snapshot as unknown as SqlFragment<number | null>;
   }
 
   /**
    * Get count of items
-   * Returns SqlFragment for automatic type resolution in selectors
+   * Returns SqlFragment for automatic type resolution in selectors.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   count(): SqlFragment<number> {
-    this.aggregationType = 'COUNT';
-    return this as unknown as SqlFragment<number>;
+    const snapshot = this.captureSnapshot();
+    snapshot.aggregationType = 'COUNT';
+    return snapshot as unknown as SqlFragment<number>;
   }
 
   /**
    * Check if any items exist in the collection
-   * Returns SqlFragment<boolean> for automatic type resolution in selectors
+   * Returns SqlFragment<boolean> for automatic type resolution in selectors.
+   *
+   * A terminal READ: captures a snapshot, persists nothing on this builder. This is what
+   * `exists(...)`/`notExists(...)` resolve a collection source through
+   * (ExistsConditionBase), so a condition leg owns its predicate state from the moment it
+   * is written — a later `.where()` on the same navigation node can no longer rewrite an
+   * already-captured leg (see {@link captureSnapshot} for the two-leg gate this fixes).
    */
   exists(): SqlFragment<boolean> {
-    this.aggregationType = 'EXISTS';
-    return this as unknown as SqlFragment<boolean>;
+    const snapshot = this.captureSnapshot();
+    snapshot.aggregationType = 'EXISTS';
+    return snapshot as unknown as SqlFragment<boolean>;
   }
 
   /**
@@ -8066,53 +8174,65 @@ export class CollectionQueryBuilder<TItem = any> {
 
   /**
    * Flatten result to number array (for single-column selections)
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   toNumberList(name?: string): CollectionResult<number> {
+    const snapshot = this.captureSnapshot();
     if (name) {
-      this.asName = name;
+      snapshot.asName = name;
     }
-    this.flattenResultType = 'number';
-    this.isMarkedAsList = true;
-    return this as any as CollectionResult<number>;
+    snapshot.flattenResultType = 'number';
+    snapshot.isMarkedAsList = true;
+    return snapshot as any as CollectionResult<number>;
   }
 
   /**
    * Flatten result to string array (for single-column selections)
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   toStringList(name?: string): CollectionResult<string> {
+    const snapshot = this.captureSnapshot();
     if (name) {
-      this.asName = name;
+      snapshot.asName = name;
     }
-    this.flattenResultType = 'string';
-    this.isMarkedAsList = true;
-    return this as any as CollectionResult<string>;
+    snapshot.flattenResultType = 'string';
+    snapshot.isMarkedAsList = true;
+    return snapshot as any as CollectionResult<string>;
   }
 
   /**
    * Specify the property name for the collection in the result
-   * Marks this collection to be resolved as an array in the final result
+   * Marks this collection to be resolved as an array in the final result.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   toList(name?: string): CollectionResult<TItem> {
+    const snapshot = this.captureSnapshot();
     if (name) {
-      this.asName = name;
+      snapshot.asName = name;
     }
-    this.isMarkedAsList = true;
+    snapshot.isMarkedAsList = true;
     // Cast to CollectionResult for type inference
     // At runtime, this is still a CollectionQueryBuilder, but TypeScript sees it as CollectionResult
-    return this as any as CollectionResult<TItem>;
+    return snapshot as any as CollectionResult<TItem>;
   }
 
   /**
    * Get first item from collection or null if empty
-   * Automatically applies LIMIT 1 and returns a single item instead of array
+   * Automatically applies LIMIT 1 and returns a single item instead of array.
+   * A terminal READ: captures a snapshot, persists nothing on this builder
+   * (see {@link captureSnapshot}).
    */
   firstOrDefault(name?: string): CollectionResult<TItem | null> {
+    const snapshot = this.captureSnapshot();
     if (name) {
-      this.asName = name;
+      snapshot.asName = name;
     }
-    this.limitValue = 1;
-    this.isMarkedAsList = false;  // Single item, not a list
-    return this as any as CollectionResult<TItem | null>;
+    snapshot.limitValue = 1;
+    snapshot.isMarkedAsList = false;  // Single item, not a list
+    return snapshot as any as CollectionResult<TItem | null>;
   }
 
   /**

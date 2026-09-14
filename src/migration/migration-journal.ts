@@ -38,7 +38,9 @@ export class MigrationJournal {
 
   /**
    * Ensure the journal table exists in the database.
-   * Creates it if it doesn't exist.
+   * Creates it if it doesn't exist, and upgrades journals created before the
+   * `baselined` column existed (idempotent ADD COLUMN IF NOT EXISTS — rows in
+   * pre-existing journals keep the default false).
    */
   async ensureTable(): Promise<void> {
     // First ensure the schema exists
@@ -52,10 +54,16 @@ export class MigrationJournal {
       CREATE TABLE IF NOT EXISTS ${this.qualifiedName} (
         id SERIAL PRIMARY KEY,
         filename VARCHAR(255) NOT NULL UNIQUE,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        baselined BOOLEAN NOT NULL DEFAULT FALSE
       )
     `;
     await this.client.query(sql);
+
+    // Upgrade journals created before the baselined column existed
+    await this.client.query(
+      `ALTER TABLE ${this.qualifiedName} ADD COLUMN IF NOT EXISTS baselined BOOLEAN NOT NULL DEFAULT FALSE`
+    );
   }
 
   /**
@@ -63,7 +71,7 @@ export class MigrationJournal {
    */
   async getApplied(): Promise<MigrationJournalEntry[]> {
     const result = await this.client.query<MigrationJournalEntry>(
-      `SELECT id, filename, applied_at FROM ${this.qualifiedName} ORDER BY filename ASC`
+      `SELECT id, filename, applied_at, baselined FROM ${this.qualifiedName} ORDER BY filename ASC`
     );
     return result.rows;
   }
@@ -83,11 +91,13 @@ export class MigrationJournal {
   /**
    * Record a migration as successfully applied.
    * @param filename - The migration filename
+   * @param baselined - True when the migration was recorded by the
+   *   fresh-database baseline shortcut without being executed (default false)
    */
-  async recordApplied(filename: string): Promise<void> {
+  async recordApplied(filename: string, baselined: boolean = false): Promise<void> {
     await this.client.query(
-      `INSERT INTO ${this.qualifiedName} (filename) VALUES ($1)`,
-      [filename]
+      `INSERT INTO ${this.qualifiedName} (filename, baselined) VALUES ($1, $2)`,
+      [filename, baselined]
     );
   }
 

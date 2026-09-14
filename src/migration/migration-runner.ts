@@ -58,13 +58,18 @@ export class MigrationRunner {
    * Run all pending migrations in chronological order.
    *
    * If the journal table does not exist (fresh database), the schema is
-   * created from the model definition first (diff-based), and all existing
-   * migration files are recorded as applied.
+   * created from the model definition first (diff-based), and existing
+   * migration files are recorded as applied WITHOUT being executed — marked
+   * `baselined = true` in the journal. Migrations that declare
+   * `runOnBaseline: true` are the exception: their effects are not covered
+   * by the model build (reloptions, backfills, seed rows), so they are
+   * executed in journal order after the model build and recorded with
+   * `baselined = false`.
    *
    * Each migration is executed within a transaction. If a migration fails,
    * the transaction is rolled back and execution stops.
    *
-   * @returns Result containing applied, skipped, and failed migrations
+   * @returns Result containing applied, skipped, baselined, and failed migrations
    */
   async up(): Promise<MigrationRunResult> {
     // Check if journal table exists — if not, this is a fresh database
@@ -78,17 +83,55 @@ export class MigrationRunner {
       await this.journal.ensureTable();
       const allMigrations = await this.loader.loadAllMigrations();
 
+      const toBaseline = allMigrations.filter(m => !m.migration.runOnBaseline);
+      const toExecute = allMigrations.filter(m => m.migration.runOnBaseline);
+
       const result: MigrationRunResult = {
         applied: [],
-        skipped: allMigrations.map(m => m.filename),
+        skipped: toBaseline.map(m => m.filename),
+        baselined: toBaseline.map(m => m.filename),
       };
 
-      for (const migration of allMigrations) {
-        await this.journal.recordApplied(migration.filename);
-        this.log(`  Recorded as applied: ${migration.filename}`);
+      // Record model-covered migrations first: their effects already exist
+      // via the model build, so they must never be re-executed — even when a
+      // runOnBaseline migration below fails and this run stops early.
+      for (const migration of toBaseline) {
+        await this.journal.recordApplied(migration.filename, true);
+        this.log(`  Recorded as applied (baselined): ${migration.filename}`);
       }
 
-      this.log(`Schema created. ${allMigrations.length} migration(s) recorded as applied.`);
+      // Execute runOnBaseline migrations in journal order. A failure stops
+      // the run like a normal migration failure and leaves the failed and
+      // following runOnBaseline migrations unrecorded, so the next up() run
+      // retries them through the normal pending path.
+      for (const migration of toExecute) {
+        try {
+          this.log(`Applying (runOnBaseline): ${migration.filename}`, 'info');
+
+          // Execute migration within a transaction
+          await this.db.transaction(async (txDb) => {
+            await migration.migration.up(txDb);
+          });
+
+          // Record only after successful commit — it really ran, so baselined = false
+          await this.journal.recordApplied(migration.filename);
+          result.applied.push(migration.filename);
+
+          this.log(`  Applied: ${migration.filename}`, 'info');
+        } catch (error) {
+          result.failed = {
+            filename: migration.filename,
+            error: error as Error,
+          };
+          this.logger(`  FAILED: ${migration.filename} - ${(error as Error).message}`, 'error');
+          break; // Stop on first failure
+        }
+      }
+
+      this.log(
+        `Schema created. ${toBaseline.length} migration(s) baselined (recorded, not executed), ` +
+        `${result.applied.length} runOnBaseline migration(s) executed.`
+      );
       return result;
     }
 
@@ -240,9 +283,11 @@ export class MigrationRunner {
   /**
    * Get the status of all migrations.
    *
-   * @returns Array of migration status objects
+   * @returns Array of migration status objects. `baselined` is true for
+   *   migrations recorded by the fresh-database baseline shortcut without
+   *   being executed (undefined for migrations not yet applied).
    */
-  async status(): Promise<{ filename: string; applied: boolean; appliedAt?: Date }[]> {
+  async status(): Promise<{ filename: string; applied: boolean; appliedAt?: Date; baselined?: boolean }[]> {
     await this.journal.ensureTable();
 
     const allMigrations = await this.loader.loadAllMigrations();
@@ -253,6 +298,7 @@ export class MigrationRunner {
       filename: m.filename,
       applied: appliedMap.has(m.filename),
       appliedAt: appliedMap.get(m.filename)?.applied_at,
+      baselined: appliedMap.get(m.filename)?.baselined,
     }));
   }
 
