@@ -31,7 +31,7 @@
 		"test:verbose": "bun tests/run.ts --verbose",
 		"test:single": "bun tests/run.ts --test-name-pattern",
 		"type-check:tests": "tsc --project tests/tsconfig.json",
-		"prepublishOnly": "npm run build && npm test"
+		"prepublishOnly": "npm run build && npm run test:parity"
 	},
 	"repository": {
 		"type": "git",

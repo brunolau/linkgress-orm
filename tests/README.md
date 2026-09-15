@@ -72,9 +72,12 @@ all files, which the schema-mutating files do not tolerate.
 
 ### Parity
 
-`npm run test:parity` runs the suite against PostgreSQL, then in memory, and compares the outcome of every
-test and of every file's process (a failure outside any test — an `afterAll` hook, a crash — counts too).
-Any difference is listed and fails the run.
+`npm run test:parity` runs the suite against PostgreSQL and in memory at the same time — the PostgreSQL
+files one after another, the in-memory files in parallel beside them — and, once both are complete,
+compares the outcome of every test and of every file's process (a failure outside any test — an
+`afterAll` hook, a crash — counts too). Any difference is listed and fails the run. Files that use the
+real server even in memory mode (`tests/memory/sql-parity.test.ts`) start only after the PostgreSQL run
+has finished, and the SQL parity test may not skip itself there. `npm publish` runs it (`prepublishOnly`).
 
 `tests/memory/sql-parity.test.ts` checks the database itself statement by statement: each case of the
 corpus runs on PostgreSQL and on a fresh in-memory database, and the command tags, row counts, column

@@ -5,8 +5,8 @@
  *
  *   paths              test files or directories (or substrings of their paths); default: all of tests/
  *   --memory           run against the in-memory database instead of PostgreSQL (LINKGRESS_TEST_DB=memory)
- *   --parity           run against PostgreSQL, then in memory, and fail unless every test file and
- *                      every test has the same outcome in both
+ *   --parity           run against PostgreSQL and in memory — both at once — and fail unless every test
+ *                      file and every test has the same outcome in both
  *   --thread           memory mode: host each file's database in a worker thread (LINKGRESS_MEMORY_THREAD)
  *   --driver <name>    the DatabaseClient the suite uses: pg (default), postgres, bun or pglite (LINKGRESS_TEST_DRIVER)
  *   -t, --test-name-pattern <regex>   only run tests whose full name matches
@@ -21,7 +21,13 @@
  *
  * PostgreSQL runs create the test schema once before the files run and drop it afterwards (the database
  * in DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD, `.env` supported; the name must contain "test").
- * Memory runs build the schema once into a snapshot every file's database is restored from. PGlite runs
+ * Memory runs build the schema once into a snapshot every file's database is restored from.
+ *
+ * A parity run starts both legs together: the PostgreSQL files one after another, the in-memory files in
+ * parallel beside them (they have no shared state with the server), and compares the two result sets once
+ * both are complete. The few files that reach the real server even in memory mode (SERVER_BOUND_IN_MEMORY)
+ * wait until the PostgreSQL leg has finished, so the legs never use the server database at the same time.
+ * The SQL parity test must find the server in a parity run (LINKGRESS_SQL_PARITY_REQUIRE_PG=1). PGlite runs
  * (`--driver pglite`) dump the schema from one PGlite once; every file boots its own instance from that
  * dump (tests/utils/pglite-server.ts), so they run in parallel — the server is then only needed by files
  * that construct PgClient / PostgresClient themselves, and a run without one only warns.
@@ -50,6 +56,9 @@ interface RunResult {
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const TESTS_DIR = path.join(ROOT, 'tests');
+
+/** Test files that use the real PostgreSQL server even in memory mode (they compare with it). */
+const SERVER_BOUND_IN_MEMORY = new Set(['tests/memory/sql-parity.test.ts']);
 
 // ---------------------------------------------------------------------------
 // arguments
@@ -126,6 +135,10 @@ const baseEnv: Record<string, string> = { ...loadDotEnv(), ...(process.env as Re
 if (driver) {
   baseEnv.LINKGRESS_TEST_DRIVER = driver;
 }
+if (parity) {
+  // a parity run needs the server anyway: the SQL parity test must not skip itself
+  baseEnv.LINKGRESS_SQL_PARITY_REQUIRE_PG = '1';
+}
 
 if (!(baseEnv.DB_NAME || 'linkgress_test').includes('test')) {
   console.error('Tests must use a test database! Set DB_NAME to include "test" in the name.');
@@ -172,12 +185,20 @@ const workDir = mkdtempSync(path.join(tmpdir(), 'linkgress-tests-'));
 
 /** Runs a setup script in its own process, so the AppDatabase model never loads into the runner. */
 const runSetupScript = (script: string, extraArgs: string[], env: Record<string, string>, optional = false): boolean => {
-  const result = spawnSync(process.execPath, [script, ...extraArgs], { cwd: ROOT, env, stdio: 'inherit' });
+  // output is shown only when the script fails (or with --verbose): parity runs print two runs side by side
+  const result = spawnSync(process.execPath, [script, ...extraArgs], { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trimEnd();
+  if (verbose && output) {
+    console.log(output);
+  }
   if (result.status !== 0) {
+    if (!verbose && output) {
+      console.error(output);
+    }
     if (optional) {
       return false;
     }
-    throw new Error(`${rel(script)} failed (exit ${result.status})`);
+    throw new Error(`${rel(script)} ${extraArgs.join(' ')} failed (exit ${result.status})`);
   }
   return true;
 };
@@ -279,7 +300,17 @@ const summarize = (outcome: FileOutcome) => {
   };
 };
 
-const runAll = async (mode: Mode): Promise<RunResult> => {
+interface RunOptions {
+  /** prefixes every line this run prints (runs side by side) */
+  prefix?: string;
+  /** memory mode: SERVER_BOUND_IN_MEMORY files start only once this settles (the PostgreSQL leg is done) */
+  serverFree?: Promise<unknown>;
+}
+
+const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> => {
+  const log = (message = ''): void => {
+    console.log(options.prefix ? message.split('\n').map((line) => (line ? options.prefix + line : line)).join('\n') : message);
+  };
   const env: Record<string, string> = { ...baseEnv };
   if (mode === 'memory') {
     env.LINKGRESS_TEST_DB = 'memory';
@@ -287,46 +318,57 @@ const runAll = async (mode: Mode): Promise<RunResult> => {
       env.LINKGRESS_MEMORY_THREAD = 'true';
     }
     const snapshot = path.join(workDir, 'schema.snapshot');
-    console.log('Building the in-memory schema snapshot...');
+    log('Building the in-memory schema snapshot...');
     runSetupScript(path.join(TESTS_DIR, 'memory', 'create-schema-snapshot.ts'), [snapshot], env);
     env.LINKGRESS_MEMORY_SNAPSHOT = snapshot;
   } else if (mode === 'pglite') {
     delete env.LINKGRESS_TEST_DB;
     const snapshot = path.join(workDir, 'pglite-schema.tar');
-    console.log('Building the PGlite schema snapshot...');
+    log('Building the PGlite schema snapshot...');
     runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['pglite-snapshot', snapshot], env);
     env.LINKGRESS_TEST_PGLITE_SNAPSHOT = snapshot;
     // only the files that construct PgClient / PostgresClient themselves need the server
-    console.log('Creating the test schema in PostgreSQL (optional on PGlite)...');
+    log('Creating the test schema in PostgreSQL (optional on PGlite)...');
     if (!runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env, true)) {
-      console.warn('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
+      log('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
     }
   } else {
     delete env.LINKGRESS_TEST_DB;
-    console.log('Creating the test schema in PostgreSQL...');
+    log('Creating the test schema in PostgreSQL...');
     runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env);
   }
 
   const jobs = mode === 'pg' ? 1 : parallelJobs;
   const runStarted = Date.now();
-  console.log(`\nRunning ${files.length} test file(s) ${mode === 'pg' ? 'against PostgreSQL' : `${mode === 'memory' ? 'in memory' : 'on PGlite'} (${jobs} in parallel)`}\n`);
+  log(`Running ${files.length} test file(s) ${mode === 'pg' ? 'against PostgreSQL' : `${mode === 'memory' ? 'in memory' : 'on PGlite'} (${jobs} in parallel)`}`);
   const outcomes: FileOutcome[] = new Array(files.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < files.length) {
-      const index = next++;
-      const outcome = await runFile(files[index], mode, env, index);
-      outcomes[index] = outcome;
-      const s = summarize(outcome);
-      const failed = s.failed > 0;
-      console.log(`${failed ? 'FAIL' : 'ok  '}  ${outcome.file}  (${s.passed} passed${s.failed ? `, ${s.failed} failed` : ''}${s.skipped ? `, ${s.skipped} skipped` : ''}, ${(outcome.durationMs / 1000).toFixed(1)}s)`);
-      if (verbose || failed) {
-        console.log(outcome.output.trimEnd().split('\n').map((l) => `      ${l}`).join('\n'));
+  const indices = files.map((_, i) => i);
+  const waitsForServer = (i: number) => mode === 'memory' && !!options.serverFree && SERVER_BOUND_IN_MEMORY.has(rel(files[i]));
+  const runQueue = async (queue: number[]) => {
+    let next = 0;
+    const worker = async () => {
+      while (next < queue.length) {
+        const index = queue[next++];
+        const outcome = await runFile(files[index], mode, env, index);
+        outcomes[index] = outcome;
+        const s = summarize(outcome);
+        const failed = s.failed > 0;
+        log(`${failed ? 'FAIL' : 'ok  '}  ${outcome.file}  (${s.passed} passed${s.failed ? `, ${s.failed} failed` : ''}${s.skipped ? `, ${s.skipped} skipped` : ''}, ${(outcome.durationMs / 1000).toFixed(1)}s)`);
+        if (verbose || failed) {
+          log(outcome.output.trimEnd().split('\n').map((l) => `      ${l}`).join('\n'));
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(jobs, queue.length) }, worker));
   };
   try {
-    await Promise.all(Array.from({ length: jobs }, worker));
+    await runQueue(indices.filter((i) => !waitsForServer(i)));
+    const deferred = indices.filter(waitsForServer);
+    if (deferred.length > 0) {
+      log(`Waiting for the PostgreSQL run to finish before ${deferred.length} file(s) that use the server...`);
+      await options.serverFree;
+      await runQueue(deferred);
+    }
   } finally {
     if (mode !== 'memory') {
       runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['drop'], env, mode === 'pglite');
@@ -335,9 +377,10 @@ const runAll = async (mode: Mode): Promise<RunResult> => {
 
   const totals = outcomes.map(summarize).reduce((a, b) => ({ passed: a.passed + b.passed, failed: a.failed + b.failed, skipped: a.skipped + b.skipped }), { passed: 0, failed: 0, skipped: 0 });
   const failedFiles = outcomes.filter((o) => summarize(o).failed > 0);
-  console.log(`\n${MODE_LABEL[mode]}: ${totals.passed} passed, ${totals.failed} failed, ${totals.skipped} skipped — ${files.length - failedFiles.length}/${files.length} files passed in ${((Date.now() - runStarted) / 1000).toFixed(1)}s`);
+  log();
+  log(`${MODE_LABEL[mode]}: ${totals.passed} passed, ${totals.failed} failed, ${totals.skipped} skipped — ${files.length - failedFiles.length}/${files.length} files passed in ${((Date.now() - runStarted) / 1000).toFixed(1)}s`);
   for (const o of failedFiles) {
-    console.log(`  FAIL ${o.file}: ${Object.entries(o.tests).filter(([, s]) => s === 'failed').map(([n]) => n).join('; ')}`);
+    log(`  FAIL ${o.file}: ${Object.entries(o.tests).filter(([, s]) => s === 'failed').map(([n]) => n).join('; ')}`);
   }
   return { mode, files: outcomes };
 };
@@ -384,8 +427,12 @@ let exitCode = 0;
 try {
   const runs: RunResult[] = [];
   if (parity) {
-    runs.push(await runAll('pg'));
-    runs.push(await runAll('memory'));
+    // both legs at once: PostgreSQL files serially, in-memory files in parallel beside them
+    const started = Date.now();
+    const pgRun = runAll('pg', { prefix: '[pg]     ' });
+    const memoryRun = runAll('memory', { prefix: '[memory] ', serverFree: pgRun.catch(() => undefined) });
+    runs.push(...(await Promise.all([pgRun, memoryRun])));
+    console.log(`\nBoth runs finished in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     const diffs = compareRuns(runs[0], runs[1]);
     if (diffs.length > 0) {
       console.log(`\nPARITY: ${diffs.length} difference(s) between PostgreSQL and in-memory outcomes:`);
