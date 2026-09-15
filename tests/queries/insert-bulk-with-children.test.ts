@@ -1,7 +1,8 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
+import { expectToReject } from '../utils/expect-rejects';
 
 // ============================================================================
 // insertBulkWithChildren — N parents + their children in ONE statement
@@ -106,10 +107,10 @@ describe('insertBulkWithChildren', () => {
     // Children map to THEIR parent by index, in child input order.
     expect(result.children.map(c => c.note)).toEqual(['c0-a', 'c2-a', 'c0-b', 'c1-a']);
     const byLabel = new Map(result.parents.map(p => [p.label, p.id]));
-    expect(result.children[0].parentId).toBe(byLabel.get('p0'));
-    expect(result.children[1].parentId).toBe(byLabel.get('p2'));
-    expect(result.children[2].parentId).toBe(byLabel.get('p0'));
-    expect(result.children[3].parentId).toBe(byLabel.get('p1'));
+    expect(result.children[0].parentId).toBe(byLabel.get('p0')!);
+    expect(result.children[1].parentId).toBe(byLabel.get('p2')!);
+    expect(result.children[2].parentId).toBe(byLabel.get('p0')!);
+    expect(result.children[3].parentId).toBe(byLabel.get('p1')!);
 
     // Persisted truth matches.
     const persistedChildren = await db.bulkChildren.toList();
@@ -167,7 +168,7 @@ describe('insertBulkWithChildren', () => {
   test('single-statement atomicity: a failing child leg rolls the parents back', async () => {
     const before = await db.bulkParents.toList();
 
-    await expect(db.bulkParents.insertBulkWithChildren({
+    await expectToReject(db.bulkParents.insertBulkWithChildren({
       rows: [{ label: 'doomed', weight: 1 }],
       children: {
         table: db.bulkChildren,
@@ -179,7 +180,7 @@ describe('insertBulkWithChildren', () => {
         parents: p => ({ id: p.id }),
         children: c => ({ id: c.id }),
       },
-    })).rejects.toThrow();
+    }));
 
     const after = await db.bulkParents.toList();
     expect(after.length).toBe(before.length);

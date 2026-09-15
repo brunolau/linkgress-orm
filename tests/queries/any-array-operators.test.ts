@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, DatabaseClient,

@@ -9,13 +9,13 @@ import { AppDatabase } from '../../debug/schema/appDatabase';
 /**
  * LINKGRESS_TEST_DRIVER=pglite: the suite's "server" is an in-process PGlite.
  *
- * tests/globalSetup.ts builds the AppDatabase schema once and dumps the data directory to a
- * tarball; every test file then boots its own instance from that snapshot (~150 ms, against
- * ~700 ms for an empty initdb before even building the schema). One PGlite per file mirrors
- * jest giving every file its own module registry.
+ * The test runner (tests/run.ts, `--driver pglite`) builds the AppDatabase schema once and dumps the
+ * data directory to a tarball; every test file then boots its own instance from that snapshot
+ * (~150 ms, against ~700 ms for an empty initdb before even building the schema). One PGlite per
+ * file matches the runner giving every file its own process.
  */
 
-/** Env var through which globalSetup hands the snapshot's path to the test files. */
+/** Env var through which the runner hands the snapshot's path to the test files. */
 export const PGLITE_SNAPSHOT_ENV = 'LINKGRESS_TEST_PGLITE_SNAPSHOT';
 
 /**
@@ -66,7 +66,7 @@ export async function buildPgliteSnapshot(): Promise<string> {
 
 /**
  * Holds every call until the server's schema is in place. It only ever waits when there was
- * no snapshot to boot from (runners that skip tests/globalSetup.ts).
+ * no snapshot to boot from (a file run with plain `bun test`, outside tests/run.ts).
  */
 class GatedPGliteClient extends PGliteClient {
   constructor(pglite: any, private schemaReady: Promise<void>) {

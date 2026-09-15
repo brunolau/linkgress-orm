@@ -7,8 +7,18 @@ import { Executor } from '../exec/executor';
 import { EvalCtx, StatementState } from '../exec/runtime';
 import type { Session } from '../session';
 import { SessionHost } from '../session';
+import { HASH_PARTITION_SEED, hashCombine64, hashDatumExtended } from '../types/pghash';
 
 type BoundValue = unknown | 'MINVALUE' | 'MAXVALUE';
+
+function baseTypeOf(session: Session, typeOid: number): number {
+  let t = session.catalog().getType(typeOid);
+  for (let guard = 0; t && t.typtype === 'd' && guard < 32; guard++) {
+    typeOid = t.baseType;
+    t = session.catalog().getType(typeOid);
+  }
+  return typeOid;
+}
 
 function keyTypes(parent: Relation): number[] {
   return (parent.partitionKey?.keys ?? []).map((k) => (k.attnum > 0 ? parent.columns[k.attnum - 1].typeOid : 25));
@@ -80,14 +90,27 @@ export function partitionAccepts(session: Session, parent: Relation, part: Relat
       return cmpRow(from) >= 0 && cmpRow(to) < 0;
     }
     case 'HASH': {
-      let h = 0;
+      // compute_partition_hash_value: PostgreSQL's seeded type hash per key column (NULLs ignored),
+      // combined with hash_combine64, modulo the partition's modulus
+      let rowHash = 0n;
       for (let i = 0; i < keyValues.length; i++) {
-        const s = String(typeOps.hashKey(types[i], keyValues[i]));
-        for (let j = 0; j < s.length; j++) {
-          h = (h * 31 + s.charCodeAt(j)) | 0;
+        if (keyValues[i] === null || keyValues[i] === undefined) {
+          continue;
         }
+        const baseType = session.catalog().getType(types[i])?.typtype === 'd' ? baseTypeOf(session, types[i]) : types[i];
+        let h = hashDatumExtended(baseType, keyValues[i], HASH_PARTITION_SEED, typeOps);
+        if (h === null) {
+          // a type whose PostgreSQL hash is not reproduced: a stable hash of its own
+          let x = 0;
+          const s = String(typeOps.hashKey(types[i], keyValues[i]));
+          for (let j = 0; j < s.length; j++) {
+            x = (x * 31 + s.charCodeAt(j)) | 0;
+          }
+          h = BigInt(x >>> 0);
+        }
+        rowHash = hashCombine64(rowHash, h);
       }
-      return Math.abs(h) % bound.modulus === bound.remainder;
+      return Number(rowHash % BigInt(bound.modulus)) === bound.remainder;
     }
   }
 }

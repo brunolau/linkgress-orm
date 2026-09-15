@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, sql, DbCteBuilder, exists, and, gte, lte, EntityQuery, inSubquery, notInSubquery } from '../../src';
 import { Post } from '../../debug/model/post';

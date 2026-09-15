@@ -1,3 +1,4 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createFreshClient } from '../utils/test-database';
@@ -469,7 +470,7 @@ describe('Baseline Migrations (fresh-database path)', () => {
         up: ['SELECT 1'],
       });
       // Fails on the fresh run: baseline_fail_toggle does not exist yet.
-      // (The file cannot be rewritten between runs — jest's module registry
+      // (The file cannot be rewritten between runs — the module registry
       // caches it — so the failure is environmental instead.)
       createTestMigration('20250607-120000.ts', {
         up: ['INSERT INTO baseline_fail_toggle (id) VALUES (1)'],

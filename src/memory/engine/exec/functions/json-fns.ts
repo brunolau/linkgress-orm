@@ -1,7 +1,8 @@
+import type { JsonFuncSpec } from '../../analyze/expr';
 import { Catalog, TypeOid } from '../../catalog/catalog';
 import { PgError, SqlState } from '../../errors';
 import { formatDate, formatTimestampJson } from '../../types/datetime';
-import { outputValue } from '../../types/io';
+import { inputValue, outputValue } from '../../types/io';
 import {
   compareJsonbKeys,
   escapeJsonString,
@@ -506,6 +507,7 @@ function variadicArgs(a: unknown[], fc: FnCall): { values: unknown[]; types: num
 }
 
 export const JSON_FUNCS: Record<string, FnImpl> = {
+  __linkgress_json_func: (a, fc) => jsonFunc(a, fc),
   // constructors
   to_json: (a, fc) => datumToJson(a[0], fc.argTypes[0], fc),
   to_jsonb: (a, fc) => datumToJsonb(a[0], fc.argTypes[0], fc),
@@ -928,5 +930,222 @@ export const JSON_SRFS: Record<string, FnImpl> = {
     return members.map(([k]) => k);
   },
 };
+
+/** Does JSON text contain an object with a repeated key? (IS JSON ... WITH UNIQUE KEYS) */
+function jsonHasDuplicateKeys(text: string): boolean {
+  const stack: (Set<string> | null)[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') {
+        j += text[j] === '\\' ? 2 : 1;
+      }
+      const lit = text.slice(i, j + 1);
+      i = j + 1;
+      while (i < text.length && /\s/.test(text[i])) {
+        i++;
+      }
+      const top = stack[stack.length - 1];
+      if (text[i] === ':' && top) {
+        const key = JSON.parse(lit) as string;
+        if (top.has(key)) {
+          return true;
+        }
+        top.add(key);
+      }
+      continue;
+    }
+    if (ch === '{') {
+      stack.push(new Set());
+    } else if (ch === '[') {
+      stack.push(null);
+    } else if (ch === '}' || ch === ']') {
+      stack.pop();
+    }
+    i++;
+  }
+  return false;
+}
+
+function jsonIsPredicate(v: unknown, argType: number, spec: JsonFuncSpec): boolean {
+  let value: JsonbValue;
+  if (argType === TypeOid.jsonb) {
+    value = v as JsonbValue;
+  } else {
+    const text = v instanceof Uint8Array ? new TextDecoder().decode(v) : String(v);
+    try {
+      value = parseJsonb(text, 'json');
+    } catch {
+      return false;
+    }
+    if (spec.uniqueKeys && jsonHasDuplicateKeys(text)) {
+      return false;
+    }
+  }
+  switch (spec.itemType) {
+    case 'object':
+      return isJsonbObject(value);
+    case 'array':
+      return Array.isArray(value);
+    case 'scalar':
+      return !isJsonbObject(value) && !Array.isArray(value);
+    default:
+      return true;
+  }
+}
+
+/** JSON_VALUE / JSON_QUERY / JSON_EXISTS / IS JSON (ExecEvalJsonExprPath). */
+function jsonFunc(a: unknown[], fc: FnCall): unknown {
+  const isPredicate = fc.node.k === 'func' && fc.node.funcName === 'is_json';
+  const spec = JSON.parse(a[isPredicate ? 1 : 2] as string) as JsonFuncSpec;
+  if (spec.op === 'is_json') {
+    return a[0] === null ? null : jsonIsPredicate(a[0], fc.st.catalog.getType(fc.argTypes[0])?.baseType || fc.argTypes[0], spec);
+  }
+  if (a[0] === null || a[1] === null) {
+    return null;
+  }
+  const io = fc.st.session.io;
+  const type = fc.resultType;
+  const typmod = fc.resultTypmod;
+  const fromText = (text: string): unknown => inputValue(type, text, typmod, io);
+  const fromJsonb = (v: JsonbValue): unknown => {
+    if (type === TypeOid.jsonb) {
+      return v;
+    }
+    return fromText(jsonbToText(v));
+  };
+  const behaviorValue = (kind: JsonFuncSpec['onError'], defaultIdx: number): unknown => {
+    switch (kind) {
+      case 'null':
+      case 'unknown':
+        return null;
+      case 'true':
+      case 'false':
+        return type === TypeOid.bool ? kind === 'true' : fromText(kind);
+      case 'empty_array':
+        return fromJsonb([]);
+      case 'empty_object':
+        return fromJsonb(new JsonbObject());
+      case 'default':
+        return a[defaultIdx];
+      default:
+        return null;
+    }
+  };
+  let emptyError: PgError | null = null;
+  try {
+    const vars = new JsonbObject();
+    const pairs: [string, JsonbValue][] = spec.names.map((n, i) => [n, datumToJsonb(a[3 + i], fc.argTypes[3 + i], fc)]);
+    const items = executeJsonPath(parseJsonPath(a[1] as string), a[0] as JsonbValue, pairs.length ? JsonbObject.fromPairs(pairs) : vars, false) ?? [];
+    if (spec.op === 'json_exists') {
+      const exists = items.length > 0;
+      return type === TypeOid.bool ? exists : fromText(String(exists));
+    }
+    let singleton: JsonbValue | null;
+    if (spec.op === 'json_value') {
+      if (items.length > 1) {
+        throw new PgError('22034', 'JSON path expression in JSON_VALUE must return single scalar item');
+      }
+      singleton = items.length ? items[0] : null;
+      if (singleton !== null && (isJsonbObject(singleton) || Array.isArray(singleton))) {
+        throw new PgError('2203F', 'JSON path expression in JSON_VALUE must return single scalar item');
+      }
+    } else {
+      const wrap = items.length > 0 && (spec.wrapper === 'unconditional' || (spec.wrapper === 'conditional' && items.length > 1));
+      if (wrap) {
+        singleton = items;
+      } else {
+        if (items.length > 1) {
+          throw new PgError('22034', 'JSON path expression in JSON_QUERY must return single item when no wrapper is requested', {
+            hint: 'Use the WITH WRAPPER clause to wrap SQL/JSON items into an array.',
+          });
+        }
+        singleton = items.length ? items[0] : null;
+      }
+    }
+    if (singleton === null) {
+      if (spec.onEmpty === 'error') {
+        emptyError = new PgError('22035', 'no SQL/JSON item found for specified path');
+        throw emptyError;
+      }
+      return behaviorValue(spec.onEmpty, spec.emptyDefault);
+    }
+    if (singleton === JNULL) {
+      return null;
+    }
+    if (spec.op === 'json_value') {
+      return type === TypeOid.jsonb ? singleton : type === TypeOid.json ? jsonbToText(singleton) : fromText(jsonbAsText(singleton)!);
+    }
+    if (spec.omitQuotes && typeof singleton === 'string') {
+      return fromText(singleton);
+    }
+    return fromJsonb(singleton);
+  } catch (err) {
+    if (spec.onError === 'error' || !(err instanceof PgError) || err === emptyError) {
+      throw err;
+    }
+    return behaviorValue(spec.onError, spec.errorDefault);
+  }
+}
+
+export const JSON_TO_RECORD_FUNCS =new Set(['json_to_record', 'jsonb_to_record', 'json_to_recordset', 'jsonb_to_recordset']);
+
+/** Rows of json(b)_to_record(set) for a column definition list (populate_record semantics). */
+export function jsonToRecordRows(
+  funcSrc: string,
+  arg: unknown,
+  cols: { type: number; typmod: number }[],
+  colNames: string[],
+  fc: FnCall,
+): unknown[][] {
+  const catalog = fc.st.catalog;
+  const io = fc.st.session.io;
+  const isJson = !funcSrc.startsWith('jsonb');
+  const root = isJson ? parseJsonb(arg as string, 'json') : (arg as JsonbValue);
+  const scalar = (v: JsonbValue, type: number, typmod: number, key: string): unknown => {
+    if (v === JNULL) {
+      return null;
+    }
+    const t = catalog.getType(type);
+    if (type === TypeOid.jsonb) {
+      return v;
+    }
+    if (type === TypeOid.json) {
+      return jsonbToText(v);
+    }
+    if (t?.isArray) {
+      if (Array.isArray(v)) {
+        const conv = (arr: JsonbValue[]): unknown[] => arr.map((x) => (Array.isArray(x) ? conv(x) : scalar(x, t.elem, -1, key)));
+        return conv(v);
+      }
+      if (typeof v !== 'string') {
+        throw new PgError(SqlState.INVALID_PARAMETER_VALUE, 'expected JSON array', { hint: `See the value of key "${key}".` });
+      }
+    }
+    return inputValue(type, jsonbAsText(v)!, typmod, io);
+  };
+  const record = (obj: JsonbValue): unknown[] =>
+    cols.map((c, i) => {
+      const idx = (obj as JsonbObject).indexOf(colNames[i]);
+      return idx < 0 ? null : scalar((obj as JsonbObject).vals[idx], c.type, c.typmod, colNames[i]);
+    });
+  if (funcSrc.endsWith('recordset')) {
+    if (!Array.isArray(root)) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call ${funcSrc} on a non-array`);
+    }
+    return root.map((el) => {
+      if (!isJsonbObject(el)) {
+        throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `argument of ${funcSrc} must be an array of objects`);
+      }
+      return record(el);
+    });
+  }
+  if (!isJsonbObject(root)) {
+    throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call ${funcSrc} on a non-object`);
+  }
+  return [record(root)];
+}
 
 export { compareJsonbKeys };

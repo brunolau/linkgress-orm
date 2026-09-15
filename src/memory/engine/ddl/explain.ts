@@ -9,6 +9,7 @@ import { EvalCtx, StatementState } from '../exec/runtime';
 import type { Session } from '../session';
 import { SessionHost } from '../session';
 import type { UtilityResult } from './ddl';
+import { evaluateExecuteParams, fetchPreparedStatement, revalidatePrepared } from './prepared';
 
 /**
  * EXPLAIN.
@@ -40,6 +41,26 @@ const node = (label: string, json: Record<string, unknown>, children: PlanNode[]
   json,
   rows: rows ?? children.reduce((m, c) => Math.max(m, c.rows), 1),
 });
+
+/** A query that only projects its single *SELECT* subquery (INSERT's assignments to parts of columns). */
+function isTrivialProjection(q: Query): boolean {
+  const from = q.fromlist[0];
+  return (
+    q.fromlist.length === 1 &&
+    from.k === 'ref' &&
+    q.rtable[from.rtIndex]?.kind === 'subquery' &&
+    q.rtable[from.rtIndex].eref.aliasname === '*SELECT*' &&
+    !q.where &&
+    !q.setOperations &&
+    !q.hasAggs &&
+    !q.hasWindowFuncs &&
+    q.groupClause.length === 0 &&
+    q.sortClause.length === 0 &&
+    !q.distinctClause &&
+    !q.limitCount &&
+    !q.limitOffset
+  );
+}
 
 /** clause selectivity without statistics (PostgreSQL's DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL family) */
 function selectivity(c: TExpr): number {
@@ -94,7 +115,13 @@ class Explainer {
       const rel = this.relOf(q, q.resultRelation);
       const children: PlanNode[] = [];
       if (q.insertSource?.kind === 'select') {
-        children.push(this.planRte(q, q.insertSource.rtIndex, []));
+        // the *SELECT* subquery (and the projection of assignments to array elements / subfields over it)
+        // is pulled up: its scan is trivial under ModifyTable
+        let source = q.rtable[q.insertSource.rtIndex];
+        while (source.kind === 'subquery' && source.eref.aliasname === '*SELECT*' && isTrivialProjection(source.subquery)) {
+          source = source.subquery.rtable[(source.subquery.fromlist[0] as { rtIndex: number }).rtIndex];
+        }
+        children.push(source.kind === 'subquery' && source.eref.aliasname === '*SELECT*' ? this.planQuery(source.subquery) : this.planRte(q, q.insertSource.rtIndex, []));
       } else if (q.insertSource?.kind === 'values' && q.insertSource.rows.length > 1) {
         children.push(node('Values Scan on "*VALUES*"', { 'Node Type': 'Values Scan' }));
       } else {
@@ -1054,10 +1081,19 @@ function optionOn(stmt: A.ExplainStmt, name: string): boolean {
 
 export function explainStatement(session: Session, stmt: A.ExplainStmt, params: unknown[], paramTypes: number[] = [], parentSt: StatementState | null = null): UtilityResult {
   const format = String(stmt.options.find((x) => x.name.toLowerCase() === 'format')?.value ?? 'text').toLowerCase();
-  const inner = stmt.query;
+  let inner = stmt.query;
   const lines: string[] = [];
   let plan: PlanNode = node('Result', { 'Node Type': 'Result' });
   const started = Date.now();
+  if (inner.kind === 'ExecuteStmt') {
+    // EXPLAIN EXECUTE: the prepared statement with its evaluated arguments
+    const prepared = fetchPreparedStatement(session, inner.name);
+    params = evaluateExecuteParams(session, inner, prepared, params, paramTypes, parentSt, parentSt?.undo ?? null);
+    revalidatePrepared(session, prepared);
+    paramTypes = prepared.paramTypes;
+    parentSt = null;
+    inner = prepared.stmt ?? inner;
+  }
   if (inner.kind === 'SelectStmt' || inner.kind === 'InsertStmt' || inner.kind === 'UpdateStmt' || inner.kind === 'DeleteStmt' || inner.kind === 'MergeStmt') {
     const typedParams = parentSt ? parentSt.params : params;
     const types = parentSt ? parentSt.paramTypes : paramTypes;

@@ -6,6 +6,7 @@ import { PgNumeric } from '../types/numeric';
 import { withLowerBound } from '../types/values';
 import { Catalog, Column, NS_PG_CATALOG, PgType, Relation, TypeOid } from './catalog';
 import { CatalogFunctionsImpl } from './deparse';
+import { viewIsAutoUpdatable } from '../analyze/view-rewrite';
 
 type Row = Record<string, unknown>;
 
@@ -100,6 +101,9 @@ function dataTypeName(types: TypeUtil, cat: Catalog, typeOid: number): string {
 /** system catalogs whose rows are a function of the catalog alone (no session or storage state) */
 const CATALOG_ONLY_RELATIONS = new Set(['pg_catalog.pg_type', 'pg_catalog.pg_namespace']);
 const catalogOnlyRows = new WeakMap<Catalog, Map<number, { version: number; rows: unknown[][] }>>();
+
+
+const viewUpdatable = (session: Session, r: Relation): 'YES' | 'NO' => (viewIsAutoUpdatable(session.makeAnalyzer(), r) ? 'YES' : 'NO');
 
 export function catalogRelationRows(session: Session, relOid: number, st: StatementState): unknown[][] {
   const cat = st.catalog;
@@ -433,8 +437,8 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
     [...cat.relations.values()]
       .filter((r) => r.kind === 'r' || r.kind === 'p')
       .map((r) => ({ schemaname: cat.namespaceName(r.nspOid), tablename: r.name, tableowner: 'postgres', tablespace: null, hasindexes: cat.indexesOf(r.oid).length > 0, hasrules: false, hastriggers: r.hasTriggers, rowsecurity: false })),
-  'pg_catalog.pg_views': (_s, cat) => [...cat.relations.values()].filter((r) => r.kind === 'v').map((r) => ({ schemaname: cat.namespaceName(r.nspOid), viewname: r.name, viewowner: 'postgres', definition: r.view?.text ?? '' })),
-  'pg_catalog.pg_matviews': (_s, cat) => [...cat.relations.values()].filter((r) => r.kind === 'm').map((r) => ({ schemaname: cat.namespaceName(r.nspOid), matviewname: r.name, matviewowner: 'postgres', tablespace: null, hasindexes: cat.indexesOf(r.oid).length > 0, ispopulated: r.populated, definition: r.view?.text ?? '' })),
+  'pg_catalog.pg_views': (session, cat) => [...cat.relations.values()].filter((r) => r.kind === 'v').map((r) => ({ schemaname: cat.namespaceName(r.nspOid), viewname: r.name, viewowner: 'postgres', definition: session.catalogFns.viewDef(r.oid, false) })),
+  'pg_catalog.pg_matviews': (_s, cat) => [...cat.relations.values()].filter((r) => r.kind === 'm').map((r) => ({ schemaname: cat.namespaceName(r.nspOid), matviewname: r.name, matviewowner: 'postgres', tablespace: null, hasindexes: cat.indexesOf(r.oid).length > 0, ispopulated: r.populated, definition: _s.catalogFns.viewDef(r.oid, false) })),
   'pg_catalog.pg_sequence': (_s, cat) =>
     [...cat.relations.values()]
       .filter((r) => r.kind === 'S' && r.sequence)
@@ -496,7 +500,7 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
       .filter((r) => r.partitionKey)
       .map((r) => ({ partrelid: r.oid, partstrat: r.partitionKey!.strategy, partnatts: r.partitionKey!.keys.length, partdefid: 0, partattrs: r.partitionKey!.keys.map((k) => k.attnum), partclass: r.partitionKey!.keys.map((k) => k.opclassOid), partcollation: r.partitionKey!.keys.map((k) => k.collation), partexprs: null })),
   'pg_catalog.pg_trigger': (_s, cat) =>
-    [...cat.triggers.values()].map((t) => ({ oid: t.oid, tgrelid: t.relOid, tgparentid: 0, tgname: t.name, tgfoid: t.funcOid, tgtype: 0, tgenabled: t.enabled ? 'O' : 'D', tgisinternal: false, tgconstrrelid: 0, tgconstrindid: 0, tgconstraint: 0, tgdeferrable: false, tginitdeferred: false, tgnargs: t.args.length, tgattr: [], tgargs: null, tgqual: null, tgoldtable: null, tgnewtable: null })),
+    [...cat.triggers.values()].map((t) => ({ oid: t.oid, tgrelid: t.relOid, tgparentid: 0, tgname: t.name, tgfoid: t.funcOid, tgtype: 0, tgenabled: t.enabled ? 'O' : 'D', tgisinternal: false, tgconstrrelid: 0, tgconstrindid: 0, tgconstraint: 0, tgdeferrable: false, tginitdeferred: false, tgnargs: t.args.length, tgattr: [], tgargs: null, tgqual: null, tgoldtable: t.oldTable ?? null, tgnewtable: t.newTable ?? null })),
   'pg_catalog.pg_roles': () => [{ rolname: 'postgres', rolsuper: true, rolinherit: true, rolcreaterole: true, rolcreatedb: true, rolcanlogin: true, rolreplication: true, rolconnlimit: -1, rolpassword: '********', rolvaliduntil: null, rolbypassrls: true, rolconfig: null, oid: 10 }],
   'pg_catalog.pg_user': () => [{ usename: 'postgres', usesysid: 10, usecreatedb: true, usesuper: true, userepl: true, usebypassrls: true, passwd: '********', valuntil: null, useconfig: null }],
   'pg_catalog.pg_authid': () => [{ oid: 10, rolname: 'postgres', rolsuper: true, rolinherit: true, rolcreaterole: true, rolcreatedb: true, rolcanlogin: true, rolreplication: true, rolbypassrls: true, rolconnlimit: -1 }],
@@ -590,14 +594,14 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
         user_defined_type_catalog: null,
         user_defined_type_schema: null,
         user_defined_type_name: null,
-        is_insertable_into: r.kind === 'v' ? 'NO' : 'YES',
+        is_insertable_into: r.kind === 'v' ? viewUpdatable(session, r) : 'YES',
         is_typed: 'NO',
         commit_action: r.persistence === 't' ? 'PRESERVE' : null,
       })),
   'information_schema.views': (session, cat) =>
     [...cat.relations.values()]
       .filter((r) => r.kind === 'v')
-      .map((r) => ({ table_catalog: session.databaseName, table_schema: cat.namespaceName(r.nspOid), table_name: r.name, view_definition: r.view?.text ?? null, check_option: 'NONE', is_updatable: 'NO', is_insertable_into: 'NO', is_trigger_updatable: 'NO', is_trigger_deletable: 'NO', is_trigger_insertable_into: 'NO' })),
+      .map((r) => ({ table_catalog: session.databaseName, table_schema: cat.namespaceName(r.nspOid), table_name: r.name, view_definition: session.catalogFns.viewDef(r.oid, false), check_option: (r.view?.checkOption ?? 'none').toUpperCase(), is_updatable: viewUpdatable(session, r), is_insertable_into: viewUpdatable(session, r), is_trigger_updatable: 'NO', is_trigger_deletable: 'NO', is_trigger_insertable_into: 'NO' })),
   'information_schema.columns': (session, cat) => {
     const types = new TypeUtil(cat);
     const fns = new CatalogFunctionsImpl(session);

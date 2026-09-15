@@ -1,10 +1,11 @@
 import type * as A from '../ast';
-import { ProcDef, TypeOid } from '../catalog/catalog';
+import { COLL_DEFAULT, ProcDef, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { SqlParser } from '../parser-ddl';
 import type { Analyzer } from './analyzer';
 import { transformExprRecurse, coerceArg } from './expr';
 import { AggNode, FuncNode, SortClauseItem, TExpr, WindowFuncNode } from './nodes';
+import { atPosition, exprLocation, positioned } from './location';
 import { ParseState } from './parse-state';
 import { FuncCandidate, resolveFunction } from './resolve';
 import { findOrCreateWindowClause } from './select';
@@ -29,6 +30,7 @@ const AGG_FORBIDDEN: Record<string, string> = {
   function_default: 'DEFAULT expressions',
   index_expression: 'index expressions',
   index_predicate: 'index predicates',
+  partition_expression: 'partition key expressions',
   from_function: 'functions in FROM',
   from_subselect: 'FROM clause of their own query level',
   window_partition: 'window PARTITION BY',
@@ -36,8 +38,10 @@ const AGG_FORBIDDEN: Record<string, string> = {
   insert_target: 'INSERT',
   merge_when: 'MERGE WHEN conditions',
   partition_bound: 'partition bound',
-  generated_column: 'generation expressions',
+  generated_column: 'column generation expressions',
   call_argument: 'CALL arguments',
+  execute_parameter: 'EXECUTE parameters',
+  alter_col_transform: 'transform expressions',
   trigger_when: 'trigger WHEN conditions',
 };
 
@@ -48,12 +52,49 @@ function displayArgTypes(an: Analyzer, types: number[]): string {
 }
 
 export function transformFuncCall(an: Analyzer, pstate: ParseState, node: A.FuncCall): TExpr {
+  // MERGE_ACTION() (MergeSupportFunc)
+  if (node.name.length === 1 && node.name[0] === 'merge_action' && node.args.length === 0 && !node.aggStar && !node.over) {
+    let p: ParseState | null = pstate;
+    while (p && !(p.exprKind === 'returning' && p.query.commandType === 'merge')) {
+      p = p.parent;
+    }
+    if (!p) {
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'MERGE_ACTION() can only be used in the RETURNING list of a MERGE command'), node.loc);
+    }
+    return {
+      k: 'func',
+      funcOid: 0,
+      funcName: 'merge_action',
+      funcSrc: '__linkgress_merge_action',
+      args: [],
+      type: TypeOid.text,
+      typmod: -1,
+      collation: COLL_DEFAULT,
+      inputCollation: 0,
+      retset: false,
+      format: 'call',
+      variadic: false,
+      strict: false,
+    };
+  }
   // arguments
   const args: TExpr[] = [];
   for (const a of node.args) {
     args.push(transformExprRecurse(an, pstate, a));
   }
-  return parseFuncOrColumn(an, pstate, node, args);
+  if (node.aggWithinGroup) {
+    // an ordered-set aggregate's WITHIN GROUP expressions are arguments after the direct ones
+    for (const s of node.aggOrder) {
+      const e = transformExprRecurse(an, pstate, s.node);
+      args.push(e.type === TypeOid.unknown ? an.resolveUnknownToText(e) : e);
+    }
+  }
+  const result = atPosition(node.loc, () => parseFuncOrColumn(an, pstate, node, args));
+  if (node.special && result.k === 'func' && result.format === 'call') {
+    // COERCE_SQL_SYNTAX: deparsed back as EXTRACT(... FROM ...), x AT TIME ZONE z, TRIM(...), ...
+    result.format = 'sql_syntax';
+  }
+  return result;
 }
 
 function parseDefaults(proc: ProcDef): A.Expr[] {
@@ -76,7 +117,7 @@ export function transformProcedureCall(an: Analyzer, pstate: ParseState, node: A
   try {
     const args = node.args.map((a) => transformExprRecurse(an, pstate, a));
     try {
-      return parseFuncOrColumn(an, pstate, node, args, true);
+      return atPosition(node.loc, () => parseFuncOrColumn(an, pstate, node, args, true));
     } catch (e) {
       if (e instanceof PgError && (e.code === SqlState.UNDEFINED_FUNCTION || e.code === SqlState.AMBIGUOUS_FUNCTION) && e.message.startsWith('function ')) {
         throw new PgError(e.code, 'procedure ' + e.message.slice('function '.length), { ...e, hint: e.hint?.replace(/function/g, 'procedure') });
@@ -233,7 +274,8 @@ export function parseFuncOrColumn(an: Analyzer, pstate: ParseState, node: A.Func
     rettype = TypeOid.record;
   }
   if (isPolymorphic(rettype)) {
-    throw new PgError(SqlState.DATATYPE_MISMATCH, 'could not determine polymorphic type because input has type unknown');
+    // enforce_generic_type_consistency reports no position
+    throw new PgError(SqlState.DATATYPE_MISMATCH, 'could not determine polymorphic type because input has type unknown', { noPosition: true });
   }
   const fn: FuncNode = {
     k: 'func',
@@ -290,13 +332,19 @@ export function checkSrfAllowed(an: Analyzer, pstate: ParseState): void {
     limit: 'LIMIT',
     offset: 'OFFSET',
     check_constraint: 'check constraints',
+    domain_check: 'check constraints',
     column_default: 'DEFAULT expressions',
     index_expression: 'index expressions',
     index_predicate: 'index predicates',
+    partition_expression: 'partition key expressions',
     values: 'VALUES',
     values_single: 'VALUES',
     window_partition: 'window definitions',
     window_order: 'window definitions',
+    execute_parameter: 'EXECUTE parameters',
+    generated_column: 'column generation expressions',
+    call_argument: 'CALL arguments',
+    alter_col_transform: 'transform expressions',
   };
   if (forbidden[kind]) {
     throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `set-returning functions are not allowed in ${forbidden[kind]}`, {
@@ -307,6 +355,23 @@ export function checkSrfAllowed(an: Analyzer, pstate: ParseState): void {
     pstate.hasTargetSRFs = true;
   }
   void an;
+}
+
+/** locate_agg_of_level: the location of the first aggregate (or window function) inside an expression */
+function innerAggLocation(e: TExpr): number | undefined {
+  let loc: number | undefined;
+  const visit = (x: TExpr) => {
+    if (loc !== undefined) {
+      return;
+    }
+    if ((x.k === 'agg' && x.levelsUp === 0) || x.k === 'window') {
+      loc = exprLocation(x);
+      return;
+    }
+    forEachChild(x, visit);
+  };
+  visit(e);
+  return loc;
 }
 
 function containsAgg(e: TExpr): boolean {
@@ -348,7 +413,7 @@ function makeAggregate(
   const aggKind = (aggDef?.kind ?? 'n') as 'n' | 'o' | 'h';
   for (const a of args) {
     if (containsAgg(a)) {
-      throw new PgError(SqlState.GROUPING_ERROR, 'aggregate function calls cannot be nested');
+      throw positioned(new PgError(SqlState.GROUPING_ERROR, 'aggregate function calls cannot be nested'), innerAggLocation(a));
     }
   }
   let order: SortClauseItem[] = [];
@@ -358,11 +423,14 @@ function makeAggregate(
     if (aggKind === 'n') {
       throw new PgError(SqlState.WRONG_OBJECT_TYPE, `WITHIN GROUP specified, but ${proc.name} is not an ordered-set aggregate`);
     }
-    const ndirect = aggDef?.ndirect ?? args.length;
+    // the aggregated arguments were resolved (and coerced) after the direct ones
+    const ndirect = args.length - node.aggOrder.length;
     directArgs = args.slice(0, ndirect);
     aggArgs = args.slice(ndirect);
-    order = node.aggOrder.map((s) => sortItem(an, pstate, s));
-    aggArgs = order.map((o) => o.expr);
+    order = node.aggOrder.map((s, i) => {
+      const desc = s.dir === 'DESC' || (s.dir === 'USING' && s.useOp?.[s.useOp.length - 1] === '>');
+      return { expr: aggArgs[i], desc, nullsFirst: s.nulls === 'DEFAULT' ? desc : s.nulls === 'FIRST', useOpName: s.dir === 'USING' ? s.useOp![s.useOp!.length - 1] : undefined };
+    });
   } else {
     if (aggKind !== 'n') {
       throw new PgError(SqlState.WRONG_OBJECT_TYPE, `WITHIN GROUP is required for ordered-set aggregate ${proc.name}`);
@@ -371,7 +439,7 @@ function makeAggregate(
     if (node.aggDistinct && order.length > 0) {
       for (const o of order) {
         if (!args.some((a) => exprEqualLoose(a, o.expr))) {
-          throw new PgError(SqlState.INVALID_COLUMN_REFERENCE, 'in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list');
+          throw positioned(new PgError(SqlState.INVALID_COLUMN_REFERENCE, 'in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list'), exprLocation(o.expr));
         }
       }
     }

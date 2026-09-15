@@ -23,6 +23,7 @@ import {
   typeNameInUse,
 } from './common';
 import { DdlContext } from './stmt-context';
+import { atPosition } from '../analyze/location';
 
 const SERIAL_TYPES: Record<string, number> = {
   serial: TypeOid.int4,
@@ -130,7 +131,7 @@ export function createTable(session: Session, stmt: A.CreateTableStmt): string {
     }
   }
   for (const like of stmt.like ?? []) {
-    const src = lookupTable(session, like);
+    const src = atPosition(like.loc, () => lookupTable(session, like));
     for (const pc of src.columns) {
       if (pc.isDropped) {
         continue;
@@ -153,7 +154,8 @@ export function createTable(session: Session, stmt: A.CreateTableStmt): string {
         typeOid = serialName ?? SERIAL_TYPES[tn.names[1]];
         typmod = -1;
       } else {
-        const r = an.types.lookupTypeName(tn, session.relationSearchPath());
+        // transformColumnType: reported at the type name
+        const r = atPosition(tn.loc, () => an.types.lookupTypeName(tn, session.relationSearchPath()));
         typeOid = r.oid;
         typmod = r.typmod;
         const t = cat.getType(typeOid);
@@ -290,7 +292,7 @@ export function createTable(session: Session, stmt: A.CreateTableStmt): string {
     const strategy = stmt.partitionSpec.strategy === 'RANGE' ? 'r' : stmt.partitionSpec.strategy === 'LIST' ? 'l' : 'h';
     rel.partitionKey = {
       strategy,
-      keys: stmt.partitionSpec.params.map((p) => buildIndexElem(session, cat, rel, p, 'btree')),
+      keys: stmt.partitionSpec.params.map((p) => buildIndexElem(session, cat, rel, p, 'btree', 'partition_expression')),
     };
   }
 
@@ -414,7 +416,7 @@ export function addIndexConstraint(
   return { index, constraint };
 }
 
-export function buildIndexElem(session: Session, cat: Catalog, rel: Relation, elem: A.IndexElem, method: string): IndexElemDef {
+export function buildIndexElem(session: Session, cat: Catalog, rel: Relation, elem: A.IndexElem, method: string, exprKind: 'index_expression' | 'partition_expression' = 'index_expression'): IndexElemDef {
   const an = session.makeAnalyzer();
   let attnum = 0;
   let typeOid: number;
@@ -434,12 +436,12 @@ export function buildIndexElem(session: Session, cat: Catalog, rel: Relation, el
     const pstate = new ParseState(null, q);
     const rtIndex = addRelationRte(an, pstate, rel, undefined, false, rel.name);
     pstate.namespace.push({ rtIndex, rte: q.rtable[rtIndex], relVisible: true, colsVisible: true, lateralOnly: false, lateralOk: true });
-    const texpr = transformExpr(an, pstate, elem.expr!, 'index_expression');
+    const texpr = transformExpr(an, pstate, elem.expr!, exprKind);
     typeOid = texpr.type;
     collation = texpr.collation;
     const proc = texpr.k === 'func' ? cat.getProc(texpr.funcOid) : null;
     if (proc && proc.volatile !== 'i' && proc.isBuiltin) {
-      throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, 'functions in index expression must be marked IMMUTABLE');
+      throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, `functions in ${exprKind === 'partition_expression' ? 'partition key' : 'index'} expression must be marked IMMUTABLE`);
     }
   }
   if (elem.collation) {
@@ -480,6 +482,10 @@ export function createIndexRelation(
   withOptions: A.DefElem[],
   ctx: DdlContext
 ): Relation {
+  // transformIndexStmt: the WHERE clause is transformed before the index expressions
+  if (predicate) {
+    ctx.host.analyzeRelationExpr(rel, predicate, 'predicate');
+  }
   const keys = elems.map((e) => buildIndexElem(session, cat, rel, e, method));
   const includeAttnums = include.map((cn) => {
     const col = rel.columns.find((c) => !c.isDropped && c.name === cn);

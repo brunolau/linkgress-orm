@@ -1,7 +1,9 @@
 import { Catalog, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { CaseNode, FuncNode, OpNode, Query, SubLinkNode, TExpr, VarNode } from '../analyze/nodes';
+import { SYSTEM_ATTNO_BASE } from '../analyze/colref';
 import { forEachChild } from '../analyze/walk';
+import type { Tuple } from '../storage/mvcc';
 import { USECS_PER_DAY, USECS_PER_SEC, zoneOffsetAt } from '../types/datetime';
 import { inputValue, outputValue } from '../types/io';
 import { JNULL, JsonbObject, JsonbValue } from '../types/json';
@@ -28,6 +30,10 @@ export interface RtInfo {
   colNames: string[];
   /** composite type oid for whole-row references */
   rowType: number;
+  /** range-table size of the query level (rows keep tuple versions at `nrt + rtIndex`) */
+  nrt?: number;
+  /** relation oid (tableoid of rows not read through an inheritance parent) */
+  relOid?: number;
 }
 
 const COMPARISON_OPS = new Set(['=', '<>', '<', '<=', '>', '>=']);
@@ -390,6 +396,9 @@ function compileVar(e: TExpr & { k: 'var' }, env: CompileEnv): Evaluator {
           }
           return ctx ? (ctx.row[rtIndex] as unknown[] | null | undefined) : null;
         };
+  if (attno <= SYSTEM_ATTNO_BASE - 1) {
+    return compileSystemColumn(levelsUp, rtIndex, attno - SYSTEM_ATTNO_BASE, info);
+  }
   if (attno === -1) {
     const colTypes = info?.colTypes ?? [];
     const colNames = info?.colNames ?? [];
@@ -421,6 +430,52 @@ function compileVar(e: TExpr & { k: 'var' }, env: CompileEnv): Evaluator {
     }
     const v = t[attno];
     return v === undefined ? null : v;
+  };
+}
+
+/**
+ * A system column (PostgreSQL attnum -1 ctid, -2 xmin, -3 cmin, -4 xmax, -5 cmax, -6 tableoid) of the
+ * tuple version in the row. xmax also reports a lock-only locker (a row locked by FOR UPDATE, or the new
+ * version an ON CONFLICT DO UPDATE wrote), as PostgreSQL's infomask-less xmax field does.
+ */
+function compileSystemColumn(levelsUp: number, rtIndex: number, attnum: number, info: RtInfo | undefined): Evaluator {
+  const nrt = info?.nrt ?? 0;
+  const relOid = info?.relOid ?? 0;
+  const rowOf = (c: EvalCtx): unknown[] | null => {
+    let ctx: EvalCtx | null = c;
+    for (let i = 0; i < levelsUp && ctx; i++) {
+      ctx = ctx.parent;
+    }
+    return ctx ? ctx.row : null;
+  };
+  return (c) => {
+    const row = rowOf(c);
+    const t = row ? (row[nrt + rtIndex] as Tuple | null | undefined) : null;
+    if (!t) {
+      return null;
+    }
+    switch (attnum) {
+      case -1:
+        return `(${Math.floor(t.seq / 256)},${(t.seq % 256) + 1})`;
+      case -2:
+        return t.xmin;
+      case -3:
+      case -5:
+        return t.xmax ? t.cmax : t.cmin;
+      case -4:
+        if (t.xmax) {
+          return t.xmax;
+        }
+        if (t.lockXmax) {
+          return t.lockXmax;
+        }
+        if (t.locks && t.locks.size > 0) {
+          return t.locks.keys().next().value as number;
+        }
+        return 0;
+      default:
+        return (row![2 * nrt + rtIndex] as number | undefined) ?? relOid;
+    }
   };
 }
 
@@ -978,6 +1033,47 @@ function compileSublink(e: SubLinkNode, env: CompileEnv): Evaluator {
         return !isAny;
       };
     }
+    case 'ROWCOMPARE': {
+      const lefts = e.testLeft.map((x) => compileExpr(x, env));
+      const opName = e.operators[0].opName;
+      const ops = e.operators.map((o, i) => operatorImpl(o.opName, o.opSrc, o.leftType, o.rightType, o.collation, env, e.testLeft[i]));
+      const cmps = e.operators.map((o) => env.typeOps.crossComparator(o.leftType, o.rightType, o.collation) ?? env.typeOps.comparator(o.leftType, o.collation));
+      return (c) => {
+        const lvals = lefts.map((l) => l(c));
+        const rows = cached(c, () => runner.run(query, c, 2)) as unknown[][];
+        if (rows.length > 1) {
+          throw new PgError(SqlState.CARDINALITY_VIOLATION, 'more than one row returned by a subquery used as an expression');
+        }
+        if (rows.length === 0) {
+          return null;
+        }
+        const row = rows[0];
+        if (opName === '=' || opName === '<>') {
+          // "=": all columns equal; "<>": any column differs
+          const decisive = opName === '<>';
+          let sawNull = false;
+          for (let i = 0; i < ops.length; i++) {
+            const r = lvals[i] === null || row[i] === null ? null : ops[i]([lvals[i], row[i]], c);
+            if (r === null) {
+              sawNull = true;
+            } else if (r === decisive) {
+              return decisive;
+            }
+          }
+          return sawNull ? null : !decisive;
+        }
+        for (let i = 0; i < cmps.length; i++) {
+          if (lvals[i] === null || row[i] === null) {
+            return null;
+          }
+          const r = cmps[i](lvals[i], row[i]);
+          if (r !== 0) {
+            return opName === '<' || opName === '<=' ? r < 0 : r > 0;
+          }
+        }
+        return opName === '<=' || opName === '>=';
+      };
+    }
     default:
       throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `sublink ${e.linkType} not supported`);
   }
@@ -995,13 +1091,18 @@ function compileDomainCoerce(argNode: TExpr, domainOid: number, env: CompileEnv)
       throw new PgError(SqlState.NOT_NULL_VIOLATION, `domain ${t.name} does not allow null values`, { dataType: t.name });
     }
     if (t.domainChecks && t.domainChecks.length > 0 && v !== null) {
-      for (const chk of t.domainChecks) {
-        const ev = chk.expr.cache?.evaluator as ((val: unknown, st: unknown) => unknown) | undefined;
-        if (ev) {
-          const r = ev(v, c.st);
-          if (r === false) {
-            throw new PgError(SqlState.CHECK_VIOLATION, `value for domain ${t.name} violates check constraint "${chk.name}"`, { dataType: t.name, constraint: chk.name });
-          }
+      for (const chk of c.st.session.domainChecks(t)) {
+        const params = c.st.execParams;
+        const saved = params[chk.slot];
+        params[chk.slot] = v;
+        let r: unknown;
+        try {
+          r = chk.ev(c);
+        } finally {
+          params[chk.slot] = saved;
+        }
+        if (r === false) {
+          throw new PgError(SqlState.CHECK_VIOLATION, `value for domain ${t.name} violates check constraint "${chk.name}"`, { dataType: t.name, constraint: chk.name });
         }
       }
     }

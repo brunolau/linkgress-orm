@@ -10,6 +10,7 @@ import {
   missingRteError,
   refnameNsItem,
   scanNsItemForColumn,
+  systemColumnVar,
   varForColumn,
   wholeRowVar,
 } from './colref';
@@ -18,6 +19,7 @@ import { ArrayNode, CaseNode, SubLinkNode, TExpr } from './nodes';
 import { ExprKind, ParseState } from './parse-state';
 import { resolveBinaryOperator, resolvePrefixOperator } from './resolve';
 import { analyzeSelectForSubquery } from './select';
+import { atPosition, exprLocation, noteExprSource, positioned } from './location';
 import { containsVarsOfLevel } from './walk';
 
 export function transformExpr(an: Analyzer, pstate: ParseState, node: A.Expr, kind: ExprKind): TExpr {
@@ -31,19 +33,25 @@ export function transformExpr(an: Analyzer, pstate: ParseState, node: A.Expr, ki
 }
 
 export function transformExprRecurse(an: Analyzer, pstate: ParseState, node: A.Expr): TExpr {
+  const result = transformExprNode(an, pstate, node);
+  noteExprSource(result, node);
+  return result;
+}
+
+function transformExprNode(an: Analyzer, pstate: ParseState, node: A.Expr): TExpr {
   switch (node.kind) {
     case 'ParenExpr':
       return transformExprRecurse(an, pstate, node.arg);
     case 'ColumnRef':
-      return transformColumnRef(an, pstate, node);
+      return atPosition(node.loc, () => transformColumnRef(an, pstate, node));
     case 'ParamRef':
-      return transformParamRef(an, pstate, node);
+      return atPosition(node.loc, () => transformParamRef(an, pstate, node));
     case 'AConst':
       return transformConst(an, node);
     case 'TypeCast':
-      return transformTypeCast(an, pstate, node);
+      return atPosition(node.loc, () => transformTypeCast(an, pstate, node));
     case 'AExpr':
-      return transformAExpr(an, pstate, node);
+      return atPosition(node.loc, () => transformAExpr(an, pstate, node));
     case 'BoolExpr': {
       const name = node.op;
       const args = node.args.map((a) => an.coerceToBoolean(pstate, transformExprRecurse(an, pstate, a), name));
@@ -60,13 +68,16 @@ export function transformExprRecurse(an: Analyzer, pstate: ParseState, node: A.E
     }
     case 'FuncCall':
       return transformFuncCall(an, pstate, node);
+    case 'JsonFuncExpr':
+      return transformJsonFuncExpr(an, pstate, node);
     case 'CaseExpr':
       return transformCaseExpr(an, pstate, node);
     case 'CoalesceExpr': {
       const args = node.args.map((a) => transformExprRecurse(an, pstate, a));
       const type = an.types.selectCommonType(
         args.map((a) => a.type),
-        'COALESCE'
+        'COALESCE',
+        args.map((a) => exprLocation(a))
       );
       const typmod = an.selectCommonTypmod(args, type);
       const coerced = args.map((a) => an.coerceToCommonType(a, type, 'COALESCE'));
@@ -77,7 +88,8 @@ export function transformExprRecurse(an: Analyzer, pstate: ParseState, node: A.E
       const args = node.args.map((a) => transformExprRecurse(an, pstate, a));
       const type = an.types.selectCommonType(
         args.map((a) => a.type),
-        ctx
+        ctx,
+        args.map((a) => exprLocation(a))
       );
       const typmod = an.selectCommonTypmod(args, type);
       const coerced = args.map((a) => an.coerceToCommonType(a, type, ctx));
@@ -85,7 +97,7 @@ export function transformExprRecurse(an: Analyzer, pstate: ParseState, node: A.E
       return { k: 'minmax', op: ctx === 'GREATEST' ? 'greatest' : 'least', args: coerced, type, typmod, collation: an.typeCollation(type) ? resolveCollation(coerced, an.typeCollation(type)) : 0 };
     }
     case 'SubLink':
-      return transformSubLink(an, pstate, node);
+      return atPosition(node.loc, () => transformSubLink(an, pstate, node));
     case 'ArrayExpr':
       return transformArrayExpr(an, pstate, node, 0, 0, -1);
     case 'RowExpr':
@@ -98,10 +110,10 @@ export function transformExprRecurse(an: Analyzer, pstate: ParseState, node: A.E
       const nsp = node.collname.length > 1 ? an.catalog.findNamespace(node.collname[0])?.oid ?? -1 : null;
       const coll = an.catalog.findCollation(nsp, collName);
       if (!coll) {
-        throw new PgError(SqlState.UNDEFINED_OBJECT, `collation "${node.collname.join('.')}" for encoding "UTF8" does not exist`);
+        throw positioned(new PgError(SqlState.UNDEFINED_OBJECT, `collation "${node.collname.join('.')}" for encoding "UTF8" does not exist`), node.loc);
       }
       if (!an.typeCollation(arg.type) && arg.type !== TypeOid.unknown) {
-        throw new PgError(SqlState.DATATYPE_MISMATCH, `collations are not supported by type ${an.types.formatType(arg.type, -1, false)}`);
+        throw positioned(new PgError(SqlState.DATATYPE_MISMATCH, `collations are not supported by type ${an.types.formatType(arg.type, -1, false)}`), node.loc);
       }
       const base = arg.type === TypeOid.unknown ? an.resolveUnknownToText(arg) : arg;
       return { k: 'collate', arg: base, type: base.type, typmod: base.typmod, collation: coll.oid };
@@ -197,12 +209,113 @@ function transformParamRef(an: Analyzer, pstate: ParseState, node: A.ParamRef): 
   return { k: 'param', paramId: node.number, type, typmod: -1, collation: an.typeCollation(type) };
 }
 
+/** Settings of a SQL/JSON function, passed to the executor as a constant text argument. */
+export interface JsonFuncSpec {
+  op: A.JsonFuncExpr['op'];
+  onEmpty: A.JsonBehavior['kind'];
+  onError: A.JsonBehavior['kind'];
+  wrapper: A.JsonFuncExpr['wrapper'];
+  omitQuotes: boolean;
+  itemType: A.JsonFuncExpr['itemType'];
+  uniqueKeys: boolean;
+  names: string[];
+  emptyDefault: number;
+  errorDefault: number;
+}
+
+function transformJsonFuncExpr(an: Analyzer, pstate: ParseState, node: A.JsonFuncExpr): TExpr {
+  const typeName = (name: string): A.TypeName => ({ kind: 'TypeName', names: ['pg_catalog', name], typmods: [], arrayBounds: [] });
+  const textConst = (value: string): TExpr => ({ k: 'const', type: TypeOid.text, typmod: -1, collation: COLL_DEFAULT, value, isNull: false });
+  let type: number;
+  let typmod = -1;
+  const args: TExpr[] = [];
+  if (node.op === 'is_json') {
+    let ctx = transformExprRecurse(an, pstate, node.ctx);
+    if (ctx.type === TypeOid.unknown) {
+      ctx = an.coerceToSpecificType(ctx, TypeOid.text, 'IS JSON');
+    }
+    const base = an.types.baseType(ctx.type);
+    if (base !== TypeOid.text && base !== TypeOid.varchar && base !== TypeOid.bpchar && base !== TypeOid.json && base !== TypeOid.jsonb && base !== TypeOid.bytea) {
+      throw new PgError(SqlState.DATATYPE_MISMATCH, `cannot use type ${an.types.formatType(ctx.type, -1, false)} in IS JSON predicate`);
+    }
+    args.push(ctx);
+    type = TypeOid.bool;
+  } else {
+    try {
+      args.push(transformExprRecurse(an, pstate, { kind: 'TypeCast', arg: node.ctx, typeName: typeName('jsonb'), loc: node.loc }));
+    } catch (err) {
+      // the context item is converted when the expression is evaluated: its input errors carry no position
+      if (err instanceof PgError && err.code.startsWith('22')) {
+        err.position = undefined;
+        err.noPosition = true;
+      }
+      throw err;
+    }
+    args.push(transformExprRecurse(an, pstate, { kind: 'TypeCast', arg: node.path!, typeName: typeName('jsonpath'), loc: node.loc }));
+    if (node.returning) {
+      const t = atPosition(node.returning.loc ?? node.loc, () => an.types.lookupTypeName(node.returning!, an.env.relationSearchPath()));
+      type = t.oid;
+      typmod = t.typmod;
+    } else {
+      type = node.op === 'json_value' ? TypeOid.text : node.op === 'json_query' ? TypeOid.jsonb : TypeOid.bool;
+    }
+  }
+  const spec: JsonFuncSpec = {
+    op: node.op,
+    onEmpty: node.onEmpty?.kind ?? 'null',
+    onError: node.onError?.kind ?? (node.op === 'json_exists' ? 'false' : 'null'),
+    wrapper: node.wrapper,
+    omitQuotes: node.omitQuotes,
+    itemType: node.itemType,
+    uniqueKeys: node.uniqueKeys,
+    names: node.passing.map((p) => p.name),
+    emptyDefault: -1,
+    errorDefault: -1,
+  };
+  args.push(textConst(''));
+  for (const p of node.passing) {
+    args.push(transformExprRecurse(an, pstate, p.expr));
+  }
+  const addDefault = (b: A.JsonBehavior | null): number => {
+    if (b?.kind !== 'default') {
+      return -1;
+    }
+    const e = transformExprRecurse(an, pstate, b.expr!);
+    const coerced = an.coerceToTargetType(e, type, typmod, 'explicit', 'implicit_cast');
+    if (!coerced) {
+      throw new PgError(SqlState.DATATYPE_MISMATCH, `cannot cast behavior expression of type ${an.types.formatType(e.type, -1, false)} to ${an.types.formatType(type, typmod, false)}`);
+    }
+    args.push(coerced);
+    return args.length - 1;
+  };
+  spec.emptyDefault = addDefault(node.onEmpty);
+  spec.errorDefault = addDefault(node.onError);
+  args[node.op === 'is_json' ? 1 : 2] = textConst(JSON.stringify(spec));
+  return {
+    k: 'func',
+    funcOid: 0,
+    funcName: node.op,
+    funcSrc: '__linkgress_json_func',
+    args,
+    type,
+    typmod,
+    collation: an.typeCollation(type),
+    inputCollation: 0,
+    retset: false,
+    format: 'call',
+    variadic: false,
+    strict: false,
+  };
+}
+
 export function transformTypeCast(an: Analyzer, pstate: ParseState, node: A.TypeCast): TExpr {
-  const { oid: targetType, typmod: targetTypmod } = an.types.lookupTypeName(node.typeName, an.env.relationSearchPath());
+  const { oid: targetType, typmod: targetTypmod } = atPosition(node.typeName.loc ?? node.loc, () => an.types.lookupTypeName(node.typeName, an.env.relationSearchPath()));
   let arg: TExpr;
-  if (node.arg.kind === 'ArrayExpr' && an.types.isArray(targetType)) {
-    const elemType = an.types.elemType(targetType);
-    arg = transformArrayExpr(an, pstate, node.arg, targetType, elemType, targetTypmod);
+  const targetBase = an.types.baseType(targetType);
+  if (node.arg.kind === 'ArrayExpr' && an.types.isArray(targetBase)) {
+    // built as the base array type; a domain over it is then applied (and checked) by the coercion
+    const elemType = an.types.elemType(targetBase);
+    arg = transformArrayExpr(an, pstate, node.arg, targetBase, elemType, targetBase === targetType ? targetTypmod : an.domainBaseTypmod(targetType));
   } else {
     arg = transformExprRecurse(an, pstate, node.arg);
   }
@@ -235,6 +348,10 @@ function transformColumnRef(an: Analyzer, pstate: ParseState, node: A.ColumnRef)
   switch (f.length) {
     case 1: {
       const colname = f[0];
+      if (an.domainValue && colname === 'value') {
+        const dv = an.domainValue;
+        return { k: 'execparam', slot: dv.slot, type: dv.type, typmod: dv.typmod, collation: dv.collation };
+      }
       const v = colNameToVar(an, pstate, colname, true);
       if (v) {
         return v;
@@ -248,7 +365,7 @@ function transformColumnRef(an: Analyzer, pstate: ParseState, node: A.ColumnRef)
       if (pidx >= 0) {
         return transformParamRef(an, pstate, { kind: 'ParamRef', number: pidx + 1 });
       }
-      throw columnDoesNotExist(colname);
+      throw columnDoesNotExist(colname, undefined, pstate);
     }
     case 2: {
       const [relname, colname] = f;
@@ -258,13 +375,17 @@ function transformColumnRef(an: Analyzer, pstate: ParseState, node: A.ColumnRef)
         if (idx >= 0) {
           return varForColumn(found.item.rte, found.item.rtIndex, idx, found.levelsUp);
         }
+        const sys = systemColumnVar(found.item, colname, found.levelsUp);
+        if (sys) {
+          return sys;
+        }
         // composite column of whole-row? try function-style
         const wr = wholeRowVar(an, found.item, found.levelsUp);
         const fs = tryFieldSelect(an, wr, colname);
         if (fs) {
           return fs;
         }
-        throw columnDoesNotExist(colname, relname);
+        throw columnDoesNotExist(colname, relname, pstate);
       }
       if (relname === an.paramFunctionName && an.paramNames.includes(colname)) {
         return transformParamRef(an, pstate, { kind: 'ParamRef', number: an.paramNames.indexOf(colname) + 1 });
@@ -287,6 +408,10 @@ function transformColumnRef(an: Analyzer, pstate: ParseState, node: A.ColumnRef)
         const idx = scanNsItemForColumn(found.item, c);
         if (idx >= 0) {
           return varForColumn(found.item.rte, found.item.rtIndex, idx, found.levelsUp);
+        }
+        const sys = systemColumnVar(found.item, c, found.levelsUp);
+        if (sys) {
+          return sys;
         }
         throw columnDoesNotExist(c, `${a}.${b}`);
       }
@@ -325,6 +450,19 @@ function transformColumnRef(an: Analyzer, pstate: ParseState, node: A.ColumnRef)
 export function compositeFields(an: Analyzer, e: TExpr): { names: string[]; types: { type: number; typmod: number; collation: number }[] } | null {
   if (e.k === 'row') {
     return { names: e.fieldNames, types: e.args.map((a) => ({ type: a.type, typmod: a.typmod, collation: a.collation })) };
+  }
+  if (e.k === 'func' && e.type === TypeOid.record && !e.retset) {
+    // a function whose OUT parameters make up its (record) result
+    const proc = an.catalog.getProc(e.funcOid);
+    if (proc?.argmodes && proc.allargtypes) {
+      const outs = proc.argmodes.map((m, i) => ({ m, i })).filter((x) => x.m === 'o' || x.m === 'b' || x.m === 't');
+      if (outs.length > 1) {
+        return {
+          names: outs.map((x) => proc.argnames?.[x.i] || `column${x.i + 1}`),
+          types: outs.map((x) => ({ type: proc.allargtypes![x.i], typmod: -1, collation: an.typeCollation(proc.allargtypes![x.i]) })),
+        };
+      }
+    }
   }
   const t = an.catalog.getType(an.types.baseType(e.type));
   if (t && t.typtype === 'c' && t.relid) {
@@ -423,6 +561,10 @@ function transformAExpr(an: Analyzer, pstate: ParseState, node: A.AExpr): TExpr 
     case 'OP': {
       const lexpr = node.lexpr;
       const rexpr = node.rexpr as A.Expr;
+      // "row op subselect" is a ROWCOMPARE sublink
+      if (lexpr && lexpr.kind === 'RowExpr' && rexpr.kind === 'SubLink' && rexpr.linkType === 'EXPR') {
+        return transformSubLink(an, pstate, { ...rexpr, linkType: 'ROWCOMPARE', testexpr: lexpr, operName: node.name, loc: node.loc });
+      }
       // row comparison: (a,b) = (c,d)
       if (lexpr && isRowish(lexpr) && isRowish(rexpr)) {
         const l = transformExprRecurse(an, pstate, lexpr);
@@ -690,7 +832,8 @@ function transformCaseExpr(an: Analyzer, pstate: ParseState, node: A.CaseExpr): 
   const allResults = [def, ...results];
   const type = an.types.selectCommonType(
     allResults.map((r) => r.type),
-    'CASE'
+    'CASE',
+    allResults.map((r) => exprLocation(r))
   );
   const typmod = an.selectCommonTypmod(allResults, type);
   const coercedDef = an.coerceToCommonType(def, type, 'CASE/ELSE');
@@ -714,15 +857,28 @@ function transformCaseExpr(an: Analyzer, pstate: ParseState, node: A.CaseExpr): 
 // Sublinks
 // ---------------------------------------------------------------------------
 
+/** transformSubLink: expression kinds that cannot contain a subquery, and whether the error has a position */
+const SUBLINK_FORBIDDEN: Partial<Record<ExprKind, [string, boolean]>> = {
+  check_constraint: ['check constraint', true],
+  domain_check: ['check constraint', false],
+  column_default: ['DEFAULT expression', true],
+  index_expression: ['index expression', true],
+  index_predicate: ['index predicate', true],
+  partition_expression: ['partition key expression', false],
+  alter_col_transform: ['transform expression', true],
+  execute_parameter: ['EXECUTE parameter', true],
+  trigger_when: ['trigger WHEN condition', true],
+  call_argument: ['CALL argument', true],
+  generated_column: ['column generation expression', true],
+};
+
 function transformSubLink(an: Analyzer, pstate: ParseState, node: A.SubLink): TExpr {
-  if (pstate.exprKind === 'check_constraint' || pstate.exprKind === 'column_default' || pstate.exprKind === 'index_expression' || pstate.exprKind === 'index_predicate') {
-    const what: Record<string, string> = {
-      check_constraint: 'check constraint',
-      column_default: 'DEFAULT expression',
-      index_expression: 'index expression',
-      index_predicate: 'index predicate',
-    };
-    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `cannot use subquery in ${what[pstate.exprKind]}`);
+  const forbidden = SUBLINK_FORBIDDEN[pstate.exprKind];
+  if (forbidden) {
+    const err = new PgError(SqlState.FEATURE_NOT_SUPPORTED, `cannot use subquery in ${forbidden[0]}`);
+    // parser_errposition: only where the statement's source text reaches the parse state
+    err.noPosition = !forbidden[1];
+    throw err;
   }
   const { query, child } = analyzeSelectForSubquery(an, node.subselect, pstate);
   const correlated = child.maxOuterRef >= 1;
@@ -760,7 +916,8 @@ function transformSubLink(an: Analyzer, pstate: ParseState, node: A.SubLink): TE
       return { ...base, linkType: 'ARRAY', type: arrType, typmod: -1, collation: te.expr.collation };
     }
     case 'ANY':
-    case 'ALL': {
+    case 'ALL':
+    case 'ROWCOMPARE': {
       const left = transformExprRecurse(an, pstate, node.testexpr!);
       const lefts = left.k === 'row' ? left.args : [left];
       if (lefts.length < visibleTargets.length) {
@@ -842,7 +999,8 @@ export function transformArrayExpr(an: Analyzer, pstate: ParseState, node: A.Arr
   } else {
     const common = an.types.selectCommonType(
       elements.map((e) => e.type),
-      'ARRAY'
+      'ARRAY',
+      elements.map((e) => exprLocation(e))
     );
     if (an.types.isArray(common)) {
       coerceType = common;

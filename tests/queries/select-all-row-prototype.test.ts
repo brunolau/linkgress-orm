@@ -1,4 +1,4 @@
-import { describe, test, expect, afterEach } from '@jest/globals';
+import { describe, test, expect, afterEach } from 'bun:test';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn,
   integer, varchar, boolean, eq, MockRowCache,

@@ -1,6 +1,8 @@
 import { TypeOid } from '../../catalog/catalog';
 import { PgError, SqlState } from '../../errors';
 import { formatFloat4ForNumeric, formatFloat8ForNumeric, PgNumeric } from '../../types/numeric';
+import { numericExp, numericLn, numericLog, numericPowerFinite, numericSqrt } from '../../types/numeric-math';
+import { floatToChar, intToChar, numericToChar, numericToNumber } from '../../types/numeric-format';
 import { FnImpl } from '../runtime';
 import { checkFloat4, checkFloat8, checkInt2, checkInt4, checkInt8, divisionByZero, toBigInt } from '../typeops';
 
@@ -296,6 +298,9 @@ export function numericPower(base: PgNumeric, exp: PgNumeric): PgNumeric {
   if (base.isZero() && exp.signum() < 0) {
     throw new PgError(SqlState.INVALID_ARGUMENT_FOR_POWER_FUNCTION, 'zero raised to a negative power is undefined');
   }
+  if (base.kind === 'n' && exp.kind === 'n') {
+    return numericPowerFinite(base, exp);
+  }
   if (exp.kind === 'n' && exp.scale === 0 || exp.trimScale().scale === 0) {
     const e = exp.trimScale();
     if (e.kind === 'n' && e.mag <= 10000n) {
@@ -408,6 +413,13 @@ function numArg(v: unknown): PgNumeric {
 
 /** Math functions keyed by prosrc. */
 export const NUMERIC_FUNCS: Record<string, FnImpl> = {
+  // to_char / to_number
+  numeric_to_char: (a) => numericToChar(a[0] as PgNumeric, a[1] as string),
+  int4_to_char: (a) => intToChar(a[0] as number, a[1] as string),
+  int8_to_char: (a) => intToChar(toBigInt(a[0]), a[1] as string),
+  float4_to_char: (a) => floatToChar(a[0] as number, a[1] as string, true),
+  float8_to_char: (a) => floatToChar(a[0] as number, a[1] as string, false),
+  numeric_to_number: (a) => numericToNumber(a[0] as string, a[1] as string),
   // abs
   int2abs: (a) => checkInt2(Math.abs(a[0] as number)),
   int4abs: (a) => checkInt4(Math.abs(a[0] as number)),
@@ -462,18 +474,10 @@ export const NUMERIC_FUNCS: Record<string, FnImpl> = {
     }
     return Math.log10(x);
   },
-  numeric_sqrt: (a) => {
-    const n = a[0] as PgNumeric;
-    if (n.signum() < 0) {
-      throw new PgError(SqlState.INVALID_ARGUMENT_FOR_POWER_FUNCTION, 'cannot take square root of a negative number');
-    }
-    const v = Math.sqrt(n.toNumber());
-    const rscale = Math.max(16, n.scale);
-    return PgNumeric.parse(v.toFixed(Math.min(20, rscale))).round(rscale);
-  },
-  numeric_exp: (a) => PgNumeric.parse(Math.exp((a[0] as PgNumeric).toNumber()).toFixed(16)),
-  numeric_ln: (a) => PgNumeric.parse(Math.log((a[0] as PgNumeric).toNumber()).toFixed(16)),
-  numeric_log: (a) => PgNumeric.parse((Math.log((a[1] as PgNumeric).toNumber()) / Math.log((a[0] as PgNumeric).toNumber())).toFixed(16)),
+  numeric_sqrt: (a) => numericSqrt(a[0] as PgNumeric),
+  numeric_exp: (a) => numericExp(a[0] as PgNumeric),
+  numeric_ln: (a) => numericLn(a[0] as PgNumeric),
+  numeric_log: (a) => numericLog(a[0] as PgNumeric, a[1] as PgNumeric),
   numeric_power: (a) => numericPower(a[0] as PgNumeric, a[1] as PgNumeric),
   numeric_mod: (a) => (a[0] as PgNumeric).mod(a[1] as PgNumeric),
   numeric_div_trunc: (a) => {

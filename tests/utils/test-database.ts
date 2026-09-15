@@ -136,7 +136,7 @@ export function getSharedDatabase(options?: {
 
 /**
  * Setup database for tests
- * Schema is created in globalSetup, this just truncates tables
+ * Schema is created by the test runner (tests/run.ts), this just truncates tables
  * If truncation fails (schema was dropped), recreate the schema
  */
 export async function setupDatabase(db: AppDatabase): Promise<void> {

@@ -1,4 +1,4 @@
-import { describe, test, expect, afterEach, beforeEach } from '@jest/globals';
+import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
 import { eq, gt, sql, MockRowCache, LateralSqlCache } from '../../src';
 import { LscDatabase, makeLscDb } from '../utils/lateral-shape-model';
 
@@ -186,13 +186,13 @@ describe('LateralSqlCache — rendered lateral SQL is memoised per shape', () =>
     for (const shape of shapes) {
       await shape.build(db, paramsA);
       expectedEntries += shape.laterals;
-      expect({ shape: shape.name, sql: client.last!.sql }).toEqual({ shape: shape.name, sql: fresh.get(shape.name) });
+      expect({ shape: shape.name, sql: client.last!.sql }).toEqual({ shape: shape.name, sql: fresh.get(shape.name)! });
       expect({ shape: shape.name, entries: LateralSqlCache.diagnostics().entries }).toEqual({ shape: shape.name, entries: expectedEntries });
     }
 
     for (const shape of shapes) {
       await shape.build(db, paramsA);
-      expect({ shape: shape.name, sql: client.last!.sql }).toEqual({ shape: shape.name, sql: fresh.get(shape.name) });
+      expect({ shape: shape.name, sql: client.last!.sql }).toEqual({ shape: shape.name, sql: fresh.get(shape.name)! });
     }
 
     expect(LateralSqlCache.diagnostics()).toEqual({ enabled: true, entries: expectedEntries, maxEntries: LateralSqlCache.MAX_ENTRIES });

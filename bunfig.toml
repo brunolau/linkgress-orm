@@ -1,0 +1,4 @@
+[test]
+# Global test hooks, custom matchers and the in-memory database mode (LINKGRESS_TEST_DB=memory)
+preload = ["./tests/setup.ts"]
+root = "./tests"

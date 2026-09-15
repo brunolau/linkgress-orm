@@ -2,7 +2,7 @@ import type * as A from '../ast';
 import { TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import type { Analyzer } from './analyzer';
-import { colNameToVar, expandNsItemColumns, missingRteError, refnameNsItem } from './colref';
+import { colNameToVar, expandNsItemColumns, isSystemAttno, missingRteError, refnameNsItem, SYSTEM_ATTNO_BASE } from './colref';
 import { requireOrdering, transformExpr } from './expr';
 import { addRte, transformFromClause } from './from';
 import {
@@ -21,6 +21,7 @@ import {
 import { ExprKind, ParseState } from './parse-state';
 import { analyzeDmlStatement } from './dml';
 import { exprEqual, forEachChild, stripImplicitCoercions } from './walk';
+import { exprLocation, positioned } from './location';
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -126,7 +127,7 @@ function analyzeCte(an: Analyzer, pstate: ParseState, c: A.CommonTableExpr, recu
     }
     const recOut = cteOutput(rec);
     if (recOut.types.length !== out.types.length) {
-      throw new PgError(SqlState.SYNTAX_ERROR, 'each UNION query must have the same number of columns');
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'each UNION query must have the same number of columns'), exprLocation(rec.targetList.find((t) => !t.resjunk)?.expr));
     }
     for (let i = 0; i < out.types.length; i++) {
       if (recOut.types[i].type !== out.types[i].type) {
@@ -151,26 +152,89 @@ function analyzeCte(an: Analyzer, pstate: ParseState, c: A.CommonTableExpr, recu
     entry.colTypes = out.types;
   }
   if (c.search || c.cycle) {
+    // rewriteSearchAndCycle: the executor computes the added columns; the recursive term also
+    // returns the self-reference's added columns (appended below) to derive them from
+    if (!entry.recursiveParts) {
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'WITH query is not recursive'), c.loc);
+    }
+    const baseCount = entry.colNames.length;
+    const checkColumns = (cols: string[], what: string, loc: number | undefined): number[] => {
+      const seen = new Set<string>();
+      return cols.map((n) => {
+        if (seen.has(n)) {
+          throw positioned(new PgError(SqlState.DUPLICATE_COLUMN, `${what} column "${n}" specified more than once`), loc);
+        }
+        seen.add(n);
+        const idx = entry.colNames.indexOf(n);
+        if (idx < 0 || idx >= baseCount) {
+          throw positioned(new PgError(SqlState.SYNTAX_ERROR, `${what} column "${n}" not in WITH query column list`), loc);
+        }
+        return idx;
+      });
+    };
+    const checkName = (name: string, msg: string, loc: number | undefined): void => {
+      if (entry.colNames.slice(0, baseCount).includes(name)) {
+        throw positioned(new PgError(SqlState.SYNTAX_ERROR, `${msg} "${name}" already used in WITH query column list`), loc);
+      }
+    };
     if (c.search) {
-      entry.search = {
-        breadthFirst: c.search.breadthFirst,
-        columns: c.search.columns.map((n) => entry.colNames.indexOf(n)),
-        seqColumn: c.search.seqColumn,
-      };
-      entry.colNames.push(c.search.seqColumn);
-      entry.colTypes.push({ type: TypeOid.record, typmod: -1, collation: 0 });
+      entry.search = { breadthFirst: c.search.breadthFirst, columns: checkColumns(c.search.columns, 'search', c.search.loc), seqColumn: c.search.seqColumn };
+      checkName(c.search.seqColumn, 'search sequence column name', c.search.loc);
     }
     if (c.cycle) {
-      entry.colNames.push(c.cycle.markColumn, c.cycle.pathColumn);
-      entry.colTypes.push({ type: TypeOid.bool, typmod: -1, collation: 0 }, { type: TypeOid._record, typmod: -1, collation: 0 });
-      entry.cycle = {
-        columns: c.cycle.columns.map((n) => entry.colNames.indexOf(n)),
-        markColumn: c.cycle.markColumn,
-        markValue: an.makeBoolConst(true),
-        markDefault: an.makeBoolConst(false),
-        pathColumn: c.cycle.pathColumn,
-      };
+      const columns = checkColumns(c.cycle.columns, 'cycle', c.cycle.loc);
+      checkName(c.cycle.markColumn, 'cycle mark column name', c.cycle.loc);
+      checkName(c.cycle.pathColumn, 'cycle path column name', c.cycle.loc);
+      if (c.cycle.markColumn === c.cycle.pathColumn) {
+        throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'cycle mark column name and cycle path column name are the same'), c.cycle.loc);
+      }
+      let markValue: TExpr = an.makeBoolConst(true);
+      let markDefault: TExpr = an.makeBoolConst(false);
+      if (c.cycle.markValue && c.cycle.markDefault) {
+        const v = transformExpr(an, pstate, c.cycle.markValue, 'cycle_mark');
+        const d = transformExpr(an, pstate, c.cycle.markDefault, 'cycle_mark');
+        const t = an.types.selectCommonType([v.type, d.type], 'CYCLE');
+        markValue = an.coerceToCommonType(v, t, 'CYCLE');
+        markDefault = an.coerceToCommonType(d, t, 'CYCLE');
+      }
+      entry.cycle = { columns, markColumn: c.cycle.markColumn, markValue, markDefault, pathColumn: c.cycle.pathColumn };
     }
+    if (c.search && c.cycle) {
+      if (c.search.seqColumn === c.cycle.markColumn) {
+        throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'search sequence column name and cycle mark column name are the same'), c.search.loc);
+      }
+      if (c.search.seqColumn === c.cycle.pathColumn) {
+        throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'search sequence column name and cycle path column name are the same'), c.search.loc);
+      }
+    }
+    const rec = entry.recursiveParts.recursive;
+    const selfIndex = rec.rtable.findIndex((r) => r.kind === 'cte' && r.selfReference && r.cte === entry);
+    if (selfIndex < 0) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'in-memory engine: SEARCH/CYCLE with a recursive reference below the top level of the recursive term is not implemented');
+    }
+    const added: TypeInfo[] = [];
+    const addedNames: string[] = [];
+    if (c.search) {
+      added.push({ type: c.search.breadthFirst ? TypeOid.record : TypeOid._record, typmod: -1, collation: 0 });
+      addedNames.push(c.search.seqColumn);
+    }
+    if (entry.cycle) {
+      added.push({ type: entry.cycle.markValue.type, typmod: -1, collation: an.typeCollation(entry.cycle.markValue.type) }, { type: TypeOid._record, typmod: -1, collation: 0 });
+      addedNames.push(entry.cycle.markColumn, entry.cycle.pathColumn);
+    }
+    added.forEach((ti, i) => {
+      rec.targetList.push({
+        expr: { k: 'var', levelsUp: 0, rtIndex: selfIndex, attno: baseCount + i, type: ti.type, typmod: ti.typmod, collation: ti.collation },
+        resno: rec.targetList.length + 1,
+        name: addedNames[i],
+        resjunk: false,
+        sortGroupRef: 0,
+        origTable: 0,
+        origColumn: 0,
+      });
+    });
+    entry.colNames = [...entry.colNames, ...addedNames];
+    entry.colTypes = [...entry.colTypes, ...added];
   }
   return entry;
 }
@@ -384,6 +448,8 @@ function figureColnameInternal(node: A.Expr): { name: string | null; strength: n
     }
     case 'FuncCall':
       return { name: node.name[node.name.length - 1], strength: 2 };
+    case 'JsonFuncExpr':
+      return node.op === 'is_json' ? { name: null, strength: 0 } : { name: node.op, strength: 2 };
     case 'AExpr':
       if (node.exprKind === 'NULLIF') {
         return { name: 'nullif', strength: 2 };
@@ -505,7 +571,7 @@ function findTargetlistEntrySQL92(an: Analyzer, pstate: ParseState, node: A.Expr
   }
   if (inner.kind === 'AConst') {
     if (inner.val.type !== 'integer') {
-      throw new PgError(SqlState.SYNTAX_ERROR, `non-integer constant in ${an.exprKindName(kind)}`);
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, `non-integer constant in ${an.exprKindName(kind)}`), inner.loc);
     }
     const pos = parseInt(inner.val.value, 10);
     let n = 0;
@@ -516,7 +582,7 @@ function findTargetlistEntrySQL92(an: Analyzer, pstate: ParseState, node: A.Expr
         }
       }
     }
-    throw new PgError(SqlState.INVALID_COLUMN_REFERENCE, `${an.exprKindName(kind)} position ${pos} is not in select list`);
+    throw positioned(new PgError(SqlState.INVALID_COLUMN_REFERENCE, `${an.exprKindName(kind)} position ${pos} is not in select list`), inner.loc);
   }
   return findTargetlistEntrySQL99(an, pstate, node, tlist, kind);
 }
@@ -692,7 +758,7 @@ function transformDistinctClause(an: Analyzer, pstate: ParseState, tlist: Target
   for (const s of sortClause) {
     const tle = tlist.find((t) => t.sortGroupRef === s.tleSortGroupRef)!;
     if (tle.resjunk) {
-      throw new PgError(SqlState.INVALID_COLUMN_REFERENCE, 'for SELECT DISTINCT, ORDER BY expressions must appear in select list');
+      throw positioned(new PgError(SqlState.INVALID_COLUMN_REFERENCE, 'for SELECT DISTINCT, ORDER BY expressions must appear in select list'), exprLocation(tle.expr));
     }
     out.push({ ...s });
   }
@@ -780,6 +846,9 @@ function containsLocalVars(e: TExpr): boolean {
 // ---------------------------------------------------------------------------
 
 function parseCheckAggregates(an: Analyzer, pstate: ParseState, q: Query): void {
+  if (q.hasAggs && q.rtable.some((rte) => rte.kind === 'cte' && rte.selfReference)) {
+    throw positioned(new PgError(SqlState.INVALID_RECURSION, "aggregate functions are not allowed in a recursive query's recursive term"), exprLocation(q.aggs[0]));
+  }
   const groupExprs = q.groupClause.map((g) => q.targetList.find((t) => t.sortGroupRef === g.tleSortGroupRef)!.expr);
   // functional dependency: relations whose primary key columns are all grouped
   const dependentRts = new Set<number>();
@@ -826,7 +895,7 @@ function parseCheckAggregates(an: Analyzer, pstate: ParseState, q: Query): void 
           }
         }
         const colname = x.attno >= 0 ? rte.eref.colnames[x.attno] : '*';
-        throw new PgError(SqlState.GROUPING_ERROR, `column "${rte.eref.aliasname}.${colname}" must appear in the GROUP BY clause or be used in an aggregate function`);
+        throw positioned(new PgError(SqlState.GROUPING_ERROR, `column "${rte.eref.aliasname}.${colname}" must appear in the GROUP BY clause or be used in an aggregate function`), exprLocation(x));
       }
       if (x.k === 'sublink') {
         for (const t of x.testLeft) {
@@ -1053,7 +1122,8 @@ function transformValuesClause(an: Analyzer, stmt: A.SelectStmt, pstate: ParseSt
     const col = exprRows.map((r) => r[c]);
     const type = an.types.selectCommonType(
       col.map((e) => e.type),
-      'VALUES'
+      'VALUES',
+      col.map((e) => exprLocation(e))
     );
     const typmod = an.selectCommonTypmod(col, type);
     for (const r of exprRows) {
@@ -1123,6 +1193,16 @@ function findLeftmostLeaf(tree: SetOpTree): { k: 'leaf'; rtIndex: number } {
   return t;
 }
 
+/** exprLocation of a set-operation input's target list: its first output column */
+function setOpFirstColumnLocation(pstate: ParseState, tree: SetOpTree): number | undefined {
+  let t = tree;
+  while (t.k !== 'leaf') {
+    t = t.larg;
+  }
+  const rte = pstate.query.rtable[t.rtIndex];
+  return rte.kind === 'subquery' ? exprLocation(rte.subquery.targetList.find((te) => !te.resjunk)?.expr) : undefined;
+}
+
 function transformSetOperationTree(an: Analyzer, pstate: ParseState, stmt: A.SelectStmt, isTop: boolean): SetOpTree {
   const isLeaf = stmt.op === 'NONE' || stmt.sortClause.length > 0 || stmt.limitCount !== null || stmt.limitOffset !== null || stmt.locking.length > 0 || (stmt.with !== undefined && !isTop);
   if (isLeaf && !isTop) {
@@ -1147,7 +1227,7 @@ function transformSetOperationTree(an: Analyzer, pstate: ParseState, stmt: A.Sel
   const rtypes = setOpColTypes(pstate, rarg);
   const ctx = stmt.op;
   if (ltypes.length !== rtypes.length) {
-    throw new PgError(SqlState.SYNTAX_ERROR, `each ${ctx} query must have the same number of columns`);
+    throw positioned(new PgError(SqlState.SYNTAX_ERROR, `each ${ctx} query must have the same number of columns`), setOpFirstColumnLocation(pstate, rarg));
   }
   const colTypes: TypeInfo[] = [];
   for (let i = 0; i < ltypes.length; i++) {
@@ -1212,6 +1292,9 @@ function markTargetListOrigins(an: Analyzer, q: Query): void {
     if (rte.kind === 'relation' && e.attno >= 0) {
       te.origTable = rte.relOid;
       te.origColumn = rte.attnums[e.attno];
+    } else if (rte.kind === 'relation' && isSystemAttno(e.attno)) {
+      te.origTable = rte.relOid;
+      te.origColumn = e.attno - SYSTEM_ATTNO_BASE;
     } else if (rte.kind === 'subquery' && e.attno >= 0) {
       const sub = rte.subquery.targetList.filter((t) => !t.resjunk)[e.attno];
       if (sub) {

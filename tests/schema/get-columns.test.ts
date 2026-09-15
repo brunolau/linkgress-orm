@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { createTestDatabase } from '../utils/test-database';
 
 describe('props method', () => {
@@ -226,8 +226,8 @@ describe('getColumnKeys method', () => {
     expect(keys).toContain('email');
 
     // Should include navigation properties
-    expect(keys).toContain('posts');
-    expect(keys).toContain('orders');
+    expect(keys as string[]).toContain('posts');
+    expect(keys as string[]).toContain('orders');
   });
 
   test('should exclude primary key when includePrimaryKey is false', () => {
@@ -285,8 +285,8 @@ describe('getColumnKeys method', () => {
     expect(keys).toContain('email');
 
     // Should include navigation properties
-    expect(keys).toContain('posts');
-    expect(keys).toContain('orders');
+    expect(keys as string[]).toContain('posts');
+    expect(keys as string[]).toContain('orders');
   });
 
   test('should support both includePrimaryKey: true and includeNavigation: true', () => {
@@ -304,8 +304,8 @@ describe('getColumnKeys method', () => {
     expect(keys).toContain('email');
 
     // Should include navigation properties
-    expect(keys).toContain('posts');
-    expect(keys).toContain('orders');
+    expect(keys as string[]).toContain('posts');
+    expect(keys as string[]).toContain('orders');
   });
 
   test('should support includePrimaryKey: false and includeNavigation: false (explicit)', () => {

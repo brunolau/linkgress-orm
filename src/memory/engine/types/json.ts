@@ -156,7 +156,9 @@ export function isJsonbObject(v: unknown): v is JsonbObject {
 // ---------------------------------------------------------------------------
 
 function jsonError(typeName: string, detail: string, line: number, context: string): PgError {
-  return new PgError(SqlState.INVALID_TEXT_REPRESENTATION, `invalid input syntax for type ${typeName}`, {
+  // json_errsave_error names type json for json and jsonb input alike
+  void typeName;
+  return new PgError(SqlState.INVALID_TEXT_REPRESENTATION, 'invalid input syntax for type json', {
     detail,
     where: `JSON data, line ${line}: ${context}`,
   });
@@ -432,7 +434,7 @@ class JsonScanner {
               const low = /^\\u([dD][c-fC-F][0-9a-fA-F]{2})/.exec(t.slice(i + 6));
               if (!low) {
                 this.pos = i;
-                throw new PgError(SqlState.INVALID_TEXT_REPRESENTATION, `invalid input syntax for type ${this.typeName}`, {
+                throw new PgError(SqlState.INVALID_TEXT_REPRESENTATION, 'invalid input syntax for type json', {
                   detail: 'Unicode high surrogate must not follow a high surrogate.',
                 });
               }

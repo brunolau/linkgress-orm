@@ -1,8 +1,9 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { eq, PgClient } from '../../src';
 import type { LogSection, QueryOptions } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { testConnectionConfig } from '../utils/test-database';
+import { expectToReject } from '../utils/expect-rejects';
 
 /**
  * `logFailedQueries` — a production context keeps per-statement logging OFF
@@ -52,7 +53,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: false, logFailedQueries: true, logger: rec.logger });
 
-    await expect(failingRead(db)).rejects.toThrow(/invalid input syntax for type integer/);
+    await expectToReject(failingRead(db), /invalid input syntax for type integer/);
 
     const errors = rec.ofSection('error');
     expect(errors).toHaveLength(1);
@@ -68,7 +69,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: false, logger: rec.logger });
 
-    await expect(failingRead(db)).rejects.toThrow();
+    await expectToReject(failingRead(db));
 
     expect(rec.entries).toHaveLength(0);
   });
@@ -77,7 +78,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: true, logFailedQueries: false, logger: rec.logger });
 
-    await expect(failingRead(db)).rejects.toThrow();
+    await expectToReject(failingRead(db));
 
     expect(rec.ofSection('sql').length).toBeGreaterThan(0);
     expect(rec.ofSection('error')).toHaveLength(0);
@@ -87,7 +88,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: false, logFailedQueries: true, logParameters: true, logger: rec.logger });
 
-    await expect(failingRead(db)).rejects.toThrow();
+    await expectToReject(failingRead(db));
 
     const [entry] = rec.ofSection('error');
     expect(entry.msg).toContain('[Parameters] ["not-a-number"]');
@@ -97,7 +98,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: false, logFailedQueries: true, logParameters: false, logger: rec.logger });
 
-    await expect(failingRead(db)).rejects.toThrow();
+    await expectToReject(failingRead(db));
 
     // PostgreSQL itself quotes the offending literal in its message, so the assertion is
     // on the parameters LINE, not on the value.
@@ -109,7 +110,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({ logQueries: false, logFailedQueries: true, logger: rec.logger });
 
-    await expect(db.transaction(async ctx => failingRead(ctx))).rejects.toThrow(/invalid input syntax for type integer/);
+    await expectToReject(db.transaction(async ctx => failingRead(ctx)), /invalid input syntax for type integer/);
 
     const errors = rec.ofSection('error');
     expect(errors).toHaveLength(1);
@@ -121,9 +122,7 @@ describe('logFailedQueries', () => {
     const rec = recorder();
     const db = contextWith({});
 
-    await expect(
-      db.users.withQueryOptions({ logFailedQueries: true, logger: rec.logger }).where(u => eq(u.id, 'not-a-number' as unknown as number)).toList()
-    ).rejects.toThrow();
+    await expectToReject(db.users.withQueryOptions({ logFailedQueries: true, logger: rec.logger }).where(u => eq(u.id, 'not-a-number' as unknown as number)).toList());
 
     expect(rec.ofSection('error')).toHaveLength(1);
   });

@@ -17,6 +17,7 @@ export interface PgErrorFields {
   routine?: string;
   internalQuery?: string;
   internalPosition?: number;
+  noPosition?: boolean;
 }
 
 export class PgError extends Error {
@@ -34,6 +35,8 @@ export class PgError extends Error {
   routine?: string;
   internalQuery?: string;
   internalPosition?: number;
+  /** reported without a query position even when raised while analyzing a positioned node */
+  noPosition?: boolean;
 
   constructor(code: string, message: string, fields?: PgErrorFields, severity = 'ERROR') {
     super(message);

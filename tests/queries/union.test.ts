@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, lt } from '../../src';
 
@@ -231,7 +231,7 @@ describe('UNION Queries', () => {
           .firstOrDefault();
 
         expect(result).not.toBeNull();
-        expect(['alice', 'Alice Post 1']).toContain(result?.name);
+        expect(['alice', 'Alice Post 1']).toContain(result?.name as string);
       });
     });
 

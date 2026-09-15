@@ -12,6 +12,7 @@ import {
 } from './nodes';
 import { ExprKind, EXPR_KIND_NAMES, ParseState } from './parse-state';
 import { CoercionContext, CoercionPath, TypeUtil, isPolymorphic } from './typeutil';
+import { atPosition, exprLocation, positioned } from './location';
 
 /** What the analyzer needs from the session. */
 export interface AnalyzerEnv {
@@ -46,6 +47,10 @@ export class Analyzer {
   paramNames: string[] = [];
   /** function name for qualified parameter references (fname.param) */
   paramFunctionName = '';
+  /** a domain CHECK constraint being analyzed: `VALUE` is this executor parameter (CoerceToDomainValue) */
+  domainValue: { slot: number; type: number; typmod: number; collation: number } | null = null;
+  /** ephemeral named relations of a trigger function's statement: its transition tables */
+  transitionTables: { name: string; rel: import('../catalog/catalog').Relation; rows: unknown[][] }[] | null = null;
 
   constructor(
     readonly env: AnalyzerEnv,
@@ -188,9 +193,28 @@ export class Analyzer {
     const path = this.types.findCoercionPathway(targetBase, inputType, ccontext);
     let result = this.buildCoercion(expr, path, inputType, targetBase, targetTypmod, ccontext, format);
     if (isDomain) {
-      result = { k: 'domaincoerce', arg: result, type: targetType, typmod: targetTypmod, collation: result.collation, domainOid: targetType, format };
+      result = this.coerceToDomain(result, targetBase, targetType, targetTypmod, format);
     }
     return result;
+  }
+
+  /** The typmod a domain (chain) declares for its base type (getBaseTypeAndTypmod), or -1. */
+  domainBaseTypmod(domainType: number): number {
+    let t = this.catalog.getType(domainType);
+    for (let guard = 0; t && t.typtype === 'd' && guard < 32; guard++) {
+      if (t.typmod >= 0) {
+        return t.typmod;
+      }
+      t = this.catalog.getType(t.baseType);
+    }
+    return -1;
+  }
+
+  /** coerce_to_domain: apply the base type's typmod the domain declares, then check the domain's constraints. */
+  private coerceToDomain(arg: TExpr, baseType: number, domainType: number, typmod: number, format: 'explicit_cast' | 'implicit_cast'): TExpr {
+    const baseTypmod = this.domainBaseTypmod(domainType);
+    const coerced = baseTypmod >= 0 ? this.coerceTypeTypmod(arg, baseType, baseTypmod, format === 'explicit_cast', format) : arg;
+    return { k: 'domaincoerce', arg: coerced, type: domainType, typmod, collation: coerced.collation, domainOid: domainType, format };
   }
 
   private buildCoercion(expr: TExpr, path: CoercionPath, inputType: number, target: number, targetTypmod: number, ccontext: CoercionContext, format: 'explicit_cast' | 'implicit_cast'): TExpr {
@@ -272,6 +296,11 @@ export class Analyzer {
     const baseType = this.types.baseType(targetType);
     const collation = this.typeCollation(baseType);
     if (expr.isNull) {
+      if (baseType !== targetType) {
+        // a NULL coerced to a domain is still checked against its NOT NULL constraint (CoerceToDomain)
+        const nullConst: TExpr = { k: 'const', type: baseType, typmod: -1, collation, value: null, isNull: true };
+        return { k: 'domaincoerce', arg: nullConst, type: targetType, typmod: targetTypmod, collation, domainOid: targetType, format };
+      }
       return { k: 'const', type: targetType, typmod: targetTypmod, collation, value: null, isNull: true };
     }
     const t = this.catalog.getType(baseType);
@@ -282,10 +311,11 @@ export class Analyzer {
     // PostgreSQL passes typmod -1 to the input function (length checks are applied by the caller),
     // except for interval whose input routine needs it.
     const inputTypmod = baseType === TypeOid.interval ? targetTypmod : -1;
-    const value = inputValue(baseType, expr.value as string, inputTypmod, this.env.io);
+    // errors of the input function point at the literal (coerce_type's parser error position callback)
+    const value = atPosition(expr.location, () => inputValue(baseType, expr.value as string, inputTypmod, this.env.io));
     const node: TExpr = { k: 'const', type: baseType, typmod: inputTypmod, collation, value, isNull: false };
     if (baseType !== targetType) {
-      return { k: 'domaincoerce', arg: node, type: targetType, typmod: targetTypmod, collation, domainOid: targetType, format };
+      return this.coerceToDomain(node, baseType, targetType, targetTypmod, format);
     }
     return node;
   }
@@ -309,7 +339,16 @@ export class Analyzer {
     }
     // constant folding of length coercion for simple literals
     if (expr.k === 'const' && !expr.isNull) {
-      const folded = this.applyTypmodToValue(base, expr.value, targetTypmod, isExplicit);
+      let folded: unknown;
+      try {
+        folded = this.applyTypmodToValue(base, expr.value, targetTypmod, isExplicit);
+      } catch (e) {
+        // PostgreSQL applies the length coercion function when the plan runs: no query position
+        if (e instanceof PgError) {
+          e.noPosition = true;
+        }
+        throw e;
+      }
       if (folded !== undefined) {
         return { ...expr, value: folded, typmod: targetTypmod };
       }
@@ -365,12 +404,12 @@ export class Analyzer {
     if (expr.type !== TypeOid.bool) {
       const c = this.coerceToTargetType(expr, TypeOid.bool, -1, 'assignment', 'implicit_cast');
       if (!c) {
-        throw new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must be type boolean, not type ${this.types.formatType(expr.type, -1, false)}`);
+        throw positioned(new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must be type boolean, not type ${this.types.formatType(expr.type, -1, false)}`), exprLocation(expr));
       }
       expr = c;
     }
     if (expr.k === 'func' && expr.retset) {
-      throw new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must not return a set`);
+      throw positioned(new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must not return a set`), exprLocation(expr));
     }
     void pstate;
     return expr;
@@ -383,7 +422,7 @@ export class Analyzer {
     }
     const c = this.coerceToTargetType(expr, targetType, -1, 'assignment', 'implicit_cast');
     if (!c) {
-      throw new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must be type ${this.types.formatType(targetType, -1, false)}, not type ${this.types.formatType(expr.type, -1, false)}`);
+      throw positioned(new PgError(SqlState.DATATYPE_MISMATCH, `argument of ${constructName} must be type ${this.types.formatType(targetType, -1, false)}, not type ${this.types.formatType(expr.type, -1, false)}`), exprLocation(expr));
     }
     return c;
   }
@@ -395,7 +434,7 @@ export class Analyzer {
     }
     const c = this.coerceToTargetType(expr, targetType, -1, 'implicit', 'implicit_cast');
     if (!c) {
-      throw new PgError(SqlState.CANNOT_COERCE, `${context} could not convert type ${this.types.formatType(expr.type, -1, false)} to ${this.types.formatType(targetType, -1, false)}`);
+      throw positioned(new PgError(SqlState.CANNOT_COERCE, `${context} could not convert type ${this.types.formatType(expr.type, -1, false)} to ${this.types.formatType(targetType, -1, false)}`), exprLocation(expr));
     }
     return c;
   }

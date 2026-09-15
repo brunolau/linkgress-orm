@@ -1,21 +1,9 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGliteClient } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { expectToReject } from '../utils/expect-rejects';
 import { seedTestData } from '../utils/test-database';
-
-/**
- * PGlite loads its WASM and data bundles through dynamic `import()`, which jest's vm
- * context only allows under `--experimental-vm-modules` (`pnpm test:pglite` passes it;
- * Bun runs it natively). Without the flag these specs are skipped, not failed.
- */
-const canLoadPGlite =
-  typeof (globalThis as any).Bun !== 'undefined' ||
-  process.execArgv.includes('--experimental-vm-modules') ||
-  (process.env.NODE_OPTIONS ?? '').includes('--experimental-vm-modules');
-
-const describePGlite = canLoadPGlite ? describe : describe.skip;
 
 /** Ample time for a query that is NOT held back to run to completion (they take < 1 ms). */
 const letUnblockedQueriesRun = () => new Promise(resolve => setTimeout(resolve, 50));
@@ -37,7 +25,7 @@ const emptyDataDir = (): Promise<Blob> =>
     }
   })());
 
-describePGlite('PGliteClient', () => {
+describe('PGliteClient', () => {
   let client: PGliteClient;
 
   beforeAll(async () => {
@@ -196,7 +184,7 @@ describePGlite('PGliteClient', () => {
   });
 });
 
-describePGlite('PGliteClient instance ownership', () => {
+describe('PGliteClient instance ownership', () => {
   test('end() closes an instance the client created', async () => {
     const client = new PGliteClient();
     await client.query('SELECT 1');
@@ -276,7 +264,7 @@ describePGlite('PGliteClient instance ownership', () => {
   });
 });
 
-describePGlite('PGliteClient under a DbContext', () => {
+describe('PGliteClient under a DbContext', () => {
   test('a collection read through the multi-statement path returns the seeded rows', async () => {
     const db = new AppDatabase(new PGliteClient({ loadDataDir: await emptyDataDir() }), { collectionStrategy: 'temptable' });
 

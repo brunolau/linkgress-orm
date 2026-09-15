@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from '@jest/globals';
+import { describe, test, expect, beforeEach } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn,
@@ -183,6 +183,9 @@ describe('recreate changed indexes (auto-migration)', () => {
       const clientV2 = createFreshClient();
       v2 = new GinUsernameDb(clientV2);
 
+      // analyze() confirms a change by rebuilding the model's index on a scratch table, which needs
+      // search_normalize — migrate() creates it before analyzing; a fresh database has none yet.
+      await v2.getSchemaManager().ensureSearchNormalizeSupport();
       const plannedOps = await v2.getSchemaManager().analyze();
       const recreate = plannedOps.find(o => o.type === 'recreate_index');
       expect(recreate).toBeDefined();

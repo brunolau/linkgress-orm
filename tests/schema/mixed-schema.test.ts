@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase } from '../utils/test-database';
 import { eq } from '../../src';
 
@@ -113,7 +113,7 @@ describe('Mixed Schema Support in AppDatabase', () => {
 
       expect(postsWithActiveUsers).toHaveLength(2);
       expect(postsWithActiveUsers[0].user?.username).toBeDefined();
-      expect(['alice', 'bob']).toContain(postsWithActiveUsers[0].user?.username);
+      expect(['alice', 'bob']).toContain(postsWithActiveUsers[0].user?.username as string);
 
       // Find post by specific user - use select without chaining where for now
       const alicePosts = await db.schemaPosts

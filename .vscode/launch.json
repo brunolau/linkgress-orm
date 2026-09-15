@@ -51,65 +51,71 @@
       ]
     },
     {
-      "type": "node",
+      "type": "bun",
+      "name": "Bun: Run All Tests",
+      "program": "${workspaceFolder}/tests/run.ts",
+      "args": [],
       "request": "launch",
-      "name": "Jest: Run All Tests",
-      "program": "${workspaceFolder}/node_modules/.bin/jest",
-      "args": [
-        "--runInBand",
-        "--no-cache",
-        "--watchAll=false"
-      ],
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "neverOpen",
-      "envFile": "${workspaceFolder}/.env"
+      "envFile": "${workspaceFolder}/.env",
+      "internalConsoleOptions": "neverOpen"
     },
     {
-      "type": "node",
-      "request": "launch",
-      "name": "Jest: Run Current File",
-      "program": "${workspaceFolder}/node_modules/.bin/jest",
+      "type": "bun",
+      "name": "Bun: Run All Tests In Memory",
+      "program": "${workspaceFolder}/tests/run.ts",
       "args": [
-        "${fileBasenameNoExtension}",
-        "--runInBand",
-        "--no-cache",
-        "--watchAll=false"
+        "--memory"
       ],
+      "request": "launch",
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "neverOpen",
-      "envFile": "${workspaceFolder}/.env"
+      "envFile": "${workspaceFolder}/.env",
+      "internalConsoleOptions": "neverOpen"
     },
     {
-      "type": "node",
+      "type": "bun",
+      "name": "Bun: Debug Current Test File",
+      "runtimeArgs": [
+        "test",
+        "--timeout",
+        "30000"
+      ],
+      "program": "${file}",
       "request": "launch",
-      "name": "Jest: Watch All Tests",
-      "program": "${workspaceFolder}/node_modules/.bin/jest",
-      "args": [
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "internalConsoleOptions": "neverOpen"
+    },
+    {
+      "type": "bun",
+      "name": "Bun: Debug Selected Test",
+      "runtimeArgs": [
+        "test",
+        "--timeout",
+        "30000",
+        "--test-name-pattern",
+        "${selectedText}"
+      ],
+      "program": "${file}",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "internalConsoleOptions": "neverOpen"
+    },
+    {
+      "type": "bun",
+      "name": "Bun: Watch Current Test File",
+      "runtimeArgs": [
+        "test",
         "--watch",
-        "--runInBand"
+        "--timeout",
+        "30000"
       ],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "neverOpen",
-      "envFile": "${workspaceFolder}/.env"
-    },
-    {
-      "type": "node",
+      "program": "${file}",
       "request": "launch",
-      "name": "Jest: Debug Current Test",
-      "program": "${workspaceFolder}/node_modules/.bin/jest",
-      "args": [
-        "${fileBasenameNoExtension}",
-        "--runInBand",
-        "--no-cache",
-        "--testNamePattern=${selectedText}"
-      ],
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "neverOpen",
-      "envFile": "${workspaceFolder}/.env"
+      "envFile": "${workspaceFolder}/.env",
+      "internalConsoleOptions": "neverOpen"
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect } from 'bun:test';
 
 import { SlowQueryInfo, LogSection, eq } from '../../src';
 import { withDatabase } from '../utils/test-database';

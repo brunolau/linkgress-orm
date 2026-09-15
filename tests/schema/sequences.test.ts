@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { DbContext, DbEntity, DbColumn, DbEntityTable, DbModelConfig, integer, varchar, PgClient, sequence, DbSequence, like } from '../../src';
 
 // Test entity

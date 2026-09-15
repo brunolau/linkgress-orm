@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import 'dotenv/config';
 import { DbColumn, DbContext, DbEntity, DbEntityTable, DbModelConfig, eq, integer, PostgresClient, QueryTimeoutError, varchar } from '../../src';
 import type { QueryOptions } from '../../src';

@@ -33,7 +33,29 @@ export type Expr =
   | SetToDefault
   | GroupingFunc
   | AStar
+  | JsonFuncExpr
   | ParenExpr;
+
+export interface JsonBehavior {
+  kind: 'error' | 'null' | 'true' | 'false' | 'unknown' | 'empty_array' | 'empty_object' | 'default';
+  expr?: Expr;
+}
+
+/** SQL/JSON query functions (JSON_VALUE, JSON_QUERY, JSON_EXISTS) and the IS JSON predicate. */
+export interface JsonFuncExpr extends Loc {
+  kind: 'JsonFuncExpr';
+  op: 'json_value' | 'json_query' | 'json_exists' | 'is_json';
+  ctx: Expr;
+  path: Expr | null;
+  passing: { name: string; expr: Expr }[];
+  returning: TypeName | null;
+  onEmpty: JsonBehavior | null;
+  onError: JsonBehavior | null;
+  wrapper: 'none' | 'conditional' | 'unconditional';
+  omitQuotes: boolean;
+  itemType: 'value' | 'object' | 'array' | 'scalar';
+  uniqueKeys: boolean;
+}
 
 export interface ColumnRef extends Loc {
   kind: 'ColumnRef';
@@ -341,8 +363,8 @@ export interface CommonTableExpr extends Loc {
   aliasColnames?: string[];
   materialized: 'DEFAULT' | 'ALWAYS' | 'NEVER';
   query: Statement;
-  search?: { breadthFirst: boolean; columns: string[]; seqColumn: string };
-  cycle?: { columns: string[]; markColumn: string; markValue?: Expr; markDefault?: Expr; pathColumn: string };
+  search?: { breadthFirst: boolean; columns: string[]; seqColumn: string; loc?: number };
+  cycle?: { columns: string[]; markColumn: string; markValue?: Expr; markDefault?: Expr; pathColumn: string; loc?: number };
 }
 
 export interface WithClause {
@@ -767,7 +789,11 @@ export interface CreateTriggerStmt extends Loc {
   events: ('INSERT' | 'UPDATE' | 'DELETE' | 'TRUNCATE')[];
   updateColumns?: string[];
   forEachRow: boolean;
+  /** REFERENCING NEW TABLE AS … / OLD TABLE AS … (in the order written) */
+  transitionRels?: { isNew: boolean; name: string }[];
   when: Expr | null;
+  /** source text of the WHEN condition */
+  whenText?: string;
   funcname: string[];
   args: string[];
 }
@@ -859,6 +885,8 @@ export interface GenericNoopStmt extends Loc {
   /** command tag reported to the client */
   tag: string;
   description: string;
+  /** SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE } */
+  setConstraints?: { all: boolean; names: string[][]; deferred: boolean };
 }
 
 export interface LockStmt extends Loc {

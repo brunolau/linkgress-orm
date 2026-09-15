@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { array } from '../../src';
 import { createFreshClient } from '../utils/test-database';
 import type { DatabaseClient } from '../../src';

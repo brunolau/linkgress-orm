@@ -1,7 +1,8 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, boolean, and, eq, exists, notExists, sql } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
+import { expectToReject } from '../utils/expect-rejects';
 
 /**
  * Correlated standalone EXISTS where the INNER table declares a hasOne navigation whose
@@ -166,15 +167,13 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 		// alias in one scope. The inner join would shadow the outer table and the correlation
 		// would bind to the inner row — the same silent misbinding the same-table guard
 		// refuses. Fail loudly instead, and say what to do about it.
-		await expect(db.libraries
+		await expectToReject(db.libraries
 			.where(l => exists(db.shelves
 				.where(s => and(eq(s.libraryId, l.id), eq(s.library!.name, 'Central')))
 				.select(s => ({ id: s.id }))
 				.asSubquery()))
 			.select(l => ({ name: l.name }))
-			.toList())
-			.rejects
-			.toThrow(/would shadow the outer table/i);
+			.toList(), /would shadow the outer table/i);
 	});
 
 	test('an outer reference in the subquery SELECT does not drag in a join either', async () => {
@@ -281,7 +280,7 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 
 	test('the shadow clash is refused in the GROUPED path too', async () => {
 		// Adding `.groupBy()` must not turn the loud refusal back into a silent wrong answer.
-		await expect(db.libraries
+		await expectToReject(db.libraries
 			.where(l => exists(db.shelves
 				.where(s => and(eq(s.libraryId, l.id), eq(s.library!.name, 'Central')))
 				.select(s => ({ libraryId: s.libraryId }))
@@ -289,9 +288,7 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 				.select(g => ({ libraryId: g.key.libraryId }))
 				.asSubquery()))
 			.select(l => ({ name: l.name }))
-			.toList())
-			.rejects
-			.toThrow(/would shadow the outer table/i);
+			.toList(), /would shadow the outer table/i);
 	});
 
 	test('a collection lambda traversing the INVERSE navigation resolves to its own parent', async () => {
@@ -318,15 +315,13 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 		// The refusal used to inspect only the WHERE, so naming the colliding navigation in the
 		// projection slipped past it and misbound silently. EXISTS ignores the select list, which
 		// is exactly why nothing else would have caught it.
-		await expect(db.libraries
+		await expectToReject(db.libraries
 			.where(l => exists(db.shelves
 				.where(s => eq(s.libraryId, l.id))
 				.select(s => ({ id: s.id, libName: s.library!.name }))
 				.asSubquery()))
 			.select(l => ({ name: l.name }))
-			.toList())
-			.rejects
-			.toThrow(/would shadow the outer table/i);
+			.toList(), /would shadow the outer table/i);
 	});
 
 	test('traversing the navigation without correlating on it still works', async () => {

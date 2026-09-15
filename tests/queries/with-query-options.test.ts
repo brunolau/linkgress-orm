@@ -1,3 +1,4 @@
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, createTestDatabase, setupDatabase, seedTestData, cleanupDatabase } from '../utils/test-database';
 import { gt, eq } from '../../src/query/conditions';
 import { assertType } from '../utils/type-tester';

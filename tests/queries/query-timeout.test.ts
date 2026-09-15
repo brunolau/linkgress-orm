@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import 'dotenv/config';
+import postgres from 'postgres';
 
 import { PostgresClient, QueryTimeoutError, sql } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
@@ -125,7 +126,6 @@ describe('Query timeouts (PostgresClient)', () => {
     let client: PostgresClient;
 
     beforeAll(() => {
-      const postgres = require('postgres');
       const { max, ...rest } = connectionBase;
       sqlInstance = postgres({ ...rest, max, connection: { statement_timeout: 400 } });
       client = new PostgresClient(sqlInstance);
@@ -160,7 +160,6 @@ describe('Query timeouts (PostgresClient)', () => {
     });
 
     it('leaves the sentinel alone when the instance sets no statement_timeout', async () => {
-      const postgres = require('postgres');
       const plain = postgres({ ...connectionBase });
       const plainClient = new PostgresClient(plain);
       try {
@@ -215,7 +214,6 @@ describe('Query timeouts (PostgresClient)', () => {
       // Mirrors how an app wires this up: it builds the pool, hands the instance to the
       // client, and routes DbContext's logger to its own logging stack. The `[SQL Error]`
       // line is what an operator actually reads, so it must carry the cap that fired.
-      const postgres = require('postgres');
       const { max, ...rest } = connectionBase;
       const sqlInstance = postgres({ ...rest, max, connection: { statement_timeout: 400 } });
       const client = new PostgresClient(sqlInstance);

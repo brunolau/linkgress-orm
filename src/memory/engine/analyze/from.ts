@@ -21,6 +21,7 @@ import {
 } from './nodes';
 import { NsItem, ParseState } from './parse-state';
 import { analyzeSelectStmt, analyzeStatementAsSubquery } from './select';
+import { atPosition } from './location';
 
 export interface FromResult {
   node: JoinTreeNode;
@@ -94,6 +95,7 @@ export function transformFromItem(an: Analyzer, pstate: ParseState, item: A.From
           kind: 'subquery',
           subquery: query,
           alias: item.alias?.name,
+          userColnames: !!item.alias?.colnames?.length,
           eref: { aliasname: item.alias?.name ?? 'unnamed_subquery', colnames },
           colTypes: targets.map((t) => ({ type: t.expr.type, typmod: t.expr.typmod, collation: t.expr.collation })),
           lateral: item.lateral,
@@ -196,12 +198,33 @@ function transformRangeVar(an: Analyzer, pstate: ParseState, rv: A.RangeVar): Fr
         eref: { aliasname: rv.alias?.name ?? rv.name, colnames },
         colTypes: cte.colTypes,
         lateral: false,
+        userColnames: !!rv.alias?.colnames?.length,
+      };
+      const rtIndex = addRte(pstate, rte);
+      return { node: { k: 'ref', rtIndex }, namespace: [makeNsItem(rtIndex, rte)], rtIndex };
+    }
+    // scanNameSpaceForENR: a transition table of the trigger function running this statement
+    const enr = an.transitionTables?.find((t) => t.name === rv.name);
+    if (enr) {
+      const live = enr.rel.columns.filter((c) => !c.isDropped);
+      const rte: CatalogRTE = {
+        kind: 'catalog',
+        relOid: enr.rel.oid,
+        relname: enr.name,
+        nspname: '',
+        alias: rv.alias?.name,
+        eref: { aliasname: rv.alias?.name ?? enr.name, colnames: checkAliasColumns(rv.alias, live.map((c) => c.name), enr.name) },
+        colTypes: live.map((c) => ({ type: c.typeOid, typmod: c.typmod, collation: c.collation })),
+        lateral: false,
+        transitionRows: enr.rows.map((data) => live.map((c) => (c.attnum - 1 < data.length ? data[c.attnum - 1] : c.hasMissing ? c.missingValue : null))),
+        rowTypeOid: enr.rel.rowTypeOid || undefined,
       };
       const rtIndex = addRte(pstate, rte);
       return { node: { k: 'ref', rtIndex }, namespace: [makeNsItem(rtIndex, rte)], rtIndex };
     }
   }
-  const rel = lookupRelation(an, rv)!;
+  // parserOpenTable: a missing relation is reported at its reference
+  const rel = atPosition(rv.loc, () => lookupRelation(an, rv)!);
   const rtIndex = addRelationRte(an, pstate, rel, rv.alias, rv.inh, rv.name);
   const rte = pstate.query.rtable[rtIndex];
   return { node: { k: 'ref', rtIndex }, namespace: [makeNsItem(rtIndex, rte)], rtIndex };
@@ -232,6 +255,7 @@ export function addRelationRte(an: Analyzer, pstate: ParseState, rel: Relation, 
       eref: { aliasname: alias?.name ?? rel.name, colnames },
       colTypes: targets.map((t, i) => ({ type: live[i]?.typeOid ?? t.expr.type, typmod: t.expr.typmod, collation: t.expr.collation })),
       lateral: false,
+      viewOid: rel.oid,
     };
     return addRte(pstate, rte);
   }
@@ -279,10 +303,20 @@ function transformRangeFunction(an: Analyzer, pstate: ParseState, item: A.RangeF
   const functions: RangeFunctionItem[] = [];
   const colnames: string[] = [];
   const colTypes: TypeInfo[] = [];
-  for (const f of item.functions) {
+  let items = item.functions;
+  // an unqualified multi-argument UNNEST in FROM is ROWS FROM (unnest(arg1), unnest(arg2), ...)
+  if (items.length === 1 && !item.coldeflist && !items[0].coldeflist) {
+    const fc = items[0].func;
+    if (fc.kind === 'FuncCall' && fc.name.length === 1 && fc.name[0] === 'unnest' && fc.args.length > 1 && fc.aggOrder.length === 0 && !fc.aggFilter && !fc.over && !fc.aggStar && !fc.aggDistinct && !fc.funcVariadic) {
+      items = fc.args.map((arg) => ({ func: { ...fc, name: ['pg_catalog', 'unnest'], args: [arg] } }));
+    }
+  } else if (items.some((f) => f.func.kind === 'FuncCall' && f.func.name.length === 1 && f.func.name[0] === 'unnest' && f.func.args.length > 1 && !f.coldeflist)) {
+    throw new PgError(SqlState.SYNTAX_ERROR, 'UNNEST() with multiple arguments cannot appear in a ROWS FROM() list');
+  }
+  for (const f of items) {
     const expr = transformExpr(an, pstate, f.func, 'from_function');
-    const coldeflist = f.coldeflist ?? (item.functions.length === 1 ? item.coldeflist : undefined);
-    const fi = describeRangeFunction(an, expr, coldeflist, item.functions.length === 1 ? item.alias : undefined);
+    const coldeflist = f.coldeflist ?? (items.length === 1 ? item.coldeflist : undefined);
+    const fi = describeRangeFunction(an, expr, coldeflist, items.length === 1 ? item.alias : undefined);
     functions.push(fi);
     colnames.push(...fi.colNames);
     colTypes.push(...fi.colTypes);
@@ -291,7 +325,8 @@ function transformRangeFunction(an: Analyzer, pstate: ParseState, item: A.RangeF
     colnames.push('ordinality');
     colTypes.push({ type: TypeOid.int8, typmod: -1, collation: 0 });
   }
-  const aliasName = item.alias?.name ?? (functions.length === 1 ? functionName(functions[0].expr) : 'unnamed_rows_from');
+  // addRangeTableEntryForFunction: without an alias, the (first) function's name
+  const aliasName = item.alias?.name ?? functionName(functions[0].expr);
   const finalNames = checkAliasColumns(item.alias, colnames, aliasName);
   return {
     kind: 'function',

@@ -350,7 +350,7 @@ export class SqlParser extends Parser {
     // CREATE TABLE ... AS
     if (this.atKw('AS') && stmt.columns.length === 0 && !stmt.partitionOf) {
       this.next();
-      const query = this.parsePreparableStatement();
+      const query = this.atKw('EXECUTE') ? this.parseStatement() : this.parsePreparableStatement();
       let withData = true;
       if (this.acceptKw('WITH')) {
         withData = !this.acceptKw('NO');
@@ -1123,6 +1123,7 @@ export class SqlParser extends Parser {
     this.expectKw('ON');
     const relation = this.parseRangeVar();
     let forEachRow = false;
+    const transitionRels: { isNew: boolean; name: string }[] = [];
     while (true) {
       if (this.acceptKw('FOR')) {
         this.acceptKw('EACH');
@@ -1131,10 +1132,10 @@ export class SqlParser extends Parser {
       }
       if (this.acceptKw('REFERENCING')) {
         while (this.atKw('OLD', 'NEW')) {
-          this.next();
+          const isNew = this.next().kw === 'NEW';
           this.expectKw('TABLE');
           this.acceptKw('AS');
-          this.parseName();
+          transitionRels.push({ isNew, name: this.parseName() });
         }
         continue;
       }
@@ -1152,9 +1153,12 @@ export class SqlParser extends Parser {
       break;
     }
     let when: A.Expr | null = null;
+    let whenText: string | undefined;
     if (this.acceptKw('WHEN')) {
       this.expectPunct('(');
+      const startIdx = this.pos;
       when = this.parseExpr();
+      whenText = this.textFrom(startIdx);
       this.expectPunct(')');
     }
     this.expectKw('EXECUTE');
@@ -1168,7 +1172,7 @@ export class SqlParser extends Parser {
       } while (this.acceptPunct(','));
     }
     this.expectPunct(')');
-    return { kind: 'CreateTriggerStmt', replace, name, relation, timing, events, updateColumns, forEachRow, when, funcname, args, loc };
+    return { kind: 'CreateTriggerStmt', replace, name, relation, timing, events, updateColumns, forEachRow, transitionRels, when, whenText, funcname, args, loc };
   }
 
   private parseCreateView(replace: boolean, temp: boolean, loc: number): A.ViewStmt {
@@ -1520,7 +1524,7 @@ export class SqlParser extends Parser {
         this.expectPunct(')');
         return { kind: 'SET_COLUMN_OPTIONS', name, options, reset };
       }
-      if (this.atKw('SET') && this.isKw(this.peek(1), 'GENERATED', 'INCREMENT', 'START', 'RESTART', 'MINVALUE', 'MAXVALUE', 'CACHE', 'CYCLE', 'NO')) {
+      if ((this.atKw('SET') && this.isKw(this.peek(1), 'GENERATED', 'INCREMENT', 'START', 'RESTART', 'MINVALUE', 'MAXVALUE', 'CACHE', 'CYCLE', 'NO')) || this.atKw('RESTART')) {
         const seqOptions: A.SequenceOption[] = [];
         let always: boolean | undefined;
         while (this.atKw('SET', 'RESTART')) {
@@ -1919,8 +1923,15 @@ export class SqlParser extends Parser {
       return { kind: 'NoopStmt', tag: 'SET', description: 'SET ROLE', loc };
     }
     if (this.acceptKw('CONSTRAINTS')) {
-      this.skipToStatementEnd();
-      return { kind: 'NoopStmt', tag: 'SET CONSTRAINTS', description: 'SET CONSTRAINTS', loc };
+      const all = this.acceptKw('ALL');
+      const names: string[][] = [];
+      if (!all) {
+        do {
+          names.push(this.parseAnyName());
+        } while (this.acceptPunct(','));
+      }
+      const deferred = this.expectKw('DEFERRED', 'IMMEDIATE').kw === 'DEFERRED';
+      return { kind: 'NoopStmt', tag: 'SET CONSTRAINTS', description: 'SET CONSTRAINTS', setConstraints: { all, names, deferred }, loc };
     }
     let name = this.parseName();
     while (this.acceptPunct('.')) {

@@ -4,19 +4,21 @@ import { TExpr } from '../../analyze/nodes';
 import { ageTimestamps, Interval, USECS_PER_DAY, USECS_PER_SEC } from '../../types/datetime';
 import { applyCharTypmod, outputValue, roundTime, roundTimestamp } from '../../types/io';
 import { PgNumeric } from '../../types/numeric';
+import { numericLog } from '../../types/numeric-math';
 import { FnImpl } from '../runtime';
 import { TypeOps } from '../typeops';
 import { ARRAY_FUNCS, ARRAY_SRFS } from './array-fns';
 import { DATETIME_FUNCS } from './datetime-fns';
 import { JSON_FUNCS, JSON_PATH_FUNCS, JSON_SRFS } from './json-fns';
 import { genericArith, genericNumericCast, NUMERIC_FUNCS } from './numeric-fns';
+import { RANGE_FUNCS, RANGE_SRFS } from './range-fns';
 import { SYSTEM_FUNCS, SYSTEM_SRFS } from './system-fns';
-import { TEXT_FUNCS } from './text-fns';
+import { TEXT_FUNCS, TEXT_SRFS } from './text-fns';
 
 const SRC_MAP = new Map<string, FnImpl>();
 const SRF_MAP = new Map<string, FnImpl>();
 
-for (const table of [NUMERIC_FUNCS, TEXT_FUNCS, DATETIME_FUNCS, JSON_FUNCS, JSON_PATH_FUNCS, ARRAY_FUNCS, SYSTEM_FUNCS]) {
+for (const table of [NUMERIC_FUNCS, TEXT_FUNCS, DATETIME_FUNCS, JSON_FUNCS, JSON_PATH_FUNCS, ARRAY_FUNCS, SYSTEM_FUNCS, RANGE_FUNCS]) {
   for (const [k, v] of Object.entries(table)) {
     SRC_MAP.set(k, v);
   }
@@ -25,7 +27,7 @@ for (const table of [NUMERIC_FUNCS, TEXT_FUNCS, DATETIME_FUNCS, JSON_FUNCS, JSON
 // textanycat(text, anynonarray) / anytextcat(anynonarray, text): the non-text side goes through its output function
 SRC_MAP.set('select $1 operator(pg_catalog.||) $2::pg_catalog.text', (a, fc) => (a[0] as string) + outputValue(fc.argTypes[1], a[1], fc.st.session.io));
 SRC_MAP.set('select $1::pg_catalog.text operator(pg_catalog.||) $2', (a, fc) => outputValue(fc.argTypes[0], a[0], fc.st.session.io) + (a[1] as string));
-for (const table of [JSON_SRFS, ARRAY_SRFS, SYSTEM_SRFS]) {
+for (const table of [JSON_SRFS, ARRAY_SRFS, SYSTEM_SRFS, TEXT_SRFS, RANGE_SRFS]) {
   for (const [k, v] of Object.entries(table)) {
     SRF_MAP.set(k, v);
   }
@@ -143,10 +145,8 @@ const NAME_MAP: Record<string, FnImpl> = {
   'obj_description/1': (a, fc) => fc.st.session.catalogFns.objDescription(a[0] as number, null),
   'col_description/2': (a, fc) => fc.st.session.catalogFns.colDescription(a[0] as number, a[1] as number),
   'shobj_description/2': () => null,
-  'log/1': (a) => {
-    const n = a[0] as PgNumeric;
-    return PgNumeric.parse(Math.log10(n.toNumber()).toFixed(16));
-  },
+  // log(numeric) is SQL: log(10, $1)
+  'log/1': (a) => numericLog(PgNumeric.fromInt(10), a[0] as PgNumeric),
   'round/1': (a) => (a[0] as PgNumeric).round(0),
   'trunc/1': (a) => (a[0] as PgNumeric).trunc(0),
   'to_timestamp/1': (a, fc) => SRC_MAP.get('float8_timestamptz')!(a, fc),
@@ -229,6 +229,18 @@ export function lookupFunction(src: string, node: TExpr, typeOps: TypeOps, argTy
     const g = genericArith(name, argTypes, node.type);
     if (g) {
       return g;
+    }
+    if (src === '' && argTypes.length === 2) {
+      // SQL-bodied builtin operators are the commuted form of another one (interval + date is `select $2 + $1`)
+      const commuted = typeOps
+        .catalog()
+        .builtin.operatorsByName.get(name)
+        ?.find((o) => o.kind === 'b' && o.left === argTypes[1] && o.right === argTypes[0] && o.codeSrc !== '');
+      const impl = commuted ? SRC_MAP.get(commuted.codeSrc) : undefined;
+      if (impl) {
+        const swapped = [argTypes[1], argTypes[0]];
+        return (a, fc) => impl([a[1], a[0]], { ...fc, argTypes: swapped });
+      }
     }
   }
   if (node.k === 'func') {

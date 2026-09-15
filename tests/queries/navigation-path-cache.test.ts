@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, test } from '@jest/globals';
+import { afterAll, afterEach, describe, expect, test } from 'bun:test';
 import { MockRowCache, NavigationPathCache } from '../../src';
 import { withDatabase, seedTestData } from '../utils/test-database';
 

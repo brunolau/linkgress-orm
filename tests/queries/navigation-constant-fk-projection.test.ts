@@ -36,7 +36,7 @@
  * The tests MUST FAIL on current main and PASS after the fix.
  */
 
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withCapturedSql } from '../utils/test-database';
 import {
   DatabaseClient,

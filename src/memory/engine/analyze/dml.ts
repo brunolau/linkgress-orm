@@ -2,11 +2,14 @@ import type * as A from '../ast';
 import { Column, Relation, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import type { Analyzer } from './analyzer';
-import { transformExpr, transformExprRecurse } from './expr';
+import { varForColumn } from './colref';
+import { compositeFields, transformExpr, transformExprRecurse, transformSubscripts } from './expr';
 import { addRelationRte, addRte, lookupRelation, transformFromClause, transformFromItem } from './from';
-import { emptyQuery, MergeAction, OnConflictSpec, Query, SubLinkNode, SubqueryRTE, TExpr } from './nodes';
+import { emptyQuery, makeNullConst, MergeAction, OnConflictSpec, Query, RelationRTE, SubLinkNode, SubqueryRTE, TargetEntry, TExpr } from './nodes';
+import { rewriteTargetView } from './view-rewrite';
 import { NsItem, ParseState } from './parse-state';
 import { analyzeSelectStmt, resolveTargetListUnknowns, transformTargetList, transformWithClause } from './select';
+import { atPosition, exprLocation, positioned, rawLocation } from './location';
 
 export function analyzeDmlStatement(an: Analyzer, stmt: A.Statement, pstate: ParseState): Query {
   switch (stmt.kind) {
@@ -30,12 +33,19 @@ function liveColumns(rel: Relation): Column[] {
 }
 
 function openTarget(an: Analyzer, rv: A.RangeVar, verb: string): Relation {
-  const rel = lookupRelation(an, rv)!;
+  const rel = atPosition(rv.loc, () => lookupRelation(an, rv)!);
   if (rel.isBuiltinCatalog) {
     throw new PgError(SqlState.INSUFFICIENT_PRIVILEGE, `permission denied for table ${rel.name}`);
   }
-  if (rel.kind === 'v' || rel.kind === 'm') {
-    throw new PgError(SqlState.WRONG_OBJECT_TYPE, `cannot ${verb} ${rel.kind === 'v' ? 'view' : 'materialized view'} "${rel.name}"`);
+  if (rel.kind === 'v' && verb !== 'merge into') {
+    // an automatically updatable view: rewritten onto its base relation once analyzed (view-rewrite.ts)
+    return rel;
+  }
+  if (rel.kind === 'm') {
+    throw new PgError(SqlState.WRONG_OBJECT_TYPE, `cannot change materialized view "${rel.name}"`);
+  }
+  if (rel.kind === 'v') {
+    throw new PgError(SqlState.WRONG_OBJECT_TYPE, `cannot ${verb} view "${rel.name}"`);
   }
   if (rel.kind === 'S') {
     throw new PgError(SqlState.WRONG_OBJECT_TYPE, `cannot change sequence "${rel.name}"`);
@@ -46,15 +56,36 @@ function openTarget(an: Analyzer, rv: A.RangeVar, verb: string): Relation {
   return rel;
 }
 
+/** The result relation's range table entry (a view stays a relation entry until it is rewritten). */
+function addTargetRte(an: Analyzer, pstate: ParseState, rel: Relation, rv: A.RangeVar, inh: boolean): number {
+  if (rel.kind !== 'v') {
+    return addRelationRte(an, pstate, rel, rv.alias, inh, rv.name);
+  }
+  const live = liveColumns(rel);
+  const rte: RelationRTE = {
+    kind: 'relation',
+    relOid: rel.oid,
+    relkind: rel.kind,
+    relname: rv.name,
+    alias: rv.alias?.name,
+    eref: { aliasname: rv.alias?.name ?? rel.name, colnames: live.map((c) => c.name) },
+    colTypes: live.map((c) => ({ type: c.typeOid, typmod: c.typmod, collation: c.collation })),
+    attnums: live.map((c) => c.attnum),
+    inh,
+    lateral: false,
+  };
+  return addRte(pstate, rte);
+}
+
 function targetNsItem(pstate: ParseState, rtIndex: number): NsItem {
   return { rtIndex, rte: pstate.query.rtable[rtIndex], relVisible: true, colsVisible: true, lateralOnly: false, lateralOk: true };
 }
 
-function findColumn(rel: Relation, name: string): { col: Column; index: number } {
+function findColumn(rel: Relation, name: string, loc?: number): { col: Column; index: number } {
   const live = liveColumns(rel);
   const index = live.findIndex((c) => c.name === name);
   if (index < 0) {
-    throw new PgError(SqlState.UNDEFINED_COLUMN, `column "${name}" of relation "${rel.name}" does not exist`);
+    throw positioned(new PgError(SqlState.UNDEFINED_COLUMN, `column "${name}" of relation "${rel.name}" does not exist`), loc);
   }
   return { col: live[index], index };
 }
@@ -127,29 +158,58 @@ function transformInsert(an: Analyzer, stmt: A.InsertStmt, pstate: ParseState): 
     transformWithClause(an, pstate, stmt.with);
   }
   const rel = openTarget(an, stmt.relation, 'insert into');
-  const resultRt = addRelationRte(an, pstate, rel, stmt.relation.alias, false, stmt.relation.name);
+  const resultRt = addTargetRte(an, pstate, rel, stmt.relation, false);
   q.resultRelation = resultRt;
   q.override = stmt.override;
   const live = liveColumns(rel);
 
-  // target columns
+  // target columns (checkInsertTargets): a column may be named several times only with subscripts / subfields
   let cols: number[];
+  const indirections: (A.IndirectionEl[] | null)[] = [];
   if (stmt.cols) {
     cols = [];
+    const whole = new Set<number>();
+    const partial = new Set<number>();
     for (const c of stmt.cols) {
-      if (c.indirection) {
-        throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'INSERT into array elements / subfields is not supported by the in-memory engine');
+      const { index } = findColumn(rel, c.name!, c.loc);
+      const indirection = c.indirection && c.indirection.length > 0 ? c.indirection : null;
+      if (whole.has(index) || (!indirection && partial.has(index))) {
+        throw positioned(new PgError(SqlState.DUPLICATE_COLUMN, `column "${c.name}" specified more than once`), c.loc);
       }
-      const { index } = findColumn(rel, c.name!);
-      if (cols.includes(index)) {
-        throw new PgError(SqlState.DUPLICATE_COLUMN, `column "${c.name}" specified more than once`);
-      }
+      (indirection ? partial : whole).add(index);
       cols.push(index);
+      indirections.push(indirection);
     }
   } else {
     cols = live.map((_, i) => i);
   }
-  q.insertColumns = cols;
+  const hasIndirection = indirections.some((x) => x);
+  /** rewriteTargetListIU: the values of one row's targets, merged per column (assignments to parts compose over NULL) */
+  const mergeTargets = (values: (TExpr | null)[]): { columns: number[]; exprs: (TExpr | null)[] } => {
+    const columns: number[] = [];
+    const exprs: (TExpr | null)[] = [];
+    values.forEach((v, i) => {
+      const indirection = indirections[i];
+      if (!indirection) {
+        columns.push(cols[i]);
+        exprs.push(v);
+        return;
+      }
+      const col = live[cols[i]];
+      const target = stmt.cols![i];
+      const at = columns.indexOf(cols[i]);
+      const base = at >= 0 ? exprs[at]! : makeNullConst(col.typeOid, col.typmod, col.collation);
+      const value = atPosition(target.loc, () => assignIndirection(an, pstate, base, indirection, v!, col.name));
+      if (at >= 0) {
+        exprs[at] = value;
+      } else {
+        columns.push(cols[i]);
+        exprs.push(value);
+      }
+    });
+    return { columns, exprs };
+  };
+  q.insertColumns = hasIndirection ? [...new Set(cols)] : cols;
 
   const sel = stmt.select;
   if (sel === null) {
@@ -160,30 +220,36 @@ function transformInsert(an: Analyzer, stmt: A.InsertStmt, pstate: ParseState): 
     try {
       for (const row of sel.values) {
         if (row.length > cols.length) {
-          throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns');
+          throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns'), rawLocation(row[cols.length]));
         }
         if (row.length < cols.length && stmt.cols) {
-          throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions');
+          throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions'), stmt.cols[row.length].loc);
         }
         const out: (TExpr | null)[] = [];
         row.forEach((e, i) => {
           const col = live[cols[i]];
           if (e.kind === 'SetToDefault') {
+            const indirection = indirections[i];
+            if (indirection) {
+              const el = indirection[indirection.length - 1];
+              throw positioned(new PgError(SqlState.FEATURE_NOT_SUPPORTED, el.type === 'index' ? 'cannot set an array element to DEFAULT' : 'cannot set a subfield to DEFAULT'), stmt.cols![i].loc);
+            }
             out.push(null);
             return;
           }
           const x = transformExpr(an, pstate, e, 'values');
-          out.push(an.coerceForAssignment(x, col.typeOid, col.typmod, col.name));
+          out.push(indirections[i] ? x : an.coerceForAssignment(x, col.typeOid, col.typmod, col.name));
         });
         // implicit column list shorter than table: remaining columns default
-        rows.push(out);
+        rows.push(hasIndirection ? mergeTargets(out).exprs : out);
       }
     } finally {
       pstate.allowDefault = false;
     }
     // identity / generated checks (a column is fine when DEFAULT in every row)
-    for (let i = 0; i < cols.length; i++) {
-      const col = live[cols[i]];
+    const insertCols = q.insertColumns;
+    for (let i = 0; i < insertCols.length; i++) {
+      const col = live[insertCols[i]];
       const anyValue = rows.some((r) => i < r.length && r[i] !== null);
       if (anyValue) {
         checkAssignedValue(col, false, stmt.override, false);
@@ -197,26 +263,42 @@ function transformInsert(an: Analyzer, stmt: A.InsertStmt, pstate: ParseState): 
     const sub = analyzeSelectStmt(an, sel, child);
     const targets = sub.targetList.filter((t) => !t.resjunk);
     if (targets.length > cols.length) {
-      throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns');
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns'), exprLocation(targets[cols.length].expr));
     }
     if (targets.length < cols.length && stmt.cols) {
-      throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions');
+      throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions'), stmt.cols[targets.length].loc);
     }
     targets.forEach((te, i) => {
       const col = live[cols[i]];
-      te.expr = an.coerceForAssignment(te.expr, col.typeOid, col.typmod, col.name);
+      if (!indirections[i]) {
+        te.expr = an.coerceForAssignment(te.expr, col.typeOid, col.typmod, col.name);
+      }
       checkAssignedValue(col, false, stmt.override, false);
     });
-    const rte: SubqueryRTE = {
+    const subqueryRte = (query: Query, entries: TargetEntry[]): SubqueryRTE => ({
       kind: 'subquery',
-      subquery: sub,
-      eref: { aliasname: '*SELECT*', colnames: targets.map((t) => t.name) },
-      colTypes: targets.map((t) => ({ type: t.expr.type, typmod: t.expr.typmod, collation: t.expr.collation })),
+      subquery: query,
+      eref: { aliasname: '*SELECT*', colnames: entries.map((t) => t.name) },
+      colTypes: entries.map((t) => ({ type: t.expr.type, typmod: t.expr.typmod, collation: t.expr.collation })),
       lateral: false,
-    };
+    });
+    let rte = subqueryRte(sub, targets);
+    if (hasIndirection) {
+      // the assignments to parts of a column apply over the SELECT's output columns, one level up
+      const wrapper = emptyQuery();
+      wrapper.rtable.push(rte);
+      wrapper.fromlist.push({ k: 'ref', rtIndex: 0 });
+      // constants (untyped literals among them) are coerced where they are written, as PostgreSQL reports them
+      const vars: TExpr[] = targets.map((t, i) => (t.expr.k === 'const' ? t.expr : { k: 'var', levelsUp: 0, rtIndex: 0, attno: i, type: t.expr.type, typmod: t.expr.typmod, collation: t.expr.collation }));
+      const merged = mergeTargets(vars);
+      wrapper.targetList = merged.exprs.map((e, i) => ({ expr: e!, resno: i + 1, name: live[merged.columns[i]].name, resjunk: false, sortGroupRef: 0, origTable: 0, origColumn: 0 }));
+      rte = subqueryRte(wrapper, wrapper.targetList);
+    }
     const rtIndex = addRte(pstate, rte);
     q.insertSource = { kind: 'select', rtIndex };
-    q.insertColumns = cols.slice(0, targets.length);
+    if (!hasIndirection) {
+      q.insertColumns = cols.slice(0, targets.length);
+    }
   }
 
   // ON CONFLICT
@@ -226,6 +308,9 @@ function transformInsert(an: Analyzer, stmt: A.InsertStmt, pstate: ParseState): 
 
   pstate.namespace = [targetNsItem(pstate, resultRt)];
   transformReturning(an, pstate, q, stmt.returning);
+  if (rel.kind === 'v') {
+    rewriteTargetView(an, q);
+  }
   return q;
 }
 
@@ -288,7 +373,7 @@ function transformOnConflict(an: Analyzer, pstate: ParseState, oc: A.OnConflictC
       const assigned = new Set<number>();
       const multiSources = new Map<string, TExpr>();
       for (const t of oc.targetList) {
-        const { col, index } = findColumn(rel, t.name!);
+        const { col, index } = findColumn(rel, t.name!, t.loc);
         if (assigned.has(index)) {
           throw new PgError(SqlState.SYNTAX_ERROR, `multiple assignments to same column "${col.name}"`);
         }
@@ -384,7 +469,7 @@ function transformUpdate(an: Analyzer, stmt: A.UpdateStmt, pstate: ParseState): 
     transformWithClause(an, pstate, stmt.with);
   }
   const rel = openTarget(an, stmt.relation, 'update');
-  const resultRt = addRelationRte(an, pstate, rel, stmt.relation.alias, stmt.relation.inh, stmt.relation.name);
+  const resultRt = addTargetRte(an, pstate, rel, stmt.relation, stmt.relation.inh);
   q.resultRelation = resultRt;
   q.fromlist.push({ k: 'ref', rtIndex: resultRt });
   transformFromClause(an, pstate, stmt.from);
@@ -394,7 +479,90 @@ function transformUpdate(an: Analyzer, stmt: A.UpdateStmt, pstate: ParseState): 
   }
   q.updateSet = transformSetClauses(an, pstate, rel, stmt.targetList);
   transformReturning(an, pstate, q, stmt.returning);
+  if (rel.kind === 'v') {
+    rewriteTargetView(an, q);
+  }
   return q;
+}
+
+/**
+ * transformAssignmentIndirection: the new value of a column of which a subfield (`col.f`) or an element /
+ * slice (`col[i]`, `col[l:u]`) is assigned, built over its current value `base`.
+ */
+function assignIndirection(an: Analyzer, pstate: ParseState, base: TExpr, els: A.IndirectionEl[], rhs: TExpr, colName: string): TExpr {
+  const el = els[0];
+  if (el.type === 'star') {
+    throw new PgError(SqlState.SYNTAX_ERROR, 'row expansion via "*" is not supported here');
+  }
+  if (el.type === 'field') {
+    const fields = compositeFields(an, base);
+    if (!fields) {
+      throw new PgError(SqlState.DATATYPE_MISMATCH, `cannot assign to field "${el.name}" of column "${colName}" because its type ${an.types.formatType(base.type, -1, false, false, an.env.relationSearchPath())} is not a composite type`);
+    }
+    const idx = fields.names.indexOf(el.name);
+    if (idx < 0) {
+      throw new PgError(SqlState.UNDEFINED_COLUMN, `cannot assign to field "${el.name}" of column "${colName}" because there is no such column in data type ${an.types.formatType(base.type, -1, false, false, an.env.relationSearchPath())}`);
+    }
+    const select = (i: number): TExpr => ({ k: 'fieldselect', arg: base, fieldIndex: i, fieldName: fields.names[i], ...fields.types[i] });
+    const ft = fields.types[idx];
+    let inner: TExpr;
+    if (els.length > 1) {
+      inner = assignIndirection(an, pstate, select(idx), els.slice(1), rhs, colName);
+    } else {
+      const c = an.coerceToTargetType(rhs, ft.type, ft.typmod, 'assignment', 'implicit_cast');
+      if (!c) {
+        throw new PgError(SqlState.DATATYPE_MISMATCH, `subfield "${el.name}" is of type ${an.types.formatType(ft.type, ft.typmod, false)} but expression is of type ${an.types.formatType(rhs.type, -1, false, false, an.env.relationSearchPath())}`, {
+          hint: 'You will need to rewrite or cast the expression.',
+        });
+      }
+      inner = c;
+    }
+    return { k: 'row', args: fields.names.map((_, i) => (i === idx ? inner : select(i))), fieldNames: fields.names.slice(), explicitRow: false, type: base.type, typmod: base.typmod, collation: 0 };
+  }
+  // a run of subscripts, possibly followed by more indirection on the element
+  let n = 0;
+  while (n < els.length && els[n].type === 'index') {
+    n++;
+  }
+  const subs = els.slice(0, n) as { type: 'index'; lidx: A.Expr | null; uidx: A.Expr | null; isSlice: boolean }[];
+  const elem = transformSubscripts(an, pstate, base, subs);
+  if (elem.k !== 'subscript' || elem.isJsonb) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'in-memory engine: assignment through this subscript is not implemented');
+  }
+  let value: TExpr;
+  if (n < els.length) {
+    value = assignIndirection(an, pstate, elem, els.slice(n), rhs, colName);
+  } else {
+    const c = an.coerceToTargetType(rhs, elem.type, elem.isSlice ? base.typmod : base.typmod, 'assignment', 'implicit_cast');
+    if (!c) {
+      throw new PgError(SqlState.DATATYPE_MISMATCH, `array assignment to "${colName}" requires type ${an.types.formatType(elem.type, -1, false, false, an.env.relationSearchPath())} but expression is of type ${an.types.formatType(rhs.type, -1, false, false, an.env.relationSearchPath())}`, {
+        hint: 'You will need to rewrite or cast the expression.',
+      });
+    }
+    value = c;
+  }
+  const nullInt: TExpr = { k: 'const', type: TypeOid.int4, typmod: -1, collation: 0, value: null, isNull: true };
+  const bounds: TExpr[] = [];
+  subs.forEach((s, i) => {
+    bounds.push(elem.lower && s.isSlice ? elem.lower[i] ?? nullInt : nullInt);
+    bounds.push(elem.upper[i] ?? nullInt);
+  });
+  const spec = subs.map((s) => (s.isSlice ? `s${s.lidx ? 1 : 0}${s.uidx ? 1 : 0}` : 'e')).join(',');
+  return {
+    k: 'func',
+    funcOid: 0,
+    funcName: 'array_assign',
+    funcSrc: '__linkgress_array_assign',
+    args: [base, value, { k: 'const', type: TypeOid.text, typmod: -1, collation: 0, value: spec, isNull: false }, ...bounds],
+    type: base.type,
+    typmod: base.typmod,
+    collation: base.collation,
+    inputCollation: 0,
+    retset: false,
+    format: 'call',
+    variadic: false,
+    strict: false,
+  };
 }
 
 function transformSetClauses(an: Analyzer, pstate: ParseState, rel: Relation, items: A.SetClauseItem[]): { attIndex: number; expr: TExpr }[] {
@@ -402,11 +570,32 @@ function transformSetClauses(an: Analyzer, pstate: ParseState, rel: Relation, it
   const assigned = new Set<number>();
   pstate.allowDefault = true;
   try {
+    const indirect = new Set<number>();
     const assign = (target: A.ResTarget, expr: TExpr | 'default') => {
-      if (target.indirection) {
-        throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'UPDATE of array elements / subfields is not supported by the in-memory engine');
+      if (target.indirection && target.indirection.length > 0) {
+        const { col, index } = findColumn(rel, target.name!, target.loc);
+        if (assigned.has(index) && !indirect.has(index)) {
+          throw new PgError(SqlState.SYNTAX_ERROR, `multiple assignments to same column "${col.name}"`);
+        }
+        if (expr === 'default') {
+          const el = target.indirection[target.indirection.length - 1];
+          throw positioned(new PgError(SqlState.FEATURE_NOT_SUPPORTED, el.type === 'index' ? 'cannot set an array element to DEFAULT' : 'cannot set a subfield to DEFAULT'), target.loc);
+        }
+        // assignments to several subfields / elements of one column compose (rewriteTargetListUD)
+        const prev = out.find((o) => o.attIndex === index);
+        const rt = pstate.query.resultRelation;
+        const base = prev ? prev.expr : varForColumn(pstate.query.rtable[rt], rt, index, 0);
+        const value = atPosition(target.loc, () => assignIndirection(an, pstate, base, target.indirection!, expr, col.name));
+        if (prev) {
+          prev.expr = value;
+        } else {
+          out.push({ attIndex: index, expr: value });
+        }
+        assigned.add(index);
+        indirect.add(index);
+        return;
       }
-      const { col, index } = findColumn(rel, target.name!);
+      const { col, index } = findColumn(rel, target.name!, target.loc);
       if (assigned.has(index)) {
         throw new PgError(SqlState.SYNTAX_ERROR, `multiple assignments to same column "${col.name}"`);
       }
@@ -474,7 +663,7 @@ function transformDelete(an: Analyzer, stmt: A.DeleteStmt, pstate: ParseState): 
     transformWithClause(an, pstate, stmt.with);
   }
   const rel = openTarget(an, stmt.relation, 'delete from');
-  const resultRt = addRelationRte(an, pstate, rel, stmt.relation.alias, stmt.relation.inh, stmt.relation.name);
+  const resultRt = addTargetRte(an, pstate, rel, stmt.relation, stmt.relation.inh);
   q.resultRelation = resultRt;
   q.fromlist.push({ k: 'ref', rtIndex: resultRt });
   transformFromClause(an, pstate, stmt.using);
@@ -483,6 +672,9 @@ function transformDelete(an: Analyzer, stmt: A.DeleteStmt, pstate: ParseState): 
     q.where = an.coerceToBoolean(pstate, transformExpr(an, pstate, stmt.where, 'where'), 'WHERE');
   }
   transformReturning(an, pstate, q, stmt.returning);
+  if (rel.kind === 'v') {
+    rewriteTargetView(an, q);
+  }
   return q;
 }
 
@@ -529,16 +721,16 @@ function transformMerge(an: Analyzer, stmt: A.MergeStmt, pstate: ParseState): Qu
     } else if (wc.command === 'INSERT') {
       let cols: number[];
       if (wc.insertCols) {
-        cols = wc.insertCols.map((c) => findColumn(rel, c.name!).index);
+        cols = wc.insertCols.map((c) => findColumn(rel, c.name!, c.loc).index);
       } else {
         cols = live.map((_, i) => i);
       }
       if (wc.values) {
         if (wc.values.length > cols.length) {
-          throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns');
+          throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more expressions than target columns'), rawLocation(wc.values[cols.length]));
         }
         if (wc.values.length < cols.length && wc.insertCols) {
-          throw new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions');
+          throw positioned(new PgError(SqlState.SYNTAX_ERROR, 'INSERT has more target columns than expressions'), wc.insertCols[wc.values.length].loc);
         }
         pstate.allowDefault = true;
         try {

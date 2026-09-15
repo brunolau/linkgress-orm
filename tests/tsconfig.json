@@ -3,9 +3,14 @@
   "compilerOptions": {
     "rootDir": "..",
     "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
     "module": "esnext",
+    "target": "ES2022",
+    "lib": ["ES2022"],
     "moduleResolution": "bundler",
     "types": ["bun"]
   },
-  "include": ["./**/*", "../src/**/*", "../tests/utils/**/*"]
+  "include": ["./**/*", "../src/**/*"],
+  "exclude": []
 }

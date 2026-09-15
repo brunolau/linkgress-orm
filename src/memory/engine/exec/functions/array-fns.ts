@@ -223,6 +223,27 @@ export const ARRAY_FUNCS: Record<string, FnImpl> = {
     return arr.slice(0, arr.length - n);
   },
   array_reverse: (a) => (a[0] as unknown[]).slice().reverse(),
+  // array_shuffle_n: a partial Fisher-Yates over the first dimension (the random choices cannot match a server's)
+  array_sample: (a) => {
+    const arr = (a[0] as unknown[]).slice();
+    const n = a[1] as number;
+    if (n < 0 || n > arr.length) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `sample size must be between 0 and ${arr.length}`);
+    }
+    for (let i = 0; i < n; i++) {
+      const j = i + Math.floor(Math.random() * (arr.length - i));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr.slice(0, n);
+  },
+  array_shuffle: (a) => {
+    const arr = (a[0] as unknown[]).slice();
+    for (let i = 0; i < arr.length; i++) {
+      const j = i + Math.floor(Math.random() * (arr.length - i));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  },
   array_sort: (a, fc) => {
     const cmp = fc.st.session.typeOps.comparator(elemTypeOf(fc, 0), fc.collation || 100);
     const desc = a.length > 1 && a[1] === true;

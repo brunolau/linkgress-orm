@@ -4,6 +4,11 @@ The whole jest suite (136 files, 1,783 tests) run against a real PostgreSQL serv
 in-process against PGlite through `PGliteClient` — then every statement the two runs executed,
 compared result by result.
 
+> Measured before the suite moved from Jest to `bun:test` (v1.0.0). The findings stand; the commands
+> under *Reproduce* are the current, Bun-based ones. On the Bun runner the same host runs the suite in
+> 21.0 s on PGlite (8 files in parallel, 1,858 passed / 7 failed — the four `query-batch-fidelity`
+> date-revival failures below do not occur under Bun) and in 12.7 s in memory (12 files, 1,865 / 0).
+
 ## Setup
 
 | | |
@@ -166,23 +171,22 @@ previous day in a `date` column on this host).
 ## Reproduce
 
 ```bash
-# a database the runs may own: globalSetup drops and recreates the AppDatabase schema
+# a database the runs may own: the runner drops and recreates the AppDatabase schema
 createdb linkgress_test_pglite_cmp
 psql -d linkgress_test_pglite_cmp -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent'
 export DB_NAME=linkgress_test_pglite_cmp
-JEST="node --experimental-vm-modules node_modules/jest/bin/jest.js --json"
 
-# outcomes and timings: the same flags for both drivers
-LINKGRESS_TEST_DRIVER=pg     $JEST --outputFile=runs/pg.json
-LINKGRESS_TEST_DRIVER=pglite $JEST --outputFile=runs/pglite.json
+# outcomes and timings (add -j 1 for a serial PGlite run)
+bun tests/run.ts                 --json runs/pg.json
+bun tests/run.ts --driver pglite --json runs/pglite.json
 
 # statement results, in separate runs (recording hashes every row)
-LINKGRESS_TEST_DRIVER=pg     LINKGRESS_TEST_RECORD_DIR=runs/rec-pg     $JEST --outputFile=runs/rec-pg.json
-LINKGRESS_TEST_DRIVER=pglite LINKGRESS_TEST_RECORD_DIR=runs/rec-pglite $JEST --outputFile=runs/rec-pglite.json
+LINKGRESS_TEST_RECORD_DIR=runs/rec-pg     bun tests/run.ts                 --json runs/rec-pg.json
+LINKGRESS_TEST_RECORD_DIR=runs/rec-pglite bun tests/run.ts --driver pglite --json runs/rec-pglite.json
 
 node bench/pglite/compare-runs.mjs --a runs/pg.json --b runs/pglite.json
 node bench/pglite/compare-runs.mjs --a runs/rec-pg.json --b runs/rec-pglite.json --a-rec runs/rec-pg --b-rec runs/rec-pglite
 
-# per-operation latency and PGlite's boot costs, outside jest
+# per-operation latency and PGlite's boot costs, outside the test runner
 node -r ts-node/register/transpile-only bench/pglite/latency.ts
 ```

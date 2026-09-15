@@ -60,7 +60,8 @@ Enhancement suggestions are welcome! Please create an issue with:
 ### Prerequisites
 
 - Node.js 16 or higher
-- PostgreSQL 12 or higher (for running tests)
+- [Bun](https://bun.sh) 1.3 or higher (runs the test suite)
+- PostgreSQL 18 (for running tests against a real database; `npm run test:memory` needs none)
 - TypeScript 5.0 or higher
 
 ### Getting Started
@@ -79,12 +80,18 @@ Enhancement suggestions are welcome! Please create an issue with:
 3. **Set up test database:**
    Create a `.env` file in the root directory:
    ```env
-   DATABASE_URL=postgres://postgres:password@localhost:5432/linkgress_test
+   DB_HOST=localhost
+   DB_PORT=5432
+   DB_NAME=linkgress_test
+   DB_USER=postgres
+   DB_PASSWORD=postgres
    ```
 
 4. **Run tests:**
    ```bash
-   npm test
+   npm test              # against PostgreSQL
+   npm run test:memory   # against the in-memory database
+   npm run test:parity   # both, compared
    ```
 
 5. **Build the project:**
@@ -131,7 +138,8 @@ linkgress-orm/
 
 ### Writing Tests
 
-- Use **Jest** for testing
+- Use **bun:test** for testing (`import { describe, test, expect } from 'bun:test'`); see `tests/README.md`
+- Run the suite against PostgreSQL (`npm test`), in memory (`npm run test:memory`), and check both agree (`npm run test:parity`)
 - Place tests in the `tests/` directory mirroring the `src/` structure
 - Name test files with `.test.ts` extension
 - Write **descriptive test names**
@@ -154,13 +162,14 @@ npm run test:coverage
 npm test -- path/to/test.test.ts
 
 # Run tests matching a pattern
-npm test -- --testNamePattern="pattern"
+npm test -- -t "pattern"
 
-# Run the suite without a PostgreSQL server: on PGlite (in-process, parallel workers)...
+# Run the suite without a PostgreSQL server: on the built-in in-memory database...
+npm run test:memory
+
+# ...or on PGlite (PostgreSQL in WASM, in-process); files that construct PgClient / PostgresClient
+# themselves still need the server
 npm run test:pglite
-
-# ...or on the built-in in-memory database
-LINKGRESS_TEST_DB=memory npm test
 ```
 
 ## Documentation

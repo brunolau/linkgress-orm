@@ -13,6 +13,7 @@ import {
   j2day,
   justifyDays,
   justifyHours,
+  justifyInterval,
   localToUtcOffset,
   MONTH_NAMES,
   parseInterval,
@@ -525,6 +526,8 @@ export function formatTimestampWithPattern(ts: number, fmt: string, zone: ZoneSp
     'MONTH', 'Month', 'month', 'MON', 'Mon', 'mon', 'MM', 'DAY', 'Day', 'day', 'DY', 'Dy', 'dy', 'DDD', 'IDDD', 'DD', 'D', 'ID',
     'WW', 'IW', 'W', 'CC', 'J', 'Q', 'RM', 'rm', 'TZH', 'TZM', 'TZ', 'tz', 'OF', 'FF1', 'FF2', 'FF3', 'FF4', 'FF5', 'FF6',
   ];
+  // the longest keyword at a position wins (SSSSS over SS, IW over I)
+  const patternsByLength = [...patterns].sort((a, b) => b.length - a.length);
   let out = '';
   let i = 0;
   while (i < fmt.length) {
@@ -545,7 +548,7 @@ export function formatTimestampWithPattern(ts: number, fmt: string, zone: ZoneSp
       i += 2;
       continue;
     }
-    const p = patterns.find((x) => fmt.startsWith(x, i));
+    const p = patternsByLength.find((x) => fmt.startsWith(x, i));
     if (!p) {
       out += fmt[i];
       i++;
@@ -825,12 +828,13 @@ function parseWithPattern(input: string, fmt: string, fnName: string): Tm & { tz
     return parseInt(m[0], 10);
   };
   const patterns = ['HH24', 'HH12', 'HH', 'MI', 'SS', 'MS', 'US', 'AM', 'PM', 'am', 'pm', 'YYYY', 'YY', 'MONTH', 'Month', 'month', 'MON', 'Mon', 'mon', 'MM', 'DDD', 'DD', 'TZH', 'TZM', 'FF1', 'FF2', 'FF3', 'FF4', 'FF5', 'FF6', 'Y,YYY', 'BC', 'AD', 'J', 'OF', 'TZ'];
+  const patternsByLength = [...patterns].sort((a, b) => b.length - a.length);
   while (i < fmt.length) {
     if (fmt.startsWith('FM', i)) {
       i += 2;
       continue;
     }
-    const p = patterns.find((x) => fmt.startsWith(x, i));
+    const p = patternsByLength.find((x) => fmt.startsWith(x, i));
     if (!p) {
       if (fmt[i] === '"') {
         const end = fmt.indexOf('"', i + 1);
@@ -1077,6 +1081,11 @@ export const DATETIME_FUNCS: Record<string, FnImpl> = {
   date_pl_interval: (a) => tsRangeCheck(timestampPlusInterval(dateToTimestamp(a[0] as number), a[1] as Interval, null)),
   date_mi_interval: (a) => tsRangeCheck(timestampPlusInterval(dateToTimestamp(a[0] as number), intervalNegate(a[1] as Interval), null)),
   datetime_pl: (a) => dateToTimestamp(a[0] as number) + (a[1] as number),
+  // timestamp(date, time) and the date + time operator
+  datetime_timestamp: (a) => {
+    const ts = dateToTimestamp(a[0] as number);
+    return Number.isFinite(ts) ? tsRangeCheck(ts + (a[1] as number)) : ts;
+  },
   timedate_pl: (a) => dateToTimestamp(a[1] as number) + (a[0] as number),
   datetimetz_pl: (a) => {
     const t = a[1] as TimeTz;
@@ -1196,7 +1205,7 @@ export const DATETIME_FUNCS: Record<string, FnImpl> = {
   timestamptz_age: (a, fc) => ageTimestamps(a[0] as number, a[1] as number, sessionZone(fc)),
   interval_justify_hours: (a) => justifyHours(a[0] as Interval),
   interval_justify_days: (a) => justifyDays(a[0] as Interval),
-  interval_justify_interval: (a) => justifyHours(justifyDays(a[0] as Interval)),
+  interval_justify_interval: (a) => justifyInterval(a[0] as Interval),
   date_finite: (a) => Number.isFinite(a[0] as number),
   timestamp_finite: (a) => Number.isFinite(a[0] as number),
   interval_finite: () => true,

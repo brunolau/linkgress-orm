@@ -19,6 +19,36 @@ export function varForColumn(rte: RTE, rtIndex: number, colIndex: number, levels
   return node;
 }
 
+/**
+ * System columns of a table reference (PostgreSQL attnums -1 .. -6). Their Vars use attno
+ * `SYSTEM_ATTNO_BASE + attnum` (attno -1 is the whole-row reference).
+ */
+export const SYSTEM_ATTNO_BASE = -10;
+
+const SYSTEM_COLUMNS: Record<string, { attnum: number; type: number }> = {
+  ctid: { attnum: -1, type: TypeOid.tid },
+  xmin: { attnum: -2, type: TypeOid.xid },
+  cmin: { attnum: -3, type: TypeOid.cid },
+  xmax: { attnum: -4, type: TypeOid.xid },
+  cmax: { attnum: -5, type: TypeOid.cid },
+  tableoid: { attnum: -6, type: TypeOid.oid },
+};
+
+export const SYSTEM_COLUMN_NAMES: Record<number, string> = Object.fromEntries(Object.entries(SYSTEM_COLUMNS).map(([name, c]) => [SYSTEM_ATTNO_BASE + c.attnum, name]));
+
+export function isSystemAttno(attno: number): boolean {
+  return attno <= SYSTEM_ATTNO_BASE - 1;
+}
+
+/** A system column of a table (not of a subquery, function or join) named `colname`, or null. */
+export function systemColumnVar(item: NsItem, colname: string, levelsUp: number): TExpr | null {
+  const sys = Object.prototype.hasOwnProperty.call(SYSTEM_COLUMNS, colname) ? SYSTEM_COLUMNS[colname] : undefined;
+  if (!sys || item.rte.kind !== 'relation') {
+    return null;
+  }
+  return { k: 'var', levelsUp, rtIndex: item.rtIndex, attno: SYSTEM_ATTNO_BASE + sys.attnum, type: sys.type, typmod: -1, collation: 0 };
+}
+
 /** Adjust levelsUp of Vars in an expression copied into a deeper level. */
 export function incrementLevels(e: TExpr, delta: number): TExpr {
   if (delta === 0) {
@@ -88,11 +118,12 @@ export function colNameToVar(an: Analyzer, pstate: ParseState, colname: string, 
         continue;
       }
       const idx = scanNsItemForColumn(item, colname);
-      if (idx >= 0) {
+      const found = idx >= 0 ? varForColumn(item.rte, item.rtIndex, idx, levelsUp) : systemColumnVar(item, colname, levelsUp);
+      if (found) {
         if (result) {
           throw new PgError(SqlState.AMBIGUOUS_COLUMN, `column reference "${colname}" is ambiguous`);
         }
-        result = varForColumn(item.rte, item.rtIndex, idx, levelsUp);
+        result = found;
       }
     }
     if (result) {
@@ -203,6 +234,10 @@ export function wholeRowVar(an: Analyzer, item: NsItem, levelsUp: number): TExpr
     const type = rel && rel.rowTypeOid ? rel.rowTypeOid : TypeOid.record;
     return { k: 'var', levelsUp, rtIndex: item.rtIndex, attno: -1, type, typmod: -1, collation: 0 };
   }
+  if (rte.kind === 'catalog' && rte.rowTypeOid) {
+    // a transition table has the row type of its table
+    return { k: 'var', levelsUp, rtIndex: item.rtIndex, attno: -1, type: rte.rowTypeOid, typmod: -1, collation: 0 };
+  }
   if (rte.kind === 'join') {
     // ROW() of all join columns
     return {
@@ -223,11 +258,123 @@ export function wholeRowVar(an: Analyzer, item: NsItem, levelsUp: number): TExpr
   return { k: 'var', levelsUp, rtIndex: item.rtIndex, attno: -1, type: TypeOid.record, typmod: -1, collation: 0 };
 }
 
-export function columnDoesNotExist(colname: string, relname?: string): PgError {
-  if (relname) {
-    return new PgError(SqlState.UNDEFINED_COLUMN, `column ${relname}.${colname} does not exist`);
+export function columnDoesNotExist(colname: string, relname?: string, pstate?: ParseState): PgError {
+  const message = relname ? `column ${relname}.${colname} does not exist` : `column "${colname}" does not exist`;
+  if (!pstate) {
+    return new PgError(SqlState.UNDEFINED_COLUMN, message);
   }
-  return new PgError(SqlState.UNDEFINED_COLUMN, `column "${colname}" does not exist`);
+  return new PgError(SqlState.UNDEFINED_COLUMN, message, missingColumnDetails(pstate, relname, colname));
+}
+
+/** MAX_FUZZY_DISTANCE of parse_relation.c */
+const MAX_FUZZY_DISTANCE = 3;
+
+/** varstr_levenshtein (insertion, deletion and substitution cost 1), over code points */
+function levenshtein(a: string, b: string): number {
+  const s = [...a];
+  const t = [...b];
+  let prev = Array.from({ length: t.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= s.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= t.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (s[i - 1] === t[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[t.length];
+}
+
+/**
+ * errorMissingColumn's detail / hint: an exact match in a table this part of the query cannot reference,
+ * or up to two closest column names (searchRangeTableForCol + updateFuzzyAttrMatchState).
+ */
+function missingColumnDetails(pstate: ParseState, alias: string | undefined, colname: string): { detail?: string; hint?: string } {
+  let distance = MAX_FUZZY_DISTANCE + 1;
+  let first: { rte: RTE; col: string } | null = null;
+  let second: { rte: RTE; col: string } | null = null;
+  let exact1: { rte: RTE; ps: ParseState } | null = null;
+  let exact2: RTE | null = null;
+  const update = (penalty: number, rte: RTE, actual: string) => {
+    if (penalty > distance || actual === '') {
+      return;
+    }
+    const matchlen = [...colname].length;
+    let d = levenshtein(actual, colname);
+    if (d > Math.floor(matchlen / 2)) {
+      return;
+    }
+    d += penalty;
+    if (d < distance) {
+      distance = d;
+      first = { rte, col: actual };
+      second = null;
+    } else if (d === distance) {
+      if (second) {
+        // too many equally distant matches
+        distance = d - 1;
+        first = null;
+        second = null;
+      } else if (first) {
+        second = { rte, col: actual };
+      } else if (distance <= MAX_FUZZY_DISTANCE) {
+        first = { rte, col: actual };
+      }
+    }
+  };
+  search: for (let ps: ParseState | null = pstate; ps; ps = ps.parent) {
+    for (const rte of ps.query.rtable) {
+      if (!rte || rte.kind === 'join') {
+        continue;
+      }
+      const penalty = alias !== undefined ? Math.min(levenshtein(alias, rte.eref.aliasname), MAX_FUZZY_DISTANCE + 1) : 0;
+      let exact = false;
+      for (const name of rte.eref.colnames) {
+        if (name === colname) {
+          exact = true;
+        }
+        update(penalty, rte, name);
+      }
+      if (exact && penalty === 0) {
+        if (!exact1) {
+          exact1 = { rte, ps };
+        } else if (!exact2) {
+          exact2 = rte;
+        } else {
+          exact1 = null;
+          exact2 = null;
+          break search;
+        }
+      }
+    }
+  }
+  const e1 = exact1 as { rte: RTE; ps: ParseState } | null;
+  if (e1 && exact2) {
+    return {
+      detail: `There are columns named "${colname}", but they are in tables that cannot be referenced from this part of the query.`,
+      hint: alias === undefined ? 'Try using a table-qualified name.' : undefined,
+    };
+  }
+  if (e1) {
+    let item: NsItem | undefined;
+    for (let ps: ParseState | null = pstate; ps && !item; ps = ps.parent) {
+      item = ps.namespace.find((n) => n.rte === e1.rte);
+    }
+    const lateral = !!item && item.lateralOnly;
+    const qualified = alias === undefined && !!item && item.relVisible && !item.colsVisible;
+    return {
+      detail: `There is a column named "${colname}" in table "${e1.rte.eref.aliasname}", but it cannot be referenced from this part of the query.`,
+      hint: lateral ? 'To reference that column, you must mark this subquery with LATERAL.' : qualified ? 'To reference that column, you must use a table-qualified name.' : undefined,
+    };
+  }
+  const f = first as { rte: RTE; col: string } | null;
+  const s = second as { rte: RTE; col: string } | null;
+  if (!f) {
+    return {};
+  }
+  if (!s) {
+    return { hint: `Perhaps you meant to reference the column "${f.rte.eref.aliasname}.${f.col}".` };
+  }
+  return { hint: `Perhaps you meant to reference the column "${f.rte.eref.aliasname}.${f.col}" or the column "${s.rte.eref.aliasname}.${s.col}".` };
 }
 
 /** Expand `rel.*` / `*` into (name, expr) pairs. */

@@ -434,7 +434,11 @@ export interface TriggerDef {
   events: string[];
   updateColumns?: string[];
   forEachRow: boolean;
+  /** transition table names (REFERENCING NEW TABLE AS … / OLD TABLE AS …) */
+  newTable?: string;
+  oldTable?: string;
   when: A.Expr | null;
+  whenText?: string;
   args: string[];
   enabled: boolean;
 }
@@ -503,7 +507,8 @@ export class BuiltinCatalog {
         align,
         storage,
         relid: 0,
-        isArray: category === 'A' && elem !== 0 && name.startsWith('_'),
+        // record[] is a pseudo-type but a true array type (typsubscript = array_subscript_handler)
+        isArray: (category === 'A' || oid === TypeOid._record) && elem !== 0 && name.startsWith('_'),
       };
       this.types.set(oid, type);
       this.typesByName.set(type.nspOid + '.' + name, type);

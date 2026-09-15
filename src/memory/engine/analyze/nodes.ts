@@ -384,6 +384,10 @@ export interface SubqueryRTE {
   eref: Eref;
   colTypes: TypeInfo[];
   lateral: boolean;
+  /** the view this subquery expands (a view referenced in FROM) */
+  viewOid?: number;
+  /** column aliases were written (FROM (...) s(a, b)); deparsing prints them */
+  userColnames?: boolean;
 }
 
 export interface JoinRTE {
@@ -437,6 +441,8 @@ export interface CteRTE {
   eref: Eref;
   colTypes: TypeInfo[];
   lateral: false;
+  /** column aliases were written (FROM cte c(a, b)) */
+  userColnames?: boolean;
 }
 
 /** Catalog virtual table (pg_catalog / information_schema) — materialized from the catalog at scan time. */
@@ -449,6 +455,12 @@ export interface CatalogRTE {
   eref: Eref;
   colTypes: TypeInfo[];
   lateral: false;
+  /**
+   * A trigger's transition table (an ephemeral named relation): its rows, one value per live column of
+   * the table `relOid`, whose row type the whole-row reference has.
+   */
+  transitionRows?: unknown[][];
+  rowTypeOid?: number;
 }
 
 export type RTE = RelationRTE | SubqueryRTE | JoinRTE | FunctionRTE | ValuesRTE | CteRTE | CatalogRTE;
@@ -570,6 +582,11 @@ export interface Query {
   returningNewRt?: number;
   /** statement-level: true when the query (or a CTE) modifies data */
   hasModifyingCte: boolean;
+  /**
+   * INSERT / UPDATE through a view WITH CHECK OPTION: quals every new row must satisfy, innermost view
+   * first (over the result relation, level 0)
+   */
+  withCheckOptions?: { viewName: string; qual: TExpr | null; cascaded: boolean }[];
 }
 
 export function makeConst(type: number, value: unknown, typmod = -1, collation = 0): ConstNode {

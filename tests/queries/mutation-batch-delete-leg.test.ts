@@ -1,9 +1,10 @@
-import { describe, test, expect, beforeAll, afterAll, jest } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll, jest } from 'bun:test';
 import { withDatabase, seedTestData, createFreshClient } from '../utils/test-database';
 import { eq } from '../../src/query/conditions';
 import { MutationBatch } from '../../src/query/mutation-batch';
 import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
+import { expectToReject } from '../utils/expect-rejects';
 
 /**
  * MutationBatch DELETE leg — `addDeleteWhereIn(table, field, values, id)`
@@ -184,9 +185,7 @@ describe('MutationBatch delete legs vs NO ACTION foreign key', () => {
     const [parent] = await db.mbdlParents.insertBulk([{ label: 'locked' }]).returning();
     await db.mbdlChildren.insertBulk([{ parentId: parent.id, note: 'holds parent' }]);
 
-    await expect(
-      db.mbdlParents.where(p => eq(p.id, parent.id)).delete()
-    ).rejects.toThrow(/violates foreign key constraint|verletzt Fremdschl/);
+    await expectToReject(db.mbdlParents.where(p => eq(p.id, parent.id)).delete(), /violates foreign key constraint|verletzt Fremdschl/);
 
     // Clean up for the next test.
     await db.mbdlChildren.where(c => eq(c.parentId, parent.id)).delete();

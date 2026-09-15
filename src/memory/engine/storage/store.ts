@@ -71,11 +71,14 @@ export function lockTuple(
   recordLock: boolean
 ): LockOutcome {
   const txns = store.txns;
+  // `xid` may be a subtransaction: rows updated or locked by any (sub)transaction of the same
+  // top-level transaction are our own (e.g. locked by a statement inside a released savepoint)
+  const myTop = txns.topLevel(xid);
   // updated/deleted by someone else?
   if (tuple.xmax !== INVALID_XID) {
     const top = txns.topLevel(tuple.xmax);
     const status = txns.getStatus(tuple.xmax);
-    if (top !== xid && status === 'running') {
+    if (top !== myTop && status === 'running') {
       if (waitPolicy === 'NOWAIT') {
         throw new PgError(SqlState.LOCK_NOT_AVAILABLE, `could not obtain lock on row in relation "${relName}"`);
       }
@@ -84,7 +87,7 @@ export function lockTuple(
       }
       throw new WaitForTransaction(tuple.xmax, relName);
     }
-    if (status === 'committed' && top !== xid) {
+    if (status === 'committed' && top !== myTop) {
       if (tuple.next) {
         return { updatedTo: tuple.next };
       }
@@ -93,12 +96,12 @@ export function lockTuple(
   }
   if (tuple.locks) {
     for (const [holder, held] of tuple.locks) {
-      if (holder === xid) {
-        continue;
-      }
       const status = txns.getStatus(holder);
       if (status !== 'running') {
         tuple.locks.delete(holder);
+        continue;
+      }
+      if (holder === xid || txns.topLevel(holder) === myTop) {
         continue;
       }
       if (LOCK_CONFLICTS[strength].includes(held)) {

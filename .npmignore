@@ -5,7 +5,8 @@ debug/
 
 # Configuration files
 tsconfig.json
-jest.config.js
+tsconfig.dev.json
+bunfig.toml
 .env
 .env.*
 

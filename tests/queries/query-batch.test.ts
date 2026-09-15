@@ -1,9 +1,10 @@
-import { describe, test, expect, jest } from '@jest/globals';
+import { describe, test, expect, jest } from 'bun:test';
 import postgres from 'postgres';
 import { withDatabase, seedTestData, testConnectionConfig } from '../utils/test-database';
 import { eq, gt, PostgresClient } from '../../src';
 import { QueryBatch } from '../../src/query/query-batch';
 import { AppDatabase } from '../../debug/schema/appDatabase';
+import { expectToReject } from '../utils/expect-rejects';
 
 describe('QueryBatch', () => {
   describe('single round trip execution', () => {
@@ -64,7 +65,7 @@ describe('QueryBatch', () => {
 
         // string identifiers work as an escape hatch
         expect(batch.getList('orders')).toEqual(expectedOrders);
-        expect(batch.getItem('bob')).toEqual(expectedBob);
+        expect(batch.getItem('bob') as unknown).toEqual(expectedBob);
         expect(batch.getCount('activeCount')).toBe(expectedActiveCount);
       });
     });
@@ -237,7 +238,7 @@ describe('QueryBatch', () => {
         await batch.executeBatch();
 
         expect(() => batch.addList(db.users.select(u => ({ id: u.id })), 'more')).toThrow(/execute/i);
-        await expect(batch.executeBatch()).rejects.toThrow(/execute/i);
+        await expectToReject(batch.executeBatch(), /execute/i);
       });
     });
 
@@ -245,7 +246,7 @@ describe('QueryBatch', () => {
       await withDatabase(async () => {
         const batch = new QueryBatch();
 
-        await expect(batch.executeBatch()).rejects.toThrow(/empty/i);
+        await expectToReject(batch.executeBatch(), /empty/i);
       });
     });
 

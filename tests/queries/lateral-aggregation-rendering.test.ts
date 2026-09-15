@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from '@jest/globals';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { DbContext, DbEntity, DbColumn, DbEntityTable, DbModelConfig, gt, integer, serial, sql, varchar } from '../../src';
 import type { DatabaseClient, QueryOptions } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';

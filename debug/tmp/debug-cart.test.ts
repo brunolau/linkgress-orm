@@ -1,4 +1,4 @@
-import { describe, test } from '@jest/globals';
+import { describe, test } from 'bun:test';
 import { withDatabase, seedTestData } from '../../tests/utils/test-database';
 
 describe('Debug', () => {

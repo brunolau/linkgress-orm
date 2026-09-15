@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { DbContext, DbEntity, DbColumn, DbEntityTable, DbModelConfig, integer, varchar, text, PgClient, DatabaseClient } from '../../src';
 
 // Test entity
@@ -268,6 +268,6 @@ describe('Migration Start Hook (onMigrationStart)', () => {
 
     expect(db.events).toContain('start');
     // Table already existed on this run
-    expect(db.tableExistedAtStart).toBe(true);
+    expect(db.tableExistedAtStart as boolean | null).toBe(true);
   });
 });

@@ -7,7 +7,7 @@
  * TypeError and misreported "the postgres package is not installed".
  */
 import { describe, test, expect } from 'bun:test';
-import { PostgresClient } from '../src';
+import { PostgresClient } from '../../src';
 
 const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',

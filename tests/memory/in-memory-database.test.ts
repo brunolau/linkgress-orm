@@ -1,12 +1,17 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 import { spawnSync } from 'child_process';
 import * as path from 'path';
+import { describe, expect, test } from 'bun:test';
 import { createInMemoryDatabase, startInMemoryDatabaseThread } from '../../src';
+import { expectToReject } from '../utils/expect-rejects';
 
-// the real drivers (LINKGRESS_TEST_DB=memory maps the module names to the in-memory wrappers)
+// the real drivers (LINKGRESS_TEST_DB=memory replaces the `pg` / `postgres` modules with in-memory wrappers)
+const realDrivers = (globalThis as any).__linkgressRealDrivers;
 const pgPath = path.resolve(__dirname, '../../node_modules/pg/lib/index.js');
-const { Client } = require(pgPath);
-const postgres = require(path.resolve(__dirname, '../../node_modules/postgres/cjs/src/index.js'));
+const { Client } = realDrivers?.pg ?? require('pg');
+const postgresModule = realDrivers?.postgres ?? require('postgres');
+// Bun resolves `require('postgres')` to the package's ES module namespace
+const postgres = postgresModule.default ?? postgresModule;
 
 describe('in-memory database API', () => {
   test('snapshot and fork are independent copies of the committed state', async () => {
@@ -49,7 +54,7 @@ describe('in-memory database API', () => {
       // COMMIT is refused inside a transaction block, like PostgreSQL
       await client.query('begin');
       await client.query('create procedure just_commit() language plpgsql as $$ begin commit; end $$');
-      await expect(client.query('call just_commit()')).rejects.toMatchObject({ code: '2D000', message: 'invalid transaction termination' });
+      expect(await expectToReject(client.query('call just_commit()'))).toMatchObject({ code: '2D000', message: 'invalid transaction termination' });
       await client.query('rollback');
       await client.end();
     } finally {
@@ -95,7 +100,7 @@ describe('in-memory database API', () => {
       await w1`insert into shared values (7)`;
       // the aliased names share one database, reported under the name each connection used
       expect(await w2`select id, current_database() as db from shared`).toEqual([{ id: 7, db: 'app_test-w2' }]);
-      await expect(other`select * from shared`).rejects.toMatchObject({ code: '42P01' });
+      expect(await expectToReject(other`select * from shared`)).toMatchObject({ code: '42P01' });
       await Promise.all([w1.end(), w2.end(), other.end()]);
     } finally {
       await server.terminate();

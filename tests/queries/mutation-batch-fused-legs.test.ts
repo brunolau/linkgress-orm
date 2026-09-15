@@ -1,4 +1,4 @@
-import { describe, test, expect, jest } from '@jest/globals';
+import { describe, test, expect, jest } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq } from '../../src/query/conditions';
 import { MutationBatch } from '../../src/query/mutation-batch';

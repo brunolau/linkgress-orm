@@ -4,6 +4,7 @@ import { intervalCmpValue, Interval, TimeTz, USECS_PER_DAY, USECS_PER_SEC, ZoneS
 import { compareJsonb, compareUtf8Bytes, jsonbKey, JsonbValue } from '../types/json';
 import { PgNumeric } from '../types/numeric';
 import { PgBits, PgRecord } from '../types/values';
+import { multirangeCmp, PgMultirange, PgRange, rangeCmp, rangeHashKey } from '../types/range';
 
 export type Comparator = (a: unknown, b: unknown) => number;
 
@@ -239,6 +240,12 @@ export class TypeOps {
     if (t.typtype === 'c' || typeOid === TypeOid.record) {
       return (a, b) => this.compareRecords(a as PgRecord, b as PgRecord);
     }
+    if (t.typtype === 'r') {
+      return (a, b) => Math.sign(rangeCmp(a as PgRange, b as PgRange));
+    }
+    if (t.typtype === 'm') {
+      return (a, b) => Math.sign(multirangeCmp(a as PgMultirange, b as PgMultirange));
+    }
     return (a, b) => genericCompare(a, b);
   }
 
@@ -363,6 +370,12 @@ export class TypeOps {
       if (t.typtype === 'c' || typeOid === TypeOid.record) {
         const r = v as PgRecord;
         return 'r' + JSON.stringify(r.values.map((x, i) => keyToJson(this.hashKey(r.fieldTypes[i] ?? TypeOid.text, x))));
+      }
+      if (v instanceof PgRange) {
+        return rangeHashKey(v, (st, x) => keyToJson(this.hashKey(st, x)));
+      }
+      if (v instanceof PgMultirange) {
+        return 'multirange:' + v.ranges.map((r) => rangeHashKey(r, (st, x) => keyToJson(this.hashKey(st, x)))).join(';');
       }
     }
     if (typeof v === 'object') {

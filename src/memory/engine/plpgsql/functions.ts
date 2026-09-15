@@ -1,7 +1,7 @@
 import * as A from '../ast';
-import { ProcDef, Relation, TypeOid } from '../catalog/catalog';
+import { ProcDef, Relation, TriggerDef, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
-import { StatementState } from '../exec/runtime';
+import { StatementState, TransitionCapture, TransitionTable } from '../exec/runtime';
 import { Token, tokenize } from '../lexer';
 import type { FieldInfo, Session, StatementResult } from '../session';
 import type { UndoLog } from '../storage/mvcc';
@@ -567,10 +567,11 @@ class PlParser {
       return { k: 'assign', target: t.value, expr };
     }
     if (t.type === 'ident' && t1.type === 'punct' && t1.value === '.' && this.peek(2).type === 'ident' && ((this.peek(3).type === 'punct' && this.peek(3).value === ':=') || (this.peek(3).type === 'op' && this.peek(3).value === '='))) {
+      const field = this.peek(2).value;
       this.p += 4;
       const expr = this.textUntil((x) => this.semi(x));
       this.p++;
-      return { k: 'assign', target: t.value + '.' + this.toks[this.p - 0]?.value, expr };
+      return { k: 'assign', target: t.value + '.' + field, expr };
     }
     // plain SQL (possibly SELECT ... INTO)
     const start = this.peek().pos;
@@ -690,6 +691,8 @@ class PlInterpreter {
   returnRows: unknown[][] = [];
   /** blocks with an EXCEPTION clause being executed (each runs as a subtransaction) */
   subxactDepth = 0;
+  /** a trigger function's transition tables (SPI_register_trigger_data), visible to its statements */
+  transitionTables: TransitionTable[] | null = null;
   /** exceptions whose handlers are running (bare RAISE re-throws the innermost) */
   handling: PgError[] = [];
 
@@ -704,12 +707,25 @@ class PlInterpreter {
     this.session.procedureTransactionEnd(commit, chain, this.st);
   }
 
+  /** a function with OUT / INOUT / TABLE parameters: their variables form the result (row) */
+  outParams: { name: string; type: number }[] | null = null;
+
   constructor(
     readonly session: Session,
     readonly st: StatementState,
     readonly retType: number,
     readonly retset: boolean
   ) {}
+
+  /** The value the OUT parameters make up: the single one, or a record of all of them. */
+  outValue(frame: PlFrame): unknown {
+    const params = this.outParams!;
+    const values = params.map((p) => frame.lookup(p.name)?.value ?? null);
+    if (params.length === 1) {
+      return values[0];
+    }
+    return new PgRecord(values, TypeOid.record, params.map((p) => p.type), params.map((p) => p.name));
+  }
 
   /** Replace variable references with $n parameters and run the SQL. */
   runSql(sql: string, frame: PlFrame, extraParams: { values: unknown[]; types: number[] } | null = null): StatementResult {
@@ -739,6 +755,23 @@ class PlInterpreter {
       let name = t.value;
       let v = frame.lookup(name);
       let consumed = 0;
+      if (v && v.value === null && next && next.type === 'punct' && next.value === '.' && toks[i + 2] && toks[i + 2].type === 'ident') {
+        // a NULL row of a known composite type (OLD in an INSERT trigger): its fields are NULL
+        const relid = this.session.catalog().getType(v.type)?.relid;
+        const col = relid ? this.session.catalog().getRelation(relid)?.columns.find((c) => !c.isDropped && c.name === toks[i + 2].value) : undefined;
+        if (col) {
+          name = name + '.' + col.name;
+          if (!names.has(name)) {
+            params.push(null);
+            types.push(col.typeOid);
+            names.set(name, params.length);
+          }
+          out += sql.slice(last, t.pos) + '$' + names.get(name);
+          last = toks[i + 2].end;
+          i += 2;
+          continue;
+        }
+      }
       if (v && next && next.type === 'punct' && next.value === '.' && toks[i + 2] && toks[i + 2].type === 'ident' && v.value instanceof PgRecord) {
         const field = toks[i + 2].value;
         const rec = v.value as PgRecord;
@@ -784,10 +817,21 @@ class PlInterpreter {
     nested.undo = this.st.undo;
     nested.depth = this.st.depth + 1;
     nested.nonAtomic = this.st.nonAtomic && this.subxactDepth === 0;
-    const parsed = this.session.db.parse(sql);
+    nested.transitionTables = this.transitionTables;
     let last: StatementResult | null = null;
-    for (const ps of parsed) {
-      last = this.session.executeParsedSync(ps, [], this.st.undo, nested);
+    try {
+      const parsed = this.session.db.parse(sql);
+      for (const ps of parsed) {
+        last = this.session.executeParsedSync(ps, [], this.st.undo, nested);
+      }
+    } catch (e) {
+      // a position within a statement run by the function is an internal position, not one in the client's query
+      if (e instanceof PgError && e.position !== undefined && e.internalPosition === undefined) {
+        e.internalPosition = e.position;
+        e.internalQuery = sql;
+        e.position = undefined;
+      }
+      throw e;
     }
     const r = last ?? { command: '', rowCount: 0, fields: [], rows: [], hasRows: false };
     this.rowCount = r.rowCount ?? r.rows.length;
@@ -952,8 +996,14 @@ class PlInterpreter {
         throw new PgError('20000', 'case not found', { hint: 'CASE statement is missing ELSE part.' });
       }
       case 'return':
+        if (this.outParams && s.expr !== null) {
+          throw new PgError(SqlState.DATATYPE_MISMATCH, 'RETURN cannot have a parameter in function with OUT parameters');
+        }
         if (this.retset) {
           throw new ReturnSignal(null);
+        }
+        if (this.outParams) {
+          throw new ReturnSignal(this.outValue(frame));
         }
         if (s.expr === null) {
           throw new ReturnSignal(null);
@@ -963,6 +1013,13 @@ class PlInterpreter {
           throw new ReturnSignal(this.convert(r.value, r.type, this.retType));
         }
       case 'return_next': {
+        if (this.outParams) {
+          if (s.expr) {
+            throw new PgError(SqlState.DATATYPE_MISMATCH, 'RETURN NEXT cannot have a parameter in function with OUT parameters');
+          }
+          this.returnRows.push(this.outParams.map((p) => frame.lookup(p.name)?.value ?? null));
+          return;
+        }
         if (s.expr) {
           const r = this.evalExpr(s.expr, frame);
           this.returnRows.push(r.value instanceof PgRecord ? r.value.values : [r.value]);
@@ -1277,6 +1334,27 @@ export function callPlpgsqlFunction(
     }
     frame.vars.set(`$${i + 1}`, v);
   });
+  // a function's OUT / INOUT / TABLE parameters are variables (initially NULL) forming its result
+  if (proc.kind !== 'p' && ((proc.argmodes && proc.argmodes.some((m) => m === 'o' || m === 'b' || m === 't')) || proc.returnsTable)) {
+    interp.outParams = [];
+    (proc.argmodes ?? []).forEach((mode, i) => {
+      if (mode !== 'o' && mode !== 'b' && mode !== 't') {
+        return;
+      }
+      const name = proc.argnames?.[i] || `$${i + 1}`;
+      const type = proc.allargtypes?.[i] ?? TypeOid.text;
+      if (mode !== 'b') {
+        frame.vars.set(name, { name, type, typmod: -1, value: null });
+      }
+      interp.outParams!.push({ name, type });
+    });
+    if (proc.returnsTable && !(proc.argmodes ?? []).includes('t')) {
+      for (const c of proc.returnsTable) {
+        frame.vars.set(c.name, { name: c.name, type: c.typeOid, typmod: c.typmod, value: null });
+        interp.outParams.push({ name: c.name, type: c.typeOid });
+      }
+    }
+  }
   frame.vars.set('found', { name: 'found', type: TypeOid.bool, typmod: -1, value: false });
   // a procedure's INOUT parameters are returned as a row with their final values
   const outputs = () => {
@@ -1304,6 +1382,9 @@ export function callPlpgsqlFunction(
   }
   if (proc.retset) {
     return { value: null, rows: interp.returnRows };
+  }
+  if (interp.outParams) {
+    return { value: interp.outValue(frame) };
   }
   if (proc.rettype !== TypeOid.void && proc.kind !== 'p') {
     throw new PgError('2F005', 'control reached end of function without RETURN', { where: `PL/pgSQL function ${proc.name}` });
@@ -1335,7 +1416,80 @@ export function runDoBlock(session: Session, stmt: A.DoStmt, parentSt: Statement
   }
 }
 
-export function fireTrigger(session: Session, rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', newData: unknown[] | null, oldData: unknown[] | null, st: StatementState): unknown[] | null | undefined {
+function triggerFrame(session: Session, rel: Relation, trig: { name: string; args: string[] }, timing: string, event: string, level: 'ROW' | 'STATEMENT'): PlFrame {
+  const cat = session.catalog();
+  const frame = new PlFrame(null);
+  const set = (name: string, type: number, value: unknown) => frame.vars.set(name, { name, type, typmod: -1, value });
+  set('tg_op', TypeOid.text, event);
+  set('tg_when', TypeOid.text, timing);
+  set('tg_level', TypeOid.text, level);
+  set('tg_table_name', TypeOid.name, rel.name);
+  set('tg_relname', TypeOid.name, rel.name);
+  set('tg_table_schema', TypeOid.name, cat.namespaceName(rel.nspOid));
+  set('tg_relid', TypeOid.oid, rel.oid);
+  set('tg_name', TypeOid.name, trig.name);
+  set('tg_nargs', TypeOid.int4, trig.args.length);
+  set('tg_argv', 1009 /* text[] */, trig.args.slice());
+  set('found', TypeOid.bool, false);
+  return frame;
+}
+
+function triggerAst(session: Session, funcOid: number): Extract<PlStmt, { k: 'block' }> {
+  const proc = session.catalog().getProc(funcOid)!;
+  let ast = (proc as unknown as Record<string, unknown>).__plpgsql_ast as Extract<PlStmt, { k: 'block' }> | undefined;
+  if (!ast) {
+    ast = parseBody(proc.body ?? '');
+    (proc as unknown as Record<string, unknown>).__plpgsql_ast = ast;
+  }
+  return ast;
+}
+
+/** FOR EACH STATEMENT triggers of a relation (BEFORE ones run before the first row, AFTER ones at the end of the statement). */
+export function fireStatementTrigger(session: Session, rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', st: StatementState, transition?: TransitionCapture): void {
+  const cat = session.catalog();
+  const triggers = [...cat.triggers.values()].filter((t) => t.relOid === rel.oid && t.enabled && t.timing === timing && t.events.includes(event) && !t.forEachRow).sort((a, b) => (a.name < b.name ? -1 : 1));
+  for (const trig of triggers) {
+    const ast = triggerAst(session, trig.funcOid);
+    const interp = new PlInterpreter(session, st, TypeOid.record, false);
+    interp.transitionTables = transitionTablesOf(trig, rel, event, transition);
+    const frame = triggerFrame(session, rel, trig, timing, event, 'STATEMENT');
+    frame.vars.set('new', { name: 'new', type: rel.rowTypeOid, typmod: -1, value: null });
+    frame.vars.set('old', { name: 'old', type: rel.rowTypeOid, typmod: -1, value: null });
+    try {
+      interp.execBlock(ast, frame);
+    } catch (e) {
+      if (!(e instanceof ReturnSignal)) {
+        throw e;
+      }
+    }
+  }
+}
+
+/** The transition tables a trigger declared, filled from the statement's captured rows. */
+function transitionTablesOf(trig: TriggerDef, rel: Relation, event: 'INSERT' | 'UPDATE' | 'DELETE', transition: TransitionCapture | undefined): TransitionTable[] | null {
+  if (!trig.newTable && !trig.oldTable) {
+    return null;
+  }
+  const out: TransitionTable[] = [];
+  if (trig.newTable) {
+    out.push({ name: trig.newTable, rel, rows: (event === 'INSERT' ? transition?.insertNew : event === 'UPDATE' ? transition?.updateNew : undefined) ?? [] });
+  }
+  if (trig.oldTable) {
+    out.push({ name: trig.oldTable, rel, rows: (event === 'DELETE' ? transition?.deleteOld : event === 'UPDATE' ? transition?.updateOld : undefined) ?? [] });
+  }
+  return out;
+}
+
+export function fireTrigger(
+  session: Session,
+  rel: Relation,
+  timing: 'BEFORE' | 'AFTER',
+  event: 'INSERT' | 'UPDATE' | 'DELETE',
+  newData: unknown[] | null,
+  oldData: unknown[] | null,
+  st: StatementState,
+  transition?: TransitionCapture
+): unknown[] | null | undefined {
   const cat = session.catalog();
   const triggers = [...cat.triggers.values()].filter((t) => t.relOid === rel.oid && t.enabled && t.timing === timing && t.events.includes(event) && t.forEachRow).sort((a, b) => (a.name < b.name ? -1 : 1));
   if (triggers.length === 0) {
@@ -1353,21 +1507,20 @@ export function fireTrigger(session: Session, rel: Relation, timing: 'BEFORE' | 
       : null;
   let current = newData;
   for (const trig of triggers) {
-    const proc = cat.getProc(trig.funcOid)!;
-    let ast = (proc as unknown as Record<string, unknown>).__plpgsql_ast as Extract<PlStmt, { k: 'block' }> | undefined;
-    if (!ast) {
-      ast = parseBody(proc.body ?? '');
-      (proc as unknown as Record<string, unknown>).__plpgsql_ast = ast;
+    // UPDATE OF columns: only when one of them is a target of the UPDATE
+    if (event === 'UPDATE' && trig.updateColumns && trig.updateColumns.length > 0 && st.updateTargetColumns && !trig.updateColumns.some((name) => st.updateTargetColumns!.has(name))) {
+      continue;
     }
+    const ast = triggerAst(session, trig.funcOid);
     const interp = new PlInterpreter(session, st, TypeOid.record, false);
-    const frame = new PlFrame(null);
-    frame.vars.set('new', { name: 'new', type: TypeOid.record, typmod: -1, value: toRecord(current) });
-    frame.vars.set('old', { name: 'old', type: TypeOid.record, typmod: -1, value: toRecord(oldData) });
-    frame.vars.set('tg_op', { name: 'tg_op', type: TypeOid.text, typmod: -1, value: event });
-    frame.vars.set('tg_when', { name: 'tg_when', type: TypeOid.text, typmod: -1, value: timing });
-    frame.vars.set('tg_table_name', { name: 'tg_table_name', type: TypeOid.name, typmod: -1, value: rel.name });
-    frame.vars.set('tg_name', { name: 'tg_name', type: TypeOid.name, typmod: -1, value: trig.name });
-    frame.vars.set('found', { name: 'found', type: TypeOid.bool, typmod: -1, value: false });
+    interp.transitionTables = transitionTablesOf(trig, rel, event, transition);
+    const frame = triggerFrame(session, rel, trig, timing, event, 'ROW');
+    // OLD / NEW have the table's row type even when NULL (OLD in INSERT, NEW in DELETE triggers)
+    frame.vars.set('new', { name: 'new', type: rel.rowTypeOid, typmod: -1, value: toRecord(current) });
+    frame.vars.set('old', { name: 'old', type: rel.rowTypeOid, typmod: -1, value: toRecord(oldData) });
+    if (trig.whenText && !interp.evalBool(trig.whenText, frame)) {
+      continue;
+    }
     let result: unknown = null;
     try {
       interp.execBlock(ast, frame);

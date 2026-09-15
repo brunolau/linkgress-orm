@@ -3,6 +3,7 @@ import { Catalog, NS_PG_CATALOG, PgType, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { COL_NAME_KEYWORDS, RESERVED_KEYWORDS, TYPE_FUNC_NAME_KEYWORDS } from '../parser';
 import { TExpr } from './nodes';
+import { multirangeTypeInfo, rangeTypeInfo } from '../types/range';
 
 export type CoercionContext = 'implicit' | 'assignment' | 'explicit';
 
@@ -306,6 +307,26 @@ export class TypeUtil {
         }
       }
     }
+    // a multirange determines its range type, a range type its element (subtype)
+    if (multirangeType !== 0) {
+      const r = multirangeTypeInfo(multirangeType)?.rangeOid ?? 0;
+      if (rangeType !== 0 && r !== rangeType) {
+        fail('argument declared anymultirange is not consistent with argument declared anyrange');
+      }
+      rangeType = r || rangeType;
+    }
+    if (rangeType !== 0) {
+      const subtype = rangeTypeInfo(rangeType)?.subtype ?? 0;
+      if (subtype !== 0) {
+        if (elemType !== 0 && elemType !== subtype) {
+          fail('argument declared anyrange is not consistent with argument declared anyelement');
+        }
+        elemType = subtype;
+      }
+      if (multirangeType === 0) {
+        multirangeType = rangeTypeInfo(rangeType)?.multirangeOid ?? 0;
+      }
+    }
     if (arrayType !== 0) {
       const e = this.elemType(arrayType);
       if (!e) {
@@ -399,8 +420,8 @@ export class TypeUtil {
   // -------------------------------------------------------------------------
 
   /** select_common_type over expressions */
-  selectCommonType(types: number[], context: string | null, locations?: unknown): number {
-    void locations;
+  /** `locations`: exprLocation of each input, for the position of a mismatch error */
+  selectCommonType(types: number[], context: string | null, locations?: (number | undefined)[]): number {
     if (types.length === 0) {
       return TypeOid.text;
     }
@@ -424,7 +445,11 @@ export class TypeUtil {
           if (context === null) {
             return 0;
           }
-          throw new PgError(SqlState.DATATYPE_MISMATCH, `${context} types ${this.typeName(ptype)} and ${this.typeName(ntype)} cannot be matched`);
+          const err = new PgError(SqlState.DATATYPE_MISMATCH, `${context} types ${this.typeName(ptype)} and ${this.typeName(ntype)} cannot be matched`);
+          if (locations && locations[i] !== undefined) {
+            err.position = locations[i]! + 1;
+          }
+          throw err;
         } else if (!ppreferred && this.canCoerceSingle(ptype, ntype, 'implicit') && !this.canCoerceSingle(ntype, ptype, 'implicit')) {
           ptype = ntype;
           pcategory = ncategory;

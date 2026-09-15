@@ -1,16 +1,19 @@
 /**
- * BunClient contract tests — run with `bun test tests-bun` (Bun runtime only).
+ * BunClient contract tests against Bun's native SQL client. They prove BunClient satisfies the same
+ * DatabaseClient contract the rest of the suite exercises through PgClient.
  *
- * These cannot live in the jest suite: jest runs under Node, where Bun's SQL
- * client does not exist. The suite proves BunClient satisfies the same
- * DatabaseClient contract the jest suite exercises through PgClient.
+ * Bun's SQL client cannot use a custom socket, so in memory mode (LINKGRESS_TEST_DB=memory) it connects
+ * to the TCP endpoint of the file's in-memory database.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { BunClient } from '../src';
+import { BunClient } from '../../src';
+import { isMemoryTestDatabase, memoryTcpEndpoint } from '../memory/shared-memory-db';
+
+const memoryEndpoint = isMemoryTestDatabase() ? await memoryTcpEndpoint() : null;
 
 const DB_CONFIG = {
-  hostname: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
+  hostname: memoryEndpoint?.host ?? (process.env.DB_HOST || 'localhost'),
+  port: memoryEndpoint?.port ?? parseInt(process.env.DB_PORT || '5432'),
   database: process.env.DB_NAME || 'linkgress_test',
   username: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'postgres',

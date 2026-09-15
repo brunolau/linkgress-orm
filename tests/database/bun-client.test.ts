@@ -1,4 +1,4 @@
-import { describe, test, expect, jest } from '@jest/globals';
+import { describe, test, expect, jest, mock } from 'bun:test';
 
 // Mock result sets faithful to real Bun.SQL shapes: a result set is a REAL
 // array of row objects carrying `command` and `count` properties (verified
@@ -45,14 +45,14 @@ const createMockSql = () => {
 };
 
 // Mock the require for bun:sql
-jest.mock('bun:sql', () => {
+mock.module('bun:sql', () => {
   return {
     SQL: jest.fn<any>().mockImplementation((_config: any) => {
       const { mockSql } = createMockSql();
       return mockSql;
     }),
   };
-}, { virtual: true });
+});
 
 // Import after mocking
 import { BunClient } from '../../src/database/bun-client';

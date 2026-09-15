@@ -1,4 +1,4 @@
-import { describe, expect, test } from '@jest/globals';
+import { describe, expect, test } from 'bun:test';
 import { DbContext, DbEntity, DbColumn, DbModelConfig, integer, varchar } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 import { collectionMarkerPattern } from '../../src/query/query-utils';

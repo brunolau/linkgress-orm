@@ -3,6 +3,15 @@ import type { Database } from '../engine/database';
 import { ServerConnection } from './server-connection';
 
 /**
+ * How server output reaches the driver: after the current call stack, never re-entrantly from inside
+ * the driver's own write. Node: `setImmediate`, so I/O and timers get their turn between messages.
+ * Bun: `process.nextTick` — `bun test` does not wake for immediates queued as a test settles, so each
+ * such response waited for the next timer tick (~0.1–0.9 s between tests).
+ */
+const deliver: (fn: () => void) => void =
+  typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined' ? (fn) => process.nextTick(fn) : (fn) => setImmediate(fn);
+
+/**
  * An in-process duplex stream that looks like a TCP socket to PostgreSQL drivers and speaks the
  * frontend/backend protocol with an in-memory database. Usable as pg's `stream` option and as
  * postgres.js' `socket` option, so the real driver code performs all serialization and parsing.
@@ -18,7 +27,7 @@ export class MemorySocket extends Duplex {
     super({ allowHalfOpen: false });
     this.server = new ServerConnection(db, {
       send: (data) => {
-        setImmediate(() => {
+        deliver(() => {
           if (!this.destroyed) {
             this.push(data);
           }
@@ -29,7 +38,7 @@ export class MemorySocket extends Duplex {
           return;
         }
         this.serverClosed = true;
-        setImmediate(() => {
+        deliver(() => {
           if (!this.destroyed) {
             this.push(null);
             this.destroy();
@@ -44,7 +53,7 @@ export class MemorySocket extends Duplex {
   }
 
   connect(): this {
-    setImmediate(() => this.emit('connect'));
+    deliver(() => this.emit('connect'));
     return this;
   }
 

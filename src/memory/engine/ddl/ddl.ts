@@ -1,3 +1,4 @@
+import { viewStatementUpdateDetail } from '../analyze/view-rewrite';
 import * as A from '../ast';
 import { transformProcedureCall } from '../analyze/func-call';
 import { lookupRelation } from '../analyze/from';
@@ -20,6 +21,7 @@ import { createIndexRelation, createTable, lookupTable, resolveCreationNamespace
 import { executeDrop, executeTruncate } from './drop';
 import { createExtension } from './extensions';
 import { explainStatement } from './explain';
+import { checkResultTypes, evaluateExecuteParams, fetchPreparedStatement, revalidatePrepared } from './prepared';
 import { DdlContext } from './stmt-context';
 
 export interface UtilityResult {
@@ -38,6 +40,16 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
     case 'CreateTableStmt':
       return { command: createTable(session, stmt) };
     case 'CreateTableAsStmt':
+      if (stmt.query.kind === 'ExecuteStmt') {
+        // CREATE TABLE ... AS EXECUTE: the prepared SELECT with its evaluated arguments
+        const prepared = fetchPreparedStatement(session, stmt.query.name);
+        if (prepared.stmt?.kind !== 'SelectStmt') {
+          throw new PgError(SqlState.WRONG_OBJECT_TYPE, 'prepared statement is not a SELECT');
+        }
+        const values = evaluateExecuteParams(session, stmt.query, prepared, params, boundTypes, parentSt, undo ?? null);
+        revalidatePrepared(session, prepared);
+        return createTableAs(session, { ...stmt, query: prepared.stmt }, values, prepared.paramTypes);
+      }
       return parentSt ? createTableAs(session, stmt, parentSt.params, parentSt.paramTypes) : createTableAs(session, stmt, params, boundTypes ?? []);
     case 'CreateIndexStmt':
       return { command: createIndex(session, stmt) };
@@ -88,6 +100,9 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
       if (stmt.tag.startsWith('DISCARD')) {
         discard(session, stmt.tag);
       }
+      if (stmt.setConstraints) {
+        session.setConstraints(stmt.setConstraints);
+      }
       return { command: stmt.tag };
     case 'LockStmt':
       for (const rv of stmt.relations) {
@@ -106,12 +121,20 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
         throw new PgError(SqlState.DUPLICATE_PSTATEMENT, `prepared statement "${stmt.name}" already exists`);
       }
       const an = session.makeAnalyzer();
-      const argTypes = stmt.argTypes.map((t) => an.types.lookupTypeName(t, session.relationSearchPath()).oid);
-      session.preparedStatements.set(stmt.name, { stmt: stmt.query, argTypes, text, fromSql: true, resultTypes: [], prepareTime: session.statementTimestamp() });
+      const declared = stmt.argTypes.map((t) => an.types.lookupTypeName(t, session.relationSearchPath()).oid);
+      const { paramTypes, fields } = session.describePreparable(stmt.query, declared);
+      session.preparedStatements.set(stmt.name, {
+        stmt: stmt.query,
+        argTypes: paramTypes,
+        text,
+        fromSql: true,
+        resultTypes: fields ? fields.map((f) => f.typeOid) : [],
+        prepareTime: session.statementTimestamp(),
+      });
       return { command: 'PREPARE' };
     }
     case 'ExecuteStmt':
-      return executePrepared(session, stmt);
+      return executePrepared(session, stmt, params, parentSt, boundTypes, undo ?? null);
     case 'DeallocateStmt':
       if (stmt.name) {
         if (!session.preparedStatements.delete(stmt.name)) {
@@ -432,6 +455,8 @@ function createDomain(session: Session, stmt: A.CreateDomainStmt): string {
     }
   }
   registerWithArray(session, cat, t);
+  // domainAddCheckConstraint: the CHECK expressions are analyzed when the domain is created
+  session.domainChecks(session.catalog().getType(t.oid) ?? t);
   return 'CREATE DOMAIN';
 }
 
@@ -576,9 +601,65 @@ function createFunction(session: Session, stmt: A.CreateFunctionStmt): string {
   return stmt.isProcedure ? 'CREATE PROCEDURE' : 'CREATE FUNCTION';
 }
 
+/** CreateTriggerFiringOn: the REFERENCING clause (transition tables) and where it is allowed. */
+function checkTransitionRels(stmt: A.CreateTriggerStmt, rel: import('../catalog/catalog').Relation): { newTable?: string; oldTable?: string } {
+  const rels = stmt.transitionRels ?? [];
+  if (rels.length === 0) {
+    return {};
+  }
+  if (rel.kind === 'v') {
+    throw new PgError(SqlState.WRONG_OBJECT_TYPE, `"${rel.name}" is a view`, { detail: 'Triggers on views cannot have transition tables.' });
+  }
+  if (stmt.forEachRow && rel.parentOid) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'ROW triggers with transition tables are not supported on partitions');
+  }
+  if (stmt.forEachRow && rel.inheritsFrom.length > 0) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'ROW triggers with transition tables are not supported on inheritance children');
+  }
+  if (stmt.timing !== 'AFTER') {
+    throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, 'transition table name can only be specified for an AFTER trigger');
+  }
+  if (stmt.events.includes('TRUNCATE')) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'TRUNCATE triggers with transition tables are not supported');
+  }
+  if (stmt.events.length !== 1) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'transition tables cannot be specified for triggers with more than one event');
+  }
+  if (stmt.updateColumns && stmt.updateColumns.length > 0) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'transition tables cannot be specified for triggers with column lists');
+  }
+  let newTable: string | undefined;
+  let oldTable: string | undefined;
+  const event = stmt.events[0];
+  for (const r of rels) {
+    if (r.isNew) {
+      if (event !== 'INSERT' && event !== 'UPDATE') {
+        throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, 'NEW TABLE can only be specified for an INSERT or UPDATE trigger');
+      }
+      if (newTable !== undefined) {
+        throw new PgError(SqlState.DUPLICATE_OBJECT, 'NEW TABLE cannot be specified multiple times');
+      }
+      newTable = r.name;
+    } else {
+      if (event !== 'DELETE' && event !== 'UPDATE') {
+        throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, 'OLD TABLE can only be specified for a DELETE or UPDATE trigger');
+      }
+      if (oldTable !== undefined) {
+        throw new PgError(SqlState.DUPLICATE_OBJECT, 'OLD TABLE cannot be specified multiple times');
+      }
+      oldTable = r.name;
+    }
+  }
+  if (newTable !== undefined && newTable === oldTable) {
+    throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, 'OLD TABLE name and NEW TABLE name cannot be the same');
+  }
+  return { newTable, oldTable };
+}
+
 function createTrigger(session: Session, stmt: A.CreateTriggerStmt): string {
   const cat = session.ddlCatalog();
   const rel = lookupTable(session, stmt.relation);
+  const { newTable, oldTable } = checkTransitionRels(stmt, rel);
   const procs = cat.findProcsByName(stmt.funcname[stmt.funcname.length - 1]).filter((p) => p.rettype === TypeOid.trigger && p.argtypes.length === 0);
   if (procs.length === 0) {
     throw new PgError(SqlState.UNDEFINED_FUNCTION, `function ${stmt.funcname.join('.')}() does not exist`);
@@ -597,7 +678,10 @@ function createTrigger(session: Session, stmt: A.CreateTriggerStmt): string {
     events: stmt.events,
     updateColumns: stmt.updateColumns,
     forEachRow: stmt.forEachRow,
+    newTable,
+    oldTable,
     when: stmt.when,
+    whenText: stmt.whenText,
     args: stmt.args,
     enabled: true,
   });
@@ -615,6 +699,18 @@ function createView(session: Session, stmt: A.ViewStmt): string {
   const an = session.makeAnalyzer();
   const { query } = analyzeStatementAsSubquery(an, stmt.query, null, true);
   const targets = query.targetList.filter((t) => !t.resjunk);
+  // WITH CHECK OPTION, or WITH (check_option = local | cascaded)
+  const checkReloption = stmt.options?.find((o) => o.name === 'check_option');
+  const checkOption = stmt.withCheckOption ?? (checkReloption ? String(checkReloption.value ?? '').toLowerCase() : undefined);
+  if (checkOption) {
+    const reason = viewStatementUpdateDetail(an, stmt.query);
+    if (reason) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'WITH CHECK OPTION is supported only on automatically updatable views', { hint: reason });
+    }
+  }
+  if ((stmt.aliases?.length ?? 0) > targets.length) {
+    throw new PgError(SqlState.SYNTAX_ERROR, 'CREATE VIEW specifies more column names than columns');
+  }
   const names = targets.map((t, i) => stmt.aliases?.[i] ?? t.name);
   const seen = new Set<string>();
   for (const n of names) {
@@ -622,6 +718,37 @@ function createView(session: Session, stmt: A.ViewStmt): string {
       throw new PgError(SqlState.DUPLICATE_COLUMN, `column "${n}" specified more than once`);
     }
     seen.add(n);
+  }
+  targets.forEach((t, i) => {
+    if (t.expr.type === TypeOid.record) {
+      throw new PgError(SqlState.INVALID_TABLE_DEFINITION, `column "${names[i]}" has pseudo-type record`);
+    }
+  });
+  if (existing) {
+    // checkViewColumns: columns may only be appended
+    const types = an.types;
+    const old = existing.columns.filter((c) => !c.isDropped);
+    if (targets.length < old.length) {
+      throw new PgError(SqlState.INVALID_TABLE_DEFINITION, 'cannot drop columns from view');
+    }
+    old.forEach((c, i) => {
+      const t = targets[i].expr;
+      if (c.name !== names[i]) {
+        throw new PgError(SqlState.INVALID_TABLE_DEFINITION, `cannot change name of view column "${c.name}" to "${names[i]}"`, {
+          hint: 'Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.',
+        });
+      }
+      if (c.typeOid !== t.type || c.typmod !== t.typmod) {
+        throw new PgError(
+          SqlState.INVALID_TABLE_DEFINITION,
+          `cannot change data type of view column "${c.name}" from ${types.formatType(c.typeOid, c.typmod)} to ${types.formatType(t.type, t.typmod)}`,
+        );
+      }
+    });
+  }
+  const options = (stmt.options ?? []).map((o) => `${o.name}=${o.value ?? 'true'}`);
+  if (stmt.withCheckOption && !checkReloption) {
+    options.push(`check_option=${stmt.withCheckOption}`);
   }
   const rel: import('../catalog/catalog').Relation = {
     oid: existing?.oid ?? session.db.oids.allocate(),
@@ -632,8 +759,8 @@ function createView(session: Session, stmt: A.ViewStmt): string {
     columns: targets.map((t, i) => newColumn(i + 1, names[i], t.expr.type, t.expr.typmod, t.expr.collation)),
     rowTypeOid: existing?.rowTypeOid ?? 0,
     storageId: 0,
-    options: (stmt.options ?? []).map((o) => `${o.name}=${o.value ?? 'true'}`),
-    view: { query: stmt.query, text: stmt.queryText, checkOption: stmt.withCheckOption },
+    options,
+    view: { query: stmt.query, text: stmt.queryText, checkOption },
     inheritsFrom: [],
     hasTriggers: false,
     populated: true,
@@ -644,6 +771,12 @@ function createView(session: Session, stmt: A.ViewStmt): string {
     cat.putRelation(rel);
   }
   return 'CREATE VIEW';
+}
+
+/** A qualified type name that resolves back to `typeOid` (the exact type and typmod are patched in afterwards). */
+function typeNameParts(cat: Catalog, typeOid: number): string[] {
+  const t = cat.getType(typeOid);
+  return t ? [cat.namespaceName(t.nspOid), t.name] : ['pg_catalog', 'text'];
 }
 
 function createTableAs(session: Session, stmt: A.CreateTableAsStmt, params: unknown[], paramTypes: number[]): UtilityResult {
@@ -664,7 +797,7 @@ function createTableAs(session: Session, stmt: A.CreateTableAsStmt, params: unkn
   const colDefs = targets.map((t, i) => ({
     kind: 'ColumnDef' as const,
     name: stmt.columnNames?.[i] ?? t.name,
-    typeName: { kind: 'TypeName' as const, names: ['pg_catalog', cat.getType(t.expr.type)?.name ?? 'text'], typmods: [], arrayBounds: [] },
+    typeName: { kind: 'TypeName' as const, names: typeNameParts(cat, t.expr.type), typmods: [], arrayBounds: [] },
     constraints: [],
   }));
   createTable(session, {
@@ -684,11 +817,12 @@ function createTableAs(session: Session, stmt: A.CreateTableAsStmt, params: unkn
   if (stmt.isMaterializedView) {
     newCat.putRelation({ ...newCat.getRelation(rel.oid)!, view: { query: stmt.query as A.SelectStmt, text: '' } });
   }
-  let count = 0;
-  if (stmt.withData) {
-    count = populateFromQuery(session, newCat, rel.oid, query, params, an.paramTypes);
+  if (!stmt.withData) {
+    return { command: stmt.isMaterializedView ? 'CREATE MATERIALIZED VIEW' : 'CREATE TABLE AS' };
   }
-  return { command: stmt.isMaterializedView ? 'CREATE MATERIALIZED VIEW' : 'SELECT', rowCount: stmt.isMaterializedView ? undefined : count };
+  // populated: the command tag is the SELECT's (ExecCreateTableAs)
+  const count = populateFromQuery(session, newCat, rel.oid, query, params, an.paramTypes);
+  return { command: 'SELECT', rowCount: count };
 }
 
 function populateFromQuery(session: Session, cat: Catalog, relOid: number, query: Query, params: unknown[] = [], paramTypes: number[] = []): number {
@@ -899,11 +1033,12 @@ function variableSet(session: Session, stmt: A.VariableSetStmt): string {
     case 'MULTI': {
       const opts = stmt.transactionOptions ?? {};
       if (stmt.name === 'TRANSACTION' && session.txn) {
+        // through the GUCs, whose check hooks refuse changes after the first query
         if (opts.isolation) {
-          session.txn.isolation = opts.isolation;
+          session.setSetting('transaction_isolation', opts.isolation, true);
         }
         if (opts.readOnly !== undefined) {
-          session.txn.readOnly = opts.readOnly;
+          session.setSetting('transaction_read_only', opts.readOnly ? 'on' : 'off', true);
         }
       } else if (stmt.name === 'SESSION CHARACTERISTICS') {
         if (opts.isolation) {
@@ -954,8 +1089,17 @@ function variableShow(session: Session, stmt: A.VariableShowStmt): UtilityResult
 
 /** Row description of a utility statement for the extended protocol's Describe (null = NoData). */
 export function describeUtility(session: Session, stmt: A.Statement): FieldInfo[] | null {
-  void session;
   switch (stmt.kind) {
+    case 'ExecuteStmt': {
+      // FetchPreparedStatementResultDesc
+      const prepared = fetchPreparedStatement(session, stmt.name);
+      if (!prepared.stmt) {
+        return null;
+      }
+      const k = prepared.stmt.kind;
+      const preparable = k === 'SelectStmt' || k === 'InsertStmt' || k === 'UpdateStmt' || k === 'DeleteStmt' || k === 'MergeStmt';
+      return preparable ? session.describePreparable(prepared.stmt, prepared.paramTypes).fields : describeUtility(session, prepared.stmt);
+    }
     case 'VariableShowStmt':
       return showFields(stmt);
     case 'ExplainStmt':
@@ -1029,12 +1173,16 @@ function callProcedure(session: Session, stmt: A.CallStmt, params: unknown[], pa
   return { command: 'CALL', fields: out.fields, rows: [out.values], rowCount: 1 };
 }
 
-function executePrepared(session: Session, stmt: A.ExecuteStmt): UtilityResult {
-  const prep = session.preparedStatements.get(stmt.name);
-  if (!prep) {
-    throw new PgError(SqlState.INVALID_SQL_STATEMENT_NAME, `prepared statement "${stmt.name}" does not exist`);
+/** ExecuteQuery: the prepared statement runs with the evaluated arguments and reports its own command tag. */
+function executePrepared(session: Session, stmt: A.ExecuteStmt, params: unknown[], parentSt: StatementState | null, boundTypes: number[] | undefined, undo: UndoLog | null): UtilityResult {
+  const prepared = fetchPreparedStatement(session, stmt.name);
+  const values = evaluateExecuteParams(session, stmt, prepared, params, boundTypes, parentSt, undo);
+  if (!prepared.stmt) {
+    return { command: '' };
   }
-  throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'in-memory engine: EXECUTE of SQL-level prepared statements is not supported');
+  const r = session.executeParsedSync({ stmt: prepared.stmt, text: prepared.text, start: 0, end: 0 }, values, undo ?? parentSt?.undo ?? null, null, 0, prepared.paramTypes);
+  checkResultTypes(prepared, r.hasRows ? r.fields.map((f) => f.typeOid) : null);
+  return { command: r.command, rowCount: r.rowCount ?? undefined, fields: r.hasRows ? r.fields : undefined, rows: r.rows };
 }
 
 function rename(session: Session, stmt: A.RenameStmt): string {
@@ -1059,15 +1207,18 @@ function rename(session: Session, stmt: A.RenameStmt): string {
       return rel.kind === 'i' ? 'ALTER INDEX' : rel.kind === 'S' ? 'ALTER SEQUENCE' : rel.kind === 'v' ? 'ALTER VIEW' : 'ALTER TABLE';
     }
     case 'COLUMN':
-    case 'CONSTRAINT':
+    case 'CONSTRAINT': {
+      // renameatt accepts a view's (or materialized view's) columns whichever ALTER form names it
+      const target = stmt.objectType === 'COLUMN' ? lookupRelation(session.makeAnalyzer(), stmt.relation!, true) : null;
       return executeAlterTable(session, {
         kind: 'AlterTableStmt',
         relation: stmt.relation!,
-        objectType: 'TABLE',
+        objectType: target?.kind === 'v' ? 'VIEW' : target?.kind === 'm' ? 'MATERIALIZED VIEW' : 'TABLE',
         ifExists: stmt.ifExists,
         only: false,
         cmds: [stmt.objectType === 'COLUMN' ? { kind: 'RENAME_COLUMN', oldName: stmt.subname!, newName: stmt.newname } : { kind: 'RENAME_CONSTRAINT', oldName: stmt.subname!, newName: stmt.newname }],
       });
+    }
     case 'SCHEMA': {
       const ns = cat.findNamespace(stmt.object![0]);
       if (!ns) {

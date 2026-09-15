@@ -1,70 +1,98 @@
 # Linkgress ORM Test Suite
 
-Comprehensive test suite for the Linkgress ORM library using Jest and TypeScript.
+The Linkgress test suite runs on [Bun](https://bun.sh)'s test runner (`bun:test`). It runs against a real
+PostgreSQL database and, unchanged, against the Linkgress in-memory database — and it can check that both
+give identical results.
 
 ## Test Structure
 
 ```
 tests/
-├── setup.ts                    # Global test setup and custom matchers
+├── run.ts                      # Test runner: one `bun test` process per file, PostgreSQL / memory / parity
+├── setup.ts                    # Preload (bunfig.toml): global hooks, custom matchers, memory-mode driver swap
+├── global-schema.ts            # Creates / drops the test schema of a PostgreSQL run
+├── tsconfig.json               # Type-checking of the tests (`npm run type-check:tests`)
 ├── utils/
-│   └── test-database.ts       # Database utilities and helpers
-├── queries/
-│   ├── basic-queries.test.ts  # SELECT, WHERE, ORDER BY, pagination
-│   ├── grouping.test.ts       # GROUP BY, aggregations, HAVING
-│   ├── joins.test.ts          # INNER/LEFT JOINs, subqueries in joins
-│   └── subqueries.test.ts     # Scalar, array, table subqueries
-├── mutations/
-│   └── insert-update-delete.test.ts  # INSERT, UPDATE, DELETE, UPSERT
-└── entities/
-    └── navigation.test.ts     # Navigation properties, relationships
+│   ├── test-database.ts        # Database utilities and helpers
+│   └── expect-rejects.ts       # expectToReject() — rejection assertions
+├── memory/
+│   ├── in-memory-database.test.ts  # In-memory database API
+│   ├── sql-parity.test.ts          # Same SQL on PostgreSQL and in memory, results compared
+│   ├── sql-parity-corpus.ts        # The statements it compares
+│   ├── create-schema-snapshot.ts   # Schema snapshot every memory-mode file starts from
+│   └── shared-memory-db.ts, pg-memory.ts, postgres-memory.ts  # memory-mode plumbing
+├── queries/  mutations/  entities/  schema/  migration/  database/
 ```
 
 ## Running Tests
 
-### Run all tests
 ```bash
-npm test
+npm test                 # all files against PostgreSQL
+npm run test:memory      # all files against the in-memory database (no PostgreSQL needed*)
+npm run test:parity      # both, then fail unless every file and test has the same outcome
+npm run test:pglite      # all files on PGlite (PostgreSQL in WASM, in-process) through PGliteClient
 ```
 
-### Run tests in watch mode
+\* `tests/memory/sql-parity.test.ts` compares with PostgreSQL and is skipped when none is reachable.
+
+Every test file runs in its own `bun test` process, so each file has a fresh module registry (entity
+metadata, caches, shared clients) and, in memory mode, its own database. A PostgreSQL run creates the
+test schema once before the files run and drops it afterwards; the files run one after another because
+they share the database. A memory run builds the schema once into a snapshot every file's database is
+restored from, and runs files in parallel. A PGlite run (`--driver pglite`) does the same with a PGlite
+data-directory dump (every file boots its own PGlite); the server is then only needed by the files that
+construct `PgClient` / `PostgresClient` themselves, and the run only warns when it is unreachable.
+
+### Runner options (`bun tests/run.ts [paths] [options]`)
+
 ```bash
-npm run test:watch
+bun tests/run.ts tests/queries                  # a directory (or files, or path substrings)
+bun tests/run.ts grouping --memory              # files whose path contains "grouping", in memory
+bun run test:single "should group by single field"   # --test-name-pattern
+bun tests/run.ts --memory --thread              # memory databases hosted in worker threads
+bun tests/run.ts --driver postgres              # the suite on PostgresClient (also: bun, pglite, pg — default)
+bun tests/run.ts --memory --jobs 4              # parallel files in memory / PGlite runs (default: half the cores)
+bun tests/run.ts --json results.json            # per-test outcomes of the run(s)
+npm run test:coverage                           # lcov for all files, merged into coverage/lcov.info
+npm run test:verbose                            # print every file's output, not only failing ones
 ```
 
-### Run with coverage report
+### A single file directly
+
 ```bash
-npm run test:coverage
+bun test tests/queries/grouping.test.ts --timeout 30000
+LINKGRESS_TEST_DB=memory bun test tests/queries/grouping.test.ts --timeout 30000
+bun run test:watch tests/queries/grouping.test.ts
 ```
 
-### Run specific test file
-```bash
-npm test basic-queries
-```
+The preload (`tests/setup.ts`) makes a file runnable on its own: against PostgreSQL the helpers create the
+schema when it is missing; in memory mode the preload builds the schema snapshot itself. Run files through
+`tests/run.ts` rather than `bun test tests/`: a single `bun test` process shares one module graph between
+all files, which the schema-mutating files do not tolerate.
 
-### Run specific test by pattern
-```bash
-npm run test:single "should group by single field"
-```
+### Parity
+
+`npm run test:parity` runs the suite against PostgreSQL, then in memory, and compares the outcome of every
+test and of every file's process (a failure outside any test — an `afterAll` hook, a crash — counts too).
+Any difference is listed and fails the run.
+
+`tests/memory/sql-parity.test.ts` checks the database itself statement by statement: each case of the
+corpus runs on PostgreSQL and on a fresh in-memory database, and the command tags, row counts, column
+names and types, rows (as the text PostgreSQL sends) or errors (code, message, detail, hint, position)
+must be identical.
 
 ## VS Code Debugging
 
-The project includes VS Code launch configurations for debugging tests:
+With the Bun extension (`oven.bun-vscode`), `.vscode/launch.json` provides:
 
-1. **Jest: Run All Tests** - Run all tests with debugging
-2. **Jest: Run Current File** - Debug the currently open test file
-3. **Jest: Watch All Tests** - Run tests in watch mode
-4. **Jest: Debug Current Test** - Debug a specific test (select test name first)
-
-To debug:
-1. Open a test file
-2. Press `F5` or use the Debug panel
-3. Select the appropriate launch configuration
-4. Set breakpoints as needed
+1. **Bun: Run All Tests** / **Bun: Run All Tests In Memory** — the runner
+2. **Bun: Debug Current Test File** — the open file under the debugger
+3. **Bun: Debug Selected Test** — the test whose name is selected
+4. **Bun: Watch Current Test File**
 
 ## Database Setup
 
-Tests use a PostgreSQL test database. Configure via environment variables in `.env`:
+PostgreSQL runs use the database configured via environment variables in `.env`:
 
 ```env
 DB_HOST=localhost
@@ -74,7 +102,7 @@ DB_USER=postgres
 DB_PASSWORD=postgres
 ```
 
-**Important**: The test database is dropped and recreated for each test to ensure isolation.
+Test files truncate the tables they use; the schema is created per run.
 
 ## Test Utilities
 
@@ -111,27 +139,21 @@ await setupDatabase(db);
 await cleanupDatabase(db);
 ```
 
-## Test Coverage
+### `expectToReject`
+Assert that a promise (or a query builder) rejects. Use it instead of `expect(...).rejects`: Bun's
+`.rejects` / `.resolves` only await real promises, and driver queries are lazy thenables that never start.
 
-Current test coverage includes:
-
-- ✅ **Basic Queries**: SELECT, WHERE, ORDER BY, LIMIT, OFFSET
-- ✅ **Filtering**: eq, ne, gt, gte, lt, lte, like, and, or, not
-- ✅ **Aggregations**: COUNT, SUM, MIN, MAX, AVG
-- ✅ **Grouping**: GROUP BY with single/multiple keys, HAVING
-- ✅ **Joins**: INNER JOIN, LEFT JOIN, with subqueries
-- ✅ **Subqueries**: Scalar, array, table modes
-- ✅ **Mutations**: INSERT, UPDATE, DELETE, UPSERT
-- ✅ **Navigation Properties**: One-to-many, many-to-one
-- ✅ **Type Safety**: Verify proper TypeScript types
-- ✅ **Edge Cases**: NULL handling, empty results, cascades
+```typescript
+const error = await expectToReject(db.users.where(u => eq(u.id, 'x' as any)).toList(), /invalid input syntax/);
+expect(error.code).toBe('22P02');
+```
 
 ## Writing New Tests
 
 ### Test Template
 
 ```typescript
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq } from '../../src';
 
@@ -152,10 +174,13 @@ describe('Feature Name', () => {
 });
 ```
 
+Mocks come from `bun:test` too: `jest.fn()`, `jest.spyOn()` / `spyOn()`, and `mock.module()` for modules.
+
 ### Best Practices
 
 1. **Use descriptive test names** - Clearly state what is being tested
-2. **Isolate tests** - Each test should be independent
+2. **Isolate tests** - Each test should be independent; do not rely on objects another file left behind
+   (memory-mode files start from a fresh database)
 3. **Test edge cases** - NULL values, empty results, errors
 4. **Verify types** - Ensure aggregates return numbers, not strings
 5. **Clean up** - Use `withDatabase` for automatic cleanup
@@ -173,13 +198,13 @@ expect(result.avgAge).toBeWithinRange(30, 40);
 ## Troubleshooting
 
 ### Tests fail with "Cannot find module"
-Run `npm install` to ensure all dependencies are installed.
+Run `pnpm install` (or `npm install`) to ensure all dependencies are installed.
 
 ### Database connection errors
 Check your `.env` file has correct database credentials.
 
 ### Tests hang or timeout
-Increase timeout in `jest.config.js` or individual tests:
+The runner's per-test timeout is 30 s (`--timeout <ms>`). A single test can set its own:
 ```typescript
 test('long running test', async () => {
   // ...
@@ -189,18 +214,9 @@ test('long running test', async () => {
 ### "Database name must include 'test'"
 Ensure `DB_NAME` in `.env` contains the word "test" for safety.
 
-## Contributing
-
-When adding new features:
-1. Write tests first (TDD approach)
-2. Ensure tests pass: `npm test`
-3. Check coverage: `npm run test:coverage`
-4. Aim for >80% code coverage
-5. Document complex test scenarios
-
 ## CI/CD Integration
 
-Tests are designed to run in CI/CD environments. Example GitHub Actions:
+Example GitHub Actions:
 
 ```yaml
 name: Tests
@@ -210,19 +226,21 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:15
+        image: postgres:18
         env:
           POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-      - run: npm ci
-      - run: npm test
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run test:parity
         env:
           DB_NAME: linkgress_test
           DB_USER: postgres

@@ -2,6 +2,7 @@ import { Relation, TypeOid } from '../../catalog/catalog';
 import { PgError, SqlState } from '../../errors';
 import { quoteIdentifier } from '../../analyze/typeutil';
 import { TypeUtil } from '../../analyze/typeutil';
+import { arrayLowerBound, withLowerBound } from '../../types/values';
 import { unaccentText } from './text-fns';
 import { FnImpl } from '../runtime';
 import { toBigInt } from '../typeops';
@@ -118,7 +119,137 @@ export function pgHashBytes(k: Uint8Array): number {
   return c | 0;
 }
 
+/** The labels of the enum type an anyenum argument has, in sort order (enum_first & co.). */
+function enumLabelsOf(fc: { st: { catalog: { getType(oid: number): { typtype: string; enumLabels?: { label: string; sortOrder: number }[] } | undefined } }; argTypes: number[] }): string[] {
+  const t = fc.st.catalog.getType(fc.argTypes[0]);
+  if (!t || t.typtype !== 'e') {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'could not determine actual enum type');
+  }
+  return [...(t.enumLabels ?? [])].sort((x, y) => x.sortOrder - y.sortOrder).map((l) => l.label);
+}
+
+const subscriptError = (message: string) => new PgError(SqlState.ARRAY_SUBSCRIPT_ERROR, message);
+
+/** Dimensions of a (nested) array value; [] for an empty array. */
+function arrayDimsOf(arr: unknown[]): number[] {
+  if (arr.length === 0) {
+    return [];
+  }
+  const dims = [arr.length];
+  let cur: unknown = arr[0];
+  while (Array.isArray(cur)) {
+    dims.push(cur.length);
+    cur = cur[0];
+  }
+  return dims;
+}
+
+/**
+ * UPDATE ... SET col[i] = v / col[l:u] = arr (array_set_element / array_set_slice). `spec` describes the
+ * subscripts: 'e' an element subscript, 's' a slice (with the presence of its lower / upper bound as 1/0).
+ */
+function arrayAssign(container: unknown[] | null, value: unknown, spec: string, bounds: unknown[]): unknown[] {
+  const slices = spec.split(',');
+  const arr = container ?? [];
+  const dims = arrayDimsOf(arr);
+  const lb = arrayLowerBound(arr);
+  if (slices.every((s) => s === 'e')) {
+    const idx = bounds.filter((_, i) => i % 2 === 1).map((b) => {
+      if (b === null) {
+        throw new PgError(SqlState.NULL_VALUE_NOT_ALLOWED, 'array subscript in assignment must not be null');
+      }
+      return Number(b);
+    });
+    if (dims.length === 0) {
+      let v: unknown = value;
+      for (let d = idx.length - 1; d >= 1; d--) {
+        v = [v];
+      }
+      return withLowerBound([v], idx[0]);
+    }
+    if (idx.length !== dims.length) {
+      throw subscriptError('wrong number of array subscripts');
+    }
+    if (dims.length === 1) {
+      const i = idx[0];
+      const ub = lb + arr.length - 1;
+      const newLb = Math.min(lb, i);
+      const newUb = Math.max(ub, i);
+      const out: unknown[] = [];
+      for (let k = newLb; k <= newUb; k++) {
+        out.push(k === i ? value : k >= lb && k <= ub ? arr[k - lb] : null);
+      }
+      return withLowerBound(out, newLb);
+    }
+    const copy = (a: unknown[], level: number): unknown[] => {
+      const i = idx[level] - (level === 0 ? lb : 1);
+      if (i < 0 || i >= a.length) {
+        throw subscriptError('array subscript out of range');
+      }
+      const out = a.slice();
+      out[i] = level === dims.length - 1 ? value : copy(a[i] as unknown[], level + 1);
+      return out;
+    };
+    return withLowerBound(copy(arr, 0), lb);
+  }
+  if (slices.length !== 1 || (dims.length > 1)) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'in-memory engine: assignment to multi-dimensional array slices is not implemented');
+  }
+  const [hasLower, hasUpper] = [slices[0][1] === '1', slices[0][2] === '1'];
+  if (value === null) {
+    return withLowerBound(arr.slice(), lb);
+  }
+  const src = (value as unknown[]).flat(Infinity as 1);
+  if ((!hasLower || !hasUpper) && dims.length === 0) {
+    throw subscriptError('array slice subscript must provide both boundaries');
+  }
+  const lower = hasLower ? bounds[0] : lb;
+  const upper = hasUpper ? bounds[1] : lb + arr.length - 1;
+  if (lower === null || upper === null) {
+    throw new PgError(SqlState.NULL_VALUE_NOT_ALLOWED, 'array subscript in assignment must not be null');
+  }
+  const l = Number(lower);
+  const u = Number(upper);
+  if (u < l) {
+    throw subscriptError('upper bound cannot be less than lower bound');
+  }
+  if (src.length < u - l + 1) {
+    throw subscriptError('source array too small');
+  }
+  const ub = lb + arr.length - 1;
+  const newLb = dims.length === 0 ? l : Math.min(lb, l);
+  const newUb = dims.length === 0 ? u : Math.max(ub, u);
+  const out: unknown[] = [];
+  for (let k = newLb; k <= newUb; k++) {
+    out.push(k >= l && k <= u ? src[k - l] : dims.length > 0 && k >= lb && k <= ub ? arr[k - lb] : null);
+  }
+  return withLowerBound(out, newLb);
+}
+
 export const SYSTEM_FUNCS: Record<string, FnImpl> = {
+  __linkgress_merge_action: (a, fc) => (fc.st.scratch.get('merge-action') as string | undefined) ?? null,
+  __linkgress_array_assign:(a) => arrayAssign(a[0] as unknown[] | null, a[1], a[2] as string, a.slice(3)),
+  enum_first: (_a, fc) => {
+    const labels = enumLabelsOf(fc);
+    if (labels.length === 0) {
+      throw new PgError(SqlState.OBJECT_NOT_IN_PREREQUISITE_STATE, `enum ${fc.st.catalog.getType(fc.argTypes[0])!.name} contains no values`);
+    }
+    return labels[0];
+  },
+  enum_last: (_a, fc) => {
+    const labels = enumLabelsOf(fc);
+    if (labels.length === 0) {
+      throw new PgError(SqlState.OBJECT_NOT_IN_PREREQUISITE_STATE, `enum ${fc.st.catalog.getType(fc.argTypes[0])!.name} contains no values`);
+    }
+    return labels[labels.length - 1];
+  },
+  enum_range_all: (_a, fc) => enumLabelsOf(fc),
+  enum_range_bounds: (a, fc) => {
+    const labels = enumLabelsOf(fc);
+    const lo = a[0] === null ? 0 : labels.indexOf(a[0] as string);
+    const hi = a[1] === null ? labels.length - 1 : labels.indexOf(a[1] as string);
+    return lo < 0 || hi < 0 || lo > hi ? [] : labels.slice(lo, hi + 1);
+  },
   hashtext: (a) => pgHashBytes(Buffer.from(a[0] as string, 'utf8')),
   pg_sequence_last_value: (a, fc) => {
     const rel = fc.st.catalog.getRelation(a[0] as number);
@@ -200,6 +331,11 @@ export const SYSTEM_FUNCS: Record<string, FnImpl> = {
   pg_get_constraintdef_ext: (a, fc) => fc.st.session.catalogFns.constraintDef(a[0] as number, a[1] === true),
   pg_get_viewdef: (a, fc) => fc.st.session.catalogFns.viewDef(a[0] as number, false),
   pg_get_viewdef_ext: (a, fc) => fc.st.session.catalogFns.viewDef(a[0] as number, a[1] === true),
+  pg_get_viewdef_wrap: (a, fc) => fc.st.session.catalogFns.viewDef(a[0] as number, true, a[1] as number),
+  pg_get_viewdef_name_ext: (a, fc) => {
+    const oid = fc.st.session.resolveRelation(a[0] as string);
+    return oid === null ? null : fc.st.session.catalogFns.viewDef(oid, a[1] === true);
+  },
   pg_get_viewdef_name: (a, fc) => {
     const oid = fc.st.session.resolveRelation(a[0] as string);
     return oid === null ? null : fc.st.session.catalogFns.viewDef(oid, false);

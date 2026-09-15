@@ -1,12 +1,15 @@
+import { isSystemAttno, SYSTEM_COLUMN_NAMES } from '../analyze/colref';
 import { Query, TExpr } from '../analyze/nodes';
 import { quoteIdentifier, quoteLiteral, TypeUtil } from '../analyze/typeutil';
 import { CatalogFunctions, StatementState } from '../exec/runtime';
 import type { Session } from '../session';
 import { SessionHost } from '../session';
 import { outputValue } from '../types/io';
+import { analyzeStatementAsSubquery } from '../analyze/select';
 import { Catalog, Relation, StoredExpr, TypeOid } from './catalog';
+import { viewDefinition } from './ruleutils';
 
-interface DeparseCtx {
+export interface DeparseCtx {
   session: Session;
   catalog: Catalog;
   types: TypeUtil;
@@ -17,11 +20,11 @@ interface DeparseCtx {
   unqualifiedRt?: number;
 }
 
-function fmtType(ctx: DeparseCtx, oid: number, typmod: number): string {
+export function fmtType(ctx: DeparseCtx, oid: number, typmod: number): string {
   return ctx.types.formatType(oid, typmod, true, false, ctx.session.searchPathNamespaces());
 }
 
-function constText(ctx: DeparseCtx, e: TExpr & { k: 'const' }, showtype: number): string {
+export function constText(ctx: DeparseCtx, e: TExpr & { k: 'const' }, showtype: number): string {
   if (e.isNull) {
     if (showtype < 0) {
       return 'NULL';
@@ -79,7 +82,7 @@ function constText(ctx: DeparseCtx, e: TExpr & { k: 'const' }, showtype: number)
 function looksLikeFunction(e: TExpr): boolean {
   switch (e.k) {
     case 'func':
-      return e.format === 'call';
+      return e.format === 'call' || e.format === 'sql_syntax';
     case 'coalesce':
     case 'minmax':
     case 'nullif':
@@ -103,13 +106,13 @@ function isSimple(e: TExpr): boolean {
     case 'row':
       return true;
     case 'func':
-      return e.format === 'call';
+      return e.format === 'call' || e.format === 'sql_syntax';
     default:
       return false;
   }
 }
 
-function funcName(ctx: DeparseCtx, oid: number, name: string): string {
+export function funcName(ctx: DeparseCtx, oid: number, name: string): string {
   const proc = ctx.catalog.getProc(oid);
   if (!proc) {
     return quoteIdentifier(name);
@@ -136,14 +139,14 @@ function coercion(ctx: DeparseCtx, arg: TExpr, resultType: number, resultTypmod:
 export function expr(ctx: DeparseCtx, e: TExpr, showImplicit: boolean): string {
   switch (e.k) {
     case 'var': {
-      if (e.attno < 0) {
+      if (e.attno < 0 && !isSystemAttno(e.attno)) {
         return '*';
       }
       if (!ctx.q) {
         return '?';
       }
       const rte = ctx.q.rtable[e.rtIndex];
-      const col = quoteIdentifier(rte.eref.colnames[e.attno]);
+      const col = quoteIdentifier(isSystemAttno(e.attno) ? SYSTEM_COLUMN_NAMES[e.attno] : rte.eref.colnames[e.attno]);
       return ctx.qualifyVars && ctx.unqualifiedRt !== e.rtIndex ? `${quoteIdentifier(rte.eref.aliasname)}.${col}` : col;
     }
     case 'const':
@@ -240,7 +243,7 @@ export function expr(ctx: DeparseCtx, e: TExpr, showImplicit: boolean): string {
 
 function paren(ctx: DeparseCtx, e: TExpr, showImplicit: boolean): string {
   const s = expr(ctx, e, showImplicit);
-  if (ctx.pretty && !isSimple(e) && e.k !== 'relabel' && e.k !== 'iocoerce' && !(e.k === 'func' && e.format !== 'call')) {
+  if (ctx.pretty && !isSimple(e) && e.k !== 'relabel' && e.k !== 'iocoerce' && !(e.k === 'func' && e.format !== 'call' && e.format !== 'sql_syntax')) {
     return `(${s})`;
   }
   return s;
@@ -402,13 +405,20 @@ export class CatalogFunctionsImpl implements CatalogFunctions {
     return null;
   }
 
-  viewDef(viewOid: number, pretty: boolean): string | null {
+  /** pg_get_viewdef: plain = PRETTYFLAG_INDENT; pretty (or a wrap column) adds PRETTYFLAG_PAREN */
+  viewDef(viewOid: number, pretty: boolean, wrapColumn = 0): string | null {
     const rel = this.session.catalog().getRelation(viewOid);
-    void pretty;
     if (!rel || !rel.view) {
       return null;
     }
-    return ' ' + rel.view.text.trim() + ';';
+    let query: Query;
+    try {
+      query = analyzeStatementAsSubquery(this.session.makeAnalyzer(), rel.view.query, null, true).query;
+    } catch {
+      return ' ' + rel.view.text.trim() + ';';
+    }
+    const columns = rel.columns.filter((c) => !c.isDropped).map((c) => c.name);
+    return viewDefinition(this.ctx(pretty, query), query, columns, { paren: pretty, indent: true, wrapColumn });
   }
 
   partKeyDef(relOid: number): string | null {

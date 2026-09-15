@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /**
- * Compare two jest runs of the linkgress suite — typically real PostgreSQL vs PGlite
- * (LINKGRESS_TEST_DRIVER=pg | pglite, `jest --json --outputFile=<file>`):
+ * Compare two runs of the linkgress suite — typically real PostgreSQL vs PGlite:
  *
  *  - per-test outcomes: what passes on one side only, and the first line of each failure
  *  - per-file timings
  *  - with both runs recorded (LINKGRESS_TEST_RECORD_DIR, tests/utils/query-recorder.ts): the
  *    result of every statement both runs executed, paired by test and SQL text
+ *
+ * A run is the `--json` output of the test runner (`bun tests/run.ts [--driver pglite] --json <file>`;
+ * it holds no failure messages or wall time) or a jest `--json --outputFile` report (the suite ran on
+ * jest before 1.0).
  *
  * Usage:
  *   node bench/pglite/compare-runs.mjs --a pg.json --b pglite.json \
@@ -27,7 +30,7 @@ const A = { name: option('a-name') ?? 'pg', run: option('a'), rec: option('a-rec
 const B = { name: option('b-name') ?? 'pglite', run: option('b'), rec: option('b-rec') };
 
 if (!A.run || !B.run) {
-  console.error('usage: compare-runs.mjs --a <jest.json> --b <jest.json> [--a-rec <dir> --b-rec <dir>] [--details <out.json>]');
+  console.error('usage: compare-runs.mjs --a <run.json> --b <run.json> [--a-rec <dir> --b-rec <dir>] [--details <out.json>]');
   process.exit(2);
 }
 
@@ -48,8 +51,39 @@ function failureSummary(text) {
   return clip(lines.slice(0, 4).join(' ⏎ '), 400);
 }
 
+/** tests/run.ts --json: [{ mode, files: [{ file, exitCode, tests: { "describe > test": status }, durationMs }] }] */
+function loadRunnerRun(runs) {
+  const files = new Map();
+  const tests = new Map();
+
+  for (const outcome of runs.flatMap(run => run.files)) {
+    const counts = { passed: 0, failed: 0, skipped: 0 };
+
+    for (const [name, status] of Object.entries(outcome.tests)) {
+      if (name === '(file)') continue;
+      counts[status]++;
+      tests.set(`${outcome.file} › ${name}`, { file: outcome.file, name, status, duration: 0, failure: status === 'failed' ? '(see the runner output)' : '' });
+    }
+
+    const failedToRun = outcome.tests['(file)'] === 'failed';
+    files.set(outcome.file, {
+      status: outcome.exitCode === 0 ? 'passed' : 'failed',
+      duration: outcome.durationMs,
+      counts,
+      suiteError: failedToRun ? `process exited with ${outcome.exitCode} outside any test` : null,
+    });
+  }
+
+  return { files, tests, wall: NaN };
+}
+
 function loadRun(path) {
   const json = JSON.parse(readFileSync(path, 'utf8'));
+
+  if (Array.isArray(json)) {
+    return loadRunnerRun(json);
+  }
+
   const files = new Map();
   const tests = new Map();
   let lastEnd = json.startTime;
@@ -110,7 +144,7 @@ print(table(['', A.name, B.name], [
   ['tests failed', countStatus(a, 'failed'), countStatus(b, 'failed')],
   ['tests skipped', countStatus(a, 'skipped'), countStatus(b, 'skipped')],
   ['files that failed to run', suiteErrors(a), suiteErrors(b)],
-  ['wall time (jest)', secs(a.wall), secs(b.wall)],
+  ['wall time', secs(a.wall), secs(b.wall)],
   ['sum of per-file times', secs(fileTime(a)), secs(fileTime(b))],
 ]));
 

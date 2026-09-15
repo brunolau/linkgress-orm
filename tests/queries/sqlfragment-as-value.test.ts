@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { BetweenComparison, EqComparison, GtComparison, SqlBuildContext, SqlFragment, eq } from '../../src/query/conditions';
 
 /**

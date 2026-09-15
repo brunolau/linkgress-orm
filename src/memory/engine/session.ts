@@ -6,23 +6,32 @@ import { emptyQuery, Query, TExpr } from './analyze/nodes';
 import { ParseState } from './analyze/parse-state';
 import { analyzeStatementAsSubquery } from './analyze/select';
 import { quoteIdentifier, TypeUtil } from './analyze/typeutil';
-import { Catalog, Column, NS_PG_CATALOG, ProcDef, Relation, StoredExpr, TypeOid } from './catalog/catalog';
+import { Catalog, Column, Constraint, NS_PG_CATALOG, PgType, ProcDef, Relation, StoredExpr, TypeOid } from './catalog/catalog';
+import { CompileEnv, compileExpr } from './exec/compile';
+import type { Evaluator } from './exec/runtime';
 import { CatalogFunctionsImpl } from './catalog/deparse';
 import { catalogRelationRows } from './catalog/system-views';
 import type { Database } from './database';
 import { describeUtility, executeUtility, UtilityResult } from './ddl/ddl';
+import { checkGeneratedExprFolding } from './ddl/generated-expr';
 import { PgError, PgErrorFields, SqlState } from './errors';
 import { DmlExecutor } from './exec/exec-dml';
 import { Executor } from './exec/executor';
-import { CatalogFunctions, EvalCtx, ExecSession, StatementState } from './exec/runtime';
+import { CatalogFunctions, EvalCtx, ExecSession, StatementState, TransitionCapture } from './exec/runtime';
 import { Collations, TypeOps } from './exec/typeops';
 import { SqlParser } from './parser-ddl';
-import { callPlpgsqlFunction, callSqlFunction, fireTrigger } from './plpgsql/functions';
+import { callPlpgsqlFunction, callSqlFunction, fireStatementTrigger, fireTrigger } from './plpgsql/functions';
 import { displaySettingValue, normalizeSettingValue, settingDef } from './settings';
 import { Heap, INVALID_XID, SleepRequest, Snapshot, UndoLog, WaitForTransaction } from './storage/mvcc';
 import { DateTimeContext, EPOCH_DIFF_US, resolveZone, ZoneSpec } from './types/datetime';
 import { receiveBinary } from './types/binary';
 import { inputValue, IoContext } from './types/io';
+
+/** executor parameter slot `VALUE` occupies while a domain CHECK constraint is evaluated */
+export const DOMAIN_VALUE_SLOT = 1_000_000;
+
+/** compiled domain CHECK constraints, per catalog (and its version) */
+const compiledDomainChecks = new WeakMap<Catalog, { version: number; checks: Map<object, { name: string; ev: Evaluator; slot: number }> }>();
 
 export interface FieldInfo {
   name: string;
@@ -73,6 +82,14 @@ interface Savepoint {
   xid: number;
   catalog: Catalog | null;
   localSettings: Map<string, string | null>;
+  /** deferred constraint checks queued before the savepoint (the rest are dropped by ROLLBACK TO) */
+  deferredChecks?: number;
+}
+
+/** A constraint check deferred to COMMIT / SET CONSTRAINTS ... IMMEDIATE (an AFTER trigger event). */
+export interface DeferredConstraintCheck {
+  constraint: Constraint;
+  run: (dml: DmlExecutor) => void;
 }
 
 export interface TxnState {
@@ -83,6 +100,8 @@ export interface TxnState {
   readOnly: boolean;
   startTs: number;
   snapshot: Snapshot | null;
+  /** a statement of this transaction ran with a snapshot (PostgreSQL's FirstSnapshotSet) */
+  snapshotTaken?: boolean;
   cid: number;
   catalog: Catalog | null;
   catalogFrozen: boolean;
@@ -93,6 +112,11 @@ export interface TxnState {
   droppedStorage: number[];
   onCommit: (() => void)[];
   onAbort: (() => void)[];
+  /** checks of DEFERRABLE constraints currently deferred */
+  deferredChecks: DeferredConstraintCheck[];
+  /** SET CONSTRAINTS: per-constraint mode (true = deferred), over the ALL mode, over the declared default */
+  constraintModes: Map<number, boolean>;
+  constraintAllMode: boolean | null;
 }
 
 const COMMAND_TAGS: Record<string, string> = {
@@ -624,12 +648,28 @@ export class Session implements ExecSession, AnalyzerEnv {
     }
     if (key === 'transaction_isolation' && normalized !== null) {
       if (this.txn) {
+        // check_transaction_isolation
+        if (normalized !== this.txn.isolation && this.txn.snapshotTaken) {
+          throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'SET TRANSACTION ISOLATION LEVEL must be called before any query');
+        }
+        if (normalized !== this.txn.isolation && this.txn.savepoints.length > 0) {
+          throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction');
+        }
         this.txn.isolation = normalized;
       }
       return;
     }
     if (key === 'transaction_read_only' && normalized !== null) {
       if (this.txn) {
+        // check_transaction_read_only
+        if (normalized === 'off' && this.txn.readOnly) {
+          if (this.txn.savepoints.length > 0) {
+            throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'cannot set transaction read-write mode inside a read-only transaction');
+          }
+          if (this.txn.snapshotTaken) {
+            throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'transaction read-write mode must be set before any query');
+          }
+        }
         this.txn.readOnly = normalized === 'on';
       }
       return;
@@ -913,7 +953,95 @@ export class Session implements ExecSession, AnalyzerEnv {
       droppedStorage: [],
       onCommit: [],
       onAbort: [],
+      deferredChecks: [],
+      constraintModes: new Map(),
+      constraintAllMode: null,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Deferred constraints
+  // -------------------------------------------------------------------------
+
+  /** Whether checks of a DEFERRABLE constraint are currently deferred in this transaction. */
+  isConstraintDeferred(con: Constraint): boolean {
+    if (!con.deferrable) {
+      return false;
+    }
+    const txn = this.txn;
+    const explicit = txn?.constraintModes.get(con.oid);
+    if (explicit !== undefined) {
+      return explicit;
+    }
+    if (txn && txn.constraintAllMode !== null) {
+      return txn.constraintAllMode;
+    }
+    return con.initiallyDeferred;
+  }
+
+  deferConstraintCheck(check: DeferredConstraintCheck): void {
+    this.txn!.deferredChecks.push(check);
+  }
+
+  /** SET CONSTRAINTS: change modes, then run the queued checks of constraints that became immediate. */
+  setConstraints(spec: { all: boolean; names: string[][]; deferred: boolean }): void {
+    const txn = this.txn;
+    if (!txn || !txn.explicit) {
+      this.notice('WARNING', SqlState.NO_ACTIVE_SQL_TRANSACTION, 'SET CONSTRAINTS can only be used in transaction blocks');
+      return;
+    }
+    if (spec.all) {
+      txn.constraintModes.clear();
+      txn.constraintAllMode = spec.deferred;
+    } else {
+      const cat = this.catalog();
+      for (const name of spec.names) {
+        const conName = name[name.length - 1];
+        const nspOids = name.length > 1 ? [cat.findNamespace(name[name.length - 2])?.oid ?? -1] : this.searchPathNamespaces();
+        let found: Constraint[] = [];
+        for (const nsp of nspOids) {
+          found = [...cat.constraints.values()].filter((c) => c.name === conName && c.nspOid === nsp && (c.type === 'f' || c.type === 'u' || c.type === 'p' || c.type === 'x' || c.type === 't'));
+          if (found.length > 0) {
+            break;
+          }
+        }
+        if (found.length === 0) {
+          throw new PgError(SqlState.UNDEFINED_OBJECT, `constraint "${name.join('.')}" does not exist`);
+        }
+        for (const c of found) {
+          if (!c.deferrable) {
+            throw new PgError(SqlState.WRONG_OBJECT_TYPE, `constraint "${name.join('.')}" is not deferrable`);
+          }
+          txn.constraintModes.set(c.oid, spec.deferred);
+        }
+      }
+    }
+    if (!spec.deferred) {
+      this.runDeferredChecks(false);
+    }
+  }
+
+  /** Run queued deferred checks: all of them (COMMIT), or those whose constraint is no longer deferred. */
+  runDeferredChecks(all: boolean): void {
+    const txn = this.txn;
+    if (!txn || txn.deferredChecks.length === 0) {
+      return;
+    }
+    const due = all ? txn.deferredChecks : txn.deferredChecks.filter((c) => !this.isConstraintDeferred(c.constraint));
+    if (due.length === 0) {
+      return;
+    }
+    const st = new StatementState(this, this.catalog(), [], [], this.takeSnapshot());
+    st.cid = txn.cid;
+    const host = new SessionHost(this, st);
+    const executor = new Executor(st, host);
+    host.executor = executor;
+    const dml = new DmlExecutor(host, executor);
+    for (const check of due) {
+      check.run(dml);
+    }
+    // dequeued only once all fired: a failure leaves the queue as it was (for ROLLBACK TO SAVEPOINT)
+    txn.deferredChecks = all ? [] : txn.deferredChecks.filter((c) => !due.includes(c));
   }
 
   private getSettingNoTxn(name: string): string | null {
@@ -950,6 +1078,7 @@ export class Session implements ExecSession, AnalyzerEnv {
   takeSnapshot(): Snapshot {
     const txns = this.db.store.txns;
     const txn = this.txn!;
+    txn.snapshotTaken = true;
     if ((txn.isolation === 'repeatable read' || txn.isolation === 'serializable') && txn.snapshot) {
       return { ...txn.snapshot, ownXid: txn.topXid, curCid: txn.cid };
     }
@@ -1000,6 +1129,15 @@ export class Session implements ExecSession, AnalyzerEnv {
     const txn = this.txn;
     if (!txn) {
       return;
+    }
+    if (txn.deferredChecks.length > 0) {
+      // deferred constraint checks fire before the commit; a violation aborts the transaction instead
+      try {
+        this.runDeferredChecks(true);
+      } catch (e) {
+        this.abortTxn();
+        throw e;
+      }
     }
     if (txn.catalog) {
       this.db.catalog = txn.catalog;
@@ -1119,6 +1257,7 @@ export class Session implements ExecSession, AnalyzerEnv {
           xid: txn.topXid ? this.db.store.txns.begin(txn.topXid) : 0,
           catalog: txn.catalog,
           localSettings: new Map(txn.localSettings),
+          deferredChecks: txn.deferredChecks.length,
         };
         if (txn.catalog) {
           txn.catalogFrozen = true;
@@ -1152,8 +1291,11 @@ export class Session implements ExecSession, AnalyzerEnv {
         txn.catalogFrozen = !!sp.catalog;
         txn.localSettings = new Map(sp.localSettings);
         txn.failed = false;
+        if (sp.deferredChecks !== undefined && txn.deferredChecks.length > sp.deferredChecks) {
+          txn.deferredChecks.length = sp.deferredChecks;
+        }
         // re-establish the savepoint
-        txn.savepoints.push({ name: sp.name, xid: txn.topXid ? this.db.store.txns.begin(txn.topXid) : 0, catalog: txn.catalog, localSettings: new Map(txn.localSettings) });
+        txn.savepoints.push({ name: sp.name, xid: txn.topXid ? this.db.store.txns.begin(txn.topXid) : 0, catalog: txn.catalog, localSettings: new Map(txn.localSettings), deferredChecks: txn.deferredChecks.length });
         return empty('ROLLBACK');
       }
       default:
@@ -1174,7 +1316,7 @@ export class Session implements ExecSession, AnalyzerEnv {
         return i;
       }
     }
-    throw new PgError(SqlState.INVALID_SQL_STATEMENT_NAME, `savepoint "${name}" does not exist`);
+    throw new PgError('3B001', `savepoint "${name}" does not exist`);
   }
 
   // -------------------------------------------------------------------------
@@ -1273,19 +1415,8 @@ export class Session implements ExecSession, AnalyzerEnv {
       case 'InsertStmt':
       case 'UpdateStmt':
       case 'DeleteStmt':
-      case 'MergeStmt': {
-        const an = this.makeAnalyzer(declaredTypes, false);
-        const { query } = analyzeStatementAsSubquery(an, stmt, null, true);
-        for (let i = 0; i < an.paramTypes.length; i++) {
-          if (!an.paramTypes[i] || an.paramTypes[i] === TypeOid.unknown) {
-            throw new PgError(SqlState.INDETERMINATE_DATATYPE, `could not determine data type of parameter $${i + 1}`);
-          }
-        }
-        const hasRows = query.commandType === 'select' || query.returningList.length > 0;
-        const list = query.commandType === 'select' ? query.targetList : query.returningList;
-        const fields = hasRows ? list.filter((t) => !t.resjunk).map((t) => ({ name: t.name, typeOid: t.expr.type, typmod: t.expr.typmod, tableOid: t.origTable, columnAttnum: t.origColumn })) : null;
-        return { ps, paramTypes: an.paramTypes.slice(), fields };
-      }
+      case 'MergeStmt':
+        return { ps, ...this.describePreparable(stmt, declaredTypes) };
       case 'CreateTableAsStmt':
       case 'ExplainStmt': {
         // utility statements wrapping an analyzable query infer parameter types from it
@@ -1306,6 +1437,24 @@ export class Session implements ExecSession, AnalyzerEnv {
     }
   }
 
+  /**
+   * Analyze a preparable statement (SELECT / INSERT / UPDATE / DELETE / MERGE) with declared parameter
+   * types (0 = infer): every parameter type must be determined; fields is null when no rows are returned.
+   */
+  describePreparable(stmt: A.Statement, declaredTypes: number[]): { paramTypes: number[]; fields: FieldInfo[] | null } {
+    const an = this.makeAnalyzer(declaredTypes, false);
+    const { query } = analyzeStatementAsSubquery(an, stmt, null, true);
+    for (let i = 0; i < an.paramTypes.length; i++) {
+      if (!an.paramTypes[i] || an.paramTypes[i] === TypeOid.unknown) {
+        throw new PgError(SqlState.INDETERMINATE_DATATYPE, `could not determine data type of parameter $${i + 1}`);
+      }
+    }
+    const hasRows = query.commandType === 'select' || query.returningList.length > 0;
+    const list = query.commandType === 'select' ? query.targetList : query.returningList;
+    const fields = hasRows ? list.filter((t) => !t.resjunk).map((t) => ({ name: t.name, typeOid: t.expr.type, typmod: t.expr.typmod, tableOid: t.origTable, columnAttnum: t.origColumn })) : null;
+    return { paramTypes: an.paramTypes.slice(), fields };
+  }
+
   /** Bind message: convert wire parameter values into typed datums. */
   bindParams(info: PreparedInfo, values: (Uint8Array | null)[], formats: number[]): unknown[] {
     this.checkNotFailed(info.ps?.stmt ?? null);
@@ -1319,7 +1468,10 @@ export class Session implements ExecSession, AnalyzerEnv {
       const type = info.paramTypes[i];
       const format = formats.length === 0 ? 0 : formats.length === 1 ? formats[0] : formats[i];
       if (format === 1) {
-        return receiveBinary(type, v, this.io);
+        return receiveBinary(type, v, this.io, i + 1);
+      }
+      if (format !== 0) {
+        throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `unsupported format code: ${format}`);
       }
       return inputValue(type, Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString('utf8'), -1, this.io);
     });
@@ -1337,7 +1489,8 @@ export class Session implements ExecSession, AnalyzerEnv {
   async executeSimple(ps: A.ParsedStatement, multi: boolean): Promise<StatementResult> {
     this.inImplicitBlock = multi;
     try {
-      return await this.executeStatement(ps, [], multi);
+      // exec_simple_query analyzes with no parameters: `$1` is "there is no parameter $1"
+      return await this.executeStatement(ps, [], multi, undefined, []);
     } finally {
       this.inImplicitBlock = false;
     }
@@ -1602,6 +1755,10 @@ export class Session implements ExecSession, AnalyzerEnv {
       case 'TransactionStmt':
         return this.executeTransactionStmt(stmt);
       default: {
+        // PlannedStmtRequiresSnapshot: every utility statement but these runs with a snapshot
+        if (stmt.kind !== 'VariableSetStmt' && stmt.kind !== 'VariableShowStmt' && stmt.kind !== 'LockStmt' && !(stmt.kind === 'NoopStmt' && stmt.tag === 'SET CONSTRAINTS')) {
+          txn.snapshotTaken = true;
+        }
         this.checkReadOnlyUtility(stmt);
         const r: UtilityResult = executeUtility(this, stmt, ps.text, params, parentSt, boundTypes, undo);
         txn.cid++;
@@ -1614,6 +1771,42 @@ export class Session implements ExecSession, AnalyzerEnv {
     return new Analyzer(this, paramTypes, fixed);
   }
 
+  /** The CHECK constraints of a domain, compiled; `VALUE` is executor parameter `slot` (per catalog). */
+  domainChecks(domain: PgType): { name: string; ev: Evaluator; slot: number }[] {
+    const checks = domain.domainChecks ?? [];
+    if (checks.length === 0) {
+      return [];
+    }
+    const cat = this.catalog();
+    let perCatalog = compiledDomainChecks.get(cat);
+    if (!perCatalog || perCatalog.version !== cat.version) {
+      perCatalog = { version: cat.version, checks: new Map() };
+      compiledDomainChecks.set(cat, perCatalog);
+    }
+    return checks.map((chk) => {
+      let entry = perCatalog!.checks.get(chk);
+      if (!entry) {
+        const an = this.makeAnalyzer();
+        an.domainValue = { slot: DOMAIN_VALUE_SLOT, type: domain.baseType, typmod: domain.typmod, collation: domain.collation };
+        const pstate = new ParseState(null, emptyQuery());
+        const expr = an.coerceToBoolean(pstate, transformExpr(an, pstate, chk.expr.raw, 'domain_check'), 'CHECK');
+        const env: CompileEnv = {
+          catalog: cat,
+          typeOps: this.typeOps,
+          runner: {
+            run: () => {
+              throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'cannot use subquery in check constraint');
+            },
+          } as unknown as CompileEnv['runner'],
+          rtInfo: () => undefined,
+        };
+        entry = { name: chk.name, ev: compileExpr(expr, env), slot: DOMAIN_VALUE_SLOT };
+        perCatalog!.checks.set(chk, entry);
+      }
+      return entry;
+    });
+  }
+
   private executeQueryStmt(stmt: A.Statement, text: string, params: unknown[], undo: UndoLog | null, parentSt: StatementState | null, sleepsServed: number, boundTypes?: number[]): StatementResult {
     const txn = this.txn!;
     const paramTypesIn = parentSt ? parentSt.paramTypes.slice() : (boundTypes ?? []);
@@ -1621,6 +1814,7 @@ export class Session implements ExecSession, AnalyzerEnv {
     if (parentSt) {
       an.paramNames = parentSt.paramNames;
       an.paramFunctionName = parentSt.functionName;
+      an.transitionTables = parentSt.transitionTables;
     }
     const pstate = new ParseState(null, emptyQuery());
     const { query } = analyzeStatementAsSubquery(an, stmt, null, true);
@@ -1796,6 +1990,14 @@ export class SessionHost {
     return out;
   }
 
+  isConstraintDeferred(con: Constraint): boolean {
+    return this.session.isConstraintDeferred(con);
+  }
+
+  deferConstraintCheck(con: Constraint, run: (dml: DmlExecutor) => void): void {
+    this.session.deferConstraintCheck({ constraint: con, run });
+  }
+
   analyzeRelationExpr(rel: Relation, stored: StoredExpr, kind: 'check' | 'index' | 'generated' | 'predicate'): { q: Query; expr: TExpr } {
     const cacheKey = 'rel:' + kind + ':' + this.st.catalog.version + ':' + rel.oid;
     const cache = (stored.cache ??= {});
@@ -1811,17 +2013,24 @@ export class SessionHost {
     const exprKind = kind === 'check' ? 'check_constraint' : kind === 'generated' ? 'generated_column' : kind === 'predicate' ? 'index_predicate' : 'index_expression';
     let expr = transformExpr(an, pstate, stored.raw, exprKind);
     if (kind === 'check' || kind === 'predicate') {
-      expr = an.coerceToBoolean(pstate, expr, 'CHECK');
+      expr = an.coerceToBoolean(pstate, expr, kind === 'check' ? 'CHECK' : 'WHERE');
+    } else if (kind === 'generated') {
+      checkGeneratedExprFolding(this.st.catalog, expr);
     }
     const r = { q, expr };
     cache[cacheKey] = r;
     return r;
   }
 
+  /**
+   * The default of a column: its DEFAULT, else the DEFAULT of its domain (or of a base domain), else — for
+   * a domain column — NULL coerced to the domain, which checks the domain's NOT NULL constraint
+   * (build_column_default).
+   */
   analyzeDefault(rel: Relation, col: Column): { q: Query; expr: TExpr } {
-    const stored = col.defaultExpr!;
+    const stored = col.defaultExpr ?? this.domainDefaultOf(col.typeOid);
     const cacheKey = 'default:' + this.st.catalog.version + ':' + rel.oid + ':' + col.attnum;
-    const cache = (stored.cache ??= {});
+    const cache = stored ? (stored.cache ??= {}) : ((col as Column & { nullDefaultCache?: Record<string, unknown> }).nullDefaultCache ??= {});
     const hit = cache[cacheKey] as { q: Query; expr: TExpr } | undefined;
     if (hit) {
       return hit;
@@ -1829,11 +2038,25 @@ export class SessionHost {
     const an = this.session.makeAnalyzer();
     const q = emptyQuery();
     const pstate = new ParseState(null, q);
-    let expr = transformExpr(an, pstate, stored.raw, 'column_default');
+    let expr: TExpr = stored
+      ? transformExpr(an, pstate, stored.raw, 'column_default')
+      : { k: 'const', type: TypeOid.unknown, typmod: -1, collation: 0, value: null, isNull: true };
     expr = an.coerceForAssignment(expr, col.typeOid, col.typmod, col.name);
     const r = { q, expr };
     cache[cacheKey] = r;
     return r;
+  }
+
+  /** The DEFAULT a domain (or a domain it is based on) declares. */
+  private domainDefaultOf(typeOid: number): StoredExpr | undefined {
+    let t = this.st.catalog.getType(typeOid);
+    for (let guard = 0; t && t.typtype === 'd' && guard < 32; guard++) {
+      if (t.domainDefault) {
+        return t.domainDefault;
+      }
+      t = this.st.catalog.getType(t.baseType);
+    }
+    return undefined;
   }
 
   partitionKeyValues(parent: Relation, data: unknown[], st: StatementState, executor: Executor): unknown[] {
@@ -1853,12 +2076,27 @@ export class SessionHost {
     return require('./ddl/partition').partitionAccepts(this.session, parent, part, keyValues, st);
   }
 
-  fireRowTriggers(rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', newData: unknown[] | null, oldData: unknown[] | null, st: StatementState): unknown[] | null | undefined {
+  fireRowTriggers(
+    rel: Relation,
+    timing: 'BEFORE' | 'AFTER',
+    event: 'INSERT' | 'UPDATE' | 'DELETE',
+    newData: unknown[] | null,
+    oldData: unknown[] | null,
+    st: StatementState,
+    transition?: TransitionCapture
+  ): unknown[] | null | undefined {
     // session_replication_role = replica: ordinary (ENABLE / ORIGIN) triggers do not fire
     if (this.session.replicationRoleReplica()) {
       return undefined;
     }
-    return fireTrigger(this.session, rel, timing, event, newData, oldData, st);
+    return fireTrigger(this.session, rel, timing, event, newData, oldData, st, transition);
+  }
+
+  fireStatementTriggers(rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', st: StatementState, transition?: TransitionCapture): void {
+    if (this.session.replicationRoleReplica()) {
+      return;
+    }
+    fireStatementTrigger(this.session, rel, timing, event, st, transition);
   }
 }
 

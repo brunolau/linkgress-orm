@@ -1,4 +1,4 @@
-import { describe, test, expect, afterEach } from '@jest/globals';
+import { describe, test, expect, afterEach } from 'bun:test';
 import { MockRowCache } from '../../src';
 import { LscDatabase, makeLscDb } from '../utils/lateral-shape-model';
 

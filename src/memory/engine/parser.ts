@@ -412,6 +412,7 @@ export class Parser {
       const query = this.parsePreparableStatement();
       this.expectPunct(')');
       const cte: A.CommonTableExpr = { name, aliasColnames, materialized, query, loc };
+      const searchLoc = this.peek().pos;
       if (this.acceptKw('SEARCH')) {
         const breadthFirst = this.acceptKw('BREADTH');
         if (!breadthFirst) {
@@ -421,8 +422,9 @@ export class Parser {
         this.expectKw('BY');
         const columns = this.parseNameList();
         this.expectKw('SET');
-        cte.search = { breadthFirst, columns, seqColumn: this.parseColId() };
+        cte.search = { breadthFirst, columns, seqColumn: this.parseColId(), loc: searchLoc };
       }
+      const cycleLoc = this.peek().pos;
       if (this.acceptKw('CYCLE')) {
         const columns = this.parseNameList();
         this.expectKw('SET');
@@ -435,7 +437,7 @@ export class Parser {
           markDefault = this.parseExprPrimaryConst();
         }
         this.expectKw('USING');
-        cte.cycle = { columns, markColumn, markValue, markDefault, pathColumn: this.parseColId() };
+        cte.cycle = { columns, markColumn, markValue, markDefault, pathColumn: this.parseColId(), loc: cycleLoc };
       }
       ctes.push(cte);
     } while (this.acceptPunct(','));
@@ -1692,10 +1694,31 @@ export class Parser {
           continue;
         }
         if (t.value === '[') {
+          // c_expr: only column references, parameters, parenthesized expressions and subqueries take a subscript
+          if (left.kind !== 'ColumnRef' && left.kind !== 'ParamRef' && left.kind !== 'ParenExpr' && !(left.kind === 'SubLink' && left.linkType === 'EXPR') && left.kind !== 'Indirection') {
+            this.error(t);
+          }
           left = this.appendIndirection(left, this.parseSubscript());
           continue;
         }
         break;
+      }
+
+      if (t.type === 'ident' && !t.quoted && t.kw === 'OVERLAPS' && left.kind === 'RowExpr') {
+        // row OVERLAPS row -> overlaps(a, b, c, d)
+        this.next();
+        const right = this.parsePrefix();
+        if (left.args.length !== 2) {
+          throw syntaxError('wrong number of parameters on left side of OVERLAPS expression', left.loc);
+        }
+        if (right.kind !== 'RowExpr') {
+          this.error(this.peek());
+        }
+        if (right.args.length !== 2) {
+          throw syntaxError('wrong number of parameters on right side of OVERLAPS expression', right.loc);
+        }
+        left = this.makeFunc(['pg_catalog', 'overlaps'], [...left.args, ...right.args], loc);
+        continue;
       }
 
       if (t.type === 'op') {
@@ -1755,22 +1778,24 @@ export class Parser {
             left = this.makeFunc(['xmlexists_document'], [left], loc);
           } else if (this.atKw('JSON')) {
             this.next();
-            let fn = 'is_json';
+            let itemType: A.JsonFuncExpr['itemType'] = 'value';
             if (this.acceptKw('VALUE')) {
-              fn = 'is_json';
+              itemType = 'value';
             } else if (this.acceptKw('OBJECT')) {
-              fn = 'is_json_object';
+              itemType = 'object';
             } else if (this.acceptKw('ARRAY')) {
-              fn = 'is_json_array';
+              itemType = 'array';
             } else if (this.acceptKw('SCALAR')) {
-              fn = 'is_json_scalar';
+              itemType = 'scalar';
             }
+            let uniqueKeys = false;
             if (this.acceptKws('WITH', 'UNIQUE')) {
               this.acceptKw('KEYS');
+              uniqueKeys = true;
             } else if (this.acceptKws('WITHOUT', 'UNIQUE')) {
               this.acceptKw('KEYS');
             }
-            const call = this.makeFunc(['pg_catalog', '__' + fn], [left], loc);
+            const call: A.JsonFuncExpr = { ...this.jsonFuncBase('is_json', left, loc), itemType, uniqueKeys };
             left = not ? { kind: 'BoolExpr', op: 'NOT', args: [call], loc } : call;
           } else if (this.atKw('NFC', 'NFD', 'NFKC', 'NFKD', 'NORMALIZED')) {
             let form = 'NFC';
@@ -1898,6 +1923,93 @@ export class Parser {
       return { kind: 'BoolExpr', op, args: [...lu.args, r], loc: lu.loc };
     }
     return { kind: 'BoolExpr', op, args: [l, r], loc };
+  }
+
+  private jsonFuncBase(op: A.JsonFuncExpr['op'], ctx: A.Expr, loc: number): A.JsonFuncExpr {
+    return { kind: 'JsonFuncExpr', op, ctx, path: null, passing: [], returning: null, onEmpty: null, onError: null, wrapper: 'none', omitQuotes: false, itemType: 'value', uniqueKeys: false, loc };
+  }
+
+  /** JSON_VALUE / JSON_QUERY / JSON_EXISTS (json_value_expr, json_query_expr, json_exists_expr). */
+  private parseJsonQueryFunc(loc: number): A.Expr {
+    const op = this.next().kw.toLowerCase() as A.JsonFuncExpr['op'];
+    this.expectPunct('(');
+    const ctx = this.parseExpr();
+    this.parseJsonFormatClause();
+    this.expectPunct(',');
+    const node = this.jsonFuncBase(op, ctx, loc);
+    node.path = this.parseExpr();
+    if (this.acceptKw('PASSING')) {
+      do {
+        const expr = this.parseExpr();
+        this.parseJsonFormatClause();
+        this.expectKw('AS');
+        node.passing.push({ name: this.parseColId(), expr });
+      } while (this.acceptPunct(','));
+    }
+    if (op !== 'json_exists' && this.acceptKw('RETURNING')) {
+      node.returning = this.parseTypeName();
+      this.parseJsonFormatClause();
+    } else if (op === 'json_exists' && this.acceptKw('RETURNING')) {
+      node.returning = this.parseTypeName();
+    }
+    if (op === 'json_query') {
+      if (this.acceptKw('WITHOUT')) {
+        this.acceptKw('ARRAY');
+        this.expectKw('WRAPPER');
+      } else if (this.atKw('WITH')) {
+        this.next();
+        node.wrapper = this.acceptKw('CONDITIONAL') ? 'conditional' : (this.acceptKw('UNCONDITIONAL'), 'unconditional');
+        this.acceptKw('ARRAY');
+        this.expectKw('WRAPPER');
+      }
+      if (this.atKw('KEEP', 'OMIT')) {
+        node.omitQuotes = this.next().kw === 'OMIT';
+        this.expectKw('QUOTES');
+        if (this.acceptKws('ON', 'SCALAR')) {
+          this.expectKw('STRING');
+        }
+      }
+    }
+    while (!this.atPunct(')')) {
+      const behavior = this.parseJsonBehavior(op);
+      this.expectKw('ON');
+      if (this.acceptKw('EMPTY') && op !== 'json_exists') {
+        node.onEmpty = behavior;
+      } else {
+        this.expectKw('ERROR');
+        node.onError = behavior;
+      }
+    }
+    this.expectPunct(')');
+    return node;
+  }
+
+  private parseJsonFormatClause(): void {
+    if (this.acceptKws('FORMAT', 'JSON')) {
+      if (this.acceptKw('ENCODING')) {
+        this.parseColId();
+      }
+    }
+  }
+
+  private parseJsonBehavior(op: A.JsonFuncExpr['op']): A.JsonBehavior {
+    if (this.acceptKw('DEFAULT') && op !== 'json_exists') {
+      return { kind: 'default', expr: this.parseExpr() };
+    }
+    if (this.acceptKw('EMPTY')) {
+      if (this.acceptKw('OBJECT')) {
+        return { kind: 'empty_object' };
+      }
+      this.acceptKw('ARRAY');
+      return { kind: 'empty_array' };
+    }
+    const t = this.peek();
+    const kw = this.isKw(t, 'ERROR', 'NULL', 'TRUE', 'FALSE', 'UNKNOWN') ? t.kw : null;
+    if (!kw) {
+      this.error();
+    }
+    this.next();
+    return { kind: kw!.toLowerCase() as A.JsonBehavior['kind'] };
   }
 
   makeFunc(name: string[], args: A.Expr[], loc?: number, special?: string): A.FuncCall {
@@ -2036,12 +2148,18 @@ export class Parser {
   private parsePrimaryWithIndirection(): A.Expr {
     let e = this.parsePrimary();
     // indirection: [subscript], .field, .*
+    // c_expr: only column references, parameters, parenthesized expressions and scalar subqueries take
+    // indirection (`ARRAY[1,2][1]`, `f(x)[1]` and `f(x).col` are syntax errors)
+    const indirectable = (x: A.Expr) => x.kind === 'ColumnRef' || x.kind === 'ParamRef' || x.kind === 'ParenExpr' || x.kind === 'Indirection' || (x.kind === 'SubLink' && x.linkType === 'EXPR');
     while (true) {
       if (this.atPunct('[')) {
+        if (!indirectable(e)) {
+          this.error(this.peek());
+        }
         e = this.appendIndirection(e, this.parseSubscript());
         continue;
       }
-      if (this.atPunct('.') && (e.kind === 'ParenExpr' || e.kind === 'Indirection' || e.kind === 'ParamRef' || e.kind === 'SubLink' || e.kind === 'FuncCall')) {
+      if (this.atPunct('.') && indirectable(e) && e.kind !== 'ColumnRef') {
         this.next();
         if (this.atOp('*')) {
           this.next();
@@ -2308,6 +2426,13 @@ export class Parser {
         case 'SUBSTRING':
           if (this.atPunct('(', 1)) {
             return this.parseSubstring();
+          }
+          break;
+        case 'JSON_VALUE':
+        case 'JSON_QUERY':
+        case 'JSON_EXISTS':
+          if (this.atPunct('(', 1)) {
+            return this.parseJsonQueryFunc(loc);
           }
           break;
         case 'OVERLAY':

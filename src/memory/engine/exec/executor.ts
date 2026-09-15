@@ -21,6 +21,7 @@ import { PgNumeric } from '../types/numeric';
 import { PgRecord } from '../types/values';
 import { CompileEnv, compileExpr, RtInfo } from './compile';
 import { groupAndAggregate, computeWindowFunctions } from './exec-agg';
+import { JSON_TO_RECORD_FUNCS, jsonToRecordRows } from './functions/json-fns';
 import { lookupSrf } from './functions/registry';
 import { pgQsort } from './pgsort';
 import { pushQualsIntoSubquery, queryHasVolatile } from './pushdown';
@@ -114,9 +115,12 @@ export class QueryPlan {
         colTypes: rte.colTypes.map((c) => c.type),
         colNames: live.map((c) => c.name),
         rowType: rel.rowTypeOid || TypeOid.record,
+        nrt: this.nrt,
+        relOid: rel.oid,
       };
     } else {
-      info = { colTypes: rte.colTypes.map((c) => c.type), colNames: rte.eref.colnames, rowType: TypeOid.record };
+      const rowType = rte.kind === 'catalog' && rte.rowTypeOid ? rte.rowTypeOid : TypeOid.record;
+      info = { colTypes: rte.colTypes.map((c) => c.type), colNames: rte.eref.colnames, rowType, nrt: this.nrt };
     }
     this.rtInfos[rtIndex] = info;
     return info;
@@ -1532,7 +1536,7 @@ export class Executor implements SubqueryRunner {
         rows = this.scanCte(plan, ctx, rtIndex, rte, mine);
         break;
       case 'catalog': {
-        const data = this.host.catalogRows(rte.relOid, this.st);
+        const data = rte.transitionRows ?? this.host.catalogRows(rte.relOid, this.st);
         rows = data.map((r) => {
           const row = ctx.row.slice();
           row[rtIndex] = r;
@@ -1581,10 +1585,15 @@ export class Executor implements SubqueryRunner {
     // allocated only for the tuples that pass
     const scratchRow = ctx.row.slice();
     const scratch = this.rowCtx(scratchRow, ctx);
-    const emit = (t: Tuple, data: unknown[]) => {
+    // `tableOid`: the child relation a row read through an inheritance parent comes from (system
+    // column tableoid), kept at `2 * nrt + rtIndex`
+    const emit = (t: Tuple, data: unknown[], tableOid?: number) => {
       if (filterEvs.length > 0) {
         scratchRow[rtIndex] = data;
         scratchRow[nrt + rtIndex] = t;
+        if (tableOid !== undefined) {
+          scratchRow[2 * nrt + rtIndex] = tableOid;
+        }
         for (const ev of filterEvs) {
           if (ev(scratch) !== true) {
             return;
@@ -1594,6 +1603,9 @@ export class Executor implements SubqueryRunner {
       const row = ctx.row.slice();
       row[rtIndex] = data;
       row[nrt + rtIndex] = t;
+      if (tableOid !== undefined) {
+        row[2 * nrt + rtIndex] = tableOid;
+      }
       out.push(row);
     };
     const heap = parts.length === 1 ? parts[0].heap : null;
@@ -1700,7 +1712,7 @@ export class Executor implements SubqueryRunner {
               void i;
               return v;
             });
-            emit(t, data);
+            emit(t, data, part.rel.oid);
             if (out.length >= limit) {
               break;
             }
@@ -1933,7 +1945,11 @@ export class Executor implements SubqueryRunner {
     for (const f of rte.functions) {
       const e = f.expr;
       let values: unknown[];
-      if (e.k === 'func' && e.retset) {
+      if (e.k === 'func' && !e.isUser && JSON_TO_RECORD_FUNCS.has(e.funcSrc)) {
+        const argVals = e.args.map((a) => plan.ev(a)(ctx));
+        const fc = { st: this.st, argTypes: e.args.map((a) => a.type), resultType: e.type, resultTypmod: e.typmod, collation: e.inputCollation, node: e };
+        values = argVals[0] === null ? (e.retset ? [] : [null]) : jsonToRecordRows(e.funcSrc, argVals[0], f.colTypes, f.colNames, fc);
+      } else if (e.k === 'func' && e.retset) {
         const argVals = e.args.map((a) => plan.ev(a)(ctx));
         if (e.strict && argVals.some((v) => v === null)) {
           values = [];
@@ -2068,7 +2084,47 @@ export class Executor implements SubqueryRunner {
       }
       return fresh;
     };
-    let working = addRows(this.executeQuery(parts.nonRecursive, ctx).rows);
+    // SEARCH / CYCLE columns (rewriteSearchAndCycle), computed from the row and the working-table row it came from
+    const baseCount = cte.colTypes.length - (cte.search ? 1 : 0) - (cte.cycle ? 2 : 0);
+    const constValue = (e: TExpr): unknown => (e.k === 'const' ? (e.isNull ? null : e.value) : null);
+    const rowOf = (r: unknown[], cols: number[], prefix: unknown[] = []): PgRecord =>
+      new PgRecord([...prefix, ...cols.map((i) => r[i])], TypeOid.record, [...prefix.map(() => TypeOid.int8), ...cols.map((i) => types[i])], []);
+    const cycleCmps = cte.cycle ? cte.cycle.columns.map((i) => typeOps.comparator(types[i], cte.colTypes[i].collation)) : [];
+    const augment = (rows: unknown[][], fromWorking: boolean): unknown[][] => {
+      if (!cte.search && !cte.cycle) {
+        return rows;
+      }
+      const out: unknown[][] = [];
+      for (const r of rows) {
+        const parent = fromWorking ? r.slice(baseCount) : null;
+        let p = 0;
+        const extra: unknown[] = [];
+        if (cte.search) {
+          const cols = cte.search.columns;
+          const prev = parent ? parent[p++] : null;
+          if (cte.search.breadthFirst) {
+            const depth = prev instanceof PgRecord ? (prev.values[0] as bigint) + 1n : 0n;
+            extra.push(rowOf(r, cols, [depth]));
+          } else {
+            extra.push([...((prev as unknown[] | null) ?? []), rowOf(r, cols)]);
+          }
+        }
+        if (cte.cycle) {
+          const cyc = cte.cycle;
+          const markValue = constValue(cyc.markValue);
+          const prevMark = parent ? parent[p++] : null;
+          const prevPath = parent ? ((parent[p++] as PgRecord[] | null) ?? []) : [];
+          if (parent && prevMark !== null && typeOps.comparator(cyc.markValue.type, 0)(prevMark, markValue) === 0) {
+            continue;
+          }
+          const isCycle = prevPath.some((rec) => cyc.columns.every((ci, j) => rec.values[j] !== null && r[ci] !== null && cycleCmps[j](rec.values[j], r[ci]) === 0));
+          extra.push(isCycle ? markValue : constValue(cyc.markDefault), [...prevPath, rowOf(r, cyc.columns)]);
+        }
+        out.push([...r.slice(0, baseCount), ...extra]);
+      }
+      return out;
+    };
+    let working = addRows(augment(this.executeQuery(parts.nonRecursive, ctx).rows, false));
     let guard = 0;
     const key = 'cte-working:' + cte.id;
     while (working.length > 0) {
@@ -2083,7 +2139,7 @@ export class Executor implements SubqueryRunner {
       } finally {
         this.st.scratch.set(key, saved);
       }
-      working = addRows(next);
+      working = addRows(augment(next, true));
     }
     return result;
   }
@@ -2114,6 +2170,10 @@ export function mergeRows(left: Row, right: Row, rightRels: Set<number>, nrt: nu
   for (const r of rightRels) {
     out[r] = right[r];
     out[nrt + r] = right[nrt + r];
+    if (right.length > 2 * nrt) {
+      // tableoid of a row read through an inheritance parent
+      out[2 * nrt + r] = right[2 * nrt + r];
+    }
   }
   return out;
 }
@@ -2123,6 +2183,9 @@ export function nullExtend(row: Row, rels: Set<number>, nrt: number): Row {
   for (const r of rels) {
     out[r] = null;
     out[nrt + r] = undefined;
+    if (out.length > 2 * nrt) {
+      out[2 * nrt + r] = undefined;
+    }
   }
   return out;
 }

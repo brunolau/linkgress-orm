@@ -13,7 +13,7 @@
  * returns the array as-is when flattenResultType is set.
  */
 
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData, createTestDatabase, setupDatabase } from '../utils/test-database';
 
 // Reusable query builder — runs the same projection on any db instance

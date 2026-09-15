@@ -1,3 +1,4 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import * as fs from 'fs';
 import { expectToReject } from '../utils/expect-rejects';
 import * as path from 'path';
@@ -275,9 +276,7 @@ describe('Manual Migration System', () => {
       expect(typeof loaded.migration.up).toBe('function');
     });
 
-    // Note: This test is skipped due to Jest/ts-jest module caching issues
-    // The validation logic is tested implicitly when migrations are loaded by the runner
-    it.skip('should throw for missing up method', async () => {
+    it('should throw for missing up method', async () => {
       fs.mkdirSync(TEST_MIGRATIONS_DIR, { recursive: true });
       fs.writeFileSync(
         path.join(TEST_MIGRATIONS_DIR, '20260101-120000.ts'),

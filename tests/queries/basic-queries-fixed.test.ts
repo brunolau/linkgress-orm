@@ -1,4 +1,4 @@
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, gt, lt, gte, lte, like, and, or, not } from '../../src';
 import { assertType } from '../utils/type-tester';

@@ -1,38 +1,64 @@
-/* eslint-disable @typescript-eslint/no-var-requires */
+import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
 import { InMemoryDatabase } from '../../src/memory';
+import { InMemoryDatabaseThread } from '../../src/memory/thread';
 
 /**
  * The in-memory database a test file runs against when LINKGRESS_TEST_DB=memory.
  *
- * Jest gives every test file its own module registry, so each file gets a fresh database —
- * the equivalent of globalSetup's freshly created schema (see tests/setup.ts).
+ * Every test file runs in its own `bun test` process (see tests/run.ts), so each file gets a fresh
+ * database restored from the schema snapshot in LINKGRESS_MEMORY_SNAPSHOT — the equivalent of the
+ * freshly created schema a PostgreSQL run's global setup provides (tests/setup.ts builds the snapshot
+ * when a file is run without the runner).
  *
- * LINKGRESS_MEMORY_THREAD=true hosts it in a worker thread instead (`InMemoryDatabaseThread`, from
- * the compiled `dist` build — run `npm run build` first), exercising the thread transport.
+ * LINKGRESS_MEMORY_THREAD=true hosts it in a worker thread instead (`InMemoryDatabaseThread`),
+ * exercising the thread transport.
  */
-interface MemoryTarget {
-  pgPoolConfig<T extends Record<string, unknown>>(config?: T): T;
-  postgresOptions<T extends Record<string, unknown>>(options?: T): T;
-  terminate?(): Promise<void>;
-}
+type MemoryTarget = InMemoryDatabase | InMemoryDatabaseThread;
 
-const holder = globalThis as unknown as { __linkgressMemoryDatabase?: MemoryTarget };
+const holder = globalThis as unknown as {
+  __linkgressMemoryDatabase?: MemoryTarget;
+  __linkgressMemoryListener?: Promise<{ host: string; port: number; close?: () => Promise<void> }>;
+};
 
 const create = (): MemoryTarget => {
   const options = { databaseName: process.env.DB_NAME || 'linkgress_test', userName: process.env.DB_USER || 'postgres' };
+  const snapshotPath = process.env.LINKGRESS_MEMORY_SNAPSHOT ? path.resolve(process.env.LINKGRESS_MEMORY_SNAPSHOT) : undefined;
+
   if ((process.env.LINKGRESS_MEMORY_THREAD || '').toLowerCase() === 'true') {
-    const { InMemoryDatabaseThread } = require('../../dist/memory');
-    return InMemoryDatabaseThread.start({ database: options });
+    // with a TCP endpoint, for clients that cannot use a custom socket (Bun's SQL)
+    return InMemoryDatabaseThread.start({ database: options, snapshotPath, listen: true });
   }
-  return new InMemoryDatabase(options);
+
+  return snapshotPath ? InMemoryDatabase.fromSnapshot(readFileSync(snapshotPath), options) : new InMemoryDatabase(options);
 };
 
-// Kept on the test file's global so isolated module registries (see tests/setup.ts) share it
-export const memoryDatabase: MemoryTarget = (holder.__linkgressMemoryDatabase ??= create());
+/** The test file's database, created on first use. */
+export function memoryDatabase(): MemoryTarget {
+  return (holder.__linkgressMemoryDatabase ??= create());
+}
 
-/** Stop a thread-hosted database at the end of the test file. */
+/** A TCP endpoint of the test file's database (opened on first use). */
+export function memoryTcpEndpoint(): Promise<{ host: string; port: number }> {
+  if (!holder.__linkgressMemoryListener) {
+    const db = memoryDatabase();
+    holder.__linkgressMemoryListener = db instanceof InMemoryDatabase ? db.listen() : Promise.resolve(db.listener!);
+  }
+
+  return holder.__linkgressMemoryListener;
+}
+
+/** Stop the test file's database (its TCP endpoint and, when thread-hosted, the thread). */
 export async function disposeMemoryDatabase(): Promise<void> {
-  await holder.__linkgressMemoryDatabase?.terminate?.();
+  const listener = await holder.__linkgressMemoryListener;
+  await listener?.close?.();
+  const db = holder.__linkgressMemoryDatabase;
+
+  if (db instanceof InMemoryDatabaseThread) {
+    await db.terminate();
+  }
+  holder.__linkgressMemoryDatabase = undefined;
+  holder.__linkgressMemoryListener = undefined;
 }
 
 export function isMemoryTestDatabase(): boolean {

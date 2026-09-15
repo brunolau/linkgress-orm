@@ -378,12 +378,13 @@ export function tmToTimestamp(tm: Tm): number {
   return days * USECS_PER_DAY + tm.hour * USECS_PER_HOUR + tm.minute * USECS_PER_MINUTE + tm.second * USECS_PER_SEC + tm.fsec;
 }
 
-function checkTimestampRange(ts: number, typeName: string): number {
+function checkTimestampRange(ts: number, typeName: string, input?: string): number {
   // PostgreSQL range: 4714-11-24 BC .. 294276 AD
   const MIN = -211813488000000000;
   const MAX = 9223371331200000000;
   if (ts < MIN || ts >= MAX) {
-    throw new PgError(SqlState.DATETIME_FIELD_OVERFLOW, `${typeName} out of range`);
+    // timestamp_in / timestamptz_in quote the input
+    throw new PgError(SqlState.DATETIME_FIELD_OVERFLOW, input !== undefined ? `${typeName} out of range: "${input}"` : `${typeName} out of range`);
   }
   return ts;
 }
@@ -1051,14 +1052,14 @@ export function parseTimestamp(input: string, ctx: DateTimeContext, withTz: bool
   }
   if (!withTz) {
     // time zone in input is silently ignored for timestamp without time zone
-    return checkTimestampRange(localUs, 'timestamp');
+    return checkTimestampRange(localUs, 'timestamp', input);
   }
   if (p.tzOffset !== undefined) {
-    return checkTimestampRange(localUs - p.tzOffset * USECS_PER_SEC, 'timestamp');
+    return checkTimestampRange(localUs - p.tzOffset * USECS_PER_SEC, 'timestamp', input);
   }
   const zone = p.tzName ?? ctx.zone;
   const off = localToUtcOffset(zone, localUs);
-  return checkTimestampRange(localUs - off * USECS_PER_SEC, 'timestamp');
+  return checkTimestampRange(localUs - off * USECS_PER_SEC, 'timestamp', input);
 }
 
 export function parseTime(input: string, typeName = 'time without time zone'): number {
@@ -1433,6 +1434,32 @@ export function justifyDays(iv: Interval): Interval {
     months++;
   }
   return normalizeNegZero({ months, days, us: iv.us });
+}
+
+/** interval_justify_interval: whole days out of the time, whole months out of the days, one sign throughout */
+export function justifyInterval(iv: Interval): Interval {
+  let { months, days, us } = iv;
+  const wholeDay = Math.trunc(us / USECS_PER_DAY);
+  us -= wholeDay * USECS_PER_DAY;
+  days += wholeDay;
+  const wholeMonth = Math.trunc(days / 30);
+  days -= wholeMonth * 30;
+  months += wholeMonth;
+  if (months > 0 && (days < 0 || (days === 0 && us < 0))) {
+    days += 30;
+    months--;
+  } else if (months < 0 && (days > 0 || (days === 0 && us > 0))) {
+    days -= 30;
+    months++;
+  }
+  if (days > 0 && us < 0) {
+    us += USECS_PER_DAY;
+    days--;
+  } else if (days < 0 && us > 0) {
+    us -= USECS_PER_DAY;
+    days++;
+  }
+  return normalizeNegZero({ months, days, us });
 }
 
 /** age(timestamp, timestamp) — symbolic result using years/months/days */

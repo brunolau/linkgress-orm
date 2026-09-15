@@ -89,6 +89,11 @@ function digest(result: { rows?: any[]; rowCount?: number | null }): ResultDiges
   };
 }
 
+/**
+ * The running test file and test. Under Bun (one process per test file) the file is `Bun.main` and the
+ * test its position in the file, set by the preload (tests/setup.ts): both runs of a file execute the
+ * same tests in the same order, so positions pair up. Jest's `expect.getState()` is used where present.
+ */
 function currentTest(): { file: string; test: string } {
   let state: any;
 
@@ -98,9 +103,11 @@ function currentTest(): { file: string; test: string } {
     state = undefined;
   }
 
-  const file = state?.testPath ? relative(ROOT, state.testPath).split(/[\\/]/).join('/') : 'unknown';
+  const bun = (globalThis as any).Bun;
+  const testPath: string | undefined = state?.testPath ?? (bun?.main && /\.test\.ts$/.test(bun.main) ? bun.main : undefined);
+  const file = testPath ? relative(ROOT, testPath).split(/[\\/]/).join('/') : 'unknown';
 
-  return { file, test: state?.currentTestName ?? '(hook)' };
+  return { file, test: state?.currentTestName ?? (globalThis as any).__linkgressRecordedTest ?? '(hook)' };
 }
 
 /**

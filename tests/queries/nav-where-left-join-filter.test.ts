@@ -36,7 +36,7 @@
  *   query shapes (toList, count, first, etc.).
  */
 
-import { describe, test, expect } from '@jest/globals';
+import { describe, test, expect } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import {
   DbContext,

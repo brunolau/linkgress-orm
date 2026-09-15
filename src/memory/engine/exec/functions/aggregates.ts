@@ -3,11 +3,13 @@ import { PgError, SqlState } from '../../errors';
 import { Interval, USECS_PER_DAY } from '../../types/datetime';
 import { escapeJsonString, JNULL, jsonbToText, JsonbObject, JsonbValue } from '../../types/json';
 import { PgNumeric } from '../../types/numeric';
+import { numericStddev } from '../../types/numeric-math';
 import { AggNode } from '../../analyze/nodes';
 import { AggImpl, FnCall } from '../runtime';
 import { checkInt8, toBigInt, TypeOps } from '../typeops';
 import { datumToJson, datumToJsonb, jsonCategory } from './json-fns';
 import { floatToNumeric } from './numeric-fns';
+import { rangeAggregate } from './range-fns';
 
 interface SumState {
   kind: 'int' | 'numeric' | 'float' | 'interval';
@@ -168,16 +170,7 @@ function statAgg(name: string, argType: number, resultType: number): AggImpl {
         return null;
       }
       if (numericMode) {
-        const n = PgNumeric.fromInt(st.n);
-        const mean = st.sxn.div(n);
-        const ss = st.sxxn.sub(st.sxn.mul(mean));
-        const denom = pop ? n : PgNumeric.fromInt(st.n - 1);
-        const variance = PgNumeric.divScaled(ss, denom, Math.max(16, Math.max(st.sxxn.scale, 0)), true);
-        if (isVar) {
-          return variance;
-        }
-        const v = Math.sqrt(variance.toNumber());
-        return PgNumeric.parse(v.toFixed(Math.max(16, variance.scale))).round(Math.max(16, variance.scale));
+        return numericStddev(st.n, st.sxn, st.sxxn, isVar, !pop);
       }
       const mean = st.sx / st.n;
       const ss = st.sxx - st.sx * mean;
@@ -486,8 +479,92 @@ export function lookupAggregate(agg: AggNode, typeOps: TypeOps): AggImpl | null 
     case 'percentile_disc':
     case 'mode':
       return orderedSetAgg(name, agg.type, typeOps, argType);
+    case 'range_agg':
+    case 'range_intersect_agg':
+      return rangeAggregate(name, argType, agg.type);
+    case 'any_value':
+      // strict transition: the first non-NULL input
+      return {
+        init: () => undefined,
+        step: (s, a) => (s === undefined ? a[0] : s),
+        final: (s) => (s === undefined ? null : s),
+      };
+    case 'corr':
+    case 'covar_pop':
+    case 'covar_samp':
+    case 'regr_avgx':
+    case 'regr_avgy':
+    case 'regr_count':
+    case 'regr_intercept':
+    case 'regr_r2':
+    case 'regr_slope':
+    case 'regr_sxx':
+    case 'regr_sxy':
+    case 'regr_syy':
+      return regrAgg(name, agg.args[0].type, agg.args[1].type);
   }
   return null;
+}
+
+/**
+ * float8_regr_accum and the regression final functions. Arguments are (Y, X); rows with a NULL in either are
+ * skipped. Sxx / Syy / Sxy are kept as running central sums (Welford's method).
+ */
+function regrAgg(name: string, yType: number, xType: number): AggImpl {
+  const toF = (v: unknown, type: number) => (v instanceof PgNumeric ? v.toNumber() : typeof v === 'bigint' ? Number(v) : (v as number));
+  return {
+    init: () => ({ n: 0, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0 }),
+    step: (s, a) => {
+      const st = s as { n: number; sx: number; sy: number; sxx: number; syy: number; sxy: number };
+      const y = toF(a[0], yType);
+      const x = toF(a[1], xType);
+      const n = st.n + 1;
+      if (st.n > 0) {
+        const dx = x - st.sx / st.n;
+        const dy = y - st.sy / st.n;
+        st.sxx += (dx * dx * st.n) / n;
+        st.syy += (dy * dy * st.n) / n;
+        st.sxy += (dx * dy * st.n) / n;
+      }
+      st.n = n;
+      st.sx += x;
+      st.sy += y;
+      return st;
+    },
+    final: (s) => {
+      const { n, sx, sy, sxx, syy, sxy } = s as { n: number; sx: number; sy: number; sxx: number; syy: number; sxy: number };
+      if (name === 'regr_count') {
+        return BigInt(n);
+      }
+      if (n < 1) {
+        return null;
+      }
+      switch (name) {
+        case 'corr':
+          return sxx === 0 || syy === 0 ? null : sxy / Math.sqrt(sxx * syy);
+        case 'covar_pop':
+          return sxy / n;
+        case 'covar_samp':
+          return n < 2 ? null : sxy / (n - 1);
+        case 'regr_avgx':
+          return sx / n;
+        case 'regr_avgy':
+          return sy / n;
+        case 'regr_intercept':
+          return sxx === 0 ? null : (sy - (sx * sxy) / sxx) / n;
+        case 'regr_r2':
+          return sxx === 0 ? null : syy === 0 ? 1 : (sxy * sxy) / (sxx * syy);
+        case 'regr_slope':
+          return sxx === 0 ? null : sxy / sxx;
+        case 'regr_sxx':
+          return sxx;
+        case 'regr_sxy':
+          return sxy;
+        default:
+          return syy;
+      }
+    },
+  };
 }
 
 export { escapeJsonString, JNULL };

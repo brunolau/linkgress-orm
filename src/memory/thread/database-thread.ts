@@ -123,7 +123,7 @@ if (process.env.LINKGRESS_THREAD_STATS) {
       at: new Date().toISOString(),
       heapUsedMB: Math.round(mem.heapUsed / 1048576),
       heapTotalMB: Math.round(mem.heapTotal / 1048576),
-      // process-wide (the jest worker and this thread together)
+      // process-wide (the host process and this thread together)
       rssMB: Math.round(mem.rss / 1048576),
       arrayBuffersMB: Math.round(mem.arrayBuffers / 1048576),
     };

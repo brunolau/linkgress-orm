@@ -24,6 +24,8 @@ export interface Tuple {
   vacuumed?: boolean;
   /** row locks held on this tuple version: xid -> strength */
   locks?: Map<number, LockStrength>;
+  /** lock-only xmax a version was born with (the row ON CONFLICT DO UPDATE locked, then updated) */
+  lockXmax?: number;
 }
 
 export type LockStrength = 'KEY SHARE' | 'SHARE' | 'NO KEY UPDATE' | 'UPDATE';

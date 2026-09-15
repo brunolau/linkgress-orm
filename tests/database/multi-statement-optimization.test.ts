@@ -1,3 +1,4 @@
+import { describe, it, expect } from 'bun:test';
 import { DatabaseClient, QueryResult, PooledConnection } from '../../src/database/database-client.interface';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 

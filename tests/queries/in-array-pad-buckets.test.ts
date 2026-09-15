@@ -1,4 +1,4 @@
-import { describe, test, expect, afterEach, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, afterEach, beforeAll, afterAll } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import * as linkgress from '../../src';
 import {

@@ -1,3 +1,4 @@
+import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { expectToReject } from '../utils/expect-rejects';
 import { eq } from '../../src/query/conditions';

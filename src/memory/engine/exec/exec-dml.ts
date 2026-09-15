@@ -4,7 +4,7 @@ import { Query, RelationRTE, TExpr } from '../analyze/nodes';
 import { Heap, Snapshot, Tuple, UndoLog, WaitForTransaction } from '../storage/mvcc';
 import { lockTuple } from '../storage/store';
 import { outputValue } from '../types/io';
-import { EvalCtx, Evaluator, StatementState } from './runtime';
+import { EvalCtx, Evaluator, StatementState, TransitionCapture } from './runtime';
 import { Executor, ExecutorHost, hashFamilyKey, QueryPlan, Row } from './executor';
 
 export interface DmlHost extends ExecutorHost {
@@ -15,8 +15,22 @@ export interface DmlHost extends ExecutorHost {
   /** partition bound check for routing */
   partitionAccepts(parent: Relation, part: Relation, keyValues: unknown[], st: StatementState): boolean;
   partitionKeyValues(parent: Relation, data: unknown[], st: StatementState, executor: Executor): unknown[];
-  /** row-level triggers (BEFORE/AFTER) — returns possibly modified data, or null to skip */
-  fireRowTriggers(rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', newData: unknown[] | null, oldData: unknown[] | null, st: StatementState): unknown[] | null | undefined;
+  /** row-level triggers (BEFORE/AFTER) — returns possibly modified data, or null to skip; AFTER ones see the statement's transition rows */
+  fireRowTriggers(
+    rel: Relation,
+    timing: 'BEFORE' | 'AFTER',
+    event: 'INSERT' | 'UPDATE' | 'DELETE',
+    newData: unknown[] | null,
+    oldData: unknown[] | null,
+    st: StatementState,
+    transition?: TransitionCapture
+  ): unknown[] | null | undefined;
+  /** FOR EACH STATEMENT triggers */
+  fireStatementTriggers(rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', st: StatementState, transition?: TransitionCapture): void;
+  /** whether a DEFERRABLE constraint's checks are currently deferred (SET CONSTRAINTS / INITIALLY DEFERRED) */
+  isConstraintDeferred(con: Constraint): boolean;
+  /** queue a check until COMMIT or SET CONSTRAINTS ... IMMEDIATE; it runs with a DmlExecutor of that moment */
+  deferConstraintCheck(con: Constraint, run: (dml: DmlExecutor) => void): void;
 }
 
 interface UniqueIndexInfo {
@@ -188,10 +202,10 @@ export class DmlExecutor {
         return null;
       }
       const dom = this.st.catalog.getType(col.typeOid);
-      if (dom && dom.typtype === 'd' && dom.domainDefault) {
-        // domain default
+      if (!dom || dom.typtype !== 'd') {
+        return null;
       }
-      return null;
+      // a domain column: the domain's DEFAULT, or NULL checked against the domain's NOT NULL
     }
     if (col.generated) {
       return null;
@@ -233,6 +247,17 @@ export class DmlExecutor {
       return v === null || v === undefined ? 'null' : outputValue(c.typeOid, v, io);
     });
     return `Failing row contains (${vals.join(', ')}).`;
+  }
+
+  /** ExecWithCheckOptions: a row written through a view WITH CHECK OPTION must satisfy the view quals. */
+  private checkViewOptions(q: Query, plan: QueryPlan, base: EvalCtx, info: TableInfo, row: Row): void {
+    for (const wco of q.withCheckOptions ?? []) {
+      if (wco.qual && plan.ev(wco.qual)(this.executor.rowCtx(row, base)) !== true) {
+        throw new PgError(SqlState.WITH_CHECK_OPTION_VIOLATION, `new row violates check option for view "${wco.viewName}"`, {
+          detail: this.failingRow(info, row[q.resultRelation] as unknown[]),
+        });
+      }
+    }
   }
 
   private checkRow(info: TableInfo, data: unknown[], relForMessages: Relation): void {
@@ -388,31 +413,75 @@ export class DmlExecutor {
           continue;
         }
       }
-      const anyNull = vals.some((v) => v === null);
-      if (anyNull) {
-        if (con.fk!.matchType === 'FULL' && !vals.every((v) => v === null)) {
-          throw new PgError(SqlState.FOREIGN_KEY_VIOLATION, `insert or update on table "${relForMessages.name}" violates foreign key constraint "${con.name}"`, {
-            detail: 'MATCH FULL does not allow mixing of null and nonnull key values.',
-            constraint: con.name,
-            table: relForMessages.name,
-          });
-        }
+      if (this.host.isConstraintDeferred(con)) {
+        const relOid = info.rel.oid;
+        const messageRelOid = relForMessages.oid;
+        this.host.deferConstraintCheck(con, (dml) => dml.checkForeignKeyOut(dml.tableInfo(relOid), con, data, dml.st.catalog.getRelation(messageRelOid) ?? relForMessages));
         continue;
       }
-      // coerce to referenced column types when they differ (e.g. int4 -> int8)
-      const refRel = this.st.catalog.getRelation(con.fk!.refRelOid)!;
-      if (!this.refRowExists(con, vals)) {
-        const io = this.st.session.io;
-        const colNames = cols.map((a) => info.rel.columns[a - 1].name).join(', ');
-        const valText = vals.map((v, i) => outputValue(info.rel.columns[cols[i] - 1].typeOid, v, io)).join(', ');
+      this.checkForeignKeyOut(info, con, data, relForMessages);
+    }
+  }
+
+  /** RI_FKey_check: the referenced key of one foreign key must exist. */
+  checkForeignKeyOut(info: TableInfo, con: Constraint, data: unknown[], relForMessages: Relation): void {
+    const cols = con.columns;
+    const vals = cols.map((a) => data[a - 1] ?? null);
+    const anyNull = vals.some((v) => v === null);
+    if (anyNull) {
+      if (con.fk!.matchType === 'FULL' && !vals.every((v) => v === null)) {
         throw new PgError(SqlState.FOREIGN_KEY_VIOLATION, `insert or update on table "${relForMessages.name}" violates foreign key constraint "${con.name}"`, {
-          detail: `Key (${colNames})=(${valText}) is not present in table "${refRel.name}".`,
-          schema: this.st.catalog.namespaceName(relForMessages.nspOid),
-          table: relForMessages.name,
+          detail: 'MATCH FULL does not allow mixing of null and nonnull key values.',
           constraint: con.name,
+          table: relForMessages.name,
         });
       }
+      return;
     }
+    // coerce to referenced column types when they differ (e.g. int4 -> int8)
+    const refRel = this.st.catalog.getRelation(con.fk!.refRelOid)!;
+    if (!this.refRowExists(con, vals)) {
+      const io = this.st.session.io;
+      const colNames = cols.map((a) => info.rel.columns[a - 1].name).join(', ');
+      const valText = vals.map((v, i) => outputValue(info.rel.columns[cols[i] - 1].typeOid, v, io)).join(', ');
+      throw new PgError(SqlState.FOREIGN_KEY_VIOLATION, `insert or update on table "${relForMessages.name}" violates foreign key constraint "${con.name}"`, {
+        detail: `Key (${colNames})=(${valText}) is not present in table "${refRel.name}".`,
+        schema: this.st.catalog.namespaceName(relForMessages.nspOid),
+        table: relForMessages.name,
+        constraint: con.name,
+      });
+    }
+  }
+
+  /** A deferred NO ACTION check: the removed key must no longer be referenced (unless a new row carries it). */
+  checkNoActionStillReferenced(info: TableInfo, con: Constraint, oldKey: unknown[]): void {
+    if (this.refRowExists(con, oldKey) || this.referencingRows(con, oldKey).length === 0) {
+      return;
+    }
+    this.throwStillReferenced(info, con, oldKey, false);
+  }
+
+  private throwStillReferenced(info: TableInfo, con: Constraint, oldKey: unknown[], restrict: boolean): never {
+    const refCols = con.fk!.refColumns;
+    const referencingRel = this.st.catalog.getRelation(con.relOid)!;
+    const io = this.st.session.io;
+    const colNames = refCols.map((a) => info.rel.columns[a - 1].name).join(', ');
+    const valText = oldKey.map((v, i) => outputValue(info.rel.columns[refCols[i] - 1].typeOid, v, io)).join(', ');
+    const fields = {
+      schema: this.st.catalog.namespaceName(referencingRel.nspOid),
+      table: referencingRel.name,
+      constraint: con.name,
+    };
+    if (restrict) {
+      throw new PgError(SqlState.RESTRICT_VIOLATION, `update or delete on table "${info.rel.name}" violates RESTRICT setting of foreign key constraint "${con.name}" on table "${referencingRel.name}"`, {
+        detail: `Key (${colNames})=(${valText}) is referenced from table "${referencingRel.name}".`,
+        ...fields,
+      });
+    }
+    throw new PgError(SqlState.FOREIGN_KEY_VIOLATION, `update or delete on table "${info.rel.name}" violates foreign key constraint "${con.name}" on table "${referencingRel.name}"`, {
+      detail: `Key (${colNames})=(${valText}) is still referenced from table "${referencingRel.name}".`,
+      ...fields,
+    });
   }
 
   /** Referencing rows (visible to the RI snapshot) for a referenced key. */
@@ -470,26 +539,25 @@ export class DmlExecutor {
           continue;
         }
       }
-      // another row with the same key may still satisfy the reference (e.g. unique updated then reinserted)
-      if (this.refRowExists(con, oldKey)) {
+      const action = newData ? con.fk!.onUpdate : con.fk!.onDelete;
+      // NO ACTION: another row with the same key may still satisfy the reference (e.g. unique updated then
+      // reinserted); RESTRICT does not look for one (ri_restrict)
+      if (action !== 'RESTRICT' && this.refRowExists(con, oldKey)) {
+        continue;
+      }
+      // only NO ACTION checks are deferrable (the action triggers of CASCADE, SET NULL, ... never are)
+      if (action === 'NO ACTION' && this.host.isConstraintDeferred(con)) {
+        const relOid = info.rel.oid;
+        this.host.deferConstraintCheck(con, (dml) => dml.checkNoActionStillReferenced(dml.tableInfo(relOid), con, oldKey));
         continue;
       }
       const rows = this.referencingRows(con, oldKey);
       if (rows.length === 0) {
         continue;
       }
-      const action = newData ? con.fk!.onUpdate : con.fk!.onDelete;
       const referencingRel = this.st.catalog.getRelation(con.relOid)!;
       if (action === 'NO ACTION' || action === 'RESTRICT') {
-        const io = this.st.session.io;
-        const colNames = refCols.map((a) => info.rel.columns[a - 1].name).join(', ');
-        const valText = oldKey.map((v, i) => outputValue(info.rel.columns[refCols[i] - 1].typeOid, v, io)).join(', ');
-        throw new PgError(SqlState.FOREIGN_KEY_VIOLATION, `update or delete on table "${info.rel.name}" violates foreign key constraint "${con.name}" on table "${referencingRel.name}"`, {
-          detail: `Key (${colNames})=(${valText}) is still referenced from table "${referencingRel.name}".`,
-          schema: this.st.catalog.namespaceName(referencingRel.nspOid),
-          table: referencingRel.name,
-          constraint: con.name,
-        });
+        this.throwStillReferenced(info, con, oldKey, action === 'RESTRICT');
       }
       const refInfo = this.tableInfo(referencingRel.oid);
       for (const r of rows) {
@@ -655,10 +723,26 @@ export class DmlExecutor {
   // INSERT
   // -------------------------------------------------------------------------
 
+  /** BEFORE STATEMENT triggers now; AFTER STATEMENT ones queued behind the row-level AFTER work queued so far */
+  private statementTriggers(rel: Relation, events: ('INSERT' | 'UPDATE' | 'DELETE')[], timing: 'BEFORE' | 'AFTER', transition?: TransitionCapture | null): void {
+    if (!rel.hasTriggers) {
+      return;
+    }
+    for (const event of events) {
+      if (timing === 'BEFORE') {
+        this.host.fireStatementTriggers(rel, 'BEFORE', event, this.st);
+      } else {
+        this.st.afterQueue.push(() => this.host.fireStatementTriggers(rel, 'AFTER', event, this.st, transition ?? undefined));
+      }
+    }
+  }
+
   executeInsert(q: Query, base: EvalCtx): { rows: unknown[][]; rowCount: number } {
     const plan = this.executor.planFor(q, base.parent && base.parent.inst ? (base.parent.inst as { plan: QueryPlan }).plan : null);
     const rte = q.rtable[q.resultRelation] as RelationRTE;
     const info = this.tableInfo(rte.relOid);
+    const statementEvents: ('INSERT' | 'UPDATE')[] = q.onConflict?.action === 'UPDATE' ? ['INSERT', 'UPDATE'] : ['INSERT'];
+    this.statementTriggers(info.rel, statementEvents, 'BEFORE');
     const live = info.live;
     const cols = q.insertColumns ?? [];
     const src = q.insertSource!;
@@ -698,6 +782,7 @@ export class DmlExecutor {
     const returning: unknown[][] = [];
     const retEvs = q.returningList.map((te) => plan.ev(te.expr));
     const inserted: { data: unknown[]; rel: Relation; info: TableInfo }[] = [];
+    const conflictUpdates: { oldData: unknown[]; newData: unknown[] }[] = [];
     let rowCount = 0;
     const onConflict = q.onConflict;
     const nrt = plan.nrt;
@@ -722,7 +807,7 @@ export class DmlExecutor {
       }
 
       if (onConflict) {
-        const handled = this.handleOnConflict(q, plan, base, info, data, returning, retEvs);
+        const handled = this.handleOnConflict(q, plan, base, info, data, returning, retEvs, conflictUpdates);
         if (handled !== 'insert') {
           if (handled === 'updated') {
             rowCount++;
@@ -736,14 +821,21 @@ export class DmlExecutor {
       }
       rowCount++;
       inserted.push({ data: res.data, rel: res.rel, info: this.tableInfo(res.rel.oid) });
-      if (retEvs.length > 0) {
+      if (retEvs.length > 0 || q.withCheckOptions) {
         const row = base.row.slice();
         row[q.resultRelation] = res.rel === info.rel ? res.data : this.mapFromChild(info.rel, res.rel, res.data);
         row[nrt + q.resultRelation] = res.tuple;
+        this.checkViewOptions(q, plan, base, info, row);
         setReturningOldNew(q, row, null, row[q.resultRelation] as unknown[]);
         const c = this.executor.rowCtx(row, base);
         returning.push(retEvs.map((ev) => ev(c)));
       }
+    }
+    const transition = this.newTransitionCapture(info.rel);
+    if (transition) {
+      transition.insertNew = inserted.map((i) => this.inRootLayout(info.rel, i.rel, i.data));
+      transition.updateOld = conflictUpdates.map((u) => u.oldData);
+      transition.updateNew = conflictUpdates.map((u) => u.newData);
     }
     // foreign keys and AFTER triggers fire at the end of the whole query
     this.st.afterQueue.push(() => {
@@ -752,9 +844,35 @@ export class DmlExecutor {
           this.checkForeignKeysOut(ins.info, ins.data, ins.rel);
         }
       }
-      this.fireAfterRowTriggers(inserted.map((i) => ({ rel: i.rel, newData: i.data, oldData: null })), 'INSERT');
+      this.fireAfterRowTriggers(inserted.map((i) => ({ rel: i.rel, newData: i.data, oldData: null })), 'INSERT', transition);
     });
+    this.statementTriggers(info.rel, statementEvents, 'AFTER', transition);
     return { rows: returning, rowCount };
+  }
+
+  /** A row of a partition (or inheritance child) in the layout of the statement's target table. */
+  private inRootLayout(root: Relation, rel: Relation, data: unknown[]): unknown[] {
+    return rel === root ? data : this.mapFromChild(root, rel, data);
+  }
+
+  /** The transition-row capture of a statement whose target has triggers declaring transition tables, else null. */
+  private newTransitionCapture(rel: Relation): TransitionCapture | null {
+    if (!rel.hasTriggers) {
+      return null;
+    }
+    const key = 'transition-tables:' + rel.oid;
+    let declared = this.st.scratch.get(key) as boolean | undefined;
+    if (declared === undefined) {
+      declared = false;
+      for (const t of this.st.catalog.triggers.values()) {
+        if (t.relOid === rel.oid && (t.newTable || t.oldTable)) {
+          declared = true;
+          break;
+        }
+      }
+      this.st.scratch.set(key, declared);
+    }
+    return declared ? { insertNew: [], updateOld: [], updateNew: [], deleteOld: [] } : null;
   }
 
   private mapFromChild(parent: Relation, child: Relation, data: unknown[]): unknown[] {
@@ -767,15 +885,24 @@ export class DmlExecutor {
     });
   }
 
-  private fireAfterRowTriggers(events: { rel: Relation; newData: unknown[] | null; oldData: unknown[] | null }[], event: 'INSERT' | 'UPDATE' | 'DELETE'): void {
+  private fireAfterRowTriggers(events: { rel: Relation; newData: unknown[] | null; oldData: unknown[] | null }[], event: 'INSERT' | 'UPDATE' | 'DELETE', transition?: TransitionCapture | null): void {
     for (const e of events) {
       if (e.rel.hasTriggers) {
-        this.host.fireRowTriggers(e.rel, 'AFTER', event, e.newData, e.oldData, this.st);
+        this.host.fireRowTriggers(e.rel, 'AFTER', event, e.newData, e.oldData, this.st, transition ?? undefined);
       }
     }
   }
 
-  private handleOnConflict(q: Query, plan: QueryPlan, base: EvalCtx, info: TableInfo, data: unknown[], returning: unknown[][], retEvs: Evaluator[]): 'insert' | 'skipped' | 'updated' {
+  private handleOnConflict(
+    q: Query,
+    plan: QueryPlan,
+    base: EvalCtx,
+    info: TableInfo,
+    data: unknown[],
+    returning: unknown[][],
+    retEvs: Evaluator[],
+    updated: { oldData: unknown[]; newData: unknown[] }[]
+  ): 'insert' | 'skipped' | 'updated' {
     const oc = q.onConflict!;
     const arbiters = oc.arbiterIndexes.length > 0 ? info.uniques.filter((u) => oc.arbiterIndexes.includes(u.indexOid)) : info.uniques;
     const heap = this.heapOf(info.rel);
@@ -828,20 +955,23 @@ export class DmlExecutor {
     if (!t) {
       return 'skipped';
     }
+    // the new version keeps the row lock as a lock-only xmax (`RETURNING (xmax = 0) AS inserted` is false)
+    t.lockXmax = xid;
     const oldData = conflict.data;
+    updated.push({ oldData, newData: t.data });
     this.st.afterQueue.push(() => {
       if (info.fksOut.length > 0) {
-        this.checkForeignKeysOut(info, newData, info.rel, oldData);
+        this.checkForeignKeysOut(info, t.data, info.rel, oldData);
       }
       if (info.fksIn.length > 0) {
-        this.handleReferencedChange(info, oldData, newData);
+        this.handleReferencedChange(info, oldData, t.data);
       }
     });
     if (retEvs.length > 0) {
       const r2 = base.row.slice();
-      r2[q.resultRelation] = newData;
+      r2[q.resultRelation] = t.data;
       r2[nrt + q.resultRelation] = t;
-      setReturningOldNew(q, r2, conflict.data, newData);
+      setReturningOldNew(q, r2, conflict.data, t.data);
       const c2 = this.executor.rowCtx(r2, base);
       returning.push(retEvs.map((ev) => ev(c2)));
     }
@@ -858,6 +988,8 @@ export class DmlExecutor {
     const rte = q.rtable[rt] as RelationRTE;
     const info = this.tableInfo(rte.relOid);
     const nrt = plan.nrt;
+    this.st.updateTargetColumns = new Set(q.updateSet!.map((s) => info.live[s.attIndex].name));
+    this.statementTriggers(info.rel, ['UPDATE'], 'BEFORE');
     const rows = this.executor.executeFromWhere(plan, base);
     const seen = new Set<Tuple>();
     const setEvs = q.updateSet!.map((s) => ({ col: info.live[s.attIndex], expr: s.expr, ev: s.expr.k === 'default' ? null : plan.ev(s.expr) }));
@@ -884,19 +1016,49 @@ export class DmlExecutor {
         newData[phys] = s.ev ? s.ev(ctx) : this.defaultValue(partInfo, partRel.columns[phys]);
       }
       const heap = this.heapOf(partRel);
+      if (partRel !== info.rel && info.rel.kind === 'p') {
+        // a changed partition key moves the row: DELETE from its partition, INSERT through the root
+        const moved = this.moveAcrossPartitions(info, partInfo, partRel, heap, t, newData);
+        if (moved === false) {
+          continue;
+        }
+        if (moved !== null) {
+          rowCount++;
+          if (retEvs.length > 0 || q.withCheckOptions) {
+            const r2 = row.slice();
+            r2[rt] = moved.rel === info.rel ? moved.data : this.mapFromChild(info.rel, moved.rel, moved.data);
+            r2[nrt + rt] = moved.tuple;
+            this.checkViewOptions(q, plan, base, info, r2);
+            setReturningOldNew(q, r2, this.mapFromChild(info.rel, partRel, t.data), r2[rt] as unknown[]);
+            const c2 = this.executor.rowCtx(r2, base);
+            returning.push(retEvs.map((ev) => ev(c2)));
+          }
+          continue;
+        }
+      }
       const nt = this.updateTuple(partInfo, heap, t, newData, partRel, false);
       if (!nt) {
         continue;
       }
       rowCount++;
-      updates.push({ rel: partRel, info: partInfo, oldData: t.data, newData });
-      if (retEvs.length > 0) {
+      // the stored row: BEFORE UPDATE triggers and generated columns may have changed it
+      const stored = nt.data;
+      updates.push({ rel: partRel, info: partInfo, oldData: t.data, newData: stored });
+      if (retEvs.length > 0 || q.withCheckOptions) {
         const r2 = row.slice();
-        r2[rt] = partRel === info.rel ? newData : this.mapFromChild(info.rel, partRel, newData);
+        r2[rt] = partRel === info.rel ? stored : this.mapFromChild(info.rel, partRel, stored);
         r2[nrt + rt] = nt;
+        this.checkViewOptions(q, plan, base, info, r2);
         setReturningOldNew(q, r2, partRel === info.rel ? t.data : this.mapFromChild(info.rel, partRel, t.data), r2[rt] as unknown[]);
         const c2 = this.executor.rowCtx(r2, base);
         returning.push(retEvs.map((ev) => ev(c2)));
+      }
+    }
+    const transition = this.newTransitionCapture(info.rel);
+    if (transition) {
+      for (const u of updates) {
+        transition.updateOld.push(this.inRootLayout(info.rel, u.rel, u.oldData));
+        transition.updateNew.push(this.inRootLayout(info.rel, u.rel, u.newData));
       }
     }
     this.st.afterQueue.push(() => {
@@ -908,9 +1070,54 @@ export class DmlExecutor {
           this.handleReferencedChange(u.info, u.oldData, u.newData);
         }
       }
-      this.fireAfterRowTriggers(updates.map((u) => ({ rel: u.rel, newData: u.newData, oldData: u.oldData })), 'UPDATE');
+      this.fireAfterRowTriggers(updates.map((u) => ({ rel: u.rel, newData: u.newData, oldData: u.oldData })), 'UPDATE', transition);
     });
+    this.statementTriggers(info.rel, ['UPDATE'], 'AFTER', transition);
     return { rows: returning, rowCount };
+  }
+
+  /**
+   * UPDATE of a partitioned table whose new row no longer belongs to the partition holding it:
+   * null when the row stays, false when a trigger skipped it, else the row inserted elsewhere.
+   * BEFORE UPDATE and BEFORE DELETE row triggers fire on the source partition, BEFORE INSERT on the
+   * destination; AFTER DELETE / AFTER INSERT fire at the end of the statement (ExecCrossPartitionUpdate).
+   */
+  private moveAcrossPartitions(root: TableInfo, partInfo: TableInfo, partRel: Relation, heap: Heap, t: Tuple, newData: unknown[]): { tuple: Tuple; rel: Relation; data: unknown[] } | null | false {
+    const target = this.routeInsert(root, this.mapFromChild(root.rel, partRel, newData));
+    if (target.rel === partRel) {
+      return null;
+    }
+    let data = newData;
+    if (partRel.hasTriggers) {
+      const r = this.host.fireRowTriggers(partRel, 'BEFORE', 'UPDATE', data, t.data, this.st);
+      if (r === null) {
+        return false;
+      }
+      if (r) {
+        data = r;
+      }
+    }
+    if (!this.deleteTuple(partInfo, heap, t, partRel, false)) {
+      return false;
+    }
+    const inserted = this.insertRow(root, this.mapFromChild(root.rel, partRel, data));
+    if (!inserted.tuple) {
+      return false;
+    }
+    const oldData = t.data;
+    this.st.afterQueue.push(() => {
+      const newInfo = this.tableInfo(inserted.rel.oid);
+      if (newInfo.fksOut.length > 0) {
+        this.checkForeignKeysOut(newInfo, inserted.data, inserted.rel);
+      }
+      if (partInfo.fksIn.length > 0) {
+        // for foreign keys the move is an update of the referenced row
+        this.handleReferencedChange(partInfo, oldData, data);
+      }
+      this.fireAfterRowTriggers([{ rel: partRel, newData: null, oldData }], 'DELETE');
+      this.fireAfterRowTriggers([{ rel: inserted.rel, newData: inserted.data, oldData: null }], 'INSERT');
+    });
+    return inserted;
   }
 
   private relationOfTuple(rel: Relation, t: Tuple): Relation {
@@ -939,6 +1146,7 @@ export class DmlExecutor {
     const rte = q.rtable[rt] as RelationRTE;
     const info = this.tableInfo(rte.relOid);
     const nrt = plan.nrt;
+    this.statementTriggers(info.rel, ['DELETE'], 'BEFORE');
     const rows = this.executor.executeFromWhere(plan, base);
     const seen = new Set<Tuple>();
     const retEvs = q.returningList.map((te) => plan.ev(te.expr));
@@ -968,14 +1176,19 @@ export class DmlExecutor {
         returning.push(retEvs.map((ev) => ev(c)));
       }
     }
+    const transition = this.newTransitionCapture(info.rel);
+    if (transition) {
+      transition.deleteOld = deleted.map((d) => this.inRootLayout(info.rel, d.rel, d.oldData));
+    }
     this.st.afterQueue.push(() => {
       for (const d of deleted) {
         if (d.info.fksIn.length > 0) {
           this.handleReferencedChange(d.info, d.oldData, null);
         }
       }
-      this.fireAfterRowTriggers(deleted.map((d) => ({ rel: d.rel, newData: null, oldData: d.oldData })), 'DELETE');
+      this.fireAfterRowTriggers(deleted.map((d) => ({ rel: d.rel, newData: null, oldData: d.oldData })), 'DELETE', transition);
     });
+    this.statementTriggers(info.rel, ['DELETE'], 'AFTER', transition);
     return { rows: returning, rowCount };
   }
 
@@ -1003,7 +1216,11 @@ export class DmlExecutor {
     const touched = new Set<Tuple>();
     let rowCount = 0;
     const hasBySource = actions.some((a) => a.matchKind === 'NOT_MATCHED_BY_SOURCE');
+    // fireBSTriggers / fireASTriggers for MERGE: INSERT, UPDATE, DELETE before; the reverse after
+    const mergeEvents = (['INSERT', 'UPDATE', 'DELETE'] as const).filter((ev) => actions.some((a) => a.command === ev));
+    this.statementTriggers(info.rel, [...mergeEvents], 'BEFORE');
     const inserted: { data: unknown[]; rel: Relation; info: TableInfo }[] = [];
+    const transition = this.newTransitionCapture(info.rel);
 
     for (const srow of sourceRows) {
       const matches: Tuple[] = [];
@@ -1040,11 +1257,13 @@ export class DmlExecutor {
             if (res.tuple) {
               rowCount++;
               inserted.push({ data: res.data, rel: res.rel, info: this.tableInfo(res.rel.oid) });
+              transition?.insertNew.push(this.inRootLayout(info.rel, res.rel, res.data));
               if (retEvs.length > 0) {
                 const r2 = srow.slice();
                 r2[rt] = res.data;
                 r2[nrt + rt] = res.tuple;
                 setReturningOldNew(q, r2, null, res.data);
+                this.st.scratch.set('merge-action', 'INSERT');
                 returning.push(retEvs.map((ev) => ev(this.executor.rowCtx(r2, base))));
               }
             }
@@ -1079,9 +1298,11 @@ export class DmlExecutor {
             touched.add(t);
             if (this.deleteTuple(info, heap, t, info.rel, false)) {
               rowCount++;
+              transition?.deleteOld.push(t.data);
               if (retEvs.length > 0) {
                 const r2 = row.slice();
                 setReturningOldNew(q, r2, t.data, null);
+                this.st.scratch.set('merge-action', 'DELETE');
                 returning.push(retEvs.map((ev) => ev(this.executor.rowCtx(r2, base))));
               }
               if (info.fksIn.length > 0) {
@@ -1102,19 +1323,22 @@ export class DmlExecutor {
             if (nt) {
               rowCount++;
               const oldData = t.data;
+              transition?.updateOld.push(oldData);
+              transition?.updateNew.push(nt.data);
               this.st.afterQueue.push(() => {
                 if (info.fksOut.length > 0) {
-                  this.checkForeignKeysOut(info, newData, info.rel, oldData);
+                  this.checkForeignKeysOut(info, nt.data, info.rel, oldData);
                 }
                 if (info.fksIn.length > 0) {
-                  this.handleReferencedChange(info, oldData, newData);
+                  this.handleReferencedChange(info, oldData, nt.data);
                 }
               });
               if (retEvs.length > 0) {
                 const r2 = srow.slice();
-                r2[rt] = newData;
+                r2[rt] = nt.data;
                 r2[nrt + rt] = nt;
-                setReturningOldNew(q, r2, t.data, newData);
+                setReturningOldNew(q, r2, t.data, nt.data);
+                this.st.scratch.set('merge-action', 'UPDATE');
                 returning.push(retEvs.map((ev) => ev(this.executor.rowCtx(r2, base))));
               }
             }
@@ -1142,9 +1366,11 @@ export class DmlExecutor {
           if (a.command === 'DELETE') {
             if (this.deleteTuple(info, heap, t, info.rel, false)) {
               rowCount++;
+              transition?.deleteOld.push(t.data);
               if (retEvs.length > 0) {
                 const r2 = row.slice();
                 setReturningOldNew(q, r2, t.data, null);
+                this.st.scratch.set('merge-action', 'DELETE');
                 returning.push(retEvs.map((ev) => ev(this.executor.rowCtx(r2, base))));
               }
               if (info.fksIn.length > 0) {
@@ -1162,19 +1388,22 @@ export class DmlExecutor {
             if (nt) {
               rowCount++;
               const oldData = t.data;
+              transition?.updateOld.push(oldData);
+              transition?.updateNew.push(nt.data);
               this.st.afterQueue.push(() => {
                 if (info.fksOut.length > 0) {
-                  this.checkForeignKeysOut(info, newData, info.rel, oldData);
+                  this.checkForeignKeysOut(info, nt.data, info.rel, oldData);
                 }
                 if (info.fksIn.length > 0) {
-                  this.handleReferencedChange(info, oldData, newData);
+                  this.handleReferencedChange(info, oldData, nt.data);
                 }
               });
               if (retEvs.length > 0) {
                 const r2 = row.slice();
-                r2[rt] = newData;
+                r2[rt] = nt.data;
                 r2[nrt + rt] = nt;
-                setReturningOldNew(q, r2, t.data, newData);
+                setReturningOldNew(q, r2, t.data, nt.data);
+                this.st.scratch.set('merge-action', 'UPDATE');
                 returning.push(retEvs.map((ev) => ev(this.executor.rowCtx(r2, base))));
               }
             }
@@ -1190,6 +1419,7 @@ export class DmlExecutor {
         }
       }
     });
+    this.statementTriggers(info.rel, [...mergeEvents].reverse(), 'AFTER', transition);
     return { rows: returning, rowCount };
   }
 }

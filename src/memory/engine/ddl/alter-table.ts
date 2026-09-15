@@ -13,6 +13,7 @@ import { buildSequenceInfo, chooseConstraintName, chooseRelationName, createSequ
 import { addCheckConstraint, addForeignKey, addIndexConstraint, lookupTable } from './create-table';
 import { dropRelation } from './drop';
 import { DdlContext } from './stmt-context';
+import { atPosition } from '../analyze/location';
 
 function current(cat: Catalog, oid: number): Relation {
   return cat.getRelation(oid)!;
@@ -65,7 +66,7 @@ export function executeAlterTable(session: Session, stmt: A.AlterTableStmt): str
         if (serialType) {
           typeOid = serialType;
         } else {
-          const r = an.types.lookupTypeName(def.typeName, session.relationSearchPath());
+          const r = atPosition(def.typeName.loc, () => an.types.lookupTypeName(def.typeName, session.relationSearchPath()));
           typeOid = r.oid;
           typmod = r.typmod;
         }
@@ -119,6 +120,9 @@ export function executeAlterTable(session: Session, stmt: A.AlterTableStmt): str
         // existing rows get the default (fast default for non-volatile defaults, rewrite otherwise)
         const updatedRel = current(cat, relOid);
         const newCol = updatedRel.columns[col.attnum - 1];
+        if (newCol.generated && newCol.defaultExpr) {
+          ctx.host.analyzeRelationExpr(updatedRel, newCol.defaultExpr, 'generated');
+        }
         if (tuplesExist && (newCol.defaultExpr || newCol.identity)) {
           fillNewColumn(session, cat, ctx, updatedRel, newCol);
         }

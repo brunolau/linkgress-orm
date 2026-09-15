@@ -23,6 +23,7 @@ import {
 import { JsonbValue, jsonbToText, parseJsonb, validateJson } from './json';
 import { PgNumeric } from './numeric';
 import { PgBits, PgRecord, arrayLowerBound, withLowerBound } from './values';
+import { inputMultirange, inputRange, outputMultirange, outputRange, PgMultirange, PgRange } from './range';
 
 /** Session-dependent state needed by type input/output functions. */
 export interface IoContext extends DateTimeContext {
@@ -1010,6 +1011,12 @@ export function inputValue(typeOid: number, text: string, typmod: number, ctx: I
     const elemTypmod = typmod;
     return inputArray(text, t.elem, elemTypmod, ctx, ctx.catalog.getType(t.elem)?.delim ?? ',');
   }
+  if (t.typtype === 'r') {
+    return inputRange(typeOid, text, ctx);
+  }
+  if (t.typtype === 'm') {
+    return inputMultirange(typeOid, text, ctx);
+  }
   if (t.typtype === 'e') {
     const label = t.enumLabels?.find((l) => l.label === text);
     if (!label) {
@@ -1115,6 +1122,8 @@ export function outputValue(typeOid: number, v: unknown, ctx: IoContext): string
       return (v as number[]).join(' ');
     case TypeOid.record:
       return outputRecord(v as PgRecord, ctx);
+    case TypeOid._record:
+      return outputArray(v as unknown[], TypeOid.record, ctx);
     case TypeOid.void:
       return '';
   }
@@ -1125,6 +1134,12 @@ export function outputValue(typeOid: number, v: unknown, ctx: IoContext): string
   if (t) {
     if (t.isArray) {
       return outputArray(v as unknown[], t.elem, ctx);
+    }
+    if (v instanceof PgRange) {
+      return outputRange(v, ctx);
+    }
+    if (v instanceof PgMultirange) {
+      return outputMultirange(v, ctx);
     }
     if (t.typtype === 'd') {
       return outputValue(t.baseType, v, ctx);
@@ -1148,4 +1163,5 @@ export function outputValue(typeOid: number, v: unknown, ctx: IoContext): string
   return String(v);
 }
 
-export { USECS_PER_SEC, ZoneSpec };
+export { USECS_PER_SEC };
+export type { ZoneSpec };

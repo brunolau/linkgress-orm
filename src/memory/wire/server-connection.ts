@@ -1,6 +1,7 @@
 import type { Database } from '../engine/database';
 import { PgError, SqlState } from '../engine/errors';
 import type { FieldInfo, PreparedInfo, Session, StatementResult } from '../engine/session';
+import { sendBinary } from '../engine/types/binary';
 import { outputValue } from '../engine/types/io';
 
 const PROTOCOL_V3 = 196608;
@@ -97,9 +98,17 @@ class Writer {
     return this;
   }
 
-  bytesWithLength(s: string | null): this {
+  bytesWithLength(s: string | Buffer | null): this {
     if (s === null) {
       return this.int32(-1);
+    }
+    if (typeof s !== 'string') {
+      this.ensure(s.length + 4);
+      this.buf.writeInt32BE(s.length, this.pos);
+      this.pos += 4;
+      s.copy(this.buf, this.pos);
+      this.pos += s.length;
+      return this;
     }
     const len = Buffer.byteLength(s);
     this.ensure(len + 4);
@@ -174,12 +183,19 @@ class Reader {
 interface Portal {
   info: PreparedInfo;
   params: unknown[];
+  /** result-column format codes from Bind (0 text, 1 binary): none (all text), one for all, or one per column */
+  resultFormats: number[];
   /** buffered result once executed */
   result: StatementResult | null;
   sent: number;
 }
 
 /** Command tag as PostgreSQL reports it in CommandComplete. */
+/** The format code of result column `i` for Bind's result-format codes. */
+function columnFormat(formats: number[], i: number): number {
+  return formats.length === 0 ? 0 : formats.length === 1 ? formats[0] : formats[i] ?? 0;
+}
+
 export function commandTag(r: StatementResult): string {
   switch (r.command) {
     case 'SELECT':
@@ -636,6 +652,14 @@ export class ServerConnection {
       const len = r.int32();
       values.push(len === -1 ? null : r.bytes(len));
     }
+    const nResultFormats = r.uint16();
+    const resultFormats: number[] = [];
+    for (let i = 0; i < nResultFormats; i++) {
+      resultFormats.push(r.int16());
+    }
+    if (nFormats > 1 && nFormats !== nParams) {
+      throw new PgError(SqlState.PROTOCOL_VIOLATION, `bind message has ${nFormats} parameter formats but ${nParams} parameters`);
+    }
     let info = this.lookupStatement(stmtName);
     if (stmtName !== '') {
       const entry = this.session!.preparedStatements.get(stmtName)!;
@@ -646,7 +670,17 @@ export class ServerConnection {
       throw new PgError(SqlState.DUPLICATE_CURSOR, `cursor "${portalName}" already exists`);
     }
     const params = this.session!.bindParams(info, values, formats);
-    this.portals.set(portalName, { info, params, result: null, sent: 0 });
+    // PortalSetResultFormat
+    const columns = info.fields ? info.fields.length : 0;
+    if (nResultFormats > 1 && nResultFormats !== columns) {
+      throw new PgError(SqlState.PROTOCOL_VIOLATION, `bind message has ${nResultFormats} result formats but query has ${columns} columns`);
+    }
+    for (const f of resultFormats) {
+      if (f !== 0 && f !== 1) {
+        throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `unsupported format code: ${f}`);
+      }
+    }
+    this.portals.set(portalName, { info, params, resultFormats, result: null, sent: 0 });
     this.out.begin('2').end();
   }
 
@@ -669,7 +703,7 @@ export class ServerConnection {
     }
     const portal = this.lookupPortal(name);
     if (portal.info.fields) {
-      this.rowDescription(portal.info.fields);
+      this.rowDescription(portal.info.fields, portal.resultFormats);
     } else {
       this.out.begin('n').end();
     }
@@ -697,7 +731,7 @@ export class ServerConnection {
       const total = res.rows.length;
       const start = portal.sent;
       const end = maxRows > 0 ? Math.min(total, start + maxRows) : total;
-      this.dataRows(res, start, end);
+      this.dataRows(res, start, end, portal.resultFormats);
       portal.sent = end;
       if (maxRows > 0 && end < total) {
         this.out.begin('s').end();
@@ -771,10 +805,11 @@ export class ServerConnection {
   // Result encoding
   // ---------------------------------------------------------------------------
 
-  private rowDescription(fields: FieldInfo[]): void {
+  private rowDescription(fields: FieldInfo[], formats: number[] = []): void {
     const cat = this.session!.catalog();
     this.out.begin('T').int16(fields.length);
-    for (const f of fields) {
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
       // domains are described as their base type and typmod (printtup.c)
       let typeOid = f.typeOid;
       let typmod = f.typmod;
@@ -784,21 +819,28 @@ export class ServerConnection {
         typeOid = t.baseType;
         t = cat.getType(typeOid);
       }
-      this.out.cstr(f.name).uint32(f.tableOid).int16(f.columnAttnum).uint32(typeOid).int16(t ? t.len : -1).int32(typmod).int16(0);
+      this.out.cstr(f.name).uint32(f.tableOid).int16(f.columnAttnum).uint32(typeOid).int16(t ? t.len : -1).int32(typmod).int16(columnFormat(formats, i));
     }
     this.out.end();
   }
 
-  private dataRows(r: StatementResult, from: number, to: number): void {
+  private dataRows(r: StatementResult, from: number, to: number, formats: number[] = []): void {
     const io = this.session!.io;
     const fields = r.fields;
     const n = fields.length;
+    const binary = fields.map((_, c) => columnFormat(formats, c) === 1);
     for (let i = from; i < to; i++) {
       const row = r.rows[i];
       this.out.begin('D').int16(n);
       for (let c = 0; c < n; c++) {
         const v = row[c];
-        this.out.bytesWithLength(v === null || v === undefined ? null : outputValue(fields[c].typeOid, v, io));
+        if (v === null || v === undefined) {
+          this.out.bytesWithLength(null);
+        } else if (binary[c]) {
+          this.out.bytesWithLength(sendBinary(fields[c].typeOid, v, io));
+        } else {
+          this.out.bytesWithLength(outputValue(fields[c].typeOid, v, io));
+        }
       }
       this.out.end();
       if (this.out.length > 1 << 16) {

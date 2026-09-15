@@ -160,10 +160,14 @@ export class InMemoryDatabaseThread {
     const listenState = listen ? new SharedArrayBuffer(8) : undefined;
     const workerData = { snapshotPath: options.snapshotPath, snapshot: options.snapshot, options: options.database, databasePerName: options.databasePerName, listen, listenState };
     const compiled = path.join(__dirname, 'database-thread.js');
+    const source = path.join(__dirname, 'database-thread.ts');
     const worker = fs.existsSync(compiled)
       ? new Worker(compiled, { workerData })
-      : // running from TypeScript sources (tests): load the entry through ts-node
-        new Worker(`require('ts-node/register/transpile-only'); require(${JSON.stringify(path.join(__dirname, 'database-thread.ts'))});`, { eval: true, workerData });
+      : process.versions.bun
+        ? // running from TypeScript sources under Bun, which runs them directly
+          new Worker(source, { workerData })
+        : // running from TypeScript sources under Node: load the entry through ts-node
+          new Worker(`require('ts-node/register/transpile-only'); require(${JSON.stringify(source)});`, { eval: true, workerData });
     worker.unref();
     let listener: { host: string; port: number } | null = null;
     if (listen && listenState) {

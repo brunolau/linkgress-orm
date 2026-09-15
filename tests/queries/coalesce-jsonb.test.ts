@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { getSharedDatabase, setupDatabase, cleanupDatabase, seedTestData } from '../utils/test-database';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { coalesce, jsonbSelect, jsonbSelectText, eq, gt, sql } from '../../src';

@@ -97,15 +97,29 @@ load.
 Like a server, a thread can host a database per connection `database` name
 (`databasePerName: { aliases: [{ pattern: '-test(-w\\d+)?$', name: 'app_test' }] }`): each distinct
 name — after the first matching alias — is its own database, created from the snapshot on its first
-connection, and `current_database()` reports the name the connection used. The thread entry is compiled JavaScript (`dist`); from TypeScript sources it is loaded through
-`ts-node`.
+connection, and `current_database()` reports the name the connection used. The thread entry is compiled JavaScript (`dist`); from TypeScript sources Bun runs it
+directly and Node loads it through `ts-node`.
+
+The wire protocol covers text and binary formats: results a client requests in binary (Bind result-format
+codes, as Bun's SQL client does) and binary bind parameters use PostgreSQL's send / receive formats for
+the built-in types, arrays, composites, domains and enums.
 
 ## Running a test suite in memory
 
 Because the in-memory database is reached through the drivers, an existing suite can switch without
-touching test code — for example with Jest's `moduleNameMapper`, pointing `pg` / `postgres` at small
-wrappers that add the in-memory socket (this repository's own suite does exactly that; see
-`tests/memory/` and `LINKGRESS_TEST_DB=memory` in `jest.config.js`).
+touching test code — point `pg` / `postgres` at small wrappers that add the in-memory socket. Under Bun
+that is `mock.module()` in a test preload; with Jest, `moduleNameMapper`. This repository's own suite
+does exactly that (`tests/setup.ts`, `tests/memory/`):
+
+```bash
+npm test              # the suite against PostgreSQL
+npm run test:memory   # the same files against the in-memory database
+npm run test:parity   # both, failing on any difference in test or file outcomes
+npm run test:pglite   # the same files on PGlite (see below)
+```
+
+`tests/memory/sql-parity.test.ts` additionally runs a corpus of SQL statements against PostgreSQL and a
+fresh in-memory database and requires identical command tags, row counts, column types, rows and errors.
 
 ## PGlite, the other in-process option
 
@@ -120,11 +134,11 @@ how they are reached:
 | reached through | the real `pg` / `postgres` drivers, over an in-process socket | `PGliteClient`, a `DatabaseClient` of its own |
 | sessions | many, with PostgreSQL's isolation, row locks and deadlock detection | one; statements run one at a time |
 | runs | in process, in a worker thread, or behind a TCP endpoint | in process: Node, Bun, Deno, browsers |
-| this repository's suite | `LINKGRESS_TEST_DB=memory` — 11.6 s on 12 workers | `pnpm test:pglite` — 23.5 s on 8 workers |
+| this repository's suite | `npm run test:memory` — 12.7 s, 12 files in parallel | `npm run test:pglite` — 21.0 s, 8 files in parallel |
 
-Both give every test file its own database, so a suite can use parallel workers; on the same machine
-the suite takes 147.8 s serially against a PostgreSQL server. Measurements and every difference found:
-[bench/pglite/README.md](../../bench/pglite/README.md).
+Both give every test file its own database, so a suite can run files in parallel; on the same machine
+the suite takes about 145 s serially against a PostgreSQL server. Measurements (on the earlier Jest
+suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/README.md).
 
 ## Scope and differences
 
@@ -142,7 +156,10 @@ the suite takes 147.8 s serially against a PostgreSQL server. Measurements and e
 - Rows are stored in insertion order; PostgreSQL's physical order additionally depends on page space
   reuse and (auto)vacuum timing, so an unordered read of a table that was updated and vacuumed can
   return rows in a different order.
-- Error positions (`position` of a syntax / analysis error) are reported for syntax errors only.
+- Errors carry PostgreSQL's SQLSTATE, message, detail, hint and — for syntax and analysis errors —
+  position; `tests/memory/sql-parity.test.ts` holds a corpus of statements to that standard.
+- Not implemented (an error is raised instead): `COPY`, `EXCLUDE` constraints, `MERGE` into a view,
+  `INSTEAD OF` triggers, `SELECT … INTO`.
 - Supported extensions: `pg_trgm`, `unaccent`, `uuid-ossp`, `pgcrypto` (UUID generation).
 - Object ids, backend pids and temp schema names are allocated by the in-memory database and
   differ from any particular server.

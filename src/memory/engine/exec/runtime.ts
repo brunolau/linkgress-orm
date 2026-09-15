@@ -22,6 +22,8 @@ export interface ExecSession {
   readonly databaseName: string;
   readonly userName: string;
   readonly backendPid: number;
+  /** the compiled CHECK constraints of a domain (`VALUE` is executor parameter `slot`) */
+  domainChecks(domain: import('../catalog/catalog').PgType): { name: string; ev: Evaluator; slot: number }[];
   /** execute a user-defined (SQL / plpgsql) function */
   callUserFunction(proc: ProcDef, args: unknown[], argTypes: number[], st: StatementState): { value: unknown; rows?: unknown[][] };
   /** run arbitrary SQL from inside an executing statement (plpgsql EXECUTE, DO) */
@@ -52,7 +54,7 @@ export interface ExecSession {
 export interface CatalogFunctions {
   indexDef(indexOid: number, column: number, pretty: boolean): string | null;
   constraintDef(constraintOid: number, pretty: boolean): string | null;
-  viewDef(viewOid: number, pretty: boolean): string | null;
+  viewDef(viewOid: number, pretty: boolean, wrapColumn?: number): string | null;
   partKeyDef(relOid: number): string | null;
   statisticsObjDef(statOid: number): string | null;
   expr(exprText: unknown, relOid: number, pretty: boolean): string | null;
@@ -61,6 +63,21 @@ export interface CatalogFunctions {
   serialSequence(table: string, column: string): string | null;
   functionDef(procOid: number): string | null;
   identifyObject?(classOid: number, objOid: number): string | null;
+}
+
+/** A trigger's transition table (REFERENCING NEW / OLD TABLE): the rows a statement changed, as the table stores them. */
+export interface TransitionTable {
+  name: string;
+  rel: import('../catalog/catalog').Relation;
+  rows: unknown[][];
+}
+
+/** Transition rows captured by one data-modifying statement, per event (in the target table's layout). */
+export interface TransitionCapture {
+  insertNew: unknown[][];
+  updateOld: unknown[][];
+  updateNew: unknown[][];
+  deleteOld: unknown[][];
 }
 
 /** Per-statement execution state. */
@@ -94,6 +111,8 @@ export class StatementState {
    * statement and all its data-modifying CTEs; fired once the whole query has run (AfterTriggerEndQuery).
    */
   afterQueue: (() => void)[] = [];
+  /** columns assigned by the UPDATE being executed (UPDATE OF column triggers) */
+  updateTargetColumns: Set<string> | null = null;
 
   runAfterQueue(): void {
     while (this.afterQueue.length > 0) {
@@ -103,6 +122,8 @@ export class StatementState {
   /** names of parameters for SQL-function bodies */
   paramNames: string[] = [];
   functionName = '';
+  /** transition tables visible to the statements of the trigger function running them (named, in the table's layout) */
+  transitionTables: TransitionTable[] | null = null;
   /**
    * Transaction control (COMMIT / ROLLBACK) is allowed: a procedure CALLed, or a DO block run, at
    * top level outside a transaction block (and not inside a multi-statement query string).

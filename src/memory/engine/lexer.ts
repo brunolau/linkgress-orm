@@ -99,7 +99,7 @@ export function tokenize(sql: string): Token[] {
         }
       }
       if (depth > 0) {
-        throw syntaxError('unterminated /* comment', start);
+        throw syntaxError(`unterminated /* comment at or near "${sql.slice(start)}"`, start);
       }
       continue;
     }
@@ -188,7 +188,7 @@ export function tokenize(sql: string): Token[] {
         const bodyStart = j + 1;
         const close = sql.indexOf(tag, bodyStart);
         if (close < 0) {
-          throw syntaxError('unterminated dollar-quoted string', start);
+          throw syntaxError(`unterminated dollar-quoted string at or near "${sql.slice(start)}"`, start);
         }
         push('string', sql.slice(bodyStart, close), start, close + tag.length);
         i = close + tag.length;
@@ -307,7 +307,8 @@ function readQuoted(sql: string, quotePos: number, escapes: boolean): [string, n
   let out = '';
   while (true) {
     if (i >= n) {
-      throw syntaxError('unterminated quoted string', quotePos);
+      // scanner_yyerror: the rest of the input is the offending token
+      throw syntaxError(`unterminated quoted string at or near "${sql.slice(quotePos)}"`, quotePos);
     }
     const c = sql[i];
     if (c === "'") {
@@ -379,7 +380,7 @@ function readQuotedIdent(sql: string, quotePos: number): [string, number] {
   let out = '';
   while (true) {
     if (i >= sql.length) {
-      throw syntaxError('unterminated quoted identifier', quotePos);
+      throw syntaxError(`unterminated quoted identifier at or near "${sql.slice(quotePos)}"`, quotePos);
     }
     if (sql[i] === '"') {
       if (sql[i + 1] === '"') {

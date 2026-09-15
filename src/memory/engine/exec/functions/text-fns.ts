@@ -112,6 +112,174 @@ const POSIX_CLASSES: Record<string, string> = {
   graph: '\\x21-\\x7e',
 };
 
+/**
+ * setup_regexp_matches: the matches of a pattern (all of them when `glob`), each as [start, end, groups].
+ * A zero-length match advances the search by one character; `ignoreDegenerate` drops empty matches at the
+ * very start or end of the string (regexp_split_*).
+ */
+function regexMatches(str: string, re: RegExp, glob: boolean, ignoreDegenerate: boolean): { so: number; eo: number; groups: (string | null)[] }[] {
+  const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+  const out: { so: number; eo: number; groups: (string | null)[] }[] = [];
+  let start = 0;
+  while (start <= str.length) {
+    g.lastIndex = start;
+    const m = g.exec(str);
+    if (!m) {
+      break;
+    }
+    const so = m.index;
+    const eo = so + m[0].length;
+    if (!ignoreDegenerate || (so < str.length && eo > 0)) {
+      out.push({ so, eo, groups: m.length > 1 ? m.slice(1).map((x) => (x === undefined ? null : x)) : [m[0]] });
+    }
+    if (!glob) {
+      break;
+    }
+    start = eo;
+    if (so === eo) {
+      // one character (code point) further
+      const cp = str.codePointAt(start);
+      start += cp !== undefined && cp > 0xffff ? 2 : 1;
+    }
+  }
+  return out;
+}
+
+/** regexp_split_to_array / regexp_split_to_table */
+function regexSplit(str: string, pattern: string, flags: string, fnName: string): string[] {
+  checkRegexFlags(flags, fnName, false);
+  const matches = regexMatches(str, pgRegex(pattern, flags), true, true);
+  const out: string[] = [];
+  let prev = 0;
+  for (const m of matches) {
+    out.push(str.slice(prev, m.so));
+    prev = m.eo;
+  }
+  out.push(str.slice(prev));
+  return out;
+}
+
+export const TEXT_SRFS: Record<string, FnImpl> = {
+  regexp_matches: (a) => {
+    const flags = (a[2] as string) ?? '';
+    checkRegexFlags(flags, 'regexp_matches', true);
+    return regexMatches(a[0] as string, pgRegex(a[1] as string, flags.replace('g', '')), flags.includes('g'), false).map((m) => m.groups);
+  },
+  regexp_matches_no_flags: (a) => regexMatches(a[0] as string, pgRegex(a[1] as string, ''), false, false).map((m) => m.groups),
+  regexp_split_to_table: (a) => regexSplit(a[0] as string, a[1] as string, (a[2] as string) ?? '', 'regexp_split_to_table'),
+  regexp_split_to_table_no_flags: (a) => regexSplit(a[0] as string, a[1] as string, '', 'regexp_split_to_table'),
+};
+
+function regexError(message: string): PgError {
+  return new PgError(SqlState.INVALID_REGULAR_EXPRESSION, `invalid regular expression: ${message}`);
+}
+
+/**
+ * The structural errors PostgreSQL's regcomp reports (first one from the left, with its regerror text),
+ * checked before the pattern is translated: the JavaScript engine's own messages are engine-specific.
+ */
+function validateAre(src: string): void {
+  let depth = 0;
+  // can a quantifier follow? false at the start, after '(' or '|', and after another quantifier
+  let operand = false;
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '\\') {
+      if (i + 1 >= src.length) {
+        throw regexError('invalid escape \\ sequence');
+      }
+      i += 2;
+      operand = true;
+      continue;
+    }
+    if (c === '[') {
+      let j = i + 1;
+      if (src[j] === '^') {
+        j++;
+      }
+      if (src[j] === ']') {
+        j++;
+      }
+      while (j < src.length && src[j] !== ']') {
+        if (src[j] === '[' && (src[j + 1] === ':' || src[j + 1] === '.' || src[j + 1] === '=')) {
+          const close = src.indexOf(src[j + 1] + ']', j + 2);
+          if (close < 0) {
+            throw regexError('brackets [] not balanced');
+          }
+          j = close + 2;
+          continue;
+        }
+        j++;
+      }
+      if (j >= src.length) {
+        throw regexError('brackets [] not balanced');
+      }
+      i = j + 1;
+      operand = true;
+      continue;
+    }
+    if (c === '(') {
+      depth++;
+      i++;
+      if (src[i] === '?' && (src[i + 1] === ':' || src[i + 1] === '=' || src[i + 1] === '!')) {
+        i += 2;
+      } else if (src[i] === '?' && src[i + 1] === '<' && (src[i + 2] === '=' || src[i + 2] === '!')) {
+        i += 3;
+      }
+      operand = false;
+      continue;
+    }
+    if (c === ')') {
+      if (depth === 0) {
+        throw regexError('parentheses () not balanced');
+      }
+      depth--;
+      i++;
+      operand = true;
+      continue;
+    }
+    if (c === '|') {
+      i++;
+      operand = false;
+      continue;
+    }
+    if (c === '*' || c === '+' || c === '?' || c === '{') {
+      let end = i + 1;
+      if (c === '{') {
+        const m = /^\{(\d*)(,(\d*))?\}/.exec(src.slice(i));
+        if (!m) {
+          if (/^\{\d/.test(src.slice(i))) {
+            throw regexError('braces {} not balanced');
+          }
+          // a '{' that does not start a bound is an ordinary character
+          i++;
+          operand = true;
+          continue;
+        }
+        if (m[1] === '' || (m[3] !== undefined && m[3] !== '' && Number(m[3]) < Number(m[1])) || Number(m[1]) > 255 || (m[3] !== undefined && m[3] !== '' && Number(m[3]) > 255)) {
+          throw regexError('invalid repetition count(s)');
+        }
+        end = i + m[0].length;
+      }
+      if (!operand) {
+        throw regexError('quantifier operand invalid');
+      }
+      i = end;
+      if (src[i] === '?') {
+        i++;
+      }
+      operand = false;
+      continue;
+    }
+    i++;
+    operand = true;
+  }
+  if (depth > 0) {
+    throw regexError('parentheses () not balanced');
+  }
+}
+
 /** Translate a PostgreSQL ARE into a JS RegExp. */
 export function pgRegex(pattern: string, flags: string): RegExp {
   const key = flags + '\u0000' + pattern;
@@ -130,6 +298,7 @@ export function pgRegex(pattern: string, flags: string): RegExp {
   if (allFlags.includes('q')) {
     src = src.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   } else {
+    validateAre(src);
     src = src
       .replace(/\[\[:(\w+):\]\]/g, (_m, n) => `[${POSIX_CLASSES[n] ?? n}]`)
       .replace(/\[:(\w+):\]/g, (_m, n) => POSIX_CLASSES[n] ?? n)
@@ -430,7 +599,53 @@ export function unaccentText(s: string): string {
     .normalize('NFC');
 }
 
+function trimBytes(b: Uint8Array, set: Uint8Array, left: boolean, right: boolean): Uint8Array {
+  let s = 0;
+  let e = b.length;
+  if (left) {
+    while (s < e && set.includes(b[s])) {
+      s++;
+    }
+  }
+  if (right) {
+    while (e > s && set.includes(b[e - 1])) {
+      e--;
+    }
+  }
+  return b.slice(s, e);
+}
+
+/** bytea_substring: 1-based start that may be <= 0, like text substr */
+function byteaSubstr(b: Uint8Array, start: number, len: number | null): Uint8Array {
+  if (len !== null && len < 0) {
+    throw new PgError(SqlState.SUBSTRING_ERROR, 'negative substring length not allowed');
+  }
+  const s = Math.max(start - 1, 0);
+  const e = len === null ? b.length : Math.min(b.length, start - 1 + len);
+  return e <= s ? new Uint8Array(0) : b.slice(s, e);
+}
+
+/** to_ascii: only single-byte LATIN1 / LATIN2 / WIN1250 input converts; the database encoding is UTF8 */
+function toAscii(text: string, encoding: string): string {
+  const name = encoding.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const known: Record<string, string> = { UTF8: 'UTF8', UNICODE: 'UTF8', LATIN1: 'LATIN1', ISO88591: 'LATIN1', LATIN2: 'LATIN2', ISO88592: 'LATIN2', WIN1250: 'WIN1250', SQLASCII: 'SQL_ASCII', WIN1252: 'WIN1252', LATIN9: 'LATIN9', EUCJP: 'EUC_JP' };
+  const enc = known[name];
+  if (!enc) {
+    throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `${encoding} is not a valid encoding name`);
+  }
+  if (enc !== 'LATIN1' && enc !== 'LATIN2' && enc !== 'WIN1250') {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `encoding conversion from ${enc} to ASCII not supported`);
+  }
+  if (/[^\x00-\x7f]/.test(text)) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `in-memory engine: to_ascii of non-ASCII ${enc} text is not implemented`);
+  }
+  return text;
+}
+
 export const TEXT_FUNCS: Record<string, FnImpl> = {
+  to_ascii_default: (a) => toAscii(a[0] as string, 'UTF8'),
+  to_ascii_encname: (a) => toAscii(a[0] as string, a[1] as string),
+  to_ascii_enc: (a) => toAscii(a[0] as string, ({ 6: 'UTF8', 8: 'LATIN1', 9: 'LATIN2', 29: 'WIN1250' } as Record<number, string>)[a[1] as number] ?? String(a[1])),
   textcat: (a) => (a[0] as string) + (a[1] as string),
   anytextcat: (a, fc) => valueToText(a[0], fc.argTypes[0], fc) + (a[1] as string),
   textanycat: (a, fc) => (a[0] as string) + valueToText(a[1], fc.argTypes[1], fc),
@@ -439,6 +654,73 @@ export const TEXT_FUNCS: Record<string, FnImpl> = {
   textoctetlen: (a) => Buffer.byteLength(a[0] as string, 'utf8'),
   bpcharoctetlen: (a) => Buffer.byteLength(a[0] as string, 'utf8'),
   byteaoctetlen: (a) => (a[0] as Uint8Array).length,
+  byteaGetByte: (a) => {
+    const b = a[0] as Uint8Array;
+    const n = a[1] as number;
+    if (n < 0 || n >= b.length) {
+      throw new PgError(SqlState.ARRAY_SUBSCRIPT_ERROR, `index ${n} out of valid range, 0..${b.length - 1}`);
+    }
+    return b[n];
+  },
+  byteaSetByte: (a) => {
+    const b = a[0] as Uint8Array;
+    const n = a[1] as number;
+    if (n < 0 || n >= b.length) {
+      throw new PgError(SqlState.ARRAY_SUBSCRIPT_ERROR, `index ${n} out of valid range, 0..${b.length - 1}`);
+    }
+    const out = Uint8Array.from(b);
+    out[n] = (a[2] as number) & 0xff;
+    return out;
+  },
+  byteaGetBit: (a) => {
+    const b = a[0] as Uint8Array;
+    const n = BigInt(a[1] as bigint | number);
+    const bits = BigInt(b.length) * 8n;
+    if (n < 0n || n >= bits) {
+      throw new PgError(SqlState.ARRAY_SUBSCRIPT_ERROR, `index ${n} out of valid range, 0..${bits - 1n}`);
+    }
+    return (b[Number(n / 8n)] >> Number(n % 8n)) & 1;
+  },
+  byteaSetBit: (a) => {
+    const b = a[0] as Uint8Array;
+    const n = BigInt(a[1] as bigint | number);
+    const bits = BigInt(b.length) * 8n;
+    if (n < 0n || n >= bits) {
+      throw new PgError(SqlState.ARRAY_SUBSCRIPT_ERROR, `index ${n} out of valid range, 0..${bits - 1n}`);
+    }
+    const bit = a[2] as number;
+    if (bit !== 0 && bit !== 1) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, 'new bit must be 0 or 1');
+    }
+    const out = Uint8Array.from(b);
+    const byteNo = Number(n / 8n);
+    const mask = 1 << Number(n % 8n);
+    out[byteNo] = bit ? out[byteNo] | mask : out[byteNo] & ~mask;
+    return out;
+  },
+  byteapos: (a) => {
+    const sub = Buffer.from(a[1] as Uint8Array);
+    return Buffer.from(a[0] as Uint8Array).indexOf(sub) + 1;
+  },
+  bytea_bit_count: (a) => {
+    let n = 0n;
+    for (const x of a[0] as Uint8Array) {
+      let v = x;
+      while (v) {
+        n += BigInt(v & 1);
+        v >>= 1;
+      }
+    }
+    return n;
+  },
+  bytea_reverse: (a) => Uint8Array.from(a[0] as Uint8Array).reverse(),
+  byteatrim: (a) => trimBytes(a[0] as Uint8Array, a[1] as Uint8Array, true, true),
+  bytealtrim: (a) => trimBytes(a[0] as Uint8Array, a[1] as Uint8Array, true, false),
+  byteartrim: (a) => trimBytes(a[0] as Uint8Array, a[1] as Uint8Array, false, true),
+  bytea_substr: (a) => byteaSubstr(a[0] as Uint8Array, a[1] as number, a[2] as number),
+  bytea_substr_no_len: (a) => byteaSubstr(a[0] as Uint8Array, a[1] as number, null),
+  bytea_larger: (a) => (Buffer.compare(Buffer.from(a[0] as Uint8Array), Buffer.from(a[1] as Uint8Array)) >= 0 ? a[0] : a[1]),
+  bytea_smaller: (a) => (Buffer.compare(Buffer.from(a[0] as Uint8Array), Buffer.from(a[1] as Uint8Array)) <= 0 ? a[0] : a[1]),
   bitlength: (a) => Buffer.byteLength(a[0] as string, 'utf8') * 8,
   lower: (a) => (a[0] as string).toLowerCase(),
   upper: (a) => (a[0] as string).toUpperCase(),
@@ -692,8 +974,8 @@ export const TEXT_FUNCS: Record<string, FnImpl> = {
     }
     return m.length > 1 ? m.slice(1).map((x) => (x === undefined ? null : x)) : [m[0]];
   },
-  regexp_split_to_array: (a) => (a[0] as string).split(pgRegex(a[1] as string, (a[2] as string) ?? '')),
-  regexp_split_to_array_no_flags: (a) => (a[0] as string).split(pgRegex(a[1] as string, '')),
+  regexp_split_to_array: (a) => regexSplit(a[0] as string, a[1] as string, (a[2] as string) ?? '', 'regexp_split_to_array'),
+  regexp_split_to_array_no_flags: (a) => regexSplit(a[0] as string, a[1] as string, '', 'regexp_split_to_array'),
   regexp_substr: (a) => {
     const m = pgRegex(a[1] as string, '').exec(a[0] as string);
     return m ? m[0] : null;

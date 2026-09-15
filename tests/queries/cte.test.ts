@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { eq, lt, gt, sql, DbCteBuilder } from '../../src';
