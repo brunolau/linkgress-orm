@@ -9,6 +9,11 @@ export default async function globalSetup() {
   // Load environment variables
   require('dotenv/config');
 
+  // In-memory runs create the schema per test file instead (tests/setup.ts)
+  if ((process.env.LINKGRESS_TEST_DB || '').toLowerCase() === 'memory') {
+    return;
+  }
+
   const client = new PgClient({
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '5432'),

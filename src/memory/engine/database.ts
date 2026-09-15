@@ -1,0 +1,133 @@
+import { BuiltinCatalog, Catalog, OidAllocator } from './catalog/catalog';
+import { ParsedStatement } from './ast';
+import { parseSql } from './parser-ddl';
+import { Store } from './storage/store';
+import { Session } from './session';
+
+export interface InMemoryDatabaseOptions {
+  /** database name reported by current_database() (default "postgres") */
+  databaseName?: string;
+  /** user name (default "postgres") */
+  userName?: string;
+  /** session TimeZone default (default: the process' local IANA zone) */
+  timeZone?: string;
+  /**
+   * Default text collation: "C" for bytewise ordering, or a BCP 47 locale (default "en-US")
+   * approximating a libc/ICU linguistic collation.
+   */
+  collation?: string;
+  /** default settings (GUC name -> value) */
+  settings?: Record<string, string>;
+}
+
+let processNextPid = 10000;
+
+/**
+ * An in-memory PostgreSQL-compatible database shared by any number of sessions (connections).
+ */
+export class Database {
+  readonly builtin = BuiltinCatalog.get();
+  readonly store = new Store();
+  readonly oids = new OidAllocator();
+  /** committed catalog */
+  catalog: Catalog;
+  readonly options: Required<Omit<InMemoryDatabaseOptions, 'settings'>> & { settings: Record<string, string> };
+  private nextPid = 10000;
+  readonly sessions = new Set<Session>();
+  /** transaction id holding the DDL lock */
+  ddlLockHolder = 0;
+  /** advisory locks: key -> holder session pid & count */
+  advisoryLocks = new Map<string, { pid: number; count: number; xact: number }>();
+  private parseCache = new Map<string, ParsedStatement[]>();
+  /** channels -> listening sessions */
+  readonly listeners = new Map<string, Set<Session>>();
+
+  constructor(options: InMemoryDatabaseOptions = {}) {
+    this.catalog = new Catalog(this.builtin);
+    let tz = options.timeZone;
+    if (!tz) {
+      try {
+        tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+      } catch {
+        tz = 'UTC';
+      }
+    }
+    this.options = {
+      databaseName: options.databaseName ?? 'postgres',
+      userName: options.userName ?? 'postgres',
+      timeZone: tz,
+      collation: options.collation ?? 'en-US',
+      settings: options.settings ?? {},
+    };
+  }
+
+  allocatePid(): number {
+    // unique across the databases of the process (cancel requests find a backend by pid alone)
+    this.nextPid = Math.max(this.nextPid, processNextPid);
+    processNextPid = this.nextPid + 1;
+    return this.nextPid++;
+  }
+
+  createSession(): Session {
+    const s = new Session(this);
+    this.sessions.add(s);
+    return s;
+  }
+
+  closeSession(s: Session): void {
+    s.terminate();
+    this.sessions.delete(s);
+  }
+
+  /** Diagnostics: sizes of the structures a long-lived database accumulates. */
+  stats(): Record<string, number> {
+    let liveTuples = 0;
+    let allTuples = 0;
+    let heaps = 0;
+    let indexEntries = 0;
+    const heapsSeen = new Set<number>();
+    for (const rel of this.catalog.relations.values()) {
+      if (!rel.storageId || heapsSeen.has(rel.storageId)) {
+        continue;
+      }
+      heapsSeen.add(rel.storageId);
+      const h = this.store.getHeap(rel.storageId);
+      heaps++;
+      allTuples += h.tuples.length;
+      liveTuples += h.tuples.filter((t) => t.xmax === 0).length;
+      for (const e of h.indexCache.values()) {
+        indexEntries += e.map.size;
+      }
+    }
+    let storedExprCacheEntries = 0;
+    for (const rel of this.catalog.relations.values()) {
+      for (const c of rel.columns) {
+        storedExprCacheEntries += Object.keys(c.defaultExpr?.cache ?? {}).length;
+      }
+    }
+    return {
+      heaps,
+      allTuples,
+      liveTuples,
+      indexEntries,
+      parseCache: this.parseCache.size,
+      sessions: this.sessions.size,
+      xids: this.store.txns.nextXid,
+      catalogVersion: this.catalog.version,
+      relations: this.catalog.relations.size,
+      storedExprCacheEntries,
+    };
+  }
+
+  parse(sql: string): ParsedStatement[] {
+    let cached = this.parseCache.get(sql);
+    if (!cached) {
+      cached = parseSql(sql);
+      if (this.parseCache.size > 2000) {
+        this.parseCache.clear();
+      }
+      this.parseCache.set(sql, cached);
+    }
+    return cached;
+  }
+}

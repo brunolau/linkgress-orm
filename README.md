@@ -184,6 +184,7 @@ Array<{
 - **[Insert/Update/Upsert/BULK](./docs/guides/insert-update-guide.md)** - Insert, update, delete, and bulk operations
 - **[Configuration & Options](./docs/guides/configuration.md)** - Every option with its default: logging, prepared statements (`preparedStatements`, `.withPreparedStatements()`), timeouts, slow-query detection, `LinkgressConfig`
 - **[Migrations](./docs/guides/migrations.md)** - Automatic and manual migrations with journal tracking
+- **[In-Memory Database](./docs/guides/in-memory-database.md)** - PostgreSQL-compatible in-memory database for fast, isolated tests (real drivers, snapshots)
 
 ### Advanced
 - **[Collection Strategies](./docs/collection-strategies.md)** - CTE, LATERAL, and temp table strategies for one-to-many queries

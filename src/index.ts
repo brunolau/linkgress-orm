@@ -472,3 +472,38 @@ export type {
   PostgresOptions,
   BunSqlOptions,
 } from './database/types';
+
+// In-memory database (loaded lazily: the engine is only required when first used)
+export type { InMemoryDatabase, InMemoryDatabaseOptions } from './memory';
+
+/**
+ * Create an in-memory PostgreSQL-compatible database. Connect to it with the real drivers:
+ * `new PgClient(db.pgPoolConfig())` or `new PostgresClient(db.createPostgresSql())`.
+ */
+export function createInMemoryDatabase(options?: import('./memory').InMemoryDatabaseOptions): import('./memory').InMemoryDatabase {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { InMemoryDatabase } = require('./memory') as typeof import('./memory');
+
+  return new InMemoryDatabase(options);
+}
+
+/** Restore an in-memory database from `InMemoryDatabase.snapshot()` output. */
+export function restoreInMemoryDatabase(snapshot: Buffer | Uint8Array, options?: import('./memory').InMemoryDatabaseOptions): import('./memory').InMemoryDatabase {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { InMemoryDatabase } = require('./memory') as typeof import('./memory');
+
+  return InMemoryDatabase.fromSnapshot(snapshot, options);
+}
+
+export type { InMemoryDatabaseListener, InMemoryDatabaseThread, InMemoryDatabaseThreadOptions, InMemoryListenOptions } from './memory';
+
+/**
+ * Start an in-memory database in its own worker thread (it keeps serving while the calling thread is
+ * blocked); connect with `postgresOptions()` / `pgPoolConfig()` or over TCP with `listen: true`.
+ */
+export function startInMemoryDatabaseThread(options?: import('./memory').InMemoryDatabaseThreadOptions): import('./memory').InMemoryDatabaseThread {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { InMemoryDatabaseThread } = require('./memory') as typeof import('./memory');
+
+  return InMemoryDatabaseThread.start(options);
+}

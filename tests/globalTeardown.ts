@@ -6,6 +6,10 @@ import { AppDatabase } from '../debug/schema/appDatabase';
  * Cleans up the database schema
  */
 export default async function globalTeardown() {
+  if ((process.env.LINKGRESS_TEST_DB || '').toLowerCase() === 'memory') {
+    return;
+  }
+
   const client = new PgClient({
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '5432'),

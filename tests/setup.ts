@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import { disposeSharedDatabase } from './utils/test-database';
 
+const memoryMode = (process.env.LINKGRESS_TEST_DB || '').toLowerCase() === 'memory';
+
 /**
  * Global test setup - runs before all tests
  */
@@ -10,6 +12,25 @@ beforeAll(async () => {
   if (!dbName.includes('test')) {
     throw new Error('Tests must use a test database! Set DB_NAME to include "test" in the name.');
   }
+
+  if (memoryMode) {
+    // Each test file has its own in-memory database: create the schema globalSetup would have.
+    // Loaded in an isolated module registry so the AppDatabase model (entity/enum registries)
+    // does not leak into this test file, exactly like globalSetup running in its own process.
+    let createSchema!: () => Promise<void>;
+    jest.isolateModules(() => {
+      const { AppDatabase } = require('../debug/schema/appDatabase');
+      const { createFreshClient: isolatedClient } = require('./utils/test-database');
+      createSchema = async () => {
+        const client = isolatedClient();
+        const db = new AppDatabase(client, { logQueries: false, logParameters: false, collectionStrategy: 'cte' });
+        await db.getSchemaManager().ensureDeleted();
+        await db.getSchemaManager().ensureCreated();
+        await client.end();
+      };
+    });
+    await createSchema();
+  }
 });
 
 /**
@@ -17,6 +38,10 @@ beforeAll(async () => {
  */
 afterAll(async () => {
   await disposeSharedDatabase();
+  if (memoryMode) {
+    const { disposeMemoryDatabase } = require('./memory/shared-memory-db');
+    await disposeMemoryDatabase();
+  }
 });
 
 /**
