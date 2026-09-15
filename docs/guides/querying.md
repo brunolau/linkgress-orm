@@ -689,6 +689,32 @@ const posts = await db.posts
   .toList();
 ```
 
+### Executing a Fragment
+
+`db.query()` takes a fragment as well as SQL text. Interpolated values are sent as parameters, nested
+fragments and `sql.join()` share one parameter numbering, and `sql.raw()` text is inlined as written, so a
+raw statement needs no hand-numbered `$1`, `$2`. It returns the rows, like the text form:
+
+```typescript
+import { sql } from 'linkgress-orm';
+
+const minAge = 18;
+const adults = await db.query<{ id: number; username: string }>(
+  sql`SELECT id, username FROM users WHERE age >= ${minAge} ORDER BY id`
+);
+
+// The transactional context takes fragments too
+await db.transaction(async (tx) => {
+  await tx.query(sql`UPDATE users SET age = age + ${1} WHERE id = ${adults[0].id}`);
+});
+```
+
+Pass arrays and JSON as ordinary values with an explicit cast (`${ids}::int[]`,
+`${JSON.stringify(doc)}::jsonb`). A named `sql.placeholder()` is refused here: it only binds inside a
+prepared query (see [Prepared Statements](#prepared-statements)). The client-level `querySimple()` /
+`querySimpleMulti()` still take text only, because the simple protocol that runs several statements in
+one call cannot carry parameters.
+
 ## Built-in Operators
 
 Linkgress provides type-safe operators for common SQL operations.

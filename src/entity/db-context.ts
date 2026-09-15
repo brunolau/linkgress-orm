@@ -1855,6 +1855,26 @@ export type InferContextSchema<T extends ContextSchema> = {
 };
 
 /**
+ * Render a fragment handed straight to `db.query()`: interpolated values become `$n` parameters, nested
+ * fragments and `sql.join()` continue one numbering, `sql.raw()` text is inlined. A named
+ * `sql.placeholder()` has no value outside a prepared query, so it is refused here rather than sent as a
+ * dangling `$n`.
+ */
+function renderRawFragment(fragment: SqlFragment): { sql: string; params: any[] } {
+  const context: SqlBuildContext = { paramCounter: 1, params: [] };
+  const sql = fragment.buildSql(context);
+
+  if (context.placeholders && context.placeholders.size > 0) {
+    const names = Array.from(context.placeholders.keys()).join(', ');
+    throw new Error(
+      `db.query(sql\`...\`) cannot bind sql.placeholder() (${names}): placeholders only bind inside a prepared query (.prepare()). Interpolate the value instead.`
+    );
+  }
+
+  return { sql, params: context.params };
+}
+
+/**
  * DataContext - main entry point for database operations
  */
 export class DataContext<TSchema extends ContextSchema = any> {
@@ -1934,7 +1954,11 @@ export class DataContext<TSchema extends ContextSchema = any> {
   }
 
   /**
-   * Execute raw SQL query with optional type parameter for results
+   * Execute a raw SQL statement and return its rows.
+   *
+   * Pass either SQL text with `$n` parameters, or a `sql` fragment: its interpolated values are bound as
+   * parameters, nested fragments and `sql.join()` share one numbering, and `sql.raw()` text is inlined
+   * as written.
    *
    * @example
    * ```typescript
@@ -1946,10 +1970,18 @@ export class DataContext<TSchema extends ContextSchema = any> {
    *
    * // With parameters
    * const user = await db.query<{ id: number }>('SELECT id FROM users WHERE name = $1', ['alice']);
+   *
+   * // As a fragment - the interpolated values become parameters
+   * const adults = await db.query<{ id: number }>(sql`SELECT id FROM users WHERE age >= ${18}`);
    * ```
    */
-  async query<T = any>(sql: string, params?: any[]): Promise<T[]> {
-    const result = await this.client.query(sql, params);
+  query<T = any>(fragment: SqlFragment): Promise<T[]>;
+  query<T = any>(sql: string, params?: any[]): Promise<T[]>;
+  async query<T = any>(sqlOrFragment: string | SqlFragment, params?: any[]): Promise<T[]> {
+    const statement = sqlOrFragment instanceof SqlFragment
+      ? renderRawFragment(sqlOrFragment)
+      : { sql: sqlOrFragment, params };
+    const result = await this.client.query(statement.sql, statement.params);
     return result.rows as T[];
   }
 
