@@ -10,7 +10,9 @@
  *   --thread           memory mode: host each file's database in a worker thread (LINKGRESS_MEMORY_THREAD)
  *   --driver <name>    the DatabaseClient the suite uses: pg (default), postgres, bun or pglite (LINKGRESS_TEST_DRIVER)
  *   -t, --test-name-pattern <regex>   only run tests whose full name matches
- *   -j, --jobs <n>     parallel files in memory and PGlite runs (default: half the CPU cores); PostgreSQL runs are serial
+ *   -j, --jobs <n>     parallel files in memory and PGlite runs (default: half the CPU cores)
+ *   --pg-jobs <n>      parallel files against PostgreSQL, each on a database of its own (default 6); 1 runs
+ *                      the files one after another on DB_NAME itself
  *   --timeout <ms>     per-test timeout (default 30000)
  *   --json <file>      write the per-test outcomes of the run(s)
  *   --coverage         collect coverage (lcov) for every file, merged into coverage/lcov.info
@@ -19,22 +21,32 @@
  * Why one process per file: each test file gets a fresh module registry (entity metadata, schema caches,
  * shared clients) and, in memory mode, its own database — so files never see each other's state.
  *
- * PostgreSQL runs create the test schema once before the files run and drop it afterwards (the database
- * in DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD, `.env` supported; the name must contain "test").
- * Memory runs build the schema once into a snapshot every file's database is restored from.
+ * PostgreSQL runs use the server in DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD (`.env` supported;
+ * the name must contain "test"). With --pg-jobs N > 1 (the default) the runner builds a template database
+ * (the extensions the suite uses plus the test schema), clones it into N worker databases
+ * (`<DB_NAME>_<host>_<pid>_w<k>`, CREATE DATABASE … TEMPLATE), runs N files at a time — each file's process
+ * gets its worker's database as DB_NAME — and drops every database it created when the run ends: normally,
+ * on a failure, or on Ctrl+C / SIGTERM (DROP DATABASE … WITH (FORCE)). Databases of a runner that could
+ * not clean up (killed hard) are dropped by the next PostgreSQL run on the same machine (`<host>` is a
+ * short hash of the host name): the process that created them no longer exists. Runs on other machines
+ * sharing the server never touch each other's databases. With --pg-jobs 1 the schema is created in DB_NAME itself, the files run one after
+ * another, and the schema is dropped afterwards. Memory runs build the schema once into a snapshot every
+ * file's database is restored from.
  *
- * A parity run starts both legs together: the PostgreSQL files one after another, the in-memory files in
- * parallel beside them (they have no shared state with the server), and compares the two result sets once
- * both are complete. The few files that reach the real server even in memory mode (SERVER_BOUND_IN_MEMORY)
- * wait until the PostgreSQL leg has finished, so the legs never use the server database at the same time.
- * The SQL parity test must find the server in a parity run (LINKGRESS_SQL_PARITY_REQUIRE_PG=1). PGlite runs
+ * A parity run starts both legs together — the PostgreSQL files, the in-memory files in parallel beside
+ * them — and compares the two result sets once both are complete. When the PostgreSQL leg runs serially on
+ * DB_NAME, the few files that reach the real server even in memory mode (SERVER_BOUND_IN_MEMORY) wait until
+ * it has finished, so the legs never use that database at the same time (worker databases are private to
+ * the PostgreSQL leg). The SQL parity test must find the server in a parity run
+ * (LINKGRESS_SQL_PARITY_REQUIRE_PG=1). PGlite runs
  * (`--driver pglite`) dump the schema from one PGlite once; every file boots its own instance from that
  * dump (tests/utils/pglite-server.ts), so they run in parallel — the server is then only needed by files
  * that construct PgClient / PostgresClient themselves, and a run without one only warns.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { availableParallelism, tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { availableParallelism, hostname, tmpdir } from 'node:os';
 import * as path from 'node:path';
 
 type Mode = 'pg' | 'memory' | 'pglite';
@@ -97,6 +109,7 @@ const coverage = flag('--coverage');
 const verbose = flag('--verbose');
 const namePattern = option(['-t', '--test-name-pattern']);
 const jobsOption = option(['-j', '--jobs']);
+const pgJobsOption = option(['--pg-jobs']);
 const timeout = option(['--timeout']) ?? '30000';
 const jsonOut = option(['--json']);
 const driver = option(['--driver']);
@@ -107,6 +120,7 @@ if (unknown.length > 0) {
 }
 const filters = args;
 const parallelJobs = Math.max(1, jobsOption ? parseInt(jobsOption, 10) : Math.floor(availableParallelism() / 2));
+const pgJobs = Math.max(1, pgJobsOption ? parseInt(pgJobsOption, 10) : 6);
 const onPglite = (driver ?? process.env.LINKGRESS_TEST_DRIVER ?? '').toLowerCase() === 'pglite';
 if (onPglite && (memory || parity)) {
   console.error('--driver pglite runs on PGlite: it cannot be combined with --memory or --parity');
@@ -206,6 +220,134 @@ const runSetupScript = (script: string, extraArgs: string[], env: Record<string,
 const MODE_LABEL: Record<Mode, string> = { pg: 'PostgreSQL', memory: 'In memory', pglite: 'PGlite' };
 
 // ---------------------------------------------------------------------------
+// PostgreSQL worker databases (--pg-jobs > 1)
+// ---------------------------------------------------------------------------
+
+const BASE_DB = baseEnv.DB_NAME || 'linkgress_test';
+/** this machine, so stale-database cleanup only judges process ids it can actually check */
+const HOST_TAG = createHash('sha1').update(hostname()).digest('hex').slice(0, 6);
+const RUN_TAG = `${BASE_DB}_${HOST_TAG}_${process.pid}_`;
+/** worker databases of runners on this machine: <DB_NAME>_<host>_<pid>_(tpl|w<k>) */
+const WORKER_DB = new RegExp(`^${BASE_DB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_${HOST_TAG}_(\\d+)_(tpl|w\\d+)$`);
+const createdDatabases = new Set<string>();
+const children = new Set<ReturnType<typeof spawn>>();
+
+const quoteIdent = (name: string): string => `"${name.replace(/"/g, '""')}"`;
+
+/** One statement on DB_NAME (CREATE / DROP DATABASE cannot run inside a transaction, so no pool, no BEGIN). */
+const adminQuery = async (sql: string): Promise<{ rows: Record<string, unknown>[] }> => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pg = require('pg');
+  const client = new pg.Client({
+    host: baseEnv.DB_HOST || 'localhost',
+    port: parseInt(baseEnv.DB_PORT || '5432', 10),
+    database: BASE_DB,
+    user: baseEnv.DB_USER || 'postgres',
+    password: baseEnv.DB_PASSWORD || 'postgres',
+  });
+  await client.connect();
+  try {
+    return await client.query(sql);
+  } finally {
+    await client.end();
+  }
+};
+
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+const dropDatabase = async (name: string): Promise<void> => {
+  await adminQuery(`DROP DATABASE IF EXISTS ${quoteIdent(name)} WITH (FORCE)`);
+  createdDatabases.delete(name);
+};
+
+/** Worker databases left behind by runners that no longer exist (killed before they could clean up). */
+const dropStaleWorkerDatabases = async (): Promise<void> => {
+  const { rows } = await adminQuery('SELECT datname FROM pg_database');
+  for (const { datname } of rows as { datname: string }[]) {
+    const m = WORKER_DB.exec(datname);
+    if (m && Number(m[1]) !== process.pid && !processAlive(Number(m[1]))) {
+      console.log(`Dropping ${datname}, left behind by an earlier run`);
+      await dropDatabase(datname);
+    }
+  }
+};
+
+/** Drops every database this run created; safe to call more than once. */
+const dropWorkerDatabases = async (): Promise<void> => {
+  const names = [...createdDatabases];
+  const failures: string[] = [];
+  for (const name of names) {
+    try {
+      await dropDatabase(name);
+    } catch (e) {
+      failures.push(`${name}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  if (failures.length > 0) {
+    console.error(`Could not drop test database(s) — the next PostgreSQL run drops them:\n  ${failures.join('\n  ')}`);
+  }
+};
+
+/**
+ * A template database (extensions + the test schema) cloned into `count` worker databases; returns their names.
+ * The template carries pg_trgm and unaccent, which the long-lived DB_NAME has from earlier runs.
+ */
+const createWorkerDatabases = async (count: number, env: Record<string, string>, log: (message: string) => void): Promise<string[]> => {
+  if (`${RUN_TAG}w${count}`.length > 63) {
+    throw new Error(`DB_NAME "${BASE_DB}" is too long for worker database names (PostgreSQL allows 63 characters); use --pg-jobs 1`);
+  }
+  const template = `${RUN_TAG}tpl`;
+  log(`Creating ${count} worker databases on ${baseEnv.DB_HOST || 'localhost'}:${baseEnv.DB_PORT || '5432'} (${RUN_TAG}w1..w${count})...`);
+  // registered before CREATE: a statement that fails half-way still gets a DROP … IF EXISTS
+  createdDatabases.add(template);
+  await adminQuery(`CREATE DATABASE ${quoteIdent(template)}`);
+  runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], { ...env, DB_NAME: template, LINKGRESS_TEST_EXTENSIONS: env.LINKGRESS_TEST_EXTENSIONS ?? 'pg_trgm,unaccent' });
+  const names: string[] = [];
+  for (let k = 1; k <= count; k++) {
+    const name = `${RUN_TAG}w${k}`;
+    createdDatabases.add(name);
+    await adminQuery(`CREATE DATABASE ${quoteIdent(name)} TEMPLATE ${quoteIdent(template)}`);
+    names.push(name);
+  }
+  return names;
+};
+
+let interrupted = false;
+/** Stop the test files, drop this run's databases, exit: Ctrl+C / termination and crashes that skip `finally`. */
+const abort = (reason: string, exitCode: number): void => {
+  if (interrupted) {
+    return;
+  }
+  interrupted = true;
+  console.error(`\n${reason}: stopping the test files and dropping the worker databases...`);
+  for (const child of children) {
+    child.kill();
+  }
+  void dropWorkerDatabases().finally(() => {
+    rmSync(workDir, { recursive: true, force: true });
+    process.exit(exitCode);
+  });
+};
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as NodeJS.Signals[]) {
+  process.on(signal, () => abort(signal, 130));
+}
+process.on('uncaughtException', (error) => {
+  console.error(error);
+  abort('uncaught exception', 1);
+});
+process.on('unhandledRejection', (error) => {
+  console.error(error);
+  abort('unhandled rejection', 1);
+});
+
+// ---------------------------------------------------------------------------
 // running files
 // ---------------------------------------------------------------------------
 
@@ -275,10 +417,14 @@ const runFile = (file: string, mode: Mode, env: Record<string, string>, index: n
   const started = Date.now();
   return new Promise((resolve) => {
     const child = spawn(process.execPath, bunArgs, { cwd: ROOT, env });
+    children.add(child);
     let output = '';
     child.stdout.on('data', (d) => (output += d));
     child.stderr.on('data', (d) => (output += d));
+    // a process that cannot start still ends with 'close'; the error goes into the file's output
+    child.on('error', (error) => (output += `\n${error.stack ?? error.message}`));
     child.on('close', (code) => {
+      children.delete(child);
       const tests = existsSync(report) ? parseJunit(readFileSync(report, 'utf8')) : {};
       const exitCode = code ?? 1;
       const anyFailed = Object.values(tests).some((s) => s === 'failed');
@@ -332,24 +478,39 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
     if (!runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env, true)) {
       log('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
     }
-  } else {
-    delete env.LINKGRESS_TEST_DB;
-    log('Creating the test schema in PostgreSQL...');
-    runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env);
   }
 
-  const jobs = mode === 'pg' ? 1 : parallelJobs;
+  const jobs = mode === 'pg' ? Math.min(pgJobs, files.length) : parallelJobs;
+  // --pg-jobs > 1: every worker runs its files on a database of its own
+  let workerDatabases: string[] = [];
+  const setupStarted = Date.now();
+  if (mode === 'pg') {
+    delete env.LINKGRESS_TEST_DB;
+    await dropStaleWorkerDatabases();
+    if (jobs > 1) {
+      try {
+        workerDatabases = await createWorkerDatabases(jobs, env, log);
+      } catch (e) {
+        await dropWorkerDatabases();
+        throw e;
+      }
+    } else {
+      log('Creating the test schema in PostgreSQL...');
+      runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env);
+    }
+  }
   const runStarted = Date.now();
-  log(`Running ${files.length} test file(s) ${mode === 'pg' ? 'against PostgreSQL' : `${mode === 'memory' ? 'in memory' : 'on PGlite'} (${jobs} in parallel)`}`);
+  log(`Running ${files.length} test file(s) ${mode === 'pg' ? `against PostgreSQL${jobs > 1 ? ` (${jobs} in parallel, one database each; setup ${((runStarted - setupStarted) / 1000).toFixed(1)}s)` : ''}` : `${mode === 'memory' ? 'in memory' : 'on PGlite'} (${jobs} in parallel)`}`);
   const outcomes: FileOutcome[] = new Array(files.length);
   const indices = files.map((_, i) => i);
   const waitsForServer = (i: number) => mode === 'memory' && !!options.serverFree && SERVER_BOUND_IN_MEMORY.has(rel(files[i]));
   const runQueue = async (queue: number[]) => {
     let next = 0;
-    const worker = async () => {
-      while (next < queue.length) {
+    const worker = async (workerIndex: number) => {
+      const workerEnv = workerDatabases.length > 0 ? { ...env, DB_NAME: workerDatabases[workerIndex] } : env;
+      while (next < queue.length && !interrupted) {
         const index = queue[next++];
-        const outcome = await runFile(files[index], mode, env, index);
+        const outcome = await runFile(files[index], mode, workerEnv, index);
         outcomes[index] = outcome;
         const s = summarize(outcome);
         const failed = s.failed > 0;
@@ -359,7 +520,7 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(jobs, queue.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(jobs, queue.length) }, (_, workerIndex) => worker(workerIndex)));
   };
   try {
     await runQueue(indices.filter((i) => !waitsForServer(i)));
@@ -370,7 +531,9 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
       await runQueue(deferred);
     }
   } finally {
-    if (mode !== 'memory') {
+    if (workerDatabases.length > 0) {
+      await dropWorkerDatabases();
+    } else if (mode !== 'memory') {
       runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['drop'], env, mode === 'pglite');
     }
   }
@@ -430,7 +593,8 @@ try {
     // both legs at once: PostgreSQL files serially, in-memory files in parallel beside them
     const started = Date.now();
     const pgRun = runAll('pg', { prefix: '[pg]     ' });
-    const memoryRun = runAll('memory', { prefix: '[memory] ', serverFree: pgRun.catch(() => undefined) });
+    // server-bound in-memory files wait only when the PostgreSQL leg uses DB_NAME itself (--pg-jobs 1)
+    const memoryRun = runAll('memory', { prefix: '[memory] ', serverFree: pgJobs > 1 ? undefined : pgRun.catch(() => undefined) });
     runs.push(...(await Promise.all([pgRun, memoryRun])));
     console.log(`\nBoth runs finished in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     const diffs = compareRuns(runs[0], runs[1]);
@@ -460,6 +624,8 @@ try {
   console.error(e instanceof Error ? e.message : e);
   exitCode = 1;
 } finally {
+  // normally already dropped by the run that created them; this covers a run that threw half-way
+  await dropWorkerDatabases();
   rmSync(workDir, { recursive: true, force: true });
 }
 process.exit(exitCode);

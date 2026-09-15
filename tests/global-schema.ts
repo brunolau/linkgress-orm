@@ -2,7 +2,8 @@
  * The global setup / teardown of a test run (tests/run.ts), each action in its own process:
  *
  *   bun tests/global-schema.ts create|drop               the test schema in the PostgreSQL test database
- *                                                        (test files only truncate the tables)
+ *                                                        (test files only truncate the tables); `create`
+ *                                                        first installs LINKGRESS_TEST_EXTENSIONS (comma list)
  *   bun tests/global-schema.ts pglite-snapshot <file>     the schema built on a PGlite, its data directory
  *                                                        dumped to <file> for every file's PGlite to boot from
  */
@@ -41,6 +42,13 @@ const client = new PgClient({
 
 try {
   const db = new AppDatabase(client, { logQueries: false, logParameters: false, collectionStrategy: 'cte' });
+
+  // LINKGRESS_TEST_EXTENSIONS=pg_trgm,unaccent: extensions a fresh (worker template) database needs up front
+  if (action === 'create') {
+    for (const extension of (process.env.LINKGRESS_TEST_EXTENSIONS ?? '').split(',').filter(Boolean)) {
+      await client.query(`CREATE EXTENSION IF NOT EXISTS "${extension.replace(/"/g, '')}"`);
+    }
+  }
 
   await db.getSchemaManager().ensureDeleted();
 

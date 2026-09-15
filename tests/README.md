@@ -36,10 +36,15 @@ npm run test:pglite      # all files on PGlite (PostgreSQL in WASM, in-process) 
 \* `tests/memory/sql-parity.test.ts` compares with PostgreSQL and is skipped when none is reachable.
 
 Every test file runs in its own `bun test` process, so each file has a fresh module registry (entity
-metadata, caches, shared clients) and, in memory mode, its own database. A PostgreSQL run creates the
-test schema once before the files run and drops it afterwards; the files run one after another because
-they share the database. A memory run builds the schema once into a snapshot every file's database is
-restored from, and runs files in parallel. A PGlite run (`--driver pglite`) does the same with a PGlite
+metadata, caches, shared clients) and, in memory mode, its own database. A PostgreSQL run creates a
+template database on the configured server (the extensions the suite uses and the test schema), clones it
+into 6 worker databases (`<DB_NAME>_<host>_<pid>_w1..w6`) and runs 6 files at a time, each on its own
+database. Every database it created is dropped when the run ends — passed, failed, failed during setup,
+stopped with Ctrl+C, or crashed — and a run that was killed outright leaves them for the next PostgreSQL
+run on the same machine to drop (`<host>` is a hash of the host name, so runs on other machines sharing
+the server are left alone). `--pg-jobs N` changes the count; `--pg-jobs 1` runs the files one after
+another on `DB_NAME` itself. The server user needs `CREATEDB`. A memory run builds the schema once into a snapshot every file's database is restored
+from, and runs files in parallel. A PGlite run (`--driver pglite`) does the same with a PGlite
 data-directory dump (every file boots its own PGlite); the server is then only needed by the files that
 construct `PgClient` / `PostgresClient` themselves, and the run only warns when it is unreachable.
 
@@ -52,6 +57,7 @@ bun run test:single "should group by single field"   # --test-name-pattern
 bun tests/run.ts --memory --thread              # memory databases hosted in worker threads
 bun tests/run.ts --driver postgres              # the suite on PostgresClient (also: bun, pglite, pg — default)
 bun tests/run.ts --memory --jobs 4              # parallel files in memory / PGlite runs (default: half the cores)
+bun tests/run.ts --pg-jobs 1                    # PostgreSQL files one at a time on DB_NAME (default: 6 worker databases)
 bun tests/run.ts --json results.json            # per-test outcomes of the run(s)
 npm run test:coverage                           # lcov for all files, merged into coverage/lcov.info
 npm run test:verbose                            # print every file's output, not only failing ones
@@ -72,12 +78,12 @@ all files, which the schema-mutating files do not tolerate.
 
 ### Parity
 
-`npm run test:parity` runs the suite against PostgreSQL and in memory at the same time — the PostgreSQL
-files one after another, the in-memory files in parallel beside them — and, once both are complete,
-compares the outcome of every test and of every file's process (a failure outside any test — an
-`afterAll` hook, a crash — counts too). Any difference is listed and fails the run. Files that use the
-real server even in memory mode (`tests/memory/sql-parity.test.ts`) start only after the PostgreSQL run
-has finished, and the SQL parity test may not skip itself there. `npm publish` runs it (`prepublishOnly`).
+`npm run test:parity` runs the suite against PostgreSQL (on its worker databases) and in memory at the
+same time and, once both are complete, compares the outcome of every test and of every file's process (a
+failure outside any test — an `afterAll` hook, a crash — counts too). Any difference is listed and fails
+the run. With `--pg-jobs 1` the files that use the real server even in memory mode
+(`tests/memory/sql-parity.test.ts`) wait for the PostgreSQL run, which then uses `DB_NAME` itself; the SQL
+parity test may not skip itself in a parity run. `npm publish` runs it (`prepublishOnly`).
 
 `tests/memory/sql-parity.test.ts` checks the database itself statement by statement: each case of the
 corpus runs on PostgreSQL and on a fresh in-memory database, and the command tags, row counts, column

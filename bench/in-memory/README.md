@@ -112,9 +112,22 @@ result sets once both are complete. Measured alternately against running the two
 | PostgreSQL, then memory | 115.3 s + 13.6 s = 128.9 s | 109.6 s + 12.5 s = 122.1 s |
 
 About 5 s (4%) saved: the in-memory leg finishes in ~13 s either way, and the PostgreSQL leg — serial,
-because every file shares one database — sets the length of the run; the 12 parallel in-memory files
-slow its first seconds a little. Running the PostgreSQL leg itself in parallel would need a database
-per worker.
+because every file shared one database — set the length of the run.
+
+The runner now gives every PostgreSQL worker a database of its own (a template cloned into
+`--pg-jobs` databases, dropped at the end), so the PostgreSQL leg runs in parallel too:
+
+| run | wall time |
+| --- | --- |
+| PostgreSQL, serial on `DB_NAME` (`--pg-jobs 1`) | 110–125 s |
+| PostgreSQL, 4 worker databases | 58.6 s / 57.5 s (setup 1.4–1.9 s) |
+| PostgreSQL, 6 worker databases (default) | 52.8 s / 52.3 s / 53.4 s (setup 2.0–2.4 s) |
+| PostgreSQL, 12 worker databases | 56.9 s (setup 4.4 s) |
+| `test:parity` with 4 PostgreSQL workers | 73.0 s |
+| `test:parity` with 6 PostgreSQL workers (default) | 61.7 s |
+
+Beyond ~6 workers the server's disk (every per-test `TRUNCATE` writes new relation files) is the
+limit, not the CPU.
 
 ## A large application suite
 
