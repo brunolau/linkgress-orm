@@ -196,6 +196,10 @@ const db = new AppDatabase(client, {
 await db.getSchemaManager().ensureCreated();
 ```
 
+No server at hand — for tests, a demo, a CLI? `new PGliteClient()` runs PostgreSQL itself in your
+process (`npm install @electric-sql/pglite`), and everything else stays the same. See
+[Database Clients](./database-clients.md#3-pgliteclient-pglite).
+
 See [Migrations Guide](./guides/migrations.md) for automatic migrations, schema management, and integrating migrations into your workflow.
 
 ### Step 4: Query Your Data

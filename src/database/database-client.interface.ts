@@ -30,7 +30,8 @@ export interface QueryExecutionOptions {
    * On timeout the driver throws a {@link QueryTimeoutError}.
    *
    * NOTE: Currently only honored by `PostgresClient` (the `postgres`/porsager
-   * driver). `PgClient` and `BunClient` ignore it.
+   * driver). `PgClient`, `BunClient` and `PGliteClient` ignore it (PGlite cannot
+   * cancel a running statement at all).
    */
   timeoutMs?: number;
 
@@ -41,8 +42,8 @@ export interface QueryExecutionOptions {
    * pays. Set from the context's `preparedStatements` option or per query via
    * `.withPreparedStatements()`; absent/`false` keeps the unnamed statement (the default).
    *
-   * Only honored by `PostgresClient`; `PgClient` and `BunClient` ignore it (Bun.SQL has
-   * its own instance-level `prepare`). The postgres.js instance must allow prepared
+   * Only honored by `PostgresClient`; `PgClient`, `BunClient` and `PGliteClient` ignore it
+   * (Bun.SQL has its own instance-level `prepare`). The postgres.js instance must allow prepared
    * statements (its default) — an instance created with `prepare: false` ignores this.
    */
   prepare?: boolean;

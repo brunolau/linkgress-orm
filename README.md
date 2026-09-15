@@ -25,7 +25,7 @@ A type-safe ORM for PostgreSQL and TypeScript with automatic type inference and 
 - **Transaction Support** - Safe, type-checked transactions
 - **Production Diagnostics** - Failed-statement logging, slow-query reports with the calling stack, per-query timeouts
 - **Manual Migrations** - File-based migrations with journal tracking, up/down support, and scaffolding
-- **Multiple Clients** - Works with both `pg` and `postgres` npm packages
+- **Multiple Clients** - Works with the `pg` and `postgres` npm packages, Bun's built-in SQL, and PGlite (PostgreSQL in WASM, in-process — no server)
 
 ## Table of Contents
 
@@ -176,7 +176,7 @@ Array<{
 ### Getting Started
 - **[Getting Started Guide](./docs/getting-started.md)** - Complete walkthrough for beginners
 - **[Installation](./docs/installation.md)** - Setup and installation instructions
-- **[Database Clients](./docs/database-clients.md)** - Choose between `pg` and `postgres`, connection pooling, and lifecycle management
+- **[Database Clients](./docs/database-clients.md)** - Choose between `pg`, `postgres`, Bun's SQL and PGlite (in-process, no server), connection pooling, and lifecycle management
 
 ### Guides
 - **[Schema Configuration](./docs/guides/schema-configuration.md)** - Entity configuration, relationships, and indexes
@@ -185,6 +185,7 @@ Array<{
 - **[Configuration & Options](./docs/guides/configuration.md)** - Every option with its default: logging, prepared statements (`preparedStatements`, `.withPreparedStatements()`), timeouts, slow-query detection, `LinkgressConfig`
 - **[Migrations](./docs/guides/migrations.md)** - Automatic and manual migrations with journal tracking
 - **[In-Memory Database](./docs/guides/in-memory-database.md)** - PostgreSQL-compatible in-memory database for fast, isolated tests (real drivers, snapshots)
+- **[PGlite](./docs/database-clients.md#3-pgliteclient-pglite)** - PostgreSQL itself compiled to WASM, in-process through `PGliteClient`: tests without a server, local-first apps, browsers
 
 ### Advanced
 - **[Collection Strategies](./docs/collection-strategies.md)** - CTE, LATERAL, and temp table strategies for one-to-many queries

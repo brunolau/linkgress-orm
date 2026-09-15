@@ -155,6 +155,12 @@ npm test -- path/to/test.test.ts
 
 # Run tests matching a pattern
 npm test -- --testNamePattern="pattern"
+
+# Run the suite without a PostgreSQL server: on PGlite (in-process, parallel workers)...
+npm run test:pglite
+
+# ...or on the built-in in-memory database
+LINKGRESS_TEST_DB=memory npm test
 ```
 
 ## Documentation

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Linkgress ORM now supports multiple PostgreSQL client libraries through a client-agnostic architecture. You can use either the `pg` (node-postgres) library or the `postgres` library with the same ORM API.
+Linkgress ORM now supports multiple PostgreSQL client libraries through a client-agnostic architecture. You can use the `pg` (node-postgres) library, the `postgres` library, or PGlite — PostgreSQL compiled to WASM, running in-process — with the same ORM API.
 
 ## Architecture
 
@@ -112,6 +112,63 @@ const db = new DbContext(client, schema);
 - Built-in transaction support
 - Better TypeScript support
 - Smaller bundle size
+
+### 3. PGliteClient (PGlite)
+
+The `PGliteClient` runs linkgress on [PGlite](https://pglite.dev): the PostgreSQL engine (18.x in
+PGlite 0.5) compiled to WebAssembly, running inside your process — Node, Bun, Deno or a browser —
+with no server to install. It suits tests, local-first apps, CLIs and demos.
+
+**Installation:**
+```bash
+npm install @electric-sql/pglite
+```
+
+**Usage:**
+```typescript
+import { PGliteClient, DbContext } from 'linkgress-orm';
+
+// Option 1: In-memory, gone when the process exits
+const client = new PGliteClient();
+
+// Option 2: Persisted to a directory, with extensions (register them here; CREATE EXTENSION then works)
+import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
+const client = new PGliteClient({ dataDir: './pgdata', extensions: { pg_trgm } });
+
+// Option 3: An instance you created (ESM and browser builds, or to share one instance)
+import { PGlite } from '@electric-sql/pglite';
+const client = new PGliteClient(await PGlite.create());
+
+const db = new DbContext(client, schema);
+```
+
+`dispose()` closes an instance the client created; an instance you passed in stays open.
+
+**How it differs from a server connection:**
+- **One session.** PGlite runs a single session, one statement at a time. `connect()` leases that
+  session until `release()` — a pool of one, shared by every `PGliteClient` over the same instance —
+  and other queries wait meanwhile, so never await a query on the outer context while holding a
+  connection. Inside `db.transaction()` use the transactional context: a query on the outer context
+  (or a second transaction) from the callback could never run, so it throws at once instead of
+  hanging. Session state (temp tables, `SET`) is shared by everything using the instance.
+- **No statement timeouts.** PGlite cannot cancel a running statement: `.withTimeout()` and
+  `statement_timeout` are not enforced.
+- **Values.** An instance the client creates follows `pg` wherever `pg` and `postgres` agree:
+  `int8`/`bigint` comes back as a string, `bytea` as a `Buffer` (a `Uint8Array` where there is no
+  Buffer), and a `Date` bound to a `date` / `timestamp` / `timestamptz` parameter is sent in local
+  time, so it stores the same calendar day and wall-clock time as with `pg` and `postgres`. (PGlite's
+  own default sends UTC, which lands a local-midnight `Date` on the previous day east of Greenwich and
+  shifts every `Date` round-tripped through `timestamp` by the host's offset.) Override any type with
+  `parsers` / `serializers`, e.g. `parsers: { 20: v => BigInt(v) }`. `date` columns read back as UTC
+  midnight, as with `postgres` (`pg` gives local midnight).
+- **Collation and time zone.** A PGlite database uses the `C` collation, so text sorts by byte order
+  (`Z` before `a`) where a server usually has a linguistic default, and ICU collations need ICU data
+  PGlite does not ship. The session starts in a fixed-offset `TimeZone` such as `Etc/GMT-1`, which
+  ignores daylight saving — `now()` and `timestamptz` text are then an hour off in summer. Named zones
+  work: run `SET TIME ZONE 'Europe/Bratislava'` if your SQL depends on the zone.
+- **Multi-statement SQL** runs through PGlite's `exec()`, so the single-round-trip paths (temp-table
+  strategy, `FutureQuery` batches) apply.
+- **Under jest**, node needs `--experimental-vm-modules`: PGlite loads its WASM through dynamic `import()`.
 
 ## Creating a Custom Client
 
@@ -289,6 +346,13 @@ Both clients offer good performance, but have different characteristics:
 - Better streaming support
 - Modern async/await first API
 
+### PGliteClient (`@electric-sql/pglite`)
+- No server and no network: the engine runs in your process, as WebAssembly
+- One session, one statement at a time: not for concurrent workloads
+- Slower per statement than a native server, much faster at what makes a server touch its disk
+  (schema changes, `TRUNCATE`); in tests a database per test file allows parallel workers — see the
+  [measurements](../bench/pglite/README.md)
+
 ## Future Enhancements
 
 The client architecture enables future support for:
@@ -304,7 +368,8 @@ Each new driver can be added by implementing the `DatabaseClient` interface with
 
 ### Understanding Connection Pooling
 
-Both `PgClient` and `PostgresClient` use **connection pooling** under the hood. This means:
+Both `PgClient` and `PostgresClient` use **connection pooling** under the hood (`PGliteClient` has no
+pool: it runs one in-process session, see [above](#3-pgliteclient-pglite)). This means:
 
 - The client maintains a pool of reusable database connections
 - Each query borrows a connection from the pool and returns it when done
@@ -500,6 +565,7 @@ const userService = new UserService(db);
 1. **Choose the right client for your needs:**
    - Use `PgClient` if you need battle-tested stability
    - Use `PostgresClient` if you want modern features and smaller bundle size
+   - Use `PGliteClient` for tests without a server, local-first apps and browsers
 
 2. **Reuse DbContext instances:**
    - Create **one** instance at startup for long-running apps

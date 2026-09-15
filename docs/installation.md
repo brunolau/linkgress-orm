@@ -54,6 +54,26 @@ npm install postgres
 - Newer library (less battle-tested)
 - Smaller community
 
+### Option 3: PGlite (in-process, no server)
+
+PostgreSQL compiled to WebAssembly, running inside your process (Node, Bun, Deno, browsers):
+
+```bash
+npm install @electric-sql/pglite
+```
+
+**Pros:**
+- No server to install or run: tests, local-first apps, CLIs, demos
+- The real PostgreSQL engine (PGlite 0.5 embeds PostgreSQL 18), not an emulation
+- In-memory or persisted to a directory (IndexedDB in browsers)
+
+**Cons:**
+- One session, one statement at a time: not for concurrent server workloads
+- No statement timeouts (`.withTimeout()` is not enforced)
+- Under jest, node needs `--experimental-vm-modules`
+
+See [PGliteClient](./database-clients.md#3-pgliteclient-pglite) for how it differs from a server connection.
+
 ## Minimal Setup Examples
 
 ### Using pg
@@ -143,6 +163,27 @@ const db = new AppDatabase(client);
 await db.users.insert({ username: 'john_doe' });
 ```
 
+### Using PGlite
+
+```typescript
+import { PGliteClient } from 'linkgress-orm';
+
+// Same entity and AppDatabase as above
+
+// In-memory: no server, gone when the process exits
+const client = new PGliteClient();
+
+// Or persisted to a directory
+const client = new PGliteClient('./pgdata');
+
+// Create database context (same API)
+const db = new AppDatabase(client);
+await db.getSchemaManager().ensureCreated();
+
+// Use it (same API)
+await db.users.insert({ username: 'john_doe' });
+```
+
 ## Development vs Production
 
 ### For Library Authors
@@ -155,10 +196,12 @@ If you're building a library that depends on linkgress-orm, you should **not** i
     "linkgress-orm": "^0.1.0"
   },
   "peerDependencies": {
+    "@electric-sql/pglite": "^0.5.0",
     "pg": "^8.0.0",
     "postgres": "^3.0.0"
   },
   "peerDependenciesMeta": {
+    "@electric-sql/pglite": { "optional": true },
     "pg": { "optional": true },
     "postgres": { "optional": true }
   }
@@ -176,6 +219,9 @@ npm install --save-dev @types/pg
 
 # Option 2: Using postgres
 npm install linkgress-orm postgres
+
+# Option 3: Using PGlite (in-process, no server)
+npm install linkgress-orm @electric-sql/pglite
 ```
 
 ### For Development/Testing
@@ -206,6 +252,11 @@ const client = new PgClient(config);
 const client = new PostgresClient(config);
 // Error: PostgresClient requires the "postgres" package to be installed.
 // Install it with: npm install postgres
+
+// Without @electric-sql/pglite installed
+const client = new PGliteClient();
+// Error: PGliteClient requires the "@electric-sql/pglite" package to be installed.
+// Install it with: npm install @electric-sql/pglite
 ```
 
 ## Bundle Size Comparison

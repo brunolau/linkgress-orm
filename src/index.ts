@@ -467,10 +467,15 @@ export {
   BunClient,
 } from './database/bun-client';
 
+export {
+  PGliteClient,
+} from './database/pglite-client';
+
 export type {
   PoolConfig,
   PostgresOptions,
   BunSqlOptions,
+  PGliteClientOptions,
 } from './database/types';
 
 // In-memory database (loaded lazily: the engine is only required when first used)

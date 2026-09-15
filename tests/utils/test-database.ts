@@ -1,5 +1,7 @@
 import { PgClient, PostgresClient, BunClient, DatabaseClient, DbContext, QueryOptions } from '../../src';
 import { AppDatabase } from '../../debug/schema/appDatabase';
+import { PgliteTestServer } from './pglite-server';
+import { recordQueries } from './query-recorder';
 
 // Shared database instances per strategy (reuse connections)
 const sharedDatabases: Map<string, AppDatabase> = new Map();
@@ -7,19 +9,23 @@ const sharedDatabases: Map<string, AppDatabase> = new Map();
 // Shared client (single connection pool for all strategies)
 let sharedClient: DatabaseClient | null = null;
 
-type TestDriver = 'pg' | 'postgres' | 'bun';
+// LINKGRESS_TEST_DRIVER=pglite: this test file's in-process database (see pglite-server.ts)
+let pgliteServer: PgliteTestServer | null = null;
+
+type TestDriver = 'pg' | 'postgres' | 'bun' | 'pglite';
 
 /**
  * Which DatabaseClient implementation the suite runs on.
  * Defaults to 'pg' (node-postgres). Override with LINKGRESS_TEST_DRIVER to run
  * the same suite against another driver, e.g. under Bun:
  *   LINKGRESS_TEST_DRIVER=bun bun test tests/
+ * or in-process on PGlite, without a server: `pnpm test:pglite`
  */
 function resolveTestDriver(): TestDriver {
   const driver = (process.env.LINKGRESS_TEST_DRIVER || 'pg').toLowerCase();
 
-  if (driver !== 'pg' && driver !== 'postgres' && driver !== 'bun') {
-    throw new Error(`Unknown LINKGRESS_TEST_DRIVER "${driver}" (expected pg | postgres | bun)`);
+  if (driver !== 'pg' && driver !== 'postgres' && driver !== 'bun' && driver !== 'pglite') {
+    throw new Error(`Unknown LINKGRESS_TEST_DRIVER "${driver}" (expected pg | postgres | bun | pglite)`);
   }
 
   return driver;
@@ -40,14 +46,31 @@ export function testConnectionConfig() {
   };
 }
 
+/**
+ * A client for the configured driver. With LINKGRESS_TEST_RECORD_DIR set it also records
+ * every statement it runs, for diffing two runs (tests/utils/query-recorder.ts).
+ */
 function createClientForDriver(): DatabaseClient {
+  const client = createDriverClient();
+  const recordDir = process.env.LINKGRESS_TEST_RECORD_DIR;
+
+  return recordDir ? recordQueries(client, recordDir) : client;
+}
+
+function createDriverClient(): DatabaseClient {
+  const driver = resolveTestDriver();
+
+  if (driver === 'pglite') {
+    // Every harness client borrows this file's single PGlite; disposeSharedDatabase() stops it.
+    pgliteServer ??= new PgliteTestServer();
+    return pgliteServer.client();
+  }
+
   const host = process.env.DB_HOST || 'localhost';
   const port = parseInt(process.env.DB_PORT || '5432');
   const database = process.env.DB_NAME || 'linkgress_test';
   const user = process.env.DB_USER || 'postgres';
   const password = process.env.DB_PASSWORD || 'postgres';
-
-  const driver = resolveTestDriver();
 
   if (driver === 'bun') {
     // LINKGRESS_TEST_BUN_PREPARE=false runs the suite in Bun's text-results
@@ -183,6 +206,11 @@ export async function disposeSharedDatabase(): Promise<void> {
   if (sharedClient) {
     await sharedClient.end();
     sharedClient = null;
+  }
+  if (pgliteServer) {
+    const server = pgliteServer;
+    pgliteServer = null;
+    await server.stop();
   }
 }
 

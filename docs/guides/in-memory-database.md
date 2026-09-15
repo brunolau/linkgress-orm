@@ -107,6 +107,25 @@ touching test code — for example with Jest's `moduleNameMapper`, pointing `pg`
 wrappers that add the in-memory socket (this repository's own suite does exactly that; see
 `tests/memory/` and `LINKGRESS_TEST_DB=memory` in `jest.config.js`).
 
+## PGlite, the other in-process option
+
+Linkgress also runs on [PGlite](https://pglite.dev) — PostgreSQL itself compiled to WebAssembly —
+through a client of its own, `PGliteClient` (see
+[Database Clients](../database-clients.md#3-pgliteclient-pglite)). The two differ in what they are and
+how they are reached:
+
+| | in-memory database | PGlite |
+| --- | --- | --- |
+| engine | PostgreSQL-compatible, written in TypeScript | PostgreSQL 18, compiled to WebAssembly |
+| reached through | the real `pg` / `postgres` drivers, over an in-process socket | `PGliteClient`, a `DatabaseClient` of its own |
+| sessions | many, with PostgreSQL's isolation, row locks and deadlock detection | one; statements run one at a time |
+| runs | in process, in a worker thread, or behind a TCP endpoint | in process: Node, Bun, Deno, browsers |
+| this repository's suite | `LINKGRESS_TEST_DB=memory` — 11.6 s on 12 workers | `pnpm test:pglite` — 23.5 s on 8 workers |
+
+Both give every test file its own database, so a suite can use parallel workers; on the same machine
+the suite takes 147.8 s serially against a PostgreSQL server. Measurements and every difference found:
+[bench/pglite/README.md](../../bench/pglite/README.md).
+
 ## Scope and differences
 
 - Row order without `ORDER BY` follows PostgreSQL's sequential-scan and sort behaviour, but plans are

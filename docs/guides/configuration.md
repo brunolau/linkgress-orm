@@ -9,7 +9,7 @@ collection strategies) are cross-linked to their guides.
 
 | Scope | Set through | Applies to |
 |---|---|---|
-| **Connection** | the client constructor (`PostgresClient`, `PgClient`, `BunClient`) | pooling, `statement_timeout`, driver flags — see [Database Clients](../database-clients.md) |
+| **Connection** | the client constructor (`PostgresClient`, `PgClient`, `BunClient`, `PGliteClient`) | pooling, `statement_timeout`, driver flags — see [Database Clients](../database-clients.md) |
 | **Context** | `QueryOptions`: `new AppDatabase(client, { … })` | every query that context runs |
 | **Query** | `.withQueryOptions()`, `.withPreparedStatements()`, `.withTimeout()`, `.expectedExecutionTime()` | the one chain they are called on |
 | **Process** | `LinkgressConfig` | operators used inside `where(...)` lambdas, which have no context in reach |
@@ -150,7 +150,7 @@ distinct text would be another cached plan in every pooled connection for nothin
 
 ### What it does and does not touch
 
-- **Driver**: only `PostgresClient` honors it. `PgClient` and `BunClient` ignore it, as does a
+- **Driver**: only `PostgresClient` honors it. `PgClient`, `BunClient` and `PGliteClient` ignore it, as does a
   postgres.js instance that was constructed with `prepare: false`.
 - **Exempt regardless of the option**: `insertWithChildren`, `insertBulkWithChildren` and the
   fused `MutationBatch` statement. Their text embeds a per-call VALUES list, so preparing them

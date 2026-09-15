@@ -428,6 +428,7 @@ supportsMultiStatementQueries(): boolean {
 **Client Implementations:**
 - **PgClient (node-postgres)**: Returns `false` - uses prepared statements (safe, multiple round trips)
 - **PostgresClient (postgres.js)**: Returns `true` - uses `.simple()` mode (experimental, single round trip)
+- **PGliteClient (PGlite)**: Returns `true` - uses PGlite's `exec()` (simple protocol, one call in-process)
 
 ### Security Considerations
 

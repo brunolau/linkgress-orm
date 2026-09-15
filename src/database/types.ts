@@ -384,3 +384,84 @@ export interface BunSqlOptions {
    */
   onclose?: (client: any) => void;
 }
+
+/**
+ * Options for the PGlite instance a PGliteClient creates
+ * @see https://pglite.dev/docs/api
+ *
+ * Mirrors PGlite's `PGliteOptions` (0.5.x). Everything is handed to `new PGlite()` as-is,
+ * except `parsers` and `serializers`, which are merged over linkgress's pg-compatible
+ * defaults (see PGliteClient).
+ */
+export interface PGliteClientOptions {
+  /**
+   * Where the database lives: a directory path, `idb://name` (browser IndexedDB),
+   * or `memory://` — the default, an in-memory database
+   */
+  dataDir?: string;
+
+  /**
+   * User to connect as; permissions apply in its context (default: postgres)
+   */
+  username?: string;
+
+  /**
+   * Database of the cluster in `dataDir` to connect to (default: postgres)
+   */
+  database?: string;
+
+  /**
+   * Extensions to load, e.g. `{ pg_trgm }` from '@electric-sql/pglite/contrib/pg_trgm'.
+   * An extension must be registered here before `CREATE EXTENSION` can succeed.
+   */
+  extensions?: Record<string, any>;
+
+  /**
+   * A tarball of a data directory (a Blob/File, e.g. from `dumpDataDir()`) to start from
+   */
+  loadDataDir?: unknown;
+
+  /**
+   * Result parsers by type OID, merged over the defaults (int8 as a string, bytea as a
+   * Buffer); an entry replaces the default for its OID: `{ 20: value => BigInt(value) }`
+   */
+  parsers?: Record<number, (value: string, typeId?: number) => any>;
+
+  /**
+   * Parameter serializers by type OID, merged over the defaults (a Date bound to date,
+   * timestamp or timestamptz is sent in local time, like pg)
+   */
+  serializers?: Record<number, (value: any) => string>;
+
+  /**
+   * Return results without waiting for storage flushes to complete (default: false)
+   */
+  relaxedDurability?: boolean;
+
+  /**
+   * Initial memory, in bytes, allocated for the instance
+   */
+  initialMemory?: number;
+
+  /**
+   * Postgres debug level, 0 (off) to 5; logs go to the console
+   */
+  debug?: 0 | 1 | 2 | 3 | 4 | 5;
+
+  /**
+   * A filesystem instance, as an alternative to `dataDir`
+   */
+  fs?: unknown;
+
+  /**
+   * Advanced PGlite options, passed through as-is
+   */
+  noInitDb?: boolean;
+  icuDataDir?: unknown;
+  pgliteWasmModule?: unknown;
+  initdbWasmModule?: unknown;
+  fsBundle?: unknown;
+  startParams?: string[];
+  initDbStartParams?: string[];
+  postgresqlconf?: string[] | string;
+}

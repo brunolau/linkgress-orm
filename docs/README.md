@@ -13,7 +13,7 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 
 - **[Installation](./installation.md)** - Detailed installation instructions
   - Core installation
-  - Database client options (`pg` vs `postgres`)
+  - Database client options (`pg`, `postgres`, PGlite)
   - Environment-specific setup
   - Troubleshooting
 
@@ -21,6 +21,7 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Client comparison
   - PgClient setup
   - PostgresClient setup
+  - PGliteClient setup (PostgreSQL in WASM, in-process — no server)
   - Custom client implementation
 
 ### 📖 Guides
@@ -70,6 +71,14 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Statement-text economy (`inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt`)
   - Per-query overrides (`.withQueryOptions()`, `.withTimeout()`, `.expectedExecutionTime()`)
   - Process-wide settings (`LinkgressConfig`) and opt-in query-build caches
+
+#### Testing Without a Server
+- **[In-Memory Database](./guides/in-memory-database.md)** - PostgreSQL-compatible database reached through the real drivers
+  - Snapshots, worker threads, a TCP endpoint for other processes
+  - Running an existing suite in memory
+- **[PGlite](./database-clients.md#3-pgliteclient-pglite)** - PostgreSQL itself compiled to WASM, in-process through `PGliteClient`
+  - In-memory or persisted to a directory, extensions, browsers
+  - This repository's suite on it: `pnpm test:pglite`
 
 ### 🚀 Advanced Topics
 
