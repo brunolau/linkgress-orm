@@ -216,7 +216,7 @@ function transformRangeVar(an: Analyzer, pstate: ParseState, rv: A.RangeVar): Fr
         eref: { aliasname: rv.alias?.name ?? enr.name, colnames: checkAliasColumns(rv.alias, live.map((c) => c.name), enr.name) },
         colTypes: live.map((c) => ({ type: c.typeOid, typmod: c.typmod, collation: c.collation })),
         lateral: false,
-        transitionRows: enr.rows.map((data) => live.map((c) => (c.attnum - 1 < data.length ? data[c.attnum - 1] : c.hasMissing ? c.missingValue : null))),
+        transitionName: enr.name,
         rowTypeOid: enr.rel.rowTypeOid || undefined,
       };
       const rtIndex = addRte(pstate, rte);

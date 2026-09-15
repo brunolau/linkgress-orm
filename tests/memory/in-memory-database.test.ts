@@ -14,6 +14,46 @@ const postgresModule = realDrivers?.postgres ?? require('postgres');
 const postgres = postgresModule.default ?? postgresModule;
 
 describe('in-memory database API', () => {
+  test('dead row versions are vacuumed once no snapshot can see them', async () => {
+    const db = createInMemoryDatabase();
+    const a = new Client(db.pgPoolConfig());
+    const b = new Client(db.pgPoolConfig());
+    await a.connect();
+    await b.connect();
+    const tuples = () => db.engine.stats().allTuples;
+    await a.query('create table churn(id int primary key, v text)');
+    await a.query(`insert into churn select g, 'v' || g from generate_series(1, 100) g`);
+    // versions replaced by committed updates (21 versions per row without vacuum)
+    for (let i = 0; i < 20; i++) {
+      await a.query(`update churn set v = v || 'x'`);
+    }
+    expect(tuples()).toBeLessThanOrEqual(200);
+    // inserts of rolled-back transactions
+    for (let i = 0; i < 10; i++) {
+      await a.query('begin');
+      await a.query('insert into churn select g, null from generate_series(1000, 1100) g');
+      await a.query('rollback');
+    }
+    expect(tuples()).toBeLessThanOrEqual(201);
+    expect((await a.query(`select count(*)::int as n, count(*) filter (where v like 'v%xxxxxxxxxxxxxxxxxxxx')::int as updated from churn`)).rows[0]).toEqual({ n: 100, updated: 100 });
+
+    // an open REPEATABLE READ snapshot keeps every version it can see
+    await b.query('begin isolation level repeatable read');
+    expect((await b.query('select count(*)::int as n from churn')).rows[0].n).toBe(100);
+    await a.query('delete from churn where id <= 90');
+    for (let i = 0; i < 20; i++) {
+      await a.query(`update churn set v = v || 'y'`);
+    }
+    expect((await b.query(`select count(*)::int as n, min(id) as lo, count(*) filter (where v like '%y')::int as newer from churn`)).rows[0]).toEqual({ n: 100, lo: 1, newer: 0 });
+    await b.query('commit');
+    // the next transaction end may remove them
+    await a.query(`update churn set v = v || 'z'`);
+    expect((await b.query(`select count(*)::int as n, count(*) filter (where v like '%yz')::int as newest from churn`)).rows[0]).toEqual({ n: 10, newest: 10 });
+    expect(tuples()).toBeLessThanOrEqual(20);
+    await a.end();
+    await b.end();
+  });
+
   test('snapshot and fork are independent copies of the committed state', async () => {
     const db = createInMemoryDatabase({ databaseName: 'api_snap' });
     const client = new Client(db.pgPoolConfig());

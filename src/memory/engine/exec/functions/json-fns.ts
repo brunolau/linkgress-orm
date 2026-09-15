@@ -105,6 +105,34 @@ function isValidJsonNumber(s: string): boolean {
   return /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/.test(s);
 }
 
+const INTEGER_JSON_TYPES = new Set<number>([TypeOid.int2, TypeOid.int4, TypeOid.int8]);
+
+/**
+ * JSON text of timestamps, per session time zone (the zone object; null for timestamp without time zone).
+ * Result sets repeat the same instants (days, slot bounds) many times; the formatted text contains no
+ * character JSON escapes, so it is quoted directly.
+ */
+const TIMESTAMP_JSON_MAX = 20000;
+const timestampJsonByZone = new WeakMap<object, Map<number, string>>();
+const timestampJsonNoZone = new Map<number, string>();
+
+function timestampJson(ts: number, zone: object | null): string {
+  let cache = zone ? timestampJsonByZone.get(zone) : timestampJsonNoZone;
+  if (!cache) {
+    cache = new Map();
+    timestampJsonByZone.set(zone!, cache);
+  }
+  let text = cache.get(ts);
+  if (text === undefined) {
+    text = '"' + formatTimestampJson(ts, zone as Parameters<typeof formatTimestampJson>[1]) + '"';
+    if (cache.size >= TIMESTAMP_JSON_MAX) {
+      cache.clear();
+    }
+    cache.set(ts, text);
+  }
+  return text;
+}
+
 /** datum_to_json */
 export function datumToJson(v: unknown, type: number, fc: FnCall, keyScalar = false): string {
   if (v === null || v === undefined) {
@@ -122,6 +150,10 @@ export function datumToJson(v: unknown, type: number, fc: FnCall, keyScalar = fa
     case 'bool':
       return keyScalar ? `"${v ? 'true' : 'false'}"` : v ? 'true' : 'false';
     case 'numeric': {
+      if (!keyScalar && INTEGER_JSON_TYPES.has(base) && (typeof v === 'number' || typeof v === 'bigint')) {
+        // an integer's text is always a JSON number
+        return String(v);
+      }
       const s = outputValue(base, v, io);
       if (!keyScalar && isValidJsonNumber(s)) {
         return s;
@@ -131,9 +163,9 @@ export function datumToJson(v: unknown, type: number, fc: FnCall, keyScalar = fa
     case 'date':
       return escapeJsonString(formatDate(v as number));
     case 'timestamp':
-      return escapeJsonString(formatTimestampJson(v as number, null));
+      return timestampJson(v as number, null);
     case 'timestamptz':
-      return escapeJsonString(formatTimestampJson(v as number, io.zone));
+      return timestampJson(v as number, io.zone as unknown as object);
     case 'json':
       return v as string;
     case 'jsonb':
@@ -209,6 +241,15 @@ export function datumToJsonb(v: unknown, type: number, fc: FnCall, keyScalar = f
         }
         return keyScalar ? n.toString() : n;
       }
+      if (!keyScalar && INTEGER_JSON_TYPES.has(base)) {
+        // an integer is a JSON number of scale 0
+        if (typeof v === 'bigint') {
+          return PgNumeric.fromBigInt(v);
+        }
+        if (typeof v === 'number' && Number.isSafeInteger(v)) {
+          return PgNumeric.fromInt(v);
+        }
+      }
       const s = outputValue(base, v, io);
       if (!keyScalar && isValidJsonNumber(s)) {
         return PgNumeric.parse(s);
@@ -237,8 +278,36 @@ export function datumToJsonb(v: unknown, type: number, fc: FnCall, keyScalar = f
   }
 }
 
+/**
+ * jsonb key order of a record's field names (the same names array serves every row of a row type): the
+ * sorted keys and, per key, the field it comes from. null when a name repeats (the later field wins there).
+ */
+const jsonbKeyLayouts = new WeakMap<string[], { keys: string[]; fields: number[] } | null>();
+
+function jsonbKeyLayout(names: string[]): { keys: string[]; fields: number[] } | null {
+  let layout = jsonbKeyLayouts.get(names);
+  if (layout === undefined) {
+    const fields = names.map((_, i) => i).sort((a, b) => compareJsonbKeys(names[a], names[b]));
+    const keys = fields.map((i) => names[i]);
+    layout = keys.some((k, i) => i > 0 && k === keys[i - 1]) ? null : { keys, fields };
+    jsonbKeyLayouts.set(names, layout);
+  }
+  return layout;
+}
+
 export function compositeToJsonb(rec: PgRecord, fc: FnCall): JsonbValue {
   const { names, types } = recordFieldInfo(rec, fc.st.catalog);
+  const layout = names.length === rec.values.length ? jsonbKeyLayout(names) : null;
+  if (layout) {
+    const converted = new Array(names.length);
+    for (let i = 0; i < names.length; i++) {
+      converted[i] = datumToJsonb(rec.values[i], types[i], fc);
+    }
+    return new JsonbObject(
+      layout.keys,
+      layout.fields.map((f) => converted[f])
+    );
+  }
   const pairs: [string, JsonbValue][] = [];
   for (let i = 0; i < rec.values.length; i++) {
     pairs.push([names[i], datumToJsonb(rec.values[i], types[i], fc)]);
@@ -518,17 +587,21 @@ export const JSON_FUNCS: Record<string, FnImpl> = {
   json_build_object: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
     buildObjectArgs(a, fc, 'json_build_object');
-    const parts: string[] = [];
+    let text = '{';
     for (let i = 0; i < a.length; i += 2) {
       const key = datumToJson(a[i], types[i], fc, true);
-      parts.push(key + ' : ' + datumToJson(a[i + 1], types[i + 1], fc));
+      text += (i === 0 ? '' : ', ') + key + ' : ' + datumToJson(a[i + 1], types[i + 1], fc);
     }
-    return '{' + parts.join(', ') + '}';
+    return text + '}';
   },
   json_build_object_noargs: () => '{}',
   json_build_array: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
-    return '[' + a.map((v, i) => datumToJson(v, types[i], fc)).join(', ') + ']';
+    let text = '[';
+    for (let i = 0; i < a.length; i++) {
+      text += (i === 0 ? '' : ', ') + datumToJson(a[i], types[i], fc);
+    }
+    return text + ']';
   },
   json_build_array_noargs: () => '[]',
   jsonb_build_object: (args, fc) => {

@@ -31,6 +31,8 @@ export interface DmlHost extends ExecutorHost {
   isConstraintDeferred(con: Constraint): boolean;
   /** queue a check until COMMIT or SET CONSTRAINTS ... IMMEDIATE; it runs with a DmlExecutor of that moment */
   deferConstraintCheck(con: Constraint, run: (dml: DmlExecutor) => void): void;
+  /** a tuple version was written to the heap (`inserted`: a new version), for autovacuum */
+  noteHeapWrite(heap: Heap, inserted: boolean): void;
 }
 
 interface UniqueIndexInfo {
@@ -335,11 +337,19 @@ export class DmlExecutor {
     return null;
   }
 
-  private checkUniques(info: TableInfo, heap: Heap, data: unknown[], self: Tuple, relForMessages: Relation): void {
+  /** `replaced`: the version an UPDATE replaces — an index key it leaves unchanged needs no check (as a HOT update adds no index entry) */
+  private checkUniques(info: TableInfo, heap: Heap, data: unknown[], self: Tuple, relForMessages: Relation, replaced?: Tuple): void {
+    const typeOps = this.st.session.typeOps;
     for (const u of info.uniques) {
       const k = u.keyOf(data, self);
       if (k === null) {
         continue;
+      }
+      if (replaced) {
+        const before = u.keyOf(replaced.data, replaced);
+        if (before !== null && this.compositeKey(u.keyTypes, before, typeOps) === this.compositeKey(u.keyTypes, k, typeOps)) {
+          continue;
+        }
       }
       const conflict = this.findConflict(heap, u, k, self);
       if (conflict) {
@@ -645,6 +655,7 @@ export class DmlExecutor {
     const xid = this.host.ensureXid(this.st);
     const t = heap.insert(rowData, xid, this.st.cid, this.st);
     this.undo().recordInsert(heap, t);
+    this.host.noteHeapWrite(heap, true);
     this.st.modifiedRelations.add(routed.rel.oid);
     this.checkUniques(tinfo, heap, rowData, t, routed.rel);
     return { tuple: t, rel: routed.rel, data: rowData };
@@ -684,8 +695,9 @@ export class DmlExecutor {
     this.undo().recordXmax(heap, old);
     const t = heap.update(old, data, xid, this.st.cid, this.st);
     this.undo().recordInsert(heap, t);
+    this.host.noteHeapWrite(heap, true);
     this.st.modifiedRelations.add(rel.oid);
-    this.checkUniques(info, heap, data, t, rel);
+    this.checkUniques(info, heap, data, t, rel, old);
     if (!fromRi) {
       // referencing side checked at end of statement by caller
     } else {
@@ -712,6 +724,7 @@ export class DmlExecutor {
     }
     this.undo().recordXmax(heap, t);
     heap.delete(t, xid, this.st.cid);
+    this.host.noteHeapWrite(heap, false);
     this.st.modifiedRelations.add(rel.oid);
     if (fromRi) {
       this.handleReferencedChange(info, t.data, null);

@@ -91,6 +91,10 @@ export function groupAndAggregate(executor: Executor, plan: QueryPlan, rows: Row
   const keyTypes = groupExprs.map((e) => e.type);
   const typeOps = executor.host.session.typeOps;
 
+  if (!q.groupingSets && q.aggs.every((a) => a.order.length === 0 && !a.distinct && a.directArgs.length === 0)) {
+    return hashAggregate(executor, plan, rows, base, keyEvs, keyTypes);
+  }
+
   const groups: Group[] = [];
   const sets = q.groupingSets ?? [groupExprs.map((_, i) => i)];
   const inputCtxs = rows.map((r) => executor.rowCtx(r, base));
@@ -159,6 +163,152 @@ export function groupAndAggregate(executor: Executor, plan: QueryPlan, rows: Row
     ctx.groupingMask = g.mask;
     const rowCtxs = g.rows.map((i) => inputCtxs[i]);
     ctx.aggValues = aggs.map((agg, ai) => computeAggregate(executor, agg, aggImpls[ai], aggArgEvs[ai], aggDirectEvs[ai], aggFilterEvs[ai], aggOrderEvs[ai], rowCtxs, ctx));
+    if (having && having(ctx) !== true) {
+      continue;
+    }
+    out.push(ctx);
+  }
+  return out;
+}
+
+interface HashGroup {
+  keyValues: unknown[];
+  /** the group's first input row (ungrouped columns of the target list read it) */
+  rep: Row;
+  states: unknown[];
+}
+
+/**
+ * One grouping set, aggregates without ORDER BY / DISTINCT / direct arguments: like PostgreSQL's
+ * HashAggregate, each input row is hashed into its group and fed to the transition functions right
+ * away — no per-row contexts, key arrays or per-group input lists. Groups come out in first-seen order.
+ */
+function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: EvalCtx, keyEvs: Evaluator[], keyTypes: number[]): EvalCtx[] {
+  const q = plan.q;
+  const typeOps = executor.host.session.typeOps;
+  const aggs = q.aggs;
+  const na = aggs.length;
+  const aggImpls = aggs.map((a) => {
+    const impl = lookupAggregate(a, typeOps);
+    if (!impl) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `in-memory engine: aggregate ${a.aggName} is not implemented`);
+    }
+    return impl;
+  });
+  const aggArgEvs = aggs.map((a) => a.args.map((x) => plan.ev(x)));
+  const aggFilterEvs = aggs.map((a) => (a.filter ? plan.ev(a.filter) : null));
+  // rows whose arguments hold a NULL are skipped by strict transition functions (count(*) takes none)
+  const skipNulls = aggs.map((a, ai) => aggImpls[ai].strict !== false && !a.star);
+  // the call information depends on the aggregate only (no direct arguments here): shared by all groups
+  const fcs: FnCall[] = aggs.map((a) => ({
+    st: executor.st,
+    argTypes: a.args.map((x) => x.type),
+    resultType: a.type,
+    resultTypmod: a.typmod,
+    collation: a.inputCollation,
+    node: a,
+  }));
+  const nk = keyEvs.length;
+  const groups: HashGroup[] = [];
+  const root = new Map<unknown, unknown>();
+  const newGroup = (keyValues: unknown[], rep: Row): HashGroup => {
+    const states = new Array(na);
+    for (let ai = 0; ai < na; ai++) {
+      states[ai] = aggImpls[ai].init(fcs[ai]);
+    }
+    const g: HashGroup = { keyValues, rep, states };
+    groups.push(g);
+    return g;
+  };
+  if (nk === 0) {
+    // no GROUP BY: one group, also over no rows
+    newGroup([], rows.length > 0 ? rows[0] : base.row.slice());
+  }
+  // evaluation does not keep its context: one context walks the input rows
+  const sc = executor.rowCtx(base.row, base);
+  const kv: unknown[] = new Array(nk).fill(null);
+  const last = nk - 1;
+  // hash keys of the previous row's leading columns and the map they lead to: neighbouring input rows
+  // mostly share them (same product, season, day, ...), which then skips walking the tree
+  const prevKeys: unknown[] = new Array(Math.max(last, 0)).fill(null);
+  let prevLevel: Map<unknown, unknown> | null = null;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    sc.row = r;
+    let g: HashGroup;
+    if (nk === 0) {
+      g = groups[0];
+    } else {
+      for (let k = 0; k < nk; k++) {
+        kv[k] = keyEvs[k](sc);
+      }
+      // a tree of maps, one level per key column (hash keys are primitives): no composite key strings
+      let level = root;
+      let k = 0;
+      if (prevLevel !== null) {
+        while (k < last && typeOps.hashKey(keyTypes[k], kv[k]) === prevKeys[k]) {
+          k++;
+        }
+        if (k === last) {
+          level = prevLevel;
+        } else {
+          k = 0;
+        }
+      }
+      if (level === root) {
+        for (; k < last; k++) {
+          const hk = typeOps.hashKey(keyTypes[k], kv[k]);
+          prevKeys[k] = hk;
+          let next = level.get(hk) as Map<unknown, unknown> | undefined;
+          if (!next) {
+            next = new Map();
+            level.set(hk, next);
+          }
+          level = next;
+        }
+        prevLevel = level;
+      }
+      const leafKey = typeOps.hashKey(keyTypes[last], kv[last]);
+      let found = level.get(leafKey) as HashGroup | undefined;
+      if (!found) {
+        found = newGroup(kv.slice(), r);
+        level.set(leafKey, found);
+      }
+      g = found;
+    }
+    for (let ai = 0; ai < na; ai++) {
+      const filterEv = aggFilterEvs[ai];
+      if (filterEv && filterEv(sc) !== true) {
+        continue;
+      }
+      const evs = aggArgEvs[ai];
+      const n = evs.length;
+      const args = new Array(n);
+      let hasNull = false;
+      for (let x = 0; x < n; x++) {
+        const v = evs[x](sc);
+        if (v === null) {
+          hasNull = true;
+        }
+        args[x] = v;
+      }
+      if (hasNull && skipNulls[ai]) {
+        continue;
+      }
+      g.states[ai] = aggImpls[ai].step(g.states[ai], args, fcs[ai]);
+    }
+  }
+  const having = q.havingQual ? plan.ev(q.havingQual) : null;
+  const out: EvalCtx[] = [];
+  for (const g of groups) {
+    const ctx = executor.rowCtx(g.rep, base);
+    ctx.groupKeys = g.keyValues;
+    ctx.groupingMask = 0;
+    const values = new Array(na);
+    for (let ai = 0; ai < na; ai++) {
+      values[ai] = aggImpls[ai].final(g.states[ai], fcs[ai]);
+    }
+    ctx.aggValues = values;
     if (having && having(ctx) !== true) {
       continue;
     }

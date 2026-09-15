@@ -456,10 +456,11 @@ export interface CatalogRTE {
   colTypes: TypeInfo[];
   lateral: false;
   /**
-   * A trigger's transition table (an ephemeral named relation): its rows, one value per live column of
-   * the table `relOid`, whose row type the whole-row reference has.
+   * A trigger's transition table (an ephemeral named relation) of that name, over the table `relOid`
+   * (whose row type the whole-row reference has). The rows are the running trigger's, looked up when the
+   * statement executes: the analyzed statement does not hold them, so it can be reused.
    */
-  transitionRows?: unknown[][];
+  transitionName?: string;
   rowTypeOid?: number;
 }
 

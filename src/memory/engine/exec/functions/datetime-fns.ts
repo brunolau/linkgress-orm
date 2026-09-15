@@ -162,52 +162,76 @@ function truncUnitError(field: string, typeName: string): PgError {
 
 const VALID_UNITS = new Set(['microseconds', 'milliseconds', 'second', 'minute', 'hour', 'day', 'week', 'month', 'quarter', 'year', 'decade', 'century', 'millennium']);
 
+const UNIT_ALIASES = new Map<string, string>([
+  ['microsecond', 'microseconds'],
+  ['us', 'microseconds'],
+  ['usec', 'microseconds'],
+  ['usecs', 'microseconds'],
+  ['millisecond', 'milliseconds'],
+  ['ms', 'milliseconds'],
+  ['msec', 'milliseconds'],
+  ['msecs', 'milliseconds'],
+  ['seconds', 'second'],
+  ['sec', 'second'],
+  ['secs', 'second'],
+  ['s', 'second'],
+  ['minutes', 'minute'],
+  ['min', 'minute'],
+  ['mins', 'minute'],
+  ['m', 'minute'],
+  ['hours', 'hour'],
+  ['hr', 'hour'],
+  ['hrs', 'hour'],
+  ['h', 'hour'],
+  ['days', 'day'],
+  ['d', 'day'],
+  ['weeks', 'week'],
+  ['w', 'week'],
+  ['months', 'month'],
+  ['mon', 'month'],
+  ['mons', 'month'],
+  ['quarters', 'quarter'],
+  ['qtr', 'quarter'],
+  ['years', 'year'],
+  ['yr', 'year'],
+  ['yrs', 'year'],
+  ['y', 'year'],
+  ['decades', 'decade'],
+  ['dec', 'decade'],
+  ['centuries', 'century'],
+  ['cent', 'century'],
+  ['c', 'century'],
+  ['millennia', 'millennium'],
+  ['millenniums', 'millennium'],
+  ['mil', 'millennium'],
+]);
+
 function normUnit(u: string): string {
   const l = u.toLowerCase();
-  const map: Record<string, string> = {
-    microsecond: 'microseconds',
-    us: 'microseconds',
-    usec: 'microseconds',
-    usecs: 'microseconds',
-    millisecond: 'milliseconds',
-    ms: 'milliseconds',
-    msec: 'milliseconds',
-    msecs: 'milliseconds',
-    seconds: 'second',
-    sec: 'second',
-    secs: 'second',
-    s: 'second',
-    minutes: 'minute',
-    min: 'minute',
-    mins: 'minute',
-    m: 'minute',
-    hours: 'hour',
-    hr: 'hour',
-    hrs: 'hour',
-    h: 'hour',
-    days: 'day',
-    d: 'day',
-    weeks: 'week',
-    w: 'week',
-    months: 'month',
-    mon: 'month',
-    mons: 'month',
-    quarters: 'quarter',
-    qtr: 'quarter',
-    years: 'year',
-    yr: 'year',
-    yrs: 'year',
-    y: 'year',
-    decades: 'decade',
-    dec: 'decade',
-    centuries: 'century',
-    cent: 'century',
-    c: 'century',
-    millennia: 'millennium',
-    millenniums: 'millennium',
-    mil: 'millennium',
-  };
-  return map[l] ?? l;
+  return UNIT_ALIASES.get(l) ?? l;
+}
+
+/** Fixed-length units: truncation is arithmetic on the microsecond count (what timestampToTm / tmToTimestamp compute). */
+const FIXED_UNIT_US = new Map<string, number>([
+  ['day', USECS_PER_DAY],
+  ['hour', USECS_PER_HOUR],
+  ['minute', USECS_PER_MINUTE],
+  ['second', USECS_PER_SEC],
+]);
+
+/** date_trunc of a finite local timestamp by a normalized, valid unit */
+function truncLocal(u: string, ts: number): number {
+  const unitUs = FIXED_UNIT_US.get(u);
+  if (unitUs === undefined) {
+    return tmToTimestamp(truncTm(u, timestampToTm(ts)));
+  }
+  let days = Math.floor(ts / USECS_PER_DAY);
+  let time = ts - days * USECS_PER_DAY;
+  if (time < 0) {
+    time += USECS_PER_DAY;
+    days -= 1;
+  }
+  return days * USECS_PER_DAY + Math.floor(time / unitUs) * unitUs;
 }
 
 function timestampTrunc(unit: string, ts: number, typeName: string): number {
@@ -218,7 +242,7 @@ function timestampTrunc(unit: string, ts: number, typeName: string): number {
   if (!VALID_UNITS.has(u)) {
     throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `unit "${unit}" not recognized for type ${typeName}`);
   }
-  return tmToTimestamp(truncTm(u, timestampToTm(ts)));
+  return truncLocal(u, ts);
 }
 
 function timestamptzTrunc(unit: string, ts: number, zone: ZoneSpec): number {
@@ -231,10 +255,10 @@ function timestamptzTrunc(unit: string, ts: number, zone: ZoneSpec): number {
   }
   const off = zoneOffsetAt(zone, ts);
   const local = ts + off * USECS_PER_SEC;
-  const truncated = tmToTimestamp(truncTm(u, timestampToTm(local)));
+  const truncated = truncLocal(u, local);
   if (u === 'microseconds' || u === 'milliseconds' || u === 'second' || u === 'minute' || u === 'hour') {
     // keep the original offset for sub-day truncation (no DST re-resolution) like PostgreSQL
-    return truncated - localToUtcOffset(zone, truncated) * USECS_PER_SEC;
+    return truncated - off * USECS_PER_SEC;
   }
   return truncated - localToUtcOffset(zone, truncated) * USECS_PER_SEC;
 }

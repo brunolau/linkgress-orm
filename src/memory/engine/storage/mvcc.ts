@@ -273,7 +273,10 @@ export class Heap {
   private seqCounter = 0;
   /** incremented on every physical change (for cached index structures) */
   version = 0;
+  /** versions that may be dead: deleted or replaced ones, and inserts of aborted transactions */
   deadCount = 0;
+  /** horizon of the last vacuum pass that had to keep possibly-dead versions (0: none) */
+  vacuumHorizon = 0;
   /**
    * Lazily built hash indexes over ALL tuple versions (visibility is checked by readers):
    * key spec -> map. Maintained incrementally on insert; invalidated by vacuum / undo.
@@ -393,24 +396,55 @@ export class Heap {
     }
   }
 
-  /** Remove tuples invisible to everyone. Preserves physical order of the remaining ones. */
-  vacuum(vis: Visibility, horizon: number): void {
-    if (this.deadCount < 64 || this.deadCount * 2 < this.tuples.length) {
-      return;
+  /** whether enough versions may be dead to make a pass worthwhile (autovacuum: 50 + 20 % of the tuples) */
+  needsVacuum(): boolean {
+    return this.deadCount >= VACUUM_BASE_THRESHOLD + this.tuples.length * VACUUM_SCALE_FACTOR;
+  }
+
+  /**
+   * Remove tuples invisible to everyone, preserving the physical order of the remaining ones, when enough
+   * versions may be dead (`needsVacuum`) and the horizon moved past the last pass that had to keep some.
+   * An xmax of an aborted transaction is cleared on the way (its version is live). Returns whether
+   * versions that may become removable remain.
+   */
+  vacuum(vis: Visibility, txns: TransactionTable, horizon: number): boolean {
+    if (!this.needsVacuum()) {
+      return false;
+    }
+    if (horizon <= this.vacuumHorizon) {
+      return true;
     }
     const kept: Tuple[] = [];
+    let pending = 0;
     for (const t of this.tuples) {
       if (vis.isDeadForAll(t, horizon)) {
         t.vacuumed = true;
-      } else {
-        kept.push(t);
+        continue;
       }
+      if (t.xmax !== INVALID_XID) {
+        if (txns.isAborted(t.xmax)) {
+          t.xmax = INVALID_XID;
+          t.cmax = 0;
+          t.next = null;
+        } else {
+          pending++;
+        }
+      }
+      kept.push(t);
     }
-    this.tuples = kept;
-    this.deadCount = 0;
-    this.invalidateIndexes();
+    if (kept.length !== this.tuples.length) {
+      this.tuples = kept;
+      this.invalidateIndexes();
+    }
+    this.deadCount = pending;
+    this.vacuumHorizon = pending > 0 ? horizon : 0;
+    return this.needsVacuum();
   }
 }
+
+/** autovacuum_vacuum_threshold / autovacuum_vacuum_scale_factor */
+const VACUUM_BASE_THRESHOLD = 50;
+const VACUUM_SCALE_FACTOR = 0.2;
 
 /** Undo log of physical tuple changes made by one statement (for lock-wait restarts). */
 export class UndoLog {

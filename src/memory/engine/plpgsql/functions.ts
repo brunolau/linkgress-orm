@@ -1,7 +1,7 @@
 import * as A from '../ast';
-import { ProcDef, Relation, TriggerDef, TypeOid } from '../catalog/catalog';
+import { Catalog, ProcDef, Relation, TriggerDef, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
-import { StatementState, TransitionCapture, TransitionTable } from '../exec/runtime';
+import { EvalCtx, StatementState, TransitionCapture, TransitionTable } from '../exec/runtime';
 import { Token, tokenize } from '../lexer';
 import type { FieldInfo, Session, StatementResult } from '../session';
 import type { UndoLog } from '../storage/mvcc';
@@ -32,6 +32,14 @@ export function callSqlFunction(session: Session, proc: ProcDef, args: unknown[]
   const names = inputArgNames(proc);
   const declared = proc.argtypes.length === args.length ? proc.argtypes : argTypes;
   const nested = nestedState(session, st, args, declared, names, proc.name);
+  const inlined = session.sqlFunctionExpression(proc, nested);
+  if (inlined) {
+    let v = inlined.ev(new EvalCtx([], null, nested));
+    if (inlined.type !== proc.rettype && v !== null) {
+      v = inputValue(proc.rettype, outputValue(inlined.type, v, session.io), -1, session.io);
+    }
+    return { value: v };
+  }
   let last: StatementResult | null = null;
   if (proc.sqlBody) {
     for (const stmt of proc.sqlBody) {
@@ -642,6 +650,26 @@ function splitTopLevel(text: string): string[] {
   return out;
 }
 
+/** tokens of the SQL a function body runs (the same statement texts run on every call); read-only */
+const statementTokenCache = new Map<string, Token[]>();
+const STATEMENT_TOKEN_CACHE_MAX = 5000;
+
+function statementTokens(sql: string): Token[] {
+  let toks = statementTokenCache.get(sql);
+  if (!toks) {
+    try {
+      toks = tokenize(sql);
+    } catch {
+      toks = [];
+    }
+    if (statementTokenCache.size >= STATEMENT_TOKEN_CACHE_MAX) {
+      statementTokenCache.clear();
+    }
+    statementTokenCache.set(sql, toks);
+  }
+  return toks;
+}
+
 class ReturnSignal {
   constructor(readonly value: unknown) {}
 }
@@ -729,17 +757,11 @@ class PlInterpreter {
 
   /** Replace variable references with $n parameters and run the SQL. */
   runSql(sql: string, frame: PlFrame, extraParams: { values: unknown[]; types: number[] } | null = null): StatementResult {
-    const vars = frame.all();
     const params: unknown[] = [];
     const types: number[] = [];
     const names = new Map<string, number>();
     let out = '';
-    let toks: Token[];
-    try {
-      toks = tokenize(sql);
-    } catch {
-      toks = [];
-    }
+    const toks = statementTokens(sql);
     let last = 0;
     for (let i = 0; i < toks.length; i++) {
       const t = toks[i];
@@ -1444,10 +1466,35 @@ function triggerAst(session: Session, funcOid: number): Extract<PlStmt, { k: 'bl
   return ast;
 }
 
+const NO_TRIGGERS: TriggerDef[] = [];
+/** the triggers of each relation in firing (name) order, per catalog version: a statement and each of its rows look them up */
+const triggersByRelation = new WeakMap<Catalog, { version: number; size: number; byRel: Map<number, TriggerDef[]> }>();
+
+function relationTriggers(cat: Catalog, relOid: number): TriggerDef[] {
+  let index = triggersByRelation.get(cat);
+  if (!index || index.version !== cat.version || index.size !== cat.triggers.size) {
+    const byRel = new Map<number, TriggerDef[]>();
+    for (const t of cat.triggers.values()) {
+      let list = byRel.get(t.relOid);
+      if (!list) {
+        list = [];
+        byRel.set(t.relOid, list);
+      }
+      list.push(t);
+    }
+    for (const list of byRel.values()) {
+      list.sort((a, b) => (a.name < b.name ? -1 : 1));
+    }
+    index = { version: cat.version, size: cat.triggers.size, byRel };
+    triggersByRelation.set(cat, index);
+  }
+  return index.byRel.get(relOid) ?? NO_TRIGGERS;
+}
+
 /** FOR EACH STATEMENT triggers of a relation (BEFORE ones run before the first row, AFTER ones at the end of the statement). */
 export function fireStatementTrigger(session: Session, rel: Relation, timing: 'BEFORE' | 'AFTER', event: 'INSERT' | 'UPDATE' | 'DELETE', st: StatementState, transition?: TransitionCapture): void {
   const cat = session.catalog();
-  const triggers = [...cat.triggers.values()].filter((t) => t.relOid === rel.oid && t.enabled && t.timing === timing && t.events.includes(event) && !t.forEachRow).sort((a, b) => (a.name < b.name ? -1 : 1));
+  const triggers = relationTriggers(cat, rel.oid).filter((t) => t.enabled && t.timing === timing && t.events.includes(event) && !t.forEachRow);
   for (const trig of triggers) {
     const ast = triggerAst(session, trig.funcOid);
     const interp = new PlInterpreter(session, st, TypeOid.record, false);
@@ -1491,7 +1538,7 @@ export function fireTrigger(
   transition?: TransitionCapture
 ): unknown[] | null | undefined {
   const cat = session.catalog();
-  const triggers = [...cat.triggers.values()].filter((t) => t.relOid === rel.oid && t.enabled && t.timing === timing && t.events.includes(event) && t.forEachRow).sort((a, b) => (a.name < b.name ? -1 : 1));
+  const triggers = relationTriggers(cat, rel.oid).filter((t) => t.enabled && t.timing === timing && t.events.includes(event) && t.forEachRow);
   if (triggers.length === 0) {
     return undefined;
   }

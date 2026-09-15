@@ -54,6 +54,8 @@ interface IndexLookup {
   any?: boolean;
   /** the key is an index expression (`search_normalize(internal_id) = $1`), not a column */
   expr?: { spec: string; ev: Evaluator };
+  /** the restriction the lookup answers */
+  conj?: Conjunct;
 }
 
 /** index expression keys that failed to evaluate for some tuple: such an index is not used */
@@ -113,7 +115,7 @@ export class QueryPlan {
           return col && col.hasMissing ? col.missingValue : null;
         }),
         colTypes: rte.colTypes.map((c) => c.type),
-        colNames: live.map((c) => c.name),
+        colNames: liveColumnNames(rel, live),
         rowType: rel.rowTypeOid || TypeOid.record,
         nrt: this.nrt,
         relOid: rel.oid,
@@ -134,6 +136,18 @@ export class QueryPlan {
     }
     return f;
   }
+}
+
+/** a relation's live column names: one array per relation definition, so values keyed by it (jsonb key order) are reused */
+const liveColumnNamesOf = new WeakMap<Relation, string[]>();
+
+function liveColumnNames(rel: Relation, live: Relation['columns']): string[] {
+  let names = liveColumnNamesOf.get(rel);
+  if (!names) {
+    names = live.map((c) => c.name);
+    liveColumnNamesOf.set(rel, names);
+  }
+  return names;
 }
 
 /** Per-execution state of one query level. */
@@ -158,6 +172,23 @@ export class Executor implements SubqueryRunner {
     readonly st: StatementState,
     readonly host: ExecutorHost
   ) {}
+
+  private transitionData: Map<string, unknown[][]> | null = null;
+
+  /** The rows of a transition table of the trigger function running this statement, one value per live column. */
+  private transitionRows(name: string): unknown[][] {
+    let rows = this.transitionData?.get(name);
+    if (!rows) {
+      const enr = this.st.transitionTables?.find((t) => t.name === name);
+      if (!enr) {
+        throw new PgError(SqlState.UNDEFINED_TABLE, `relation "${name}" does not exist`);
+      }
+      const live = enr.rel.columns.filter((c) => !c.isDropped);
+      rows = enr.rows.map((data) => live.map((c) => (c.attnum - 1 < data.length ? data[c.attnum - 1] : c.hasMissing ? c.missingValue : null)));
+      (this.transitionData ??= new Map()).set(name, rows);
+    }
+    return rows;
+  }
 
   planFor(q: Query, parent: QueryPlan | null): QueryPlan {
     let p = this.plans.get(q);
@@ -186,7 +217,9 @@ export class Executor implements SubqueryRunner {
     try {
       const plan = this.planFromCtx(q, outer);
       const inst = new QueryInstance(plan);
-      const base = new EvalCtx(new Array(plan.nrt * 2), outer, this.st);
+      // filled, not holey: every row of this level is a copy of the base row, and JavaScriptCore copies an
+      // array that only has holes on a slow path (~10x slower than one holding undefined)
+      const base = new EvalCtx(new Array(plan.nrt * 2).fill(undefined), outer, this.st);
       base.inst = inst;
       if (q.commandType !== 'select') {
         return this.host.executeModify(q, base, this);
@@ -250,6 +283,8 @@ export class Executor implements SubqueryRunner {
     let ctxRows: EvalCtx[];
     if (q.hasAggs || q.groupClause.length > 0 || q.havingQual || q.groupingSets) {
       ctxRows = groupAndAggregate(this, plan, rows, base);
+    } else if (!q.hasWindowFuncs && !q.hasTargetSRFs && q.rowMarks.length === 0) {
+      return this.projectPlain(plan, base, rows, limit);
     } else {
       ctxRows = rows.map((r) => {
         const c = new EvalCtx(r, base.parent, this.st);
@@ -286,7 +321,7 @@ export class Executor implements SubqueryRunner {
 
     // DISTINCT
     if (q.distinctClause) {
-      projected = this.applyDistinct(plan, projected);
+      projected = this.applyDistinct(plan, projected, (p) => p.out);
     }
 
     // ORDER BY
@@ -329,6 +364,64 @@ export class Executor implements SubqueryRunner {
       return result.map((r) => r.out);
     }
     return result.map((r) => visibleIdx.map((i) => r.out[i]));
+  }
+
+  /**
+   * executeSelect's projection, DISTINCT, ORDER BY and LIMIT for rows nothing groups, windows, expands or
+   * locks: nothing after the projection needs a row's context, so one context walks the rows and only the
+   * output arrays are kept.
+   */
+  private projectPlain(plan: QueryPlan, base: EvalCtx, rows: Row[], limit: number | undefined): unknown[][] {
+    const q = plan.q;
+    const tlist = q.targetList;
+    const nt = tlist.length;
+    const evs = tlist.map((te) => plan.ev(te.expr));
+    const sc = this.rowCtx(base.row, base);
+    let outs: unknown[][] = new Array(rows.length);
+    for (let i = 0; i < rows.length; i++) {
+      sc.row = rows[i];
+      const out = new Array(nt);
+      for (let j = 0; j < nt; j++) {
+        out[j] = evs[j](sc);
+      }
+      outs[i] = out;
+    }
+    if (q.distinctClause) {
+      outs = this.applyDistinct(plan, outs, (o) => o);
+    }
+    let cmp: ((a: unknown[], b: unknown[]) => number) | null = null;
+    if (q.sortClause.length > 0) {
+      cmp = this.makeRowComparator(plan, q.sortClause);
+      pgQsort(outs, cmp);
+    }
+    const offset = q.limitOffset ? this.evalLimit(plan.ev(q.limitOffset)(base), 'OFFSET') : 0;
+    let count = q.limitCount ? this.evalLimit(plan.ev(q.limitCount)(base), 'LIMIT') : Infinity;
+    if (q.limitCount && plan.ev(q.limitCount)(base) === null) {
+      count = Infinity;
+    }
+    if (offset > 0 || count !== Infinity) {
+      let end = count === Infinity ? outs.length : offset + count;
+      if (q.limitWithTies && count !== Infinity && end < outs.length && end > offset) {
+        const tieCmp = cmp ?? this.makeRowComparator(plan, q.sortClause);
+        while (end < outs.length && tieCmp(outs[end - 1], outs[end]) === 0) {
+          end++;
+        }
+      }
+      outs = outs.slice(offset, end);
+    }
+    if (limit !== undefined && outs.length > limit) {
+      outs = outs.slice(0, limit);
+    }
+    const visibleIdx: number[] = [];
+    for (let i = 0; i < nt; i++) {
+      if (!tlist[i].resjunk) {
+        visibleIdx.push(i);
+      }
+    }
+    if (visibleIdx.length === nt) {
+      return outs;
+    }
+    return outs.map((out) => visibleIdx.map((i) => out[i]));
   }
 
   evalLimit(v: unknown, what: string): number {
@@ -380,39 +473,29 @@ export class Executor implements SubqueryRunner {
     };
   }
 
-  private applyDistinct(plan: QueryPlan, rows: { out: unknown[]; ctx: EvalCtx }[]): { out: unknown[]; ctx: EvalCtx }[] {
+  private applyDistinct<T>(plan: QueryPlan, rows: T[], outOf: (r: T) => unknown[]): T[] {
     const q = plan.q;
     const clauses = q.distinctClause!;
     const idxs = clauses.map((sc) => q.targetList.findIndex((t) => t.sortGroupRef === sc.tleSortGroupRef));
     const types = idxs.map((i) => q.targetList[i].expr.type);
     const typeOps = this.host.session.typeOps;
-    if (q.hasDistinctOn) {
+    if (q.hasDistinctOn && q.sortClause.length > 0) {
       // DISTINCT ON: keep the first row of each group in ORDER BY order
-      if (q.sortClause.length > 0) {
-        const cmp = this.makeRowComparator(plan, q.sortClause);
-        pgQsort(rows, (a, b) => cmp(a.out, b.out));
-      }
-      const seen = new Set<unknown>();
-      const out: { out: unknown[]; ctx: EvalCtx }[] = [];
-      for (const r of rows) {
-        const key = typeOps.multiKey(
-          types,
-          idxs.map((i) => r.out[i])
-        );
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push(r);
-        }
-      }
-      return out;
+      const cmp = this.makeRowComparator(plan, q.sortClause);
+      pgQsort(rows, (a, b) => cmp(outOf(a), outOf(b)));
     }
     const seen = new Set<unknown>();
-    const out: { out: unknown[]; ctx: EvalCtx }[] = [];
+    const out: T[] = [];
+    const single = idxs.length === 1 ? idxs[0] : -1;
     for (const r of rows) {
-      const key = typeOps.multiKey(
-        types,
-        idxs.map((i) => r.out[i])
-      );
+      const o = outOf(r);
+      const key =
+        single >= 0
+          ? typeOps.hashKey(types[0], o[single])
+          : typeOps.multiKey(
+              types,
+              idxs.map((i) => o[i])
+            );
       if (!seen.has(key)) {
         seen.add(key);
         out.push(r);
@@ -709,8 +792,9 @@ export class Executor implements SubqueryRunner {
     const remaining = conjuncts.filter((c) => !c.used);
     if (remaining.length > 0) {
       const evs = remaining.map((c) => plan.ev(c.expr));
+      const c = this.rowCtx(base.row, base);
       rows = rows.filter((r) => {
-        const c = this.rowCtx(r, base);
+        c.row = r;
         for (const ev of evs) {
           if (ev(c) !== true) {
             return false;
@@ -789,10 +873,18 @@ export class Executor implements SubqueryRunner {
         p.used = true;
       }
       if (leftRows.length === 1 && available.size === 0) {
-        // first item: merge the base row
+        // first item: merge the base row. Every producer builds its rows as fresh copies of the base row
+        // (`ctx.row.slice()` with the base context), so they already are the merged rows — unless the
+        // base row carries values of its own, which only then need copying in.
         const b = leftRows[0];
-        itemRows = itemRows.map((r) => mergeRows(b, r, itemRels, plan.nrt));
-        out = itemRows;
+        let baseHasValues = false;
+        for (let i = 0; i < b.length; i++) {
+          if (b[i] !== undefined && !itemRels.has(i % plan.nrt)) {
+            baseHasValues = true;
+            break;
+          }
+        }
+        out = baseHasValues ? itemRows.map((r) => mergeRows(b, r, itemRels, plan.nrt)) : itemRows;
       } else {
         out = this.innerJoin(plan, base, leftRows, itemRows, available, itemRels, joinConj);
       }
@@ -1030,9 +1122,12 @@ export class Executor implements SubqueryRunner {
     const typeOps = this.host.session.typeOps;
     const checks = [...rightFilters, ...quals.filter((c) => c !== probe!.conj)].map((c) => plan.ev(c.expr));
     const out: Row[] = [];
+    // one context for the probe values and checks of every row (evaluation does not keep it)
+    const sc = this.rowCtx(ctx.row, ctx);
     for (const l of leftRows) {
       let matched = false;
-      const value = probe.value(this.rowCtx(l, ctx));
+      sc.row = l;
+      const value = probe.value(sc);
       const candidates = value === null ? undefined : index.get(hashFamilyKey(probe.valueType, value, typeOps));
       if (candidates) {
         for (const t of candidates) {
@@ -1045,7 +1140,8 @@ export class Executor implements SubqueryRunner {
           m[rtIndex] = t.data;
           m[nrt + rtIndex] = t;
           if (checks.length > 0) {
-            const mc = this.rowCtx(m, ctx);
+            const mc = sc;
+            mc.row = m;
             let ok = true;
             for (const ev of checks) {
               if (ev(mc) !== true) {
@@ -1087,8 +1183,9 @@ export class Executor implements SubqueryRunner {
     const leftover = quals.filter((c) => !handed.includes(c));
     if (leftover.length > 0) {
       const evs = leftover.map((c) => plan.ev(c.expr));
+      const rc = this.rowCtx(ctx.row, ctx);
       rows = rows.filter((r) => {
-        const rc = this.rowCtx(r, ctx);
+        rc.row = r;
         for (const ev of evs) {
           if (ev(rc) !== true) {
             return false;
@@ -1190,11 +1287,12 @@ export class Executor implements SubqueryRunner {
     }
 
     const qualEvs = quals.map((c) => plan.ev(c.expr));
+    const mc = this.rowCtx(ctx.row, ctx);
     const matchesFn = (m: Row): boolean => {
       if (qualEvs.length === 0) {
         return true;
       }
-      const mc = this.rowCtx(m, ctx);
+      mc.row = m;
       for (const ev of qualEvs) {
         if (ev(mc) !== true) {
           return false;
@@ -1217,8 +1315,9 @@ export class Executor implements SubqueryRunner {
         if (hashKeys.length > 0) {
           const residual = quals.filter((c) => !hashKeys.some((h) => h.conj === c)).map((c) => plan.ev(c.expr));
           const buckets = new Map<unknown, Row[]>();
+          const rc = this.rowCtx(ctx.row, ctx);
           for (const r of rightRows) {
-            const rc = this.rowCtx(r, ctx);
+            rc.row = r;
             const key = this.compositeHashKey(hashKeys.map((h) => [h.rightType, h.right(rc)]));
             if (key === NULL_KEY) {
               continue;
@@ -1231,14 +1330,14 @@ export class Executor implements SubqueryRunner {
             b.push(r);
           }
           for (const l of leftRows) {
-            const lc = this.rowCtx(l, ctx);
-            const key = this.compositeHashKey(hashKeys.map((h) => [h.leftType, h.left(lc)]));
+            rc.row = l;
+            const key = this.compositeHashKey(hashKeys.map((h) => [h.leftType, h.left(rc)]));
             let matched = false;
             if (key !== NULL_KEY) {
               for (const r of buckets.get(key) ?? []) {
                 const m = mergeRows(l, r, rightRels, nrt);
                 if (residual.length > 0) {
-                  const mc = this.rowCtx(m, ctx);
+                  mc.row = m;
                   if (!residual.every((ev) => ev(mc) === true)) {
                     continue;
                   }
@@ -1492,9 +1591,15 @@ export class Executor implements SubqueryRunner {
     for (const c of rest) {
       c.used = true;
     }
+    const sc = this.rowCtx(ctx.row, ctx);
     return rows.filter((r) => {
-      const c = this.rowCtx(r, ctx);
-      return evs.every((ev) => ev(c) === true);
+      sc.row = r;
+      for (const ev of evs) {
+        if (ev(sc) !== true) {
+          return false;
+        }
+      }
+      return true;
     });
   }
 
@@ -1536,7 +1641,7 @@ export class Executor implements SubqueryRunner {
         rows = this.scanCte(plan, ctx, rtIndex, rte, mine);
         break;
       case 'catalog': {
-        const data = rte.transitionRows ?? this.host.catalogRows(rte.relOid, this.st);
+        const data = rte.transitionName !== undefined ? this.transitionRows(rte.transitionName) : this.host.catalogRows(rte.relOid, this.st);
         rows = data.map((r) => {
           const row = ctx.row.slice();
           row[rtIndex] = r;
@@ -1549,9 +1654,15 @@ export class Executor implements SubqueryRunner {
     }
     if (mine.length > 0 && rte.kind !== 'relation') {
       const evs = mine.map((c) => plan.ev(c.expr));
+      const sc = this.rowCtx(ctx.row, ctx);
       rows = rows.filter((r) => {
-        const c = this.rowCtx(r, ctx);
-        return evs.every((ev) => ev(c) === true);
+        sc.row = r;
+        for (const ev of evs) {
+          if (ev(sc) !== true) {
+            return false;
+          }
+        }
+        return true;
       });
     }
     for (const c of mine) {
@@ -1577,7 +1688,7 @@ export class Executor implements SubqueryRunner {
     const vis = this.host.store.vis;
     const snap = this.st.snapshot;
     const parts = this.host.relationHeaps(rel, rte.inh, this.st);
-    const filterEvs = filters.map((c) => plan.ev(c.expr));
+    let filterEvs = filters.map((c) => plan.ev(c.expr));
     const out: Row[] = [];
     // equality lookup via hash index: col = <expr without local rels>
     const lookups = parts.length === 1 && parts[0].rel === rel ? this.findIndexLookups(plan, rtIndex, rte, filters) : [];
@@ -1616,6 +1727,7 @@ export class Executor implements SubqueryRunner {
       let candidates: Tuple[] | undefined;
       let buckets: Tuple[][] | undefined;
       let size = Infinity;
+      let probe: IndexLookup | undefined;
       for (let li = 0; li < lookups.length; li++) {
         const lookup = lookups[li];
         const index = indexes[li];
@@ -1635,6 +1747,7 @@ export class Executor implements SubqueryRunner {
             candidates = bucket;
             buckets = undefined;
             size = bucket.length;
+            probe = lookup;
           }
           continue;
         }
@@ -1668,11 +1781,17 @@ export class Executor implements SubqueryRunner {
           candidates = undefined;
           buckets = found;
           size = total;
+          probe = undefined;
         }
       }
       if (buckets) {
         // heap order, as a sequential scan returns them
         candidates = buckets.length === 1 ? buckets[0] : buckets.flat().sort((a, b) => a.seq - b.seq);
+      }
+      if (probe?.conj && INT_TYPES.has(probe.colType) && INT_TYPES.has(probe.valueType)) {
+        // integer keys are equal exactly when the integers are: every candidate satisfies `col = value`
+        const answered = probe.conj;
+        filterEvs = filters.filter((c) => c !== answered).map((c) => plan.ev(c.expr));
       }
       for (const t of candidates!) {
         if (vis.visible(t, snap)) {
@@ -1771,7 +1890,7 @@ export class Executor implements SubqueryRunner {
         if (!isHashableEquality(e.funcSrc, col.type, val.type, plan, e.inputCollation)) {
           continue;
         }
-        out.push({ physIndex: rte.attnums[col.attno] - 1, colType: col.type, value: plan.ev(val), valueType: val.type });
+        out.push({ physIndex: rte.attnums[col.attno] - 1, colType: col.type, value: plan.ev(val), valueType: val.type, conj: c });
         found = true;
         break;
       }

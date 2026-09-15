@@ -7,6 +7,22 @@ export class Store {
   readonly vis = new Visibility(this.txns);
   private heaps = new Map<number, Heap>();
   private nextStorageId = 1;
+  /** heaps written (or holding possibly-dead versions) since their last vacuum check */
+  private vacuumCandidates = new Set<Heap>();
+
+  /** A transaction wrote to the heap: it is checked for dead versions when a transaction ends. */
+  noteWrite(heap: Heap): void {
+    this.vacuumCandidates.add(heap);
+  }
+
+  /** Vacuum the candidate heaps that accumulated enough possibly-dead versions; `horizon`: see Database.autovacuum. */
+  autovacuum(horizon: number): void {
+    for (const heap of this.vacuumCandidates) {
+      if (!this.heaps.has(heap.storageId) || this.heaps.get(heap.storageId) !== heap || !heap.vacuum(this.vis, this.txns, horizon)) {
+        this.vacuumCandidates.delete(heap);
+      }
+    }
+  }
 
   createHeap(): Heap {
     const h = new Heap(this.nextStorageId++);
@@ -24,6 +40,10 @@ export class Store {
   }
 
   dropHeap(storageId: number): void {
+    const heap = this.heaps.get(storageId);
+    if (heap) {
+      this.vacuumCandidates.delete(heap);
+    }
     this.heaps.delete(storageId);
   }
 

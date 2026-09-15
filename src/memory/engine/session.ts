@@ -6,6 +6,7 @@ import { emptyQuery, Query, TExpr } from './analyze/nodes';
 import { ParseState } from './analyze/parse-state';
 import { analyzeStatementAsSubquery } from './analyze/select';
 import { quoteIdentifier, TypeUtil } from './analyze/typeutil';
+import { forEachChild } from './analyze/walk';
 import { Catalog, Column, Constraint, NS_PG_CATALOG, PgType, ProcDef, Relation, StoredExpr, TypeOid } from './catalog/catalog';
 import { CompileEnv, compileExpr } from './exec/compile';
 import type { Evaluator } from './exec/runtime';
@@ -32,6 +33,30 @@ export const DOMAIN_VALUE_SLOT = 1_000_000;
 
 /** compiled domain CHECK constraints, per catalog (and its version) */
 const compiledDomainChecks = new WeakMap<Catalog, { version: number; checks: Map<object, { name: string; ev: Evaluator; slot: number }> }>();
+
+/** reusable analyses of query statements, per parse tree (Session.analyzeQueryStmt) */
+const analyzedStatements = new WeakMap<A.Statement, { catalog: Catalog; version: number; key: string; query: Query; paramTypes: number[] }[]>();
+/** analyses kept per parse tree (parameter types / search paths it runs under) */
+const ANALYZED_VARIANTS_MAX = 4;
+
+/** compiled bodies of `SELECT <expression>` SQL functions, per analysis of the body (Session.sqlFunctionExpression) */
+const compiledSqlFunctions = new WeakMap<Query, { ev: Evaluator; type: number } | null>();
+
+/** node kinds an inlined SQL function body must not contain: they need a FROM clause, a query level or a sub-select */
+const NOT_INLINABLE = new Set(['sublink', 'var', 'agg', 'window', 'groupkey', 'grouping', 'execparam']);
+
+function selfContainedExpr(e: TExpr): boolean {
+  if (NOT_INLINABLE.has(e.k)) {
+    return false;
+  }
+  let ok = true;
+  forEachChild(e, (child) => {
+    if (ok && !selfContainedExpr(child)) {
+      ok = false;
+    }
+  });
+  return ok;
+}
 
 export interface FieldInfo {
   name: string;
@@ -117,6 +142,8 @@ export interface TxnState {
   /** SET CONSTRAINTS: per-constraint mode (true = deferred), over the ALL mode, over the declared default */
   constraintModes: Map<number, boolean>;
   constraintAllMode: boolean | null;
+  /** tuples inserted per heap (dead versions when the transaction aborts), for autovacuum */
+  inserts?: Map<Heap, number>;
 }
 
 const COMMAND_TAGS: Record<string, string> = {
@@ -170,6 +197,8 @@ export class Session implements ExecSession, AnalyzerEnv {
   private cancelWaiters = new Set<() => void>();
   private cancelPending = false;
   private zoneCache: { name: string; spec: ZoneSpec } | null = null;
+  /** reads of the transaction timestamp through `io.now` (literal input such as 'now'): an analysis that made one is not reused */
+  private nowReads = 0;
 
   constructor(db: Database) {
     this.db = db;
@@ -186,7 +215,10 @@ export class Session implements ExecSession, AnalyzerEnv {
       get zone() {
         return self.zone();
       },
-      now: () => self.transactionTimestamp(),
+      now: () => {
+        self.nowReads++;
+        return self.transactionTimestamp();
+      },
       get extraFloatDigits() {
         return parseInt(self.getSetting('extra_float_digits', false) ?? '1', 10);
       },
@@ -252,7 +284,22 @@ export class Session implements ExecSession, AnalyzerEnv {
       .map((s) => (s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1).replace(/""/g, '"') : s.toLowerCase()));
   }
 
+  private searchPathMemo: { catalog: Catalog; version: number; raw: string | undefined; tempNsOid: number; namespaces: number[] } | null = null;
+
   searchPathNamespaces(): number[] {
+    // resolved once per search_path setting, catalog version and temp schema (analysis asks per name lookup)
+    const cat = this.catalog();
+    const raw = this.getSetting('search_path', false) ?? undefined;
+    const memo = this.searchPathMemo;
+    if (memo && memo.catalog === cat && memo.version === cat.version && memo.raw === raw && memo.tempNsOid === this.tempNsOid) {
+      return memo.namespaces.slice();
+    }
+    const namespaces = this.resolveSearchPath();
+    this.searchPathMemo = { catalog: cat, version: cat.version, raw, tempNsOid: this.tempNsOid, namespaces };
+    return namespaces.slice();
+  }
+
+  private resolveSearchPath(): number[] {
     const cat = this.catalog();
     const out: number[] = [];
     const names = this.searchPathNames();
@@ -905,6 +952,93 @@ export class Session implements ExecSession, AnalyzerEnv {
     return this.db.store.getHeap(rel.storageId).tuples.length;
   }
 
+  /**
+   * A SQL function whose body is a single `SELECT <expression>` — no FROM, WHERE, grouping, ordering,
+   * DISTINCT, LIMIT, set operation, sub-select, aggregate or set-returning call — returning one scalar:
+   * the expression, compiled once per analysis of the body, which the caller evaluates with the arguments
+   * as parameters (what PostgreSQL's inline_function achieves) instead of running a nested statement for
+   * every call. null for any other function. `nested` is the call's statement state (parameter types and
+   * names).
+   */
+  sqlFunctionExpression(proc: ProcDef, nested: StatementState): { ev: Evaluator; type: number } | null {
+    // like inline_function: not volatile, no SET options or SECURITY DEFINER, one scalar result
+    if (
+      proc.lang !== 'sql' ||
+      proc.kind !== 'f' ||
+      proc.volatile === 'v' ||
+      proc.retset ||
+      proc.rettype === TypeOid.void ||
+      proc.rettype === TypeOid.record ||
+      proc.returnsTable ||
+      proc.outParams?.length ||
+      proc.setOptions?.length ||
+      proc.securityDefiner
+    ) {
+      return null;
+    }
+    let stmt: A.Statement;
+    if (proc.sqlBody) {
+      if (proc.sqlBody.length !== 1) {
+        return null;
+      }
+      stmt = proc.sqlBody[0];
+    } else {
+      const parsed = this.db.parse(proc.body ?? '');
+      if (parsed.length !== 1) {
+        return null;
+      }
+      stmt = parsed[0].stmt;
+    }
+    if (stmt.kind !== 'SelectStmt') {
+      return null;
+    }
+    const catalog = this.catalog();
+    if (catalog.getType(proc.rettype)?.typtype === 'c') {
+      return null;
+    }
+    const { query: q } = this.analyzeQueryStmt(stmt, nested.paramTypes.slice(), true, nested);
+    if (compiledSqlFunctions.has(q)) {
+      return compiledSqlFunctions.get(q)!;
+    }
+    const visible = q.targetList.filter((t) => !t.resjunk);
+    const simple =
+      q.commandType === 'select' &&
+      q.rtable.length === 0 &&
+      q.cteList.length === 0 &&
+      !q.where &&
+      q.groupClause.length === 0 &&
+      !q.groupingSets &&
+      !q.havingQual &&
+      !q.distinctClause &&
+      q.sortClause.length === 0 &&
+      !q.limitCount &&
+      !q.limitOffset &&
+      q.rowMarks.length === 0 &&
+      !q.setOperations &&
+      !q.hasAggs &&
+      !q.hasWindowFuncs &&
+      !q.hasTargetSRFs &&
+      visible.length === 1 &&
+      q.targetList.length === 1 &&
+      selfContainedExpr(visible[0].expr);
+    let compiled: { ev: Evaluator; type: number } | null = null;
+    if (simple) {
+      const env: CompileEnv = {
+        catalog,
+        typeOps: this.typeOps,
+        runner: {
+          run: () => {
+            throw new PgError(SqlState.INTERNAL_ERROR, 'a sub-select in an inlined SQL function');
+          },
+        } as unknown as CompileEnv['runner'],
+        rtInfo: () => undefined,
+      };
+      compiled = { ev: compileExpr(visible[0].expr, env), type: visible[0].expr.type };
+    }
+    compiledSqlFunctions.set(q, compiled);
+    return compiled;
+  }
+
   callUserFunction(proc: ProcDef, args: unknown[], argTypes: number[], st: StatementState): { value: unknown; rows?: unknown[][] } {
     if (proc.lang === 'sql') {
       return callSqlFunction(this, proc, args, argTypes, st);
@@ -1075,6 +1209,21 @@ export class Session implements ExecSession, AnalyzerEnv {
     return txn.topXid;
   }
 
+  /** The snapshot this session's transaction keeps across statements (REPEATABLE READ / SERIALIZABLE), if any. */
+  heldSnapshot(): Snapshot | null {
+    return this.txn?.snapshot ?? null;
+  }
+
+  /** A statement wrote to `heap` (`inserted`: a new tuple version): candidates for autovacuum at transaction end. */
+  noteHeapWrite(heap: Heap, inserted: boolean): void {
+    this.db.store.noteWrite(heap);
+    const txn = this.txn;
+    if (inserted && txn) {
+      const inserts = (txn.inserts ??= new Map());
+      inserts.set(heap, (inserts.get(heap) ?? 0) + 1);
+    }
+  }
+
   takeSnapshot(): Snapshot {
     const txns = this.db.store.txns;
     const txn = this.txn!;
@@ -1162,6 +1311,9 @@ export class Session implements ExecSession, AnalyzerEnv {
     for (const fn of txn.onCommit) {
       fn();
     }
+    if (txn.topXid) {
+      this.db.autovacuum();
+    }
   }
 
   abortTxn(): void {
@@ -1191,6 +1343,13 @@ export class Session implements ExecSession, AnalyzerEnv {
     this.txn = null;
     for (const fn of txn.onAbort.reverse()) {
       fn();
+    }
+    if (txn.topXid) {
+      // the transaction's inserts are dead versions now
+      for (const [heap, count] of txn.inserts ?? []) {
+        heap.deadCount += count;
+      }
+      this.db.autovacuum();
     }
   }
 
@@ -1807,18 +1966,62 @@ export class Session implements ExecSession, AnalyzerEnv {
     });
   }
 
-  private executeQueryStmt(stmt: A.Statement, text: string, params: unknown[], undo: UndoLog | null, parentSt: StatementState | null, sleepsServed: number, boundTypes?: number[]): StatementResult {
-    const txn = this.txn!;
-    const paramTypesIn = parentSt ? parentSt.paramTypes.slice() : (boundTypes ?? []);
-    const an = this.makeAnalyzer(paramTypesIn, !!parentSt || !!boundTypes);
+  /**
+   * The analyzed form of a SELECT / INSERT / UPDATE / DELETE / MERGE, reused while nothing it depends on
+   * changed (like PostgreSQL's plan cache for prepared statements and PL/pgSQL statements): the parse tree,
+   * the catalog (object and version), the parameter types and names, the trigger transition tables in
+   * scope, the search path and the settings literal input reads. An analysis that read the transaction
+   * timestamp (a 'now' literal) is not reused.
+   */
+  private analyzeQueryStmt(stmt: A.Statement, paramTypesIn: number[], fixed: boolean, parentSt: StatementState | null): { query: Query; paramTypes: number[] } {
+    const catalog = this.catalog();
+    const transition = parentSt?.transitionTables;
+    const key =
+      (fixed ? 'f' : 'v') +
+      paramTypesIn.join(',') +
+      '|' +
+      (parentSt ? parentSt.paramNames.join(',') + '|' + parentSt.functionName : '') +
+      '|' +
+      (transition ? transition.map((t) => t.name + ':' + t.rel.oid).join(',') : '') +
+      '|' +
+      this.searchPathNamespaces().join(',') +
+      '|' +
+      (this.getSetting('TimeZone', false) ?? '') +
+      '|' +
+      (this.getSetting('DateStyle', false) ?? '') +
+      '|' +
+      (this.getSetting('IntervalStyle', false) ?? '');
+    let entries = analyzedStatements.get(stmt);
+    const hit = entries?.find((e) => e.catalog === catalog && e.version === catalog.version && e.key === key);
+    if (hit) {
+      return hit;
+    }
+    const an = this.makeAnalyzer(paramTypesIn, fixed);
     if (parentSt) {
       an.paramNames = parentSt.paramNames;
       an.paramFunctionName = parentSt.functionName;
       an.transitionTables = parentSt.transitionTables;
     }
-    const pstate = new ParseState(null, emptyQuery());
+    const nowReads = this.nowReads;
+    const version = catalog.version;
     const { query } = analyzeStatementAsSubquery(an, stmt, null, true);
-    void pstate;
+    const analyzed = { query, paramTypes: an.paramTypes };
+    if (this.nowReads === nowReads && catalog === this.catalog() && catalog.version === version) {
+      entries = (entries ?? []).filter((e) => e.catalog === catalog && e.version === catalog.version);
+      if (entries.length >= ANALYZED_VARIANTS_MAX) {
+        entries.shift();
+      }
+      entries.push({ catalog, version: catalog.version, key, ...analyzed });
+      analyzedStatements.set(stmt, entries);
+    }
+    return analyzed;
+  }
+
+  private executeQueryStmt(stmt: A.Statement, text: string, params: unknown[], undo: UndoLog | null, parentSt: StatementState | null, sleepsServed: number, boundTypes?: number[]): StatementResult {
+    const txn = this.txn!;
+    const paramTypesIn = parentSt ? parentSt.paramTypes.slice() : (boundTypes ?? []);
+    const an = this.analyzeQueryStmt(stmt, paramTypesIn, !!parentSt || !!boundTypes, parentSt);
+    const query = an.query;
     // parameters
     let typedParams: unknown[];
     if (parentSt) {
@@ -1863,6 +2066,8 @@ export class Session implements ExecSession, AnalyzerEnv {
     st.sleepsServed = sleepsServed;
     if (parentSt) {
       st.sleepsServed = Infinity;
+      // the transition tables the statement was analyzed with: its scans read their rows
+      st.transitionTables = parentSt.transitionTables;
     }
     const host = new SessionHost(this, st);
     const executor = new Executor(st, host);
@@ -1996,6 +2201,10 @@ export class SessionHost {
 
   deferConstraintCheck(con: Constraint, run: (dml: DmlExecutor) => void): void {
     this.session.deferConstraintCheck({ constraint: con, run });
+  }
+
+  noteHeapWrite(heap: Heap, inserted: boolean): void {
+    this.session.noteHeapWrite(heap, inserted);
   }
 
   analyzeRelationExpr(rel: Relation, stored: StoredExpr, kind: 'check' | 'index' | 'generated' | 'predicate'): { q: Query; expr: TExpr } {

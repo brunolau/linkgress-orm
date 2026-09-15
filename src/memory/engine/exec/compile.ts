@@ -571,7 +571,17 @@ export function operatorImpl(opName: string, src: string, left: number, right: n
   const impl = lookupFunction(src, node, env.typeOps, [left, right], opName);
   if (impl) {
     const fc = makeFnCall(node, [left, right]);
-    return (args, c) => impl(args, { ...fc, collation, st: c ? c.st : (undefined as never) });
+    // one call context per statement (it depends on nothing else), not one per evaluated row
+    let fcSt: unknown = null;
+    let fcCached: FnCall | null = null;
+    return (args, c) => {
+      const st = c ? c.st : (undefined as never);
+      if (st !== fcSt || fcCached === null) {
+        fcSt = st;
+        fcCached = { ...fc, collation, st };
+      }
+      return impl(args, fcCached);
+    };
   }
   if (COMPARISON_OPS.has(opName)) {
     const cmp = env.typeOps.crossComparator(left, right, collation) ?? env.typeOps.comparator(left, collation);
@@ -634,6 +644,16 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
   const base = makeFnCall(e, argTypes);
   const fn = impl;
   const n = args.length;
+  // the call context depends only on the statement: built once per statement, not per row
+  let fcSt: unknown = null;
+  let fcCached: FnCall | null = null;
+  const callCtx = (c: EvalCtx): FnCall => {
+    if (c.st !== fcSt || fcCached === null) {
+      fcSt = c.st;
+      fcCached = { ...base, st: c.st };
+    }
+    return fcCached;
+  };
   if (n === 1) {
     const a0 = args[0];
     return (c) => {
@@ -641,7 +661,7 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
       if (strict && v0 === null) {
         return null;
       }
-      return fn([v0], { ...base, st: c.st });
+      return fn([v0], callCtx(c));
     };
   }
   if (n === 2) {
@@ -655,7 +675,7 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
       if (strict && v1 === null) {
         return null;
       }
-      return fn([v0, v1], { ...base, st: c.st });
+      return fn([v0, v1], callCtx(c));
     };
   }
   return (c) => {
@@ -667,7 +687,7 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
       }
       vals[i] = v;
     }
-    return fn(vals, { ...base, st: c.st });
+    return fn(vals, callCtx(c));
   };
 }
 
@@ -862,6 +882,76 @@ function memoValueKey(typeOps: TypeOps, type: number, v: unknown): unknown {
   return typeOps.hashKey(type, v);
 }
 
+const HASH_INT_TYPES = new Set<number>([TypeOid.int2, TypeOid.int4, TypeOid.int8]);
+const HASH_INT_EQ = new Set(['int2eq', 'int4eq', 'int8eq', 'int24eq', 'int42eq', 'int28eq', 'int82eq', 'int48eq', 'int84eq']);
+const HASH_SAME_TYPE_EQ = new Map<number, string>([
+  [TypeOid.bool, 'booleq'],
+  [TypeOid.text, 'texteq'],
+  [TypeOid.uuid, 'uuid_eq'],
+  [TypeOid.date, 'date_eq'],
+  [TypeOid.timestamp, 'timestamp_eq'],
+  [TypeOid.timestamptz, 'timestamp_eq'],
+]);
+
+/** `x = sub.col` whose equality is exactly hash-key equality (built-in integer / text / bool / uuid / datetime equality) */
+function hashableSublinkEquality(o: SubLinkNode['operators'][number], env: CompileEnv): boolean {
+  if (o.opName !== '=') {
+    return false;
+  }
+  if (HASH_INT_TYPES.has(o.leftType) && HASH_INT_TYPES.has(o.rightType)) {
+    return HASH_INT_EQ.has(o.opSrc);
+  }
+  if (o.leftType !== o.rightType || HASH_SAME_TYPE_EQ.get(o.leftType) !== o.opSrc) {
+    return false;
+  }
+  return o.leftType !== TypeOid.text || !o.collation || env.typeOps.collations.isDeterministic(o.collation);
+}
+
+/**
+ * Uncorrelated `x IN (SELECT …)` with a hashable equality: the sub-select's values go into a hash set
+ * once per statement (like PostgreSQL's hashed SubPlan) instead of being compared row by row.
+ */
+function hashedAnySublink(e: SubLinkNode, left: Evaluator, env: CompileEnv, rowsOf: (c: EvalCtx) => unknown[][]): Evaluator {
+  const o = e.operators[0];
+  const intKeys = HASH_INT_TYPES.has(o.leftType);
+  const typeOps = env.typeOps;
+  const keyOf = (type: number, v: unknown): unknown => {
+    if (intKeys) {
+      return typeof v === 'bigint' ? (v >= -9007199254740991n && v <= 9007199254740991n ? Number(v) : v.toString()) : v;
+    }
+    return typeOps.hashKey(type, v);
+  };
+  let forRows: unknown[][] | null = null;
+  let keys: Set<unknown> = new Set();
+  let sawNull = false;
+  return (c) => {
+    const l = left(c);
+    const rows = rowsOf(c);
+    if (rows !== forRows) {
+      forRows = rows;
+      keys = new Set();
+      sawNull = false;
+      for (const row of rows) {
+        if (row[0] === null) {
+          sawNull = true;
+        } else {
+          keys.add(keyOf(o.rightType, row[0]));
+        }
+      }
+    }
+    if (rows.length === 0) {
+      return false;
+    }
+    if (l === null) {
+      return null;
+    }
+    if (keys.has(keyOf(o.leftType, l))) {
+      return true;
+    }
+    return sawNull ? null : false;
+  };
+}
+
 interface SublinkMemo {
   root: Map<unknown, unknown>;
   size: number;
@@ -988,6 +1078,9 @@ function compileSublink(e: SubLinkNode, env: CompileEnv): Evaluator {
       const lefts = e.testLeft.map((x) => compileExpr(x, env));
       const ops = e.operators.map((o, i) => operatorImpl(o.opName, o.opSrc, o.leftType, o.rightType, o.collation, env, e.testLeft[i]));
       const isAny = e.linkType === 'ANY';
+      if (isAny && !correlated && e.testLeft.length === 1 && hashableSublinkEquality(e.operators[0], env)) {
+        return hashedAnySublink(e, lefts[0], env, (c) => cached(c, () => runner.run(query, c)) as unknown[][]);
+      }
       return (c) => {
         const lvals = lefts.map((l) => l(c));
         const rows = cached(c, () => runner.run(query, c)) as unknown[][];

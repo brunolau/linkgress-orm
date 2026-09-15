@@ -79,6 +79,27 @@ export class Database {
     this.sessions.delete(s);
   }
 
+  /**
+   * Called when a transaction ends: removes versions no transaction can see any more from the heaps
+   * written since (like autovacuum). A version deleted by xid X is kept while X is at or above the
+   * horizon: the oldest running transaction and, for every open REPEATABLE READ / SERIALIZABLE
+   * snapshot, the oldest transaction it saw as running (or its xmax).
+   */
+  autovacuum(): void {
+    let horizon = this.store.txns.oldestRunning();
+    for (const s of this.sessions) {
+      const snap = s.heldSnapshot();
+      if (!snap) {
+        continue;
+      }
+      horizon = Math.min(horizon, snap.xmax);
+      for (const x of snap.xip) {
+        horizon = Math.min(horizon, x);
+      }
+    }
+    this.store.autovacuum(horizon);
+  }
+
   /** Diagnostics: sizes of the structures a long-lived database accumulates. */
   stats(): Record<string, number> {
     let liveTuples = 0;
