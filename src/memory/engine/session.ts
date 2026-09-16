@@ -2208,11 +2208,22 @@ export class SessionHost {
   }
 
   analyzeRelationExpr(rel: Relation, stored: StoredExpr, kind: 'check' | 'index' | 'generated' | 'predicate'): { q: Query; expr: TExpr } {
-    const cacheKey = 'rel:' + kind + ':' + this.st.catalog.version + ':' + rel.oid;
+    const version = this.st.catalog.version;
+    const cacheKey = 'rel:' + kind + ':' + version + ':' + rel.oid;
     const cache = (stored.cache ??= {});
     const hit = cache[cacheKey] as { q: Query; expr: TExpr } | undefined;
     if (hit) {
       return hit;
+    }
+    // The key carries the catalog version, so every DDL leaves the previous analyses of this
+    // expression behind — dead, but reachable from the catalog. A workload that issues DDL keeps
+    // adding versions, and each entry holds an analyzed Query + TExpr: a downstream test suite
+    // reached 5 008 entries in one database (catalog version 4 400 -> 4 449). Only the current
+    // version can ever be read again, so drop the rest before filling this one.
+    for (const key of Object.keys(cache)) {
+      if (!key.startsWith('rel:') || key.split(':')[2] !== String(version)) {
+        delete cache[key];
+      }
     }
     const an = this.session.makeAnalyzer();
     const q = emptyQuery();

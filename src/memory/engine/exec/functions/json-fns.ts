@@ -857,6 +857,20 @@ export const JSON_FUNCS: Record<string, FnImpl> = {
   },
   json_typeof: (a) => jsonTextKind(a[0] as string),
   json_strip_nulls: (a) => jsonbToText(stripNulls(parseJsonb(a[0] as string, 'json'), a[1] === true)).replace(/": /g, '":').replace(/, "/g, ',"'),
+  // json(b)_populate_record: not strict — the row type comes from a (usually NULL) first argument
+  json_populate_record: (a, fc) => populateRecordResult('json_populate_record', a, fc),
+  jsonb_populate_record: (a, fc) => populateRecordResult('jsonb_populate_record', a, fc),
+  jsonb_populate_record_valid: (a, fc) => {
+    try {
+      // a NULL result (no json and no base record) carries its NULL flag out through the wrapper
+      return populateRecordResult('jsonb_populate_record', a, fc) === null ? null : true;
+    } catch (e) {
+      if (e instanceof PgError && e.code !== SqlState.FEATURE_NOT_SUPPORTED && e.code !== SqlState.DATATYPE_MISMATCH) {
+        return false;
+      }
+      throw e;
+    }
+  },
 };
 
 function deleteKey(v: JsonbValue, key: string): JsonbValue {
@@ -927,6 +941,8 @@ export const JSON_PATH_FUNCS: Record<string, FnImpl> = {
 };
 
 export const JSON_SRFS: Record<string, FnImpl> = {
+  json_populate_recordset: (a, fc) => populateRecordResult('json_populate_recordset', a, fc),
+  jsonb_populate_recordset: (a, fc) => populateRecordResult('jsonb_populate_recordset', a, fc),
   jsonb_path_query: (a) => pathItems(a, false) ?? [],
   jsonb_array_elements: (a) => {
     const v = jsonbArg(a[0]);
@@ -1165,6 +1181,133 @@ function jsonFunc(a: unknown[], fc: FnCall): unknown {
 
 export const JSON_TO_RECORD_FUNCS =new Set(['json_to_record', 'jsonb_to_record', 'json_to_recordset', 'jsonb_to_recordset']);
 
+/** json(b)_populate_record(set): the result row type comes from the first (base) argument, not a column definition list. */
+export const JSON_POPULATE_RECORD_FUNCS = new Set(['json_populate_record', 'jsonb_populate_record', 'json_populate_recordset', 'jsonb_populate_recordset']);
+
+/** A tuple descriptor: the live (non-dropped) attributes of a composite type. */
+export interface RecordColumns {
+  types: { type: number; typmod: number }[];
+  names: string[];
+}
+
+/** The live attributes of a composite type (domains resolved to their base), or null when it is not one. */
+export function compositeColumns(catalog: Catalog, typeOid: number): RecordColumns | null {
+  let oid = typeOid;
+  let guard = 0;
+  let t = catalog.getType(oid);
+  while (t && t.typtype === 'd' && guard++ < 16) {
+    oid = t.baseType;
+    t = catalog.getType(oid);
+  }
+  if (!t || t.typtype !== 'c' || !t.relid) {
+    return null;
+  }
+  const rel = catalog.getRelation(t.relid);
+  if (!rel) {
+    return null;
+  }
+  const cols = rel.columns.filter((c) => !c.isDropped);
+  return { types: cols.map((c) => ({ type: c.typeOid, typmod: c.typmod })), names: cols.map((c) => c.name) };
+}
+
+/** populate_record_field: one json value coerced to a column's declared type (`base` supplies a nested record's defaults). */
+function populateField(v: JsonbValue, type: number, typmod: number, key: string, base: unknown, fc: FnCall): unknown {
+  if (v === JNULL) {
+    return null;
+  }
+  if (type === TypeOid.jsonb) {
+    return v;
+  }
+  if (type === TypeOid.json) {
+    return jsonbToText(v);
+  }
+  const catalog = fc.st.catalog;
+  const t = catalog.getType(type);
+  if (t?.isArray) {
+    if (Array.isArray(v)) {
+      const conv = (arr: JsonbValue[]): unknown[] => arr.map((x) => (Array.isArray(x) ? conv(x) : populateField(x, t.elem, -1, key, null, fc)));
+      return conv(v);
+    }
+    if (typeof v !== 'string') {
+      throw new PgError(SqlState.INVALID_TEXT_REPRESENTATION, 'expected JSON array', { hint: `See the value of key "${key}".` });
+    }
+  } else {
+    const nested = compositeColumns(catalog, type);
+    if (nested) {
+      return populateRecord(nested, base instanceof PgRecord ? base : null, v, type, fc);
+    }
+  }
+  return inputValue(type, jsonbAsText(v)!, typmod, fc.st.session.io);
+}
+
+/** populate_record: the column values of one json object, absent keys taken from `base` (NULL when there is none). */
+function populateValues(cols: RecordColumns, base: PgRecord | null, obj: JsonbObject, fc: FnCall): unknown[] {
+  return cols.types.map((c, i) => {
+    const idx = obj.indexOf(cols.names[i]);
+    if (idx < 0) {
+      return base ? base.values[i] ?? null : null;
+    }
+    return populateField(obj.vals[idx], c.type, c.typmod, cols.names[i], base ? base.values[i] : null, fc);
+  });
+}
+
+/** populate_composite: a record of `typeOid` built from a json object (which a non-object input is an error for). */
+function populateRecord(cols: RecordColumns, base: PgRecord | null, root: JsonbValue, typeOid: number, fc: FnCall): PgRecord {
+  if (!isJsonbObject(root)) {
+    throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call populate_composite on ${Array.isArray(root) ? 'an array' : 'a scalar'}`);
+  }
+  return new PgRecord(
+    populateValues(cols, base, root, fc),
+    typeOid,
+    cols.types.map((c) => c.type),
+    cols.names,
+    cols.types.map((c) => c.typmod)
+  );
+}
+
+/**
+ * json(b)_populate_record(set): `base` (argument 0) gives both the result row type and the value of every
+ * column the json object has no key for; `coldef` replaces it when the call carries a column definition
+ * list. Returns the record, null, or — for the `recordset` forms — one record per array element.
+ */
+export function populateRecordResult(funcSrc: string, args: unknown[], fc: FnCall, coldef?: RecordColumns): unknown {
+  const funcName = funcSrc;
+  const isSet = funcSrc.endsWith('recordset');
+  const base = args[0];
+  const json = args[1];
+  const argType = fc.argTypes[0];
+  if (argType !== TypeOid.record && !compositeColumns(fc.st.catalog, argType)) {
+    throw new PgError(SqlState.DATATYPE_MISMATCH, `first argument of ${funcName} must be a row type`);
+  }
+  if (json === null || json === undefined) {
+    // no json: the base record unchanged (populate_record_worker returns it as-is)
+    return isSet ? [] : base ?? null;
+  }
+  const baseRec = base instanceof PgRecord ? base : null;
+  // the declared first-argument type names the row type; an anonymous `record` one is only known from a
+  // non-null base record or the call's column definition list
+  const cols = coldef ?? compositeColumns(fc.st.catalog, argType) ?? (baseRec ? compositeColumns(fc.st.catalog, baseRec.typeOid) : null);
+  if (!cols) {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `could not determine row type for result of ${funcName}`, {
+      hint: 'Provide a non-null record argument, or call the function in the FROM clause using a column definition list.',
+    });
+  }
+  const rowType = coldef ? TypeOid.record : argType === TypeOid.record && baseRec ? baseRec.typeOid : argType;
+  const root = funcSrc.startsWith('jsonb') ? (json as JsonbValue) : parseJsonb(json as string, 'json');
+  if (!isSet) {
+    return populateRecord(cols, baseRec, root, rowType, fc);
+  }
+  if (!Array.isArray(root)) {
+    throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call ${funcName} on a non-array`);
+  }
+  return root.map((el) => {
+    if (!isJsonbObject(el)) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `argument of ${funcName} must be an array of objects`);
+    }
+    return populateRecord(cols, baseRec, el, rowType, fc);
+  });
+}
+
 /** Rows of json(b)_to_record(set) for a column definition list (populate_record semantics). */
 export function jsonToRecordRows(
   funcSrc: string,
@@ -1173,37 +1316,15 @@ export function jsonToRecordRows(
   colNames: string[],
   fc: FnCall,
 ): unknown[][] {
-  const catalog = fc.st.catalog;
-  const io = fc.st.session.io;
+  const columns: RecordColumns = { types: cols, names: colNames };
   const isJson = !funcSrc.startsWith('jsonb');
   const root = isJson ? parseJsonb(arg as string, 'json') : (arg as JsonbValue);
-  const scalar = (v: JsonbValue, type: number, typmod: number, key: string): unknown => {
-    if (v === JNULL) {
-      return null;
+  const record = (obj: JsonbValue): unknown[] => {
+    if (!isJsonbObject(obj)) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call populate_composite on ${Array.isArray(obj) ? 'an array' : 'a scalar'}`);
     }
-    const t = catalog.getType(type);
-    if (type === TypeOid.jsonb) {
-      return v;
-    }
-    if (type === TypeOid.json) {
-      return jsonbToText(v);
-    }
-    if (t?.isArray) {
-      if (Array.isArray(v)) {
-        const conv = (arr: JsonbValue[]): unknown[] => arr.map((x) => (Array.isArray(x) ? conv(x) : scalar(x, t.elem, -1, key)));
-        return conv(v);
-      }
-      if (typeof v !== 'string') {
-        throw new PgError(SqlState.INVALID_PARAMETER_VALUE, 'expected JSON array', { hint: `See the value of key "${key}".` });
-      }
-    }
-    return inputValue(type, jsonbAsText(v)!, typmod, io);
+    return populateValues(columns, null, obj, fc);
   };
-  const record = (obj: JsonbValue): unknown[] =>
-    cols.map((c, i) => {
-      const idx = (obj as JsonbObject).indexOf(colNames[i]);
-      return idx < 0 ? null : scalar((obj as JsonbObject).vals[idx], c.type, c.typmod, colNames[i]);
-    });
   if (funcSrc.endsWith('recordset')) {
     if (!Array.isArray(root)) {
       throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call ${funcSrc} on a non-array`);
@@ -1214,9 +1335,6 @@ export function jsonToRecordRows(
       }
       return record(el);
     });
-  }
-  if (!isJsonbObject(root)) {
-    throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot call ${funcSrc} on a non-object`);
   }
   return [record(root)];
 }

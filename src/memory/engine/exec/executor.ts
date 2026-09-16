@@ -21,7 +21,7 @@ import { PgNumeric } from '../types/numeric';
 import { PgRecord } from '../types/values';
 import { CompileEnv, compileExpr, RtInfo } from './compile';
 import { groupAndAggregate, computeWindowFunctions } from './exec-agg';
-import { JSON_TO_RECORD_FUNCS, jsonToRecordRows } from './functions/json-fns';
+import { JSON_POPULATE_RECORD_FUNCS, JSON_TO_RECORD_FUNCS, jsonToRecordRows, populateRecordResult } from './functions/json-fns';
 import { lookupSrf } from './functions/registry';
 import { pgQsort } from './pgsort';
 import { pushQualsIntoSubquery, queryHasVolatile } from './pushdown';
@@ -2085,6 +2085,13 @@ export class Executor implements SubqueryRunner {
         const argVals = e.args.map((a) => plan.ev(a)(ctx));
         const fc = { st: this.st, argTypes: e.args.map((a) => a.type), resultType: e.type, resultTypmod: e.typmod, collation: e.inputCollation, node: e };
         values = argVals[0] === null ? (e.retset ? [] : [null]) : jsonToRecordRows(e.funcSrc, argVals[0], f.colTypes, f.colNames, fc);
+      } else if (e.k === 'func' && !e.isUser && JSON_POPULATE_RECORD_FUNCS.has(e.funcSrc)) {
+        // the result row type comes from the base argument, except with a column definition list (an anonymous `record` base)
+        const argVals = e.args.map((a) => plan.ev(a)(ctx));
+        const fc = { st: this.st, argTypes: e.args.map((a) => a.type), resultType: e.type, resultTypmod: e.typmod, collation: e.inputCollation, node: e };
+        const coldef = e.args[0].type === TypeOid.record ? { types: f.colTypes, names: f.colNames } : undefined;
+        const r = populateRecordResult(e.funcSrc, argVals, fc, coldef);
+        values = e.retset ? (r as unknown[]) : [r];
       } else if (e.k === 'func' && e.retset) {
         const argVals = e.args.map((a) => plan.ev(a)(ctx));
         if (e.strict && argVals.some((v) => v === null)) {

@@ -581,8 +581,9 @@ class PlParser {
       this.p++;
       return { k: 'assign', target: t.value + '.' + field, expr };
     }
-    // plain SQL (possibly SELECT ... INTO)
-    const start = this.peek().pos;
+    // plain SQL, with the plpgsql target list (`... INTO var`) split out of it if it has one
+    const first = this.peek();
+    const start = first.pos;
     let into: string[] | null = null;
     let strict = false;
     let sqlText = '';
@@ -595,7 +596,13 @@ class PlParser {
       } else if (x.type === 'punct' && x.value === ')') {
         depth--;
       }
-      if (depth === 0 && this.isKw(x, 'INTO') && !into && /^\s*(select|with)\b/i.test(this.src.slice(start, x.pos))) {
+      // make_execsql_stmt: every INTO of the statement is the target list, except the three the SQL
+      // grammar itself uses — `INSERT INTO`, `MERGE INTO` and `IMPORT FOREIGN SCHEMA ... INTO`. In
+      // particular the INTO of a data-modifying statement's `RETURNING ... INTO` is a target list.
+      if (depth === 0 && this.isKw(x, 'INTO') && !this.isKw(this.toks[Math.max(0, this.p - 1)], 'INSERT', 'MERGE') && !this.isKw(first, 'IMPORT')) {
+        if (into) {
+          throw new PgError(SqlState.SYNTAX_ERROR, `INTO specified more than once at or near "${this.src.slice(x.pos, x.end)}"`);
+        }
         sqlText += this.src.slice(segStart, x.pos);
         this.p++;
         if (this.atKw('STRICT')) {
@@ -1075,6 +1082,12 @@ class PlInterpreter {
         const r = this.runSql(s.sql, frame);
         if (s.into) {
           this.intoVars(s.into, r, s.strict, frame);
+        } else if (r.hasRows) {
+          // exec_stmt_execsql: a statement that returns rows needs a destination (the PERFORM hint is
+          // only for a plain query — an INSERT/UPDATE/DELETE/MERGE ... RETURNING carries none)
+          throw new PgError(SqlState.SYNTAX_ERROR, 'query has no destination for result data', {
+            hint: r.command === 'SELECT' ? 'If you want to discard the results of a SELECT, use PERFORM instead.' : undefined,
+          });
         }
         return;
       }

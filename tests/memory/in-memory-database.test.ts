@@ -258,4 +258,18 @@ describe('in-memory database API', () => {
     expect((await q(`select count(*)::int as n from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname = 'live' and a.attnum > 0`))[0].n).toBe(3);
     await client.end();
   });
+
+  test('a plpgsql statement may carry only one INTO target list', async () => {
+    // The behaviour of `RETURNING ... INTO` itself is pinned by the differential corpus; this one
+    // cannot live there because PostgreSQL reports a POSITION for a plpgsql parse error and the
+    // engine reports none for any of them.
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+    await client.query('create table two_into(id serial primary key, n int)');
+    const e = await expectToReject(client.query(`DO $$ DECLARE v int; BEGIN INSERT INTO two_into (n) VALUES (1) RETURNING id INTO v INTO v; END $$`));
+    expect((e as { code?: string }).code).toBe('42601');
+    expect((e as { message?: string }).message).toBe('INTO specified more than once at or near "INTO"');
+    await client.end();
+  });
 });
