@@ -206,6 +206,11 @@ export const sqlParityCorpus: ParityCase[] = [
       `SELECT json_typeof('{"a": 1}'::json -> 'a'), '{"a": [1,2]}'::json #>> '{a,1}', json_array_length('[1,2,3]'), json_strip_nulls('{"a": null}')`,
       `SELECT JSON_VALUE('{"a": {"b": 42}}', '$.a.b' RETURNING int), JSON_QUERY('{"a": [1,2]}', '$.a'), JSON_EXISTS('{"a": 1}', '$.b'), '{"a":1}' IS JSON OBJECT`,
       `SELECT ('{"a": 1}'::jsonb)['a'], ('{"a": {"b": [10, 20]}}'::jsonb)['a']['b'][1]`,
+      // jsonb keeps a top-level scalar as a one-element array, so -> / ->> with 0 or -1 reach it ...
+      `SELECT '5'::jsonb -> 0, '5'::jsonb -> -1, '"s"'::jsonb ->> 0, 'true'::jsonb ->> 0, to_jsonb(true) ->> 0, 'null'::jsonb ->> 0, 'null'::jsonb -> 0`,
+      `SELECT '5'::jsonb -> 1, '5'::jsonb -> -2, '5'::jsonb -> 'a', '{"a":1}'::jsonb -> 0, '[10,20]'::jsonb -> -1, '[10,20]'::jsonb -> 5`,
+      // ... and nothing else does: not #>, not the [ ] subscript, not the json (text) type
+      `SELECT '5'::jsonb #> '{0}', '5'::jsonb #>> '{0}', '5'::jsonb #> '{}', ('5'::jsonb)[0], '5'::json -> 0, '5'::json ->> 0`,
     ],
   },
   {
@@ -284,6 +289,35 @@ export const sqlParityCorpus: ParityCase[] = [
       'SELECT name FROM emp JOIN dept ON dept.id = emp.dept_id',
       'SELECT * FROM emp e JOIN dept d',
       'SELECT e.name FROM emp e, LATERAL (SELECT e.salary * 2 AS double) x WHERE x.double > 400',
+      // a function in FROM whose arguments read a preceding FROM item is IMPLICITLY lateral
+      'CREATE TABLE lat (id int PRIMARY KEY, a int, b int, arr int[], j jsonb)',
+      `INSERT INTO lat VALUES (1, 10, 11, '{1,2}', '[100,200]'), (2, 20, 21, '{3}', '[300]'), (3, 30, 31, '{}', '[]')`,
+      'SELECT l.id, u FROM lat l, unnest(l.arr) u ORDER BY l.id, u',
+      'SELECT l.id, u FROM lat l, unnest(ARRAY[l.a, l.b]) u ORDER BY l.id, u',
+      'SELECT l.id, g FROM lat l, generate_series(l.a, l.b) g ORDER BY l.id, g',
+      `SELECT l.id, e FROM lat l, jsonb_array_elements(l.j) e ORDER BY l.id, e::text`,
+      'SELECT l.id, u.v, u.o FROM lat l, unnest(l.arr) WITH ORDINALITY AS u(v, o) ORDER BY l.id, u.o',
+      'SELECT l.id, x, y FROM lat l, ROWS FROM (generate_series(1, 2), unnest(l.arr)) AS r(x, y) ORDER BY l.id, x, y NULLS LAST',
+      'SELECT l.id, a.v, b.w FROM lat l, unnest(l.arr) a(v), generate_series(1, a.v) b(w) ORDER BY l.id, a.v, b.w',
+      'SELECT l.id, u FROM lat l LEFT JOIN LATERAL unnest(l.arr) u ON true ORDER BY l.id, u NULLS LAST',
+      // ... and a function with no outer reference stays NON-lateral: its argument is evaluated once
+      // for the whole scan, which the sequence counts (3 outer rows, one nextval)
+      'CREATE SEQUENCE lat_s',
+      `SELECT l.id, g FROM lat l, generate_series(1, nextval('lat_s')::int) g ORDER BY l.id, g`,
+      'SELECT last_value, is_called FROM lat_s',
+      'SELECT l.id, u FROM lat l, unnest(ARRAY[5, 6]) u ORDER BY l.id, u',
+      'SELECT g, l.id FROM generate_series(1, 2) g, lat l ORDER BY g, l.id',
+      // an implicitly-lateral SRF INSIDE a correlated collection lateral: losing the correlation made
+      // the whole collection come back empty, which reads as missing DATA, not as an error. The count
+      // and the distinct ids are both pinned — asserting only "not empty" would not have caught it.
+      'CREATE TABLE latc (id int PRIMARY KEY, parent int, opts jsonb)',
+      `INSERT INTO latc VALUES (101, 1, '["x"]'), (102, 1, '["x"]'), (103, 1, '["x"]'), (104, 1, '["x"]'), (201, 2, '[]')`,
+      `SELECT l.id, agg.n, agg.ids FROM lat l
+         LEFT JOIN LATERAL (SELECT count(*) AS n, array_agg(DISTINCT c.id ORDER BY c.id) AS ids
+                            FROM latc c, jsonb_array_elements(c.opts) o WHERE c.parent = l.id) agg ON true
+       ORDER BY l.id`,
+      `SELECT l.id, (SELECT count(*) FROM latc c, jsonb_array_elements(c.opts) o WHERE c.parent = l.id) AS n FROM lat l ORDER BY l.id`,
+      `SELECT l.id, (SELECT json_agg(o ORDER BY c.id) FROM latc c, jsonb_array_elements(c.opts) o WHERE c.parent = l.id) AS items FROM lat l ORDER BY l.id`,
     ],
   },
   {
@@ -694,6 +728,17 @@ export const sqlParityCorpus: ParityCase[] = [
       "SELECT true::text, false::varchar, 't'::bool AND 'f'::bool, 1::boolean, 0::boolean, 'TRUE'::boolean, bool_or(x) FROM (VALUES (true), (NULL)) v(x)",
       "SELECT '\\xZZ'::bytea",
       'SELECT 2::boolean',
+      // a boolean COLUMN goes over the wire as its output function writes it, t / f ...
+      'SELECT true AS a, false AS b, NULL::boolean AS c, ARRAY[true, false] AS d, ROW(true, false) AS e',
+      "SELECT b, b IS TRUE FROM (VALUES (true), (false), (NULL::boolean)) v(b) ORDER BY b NULLS LAST",
+      // ... but a boolean CONVERTED to text inside SQL is the pg_cast function, true / false
+      "SELECT 'x' || true, true || 'x', 'x' || (1 IS NULL), 'p:' || (1 = 1), true::text || false::text",
+      "SELECT string_agg(i || ':' || b, ',' ORDER BY i) FROM (VALUES (1, true), (2, false)) v(i, b)",
+      "SELECT length('x' || true), ('x' || true) = 'xtrue', (true::text)::boolean",
+      // the two paths disagree on purpose: quote_literal casts, format() and concat() call the output function
+      "SELECT quote_literal(true), quote_nullable(false), quote_nullable(NULL::boolean), format('%L', true), format('%s', true), concat('x', true)",
+      "SELECT quote_literal('a  '::char(4)), format('%L', 'a  '::char(4)), 'a'::char(4) || 'x', quote_literal(1), quote_literal(DATE '2024-01-02')",
+      "SELECT to_json(true), to_jsonb(false), jsonb_build_object('k', true), to_jsonb(r) FROM (SELECT true AS a, false AS b) r",
     ],
   },
   {

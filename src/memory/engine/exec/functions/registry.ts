@@ -13,7 +13,7 @@ import { JSON_FUNCS, JSON_PATH_FUNCS, JSON_SRFS } from './json-fns';
 import { genericArith, genericNumericCast, NUMERIC_FUNCS } from './numeric-fns';
 import { RANGE_FUNCS, RANGE_SRFS } from './range-fns';
 import { SYSTEM_FUNCS, SYSTEM_SRFS } from './system-fns';
-import { TEXT_FUNCS, TEXT_SRFS } from './text-fns';
+import { TEXT_CAST_SRC, TEXT_FUNCS, TEXT_SRFS } from './text-fns';
 
 const SRC_MAP = new Map<string, FnImpl>();
 const SRF_MAP = new Map<string, FnImpl>();
@@ -23,10 +23,11 @@ for (const table of [NUMERIC_FUNCS, TEXT_FUNCS, DATETIME_FUNCS, JSON_FUNCS, JSON
     SRC_MAP.set(k, v);
   }
 }
-// builtin SQL-language functions keyed by their prosrc body
-// textanycat(text, anynonarray) / anytextcat(anynonarray, text): the non-text side goes through its output function
-SRC_MAP.set('select $1 operator(pg_catalog.||) $2::pg_catalog.text', (a, fc) => (a[0] as string) + outputValue(fc.argTypes[1], a[1], fc.st.session.io));
-SRC_MAP.set('select $1::pg_catalog.text operator(pg_catalog.||) $2', (a, fc) => outputValue(fc.argTypes[0], a[0], fc.st.session.io) + (a[1] as string));
+// builtin SQL-language functions keyed by their prosrc body. The `||` operators carry theirs in
+// pg_operator.oprcode while the procs' own prosrc is empty (PostgreSQL 14+ keeps SQL bodies in
+// prosqlbody), so both spellings must reach the ONE implementation in TEXT_FUNCS.
+SRC_MAP.set('select $1 operator(pg_catalog.||) $2::pg_catalog.text', TEXT_FUNCS.textanycat);
+SRC_MAP.set('select $1::pg_catalog.text operator(pg_catalog.||) $2', TEXT_FUNCS.anytextcat);
 for (const table of [JSON_SRFS, ARRAY_SRFS, SYSTEM_SRFS, TEXT_SRFS, RANGE_SRFS]) {
   for (const [k, v] of Object.entries(table)) {
     SRF_MAP.set(k, v);
@@ -35,6 +36,8 @@ for (const table of [JSON_SRFS, ARRAY_SRFS, SYSTEM_SRFS, TEXT_SRFS, RANGE_SRFS])
 
 /** Length coercion / simple conversion functions used by pg_cast entries. */
 const CAST_SRC: Record<string, FnImpl> = {
+  // the casts to text, shared with castToText() so `x::text` and `'' || x` can never disagree
+  ...Object.fromEntries(Object.entries(TEXT_CAST_SRC).map(([src, f]): [string, FnImpl] => [src, (a) => f(a[0])])),
   varchar: (a) => applyCharTypmod(a[0] as string, TypeOid.varchar, a[1] as number, a[2] === true),
   bpchar: (a) => applyCharTypmod(a[0] as string, TypeOid.bpchar, a[1] as number, a[2] === true),
   numeric: (a) => (a[0] as PgNumeric).applyTypmod(a[1] as number),
@@ -78,15 +81,12 @@ const CAST_SRC: Record<string, FnImpl> = {
     }
     return { months, days, us };
   },
-  rtrim1: (a) => (a[0] as string).replace(/ +$/, ''),
+  // rtrim1 / name_text / char_text / booltext come from TEXT_CAST_SRC above
   text_name: (a) => truncateName(a[0] as string),
-  name_text: (a) => a[0],
   bpchar_name: (a) => truncateName((a[0] as string).replace(/ +$/, '')),
   name_bpchar: (a) => a[0],
-  char_text: (a) => a[0],
   text_char: (a) => (a[0] as string).slice(0, 1),
   char_bpchar: (a) => a[0],
-  booltext: (a) => (a[0] ? 'true' : 'false'),
   i8tooid: (a) => Number(a[0]),
   oidtoi8: (a) => BigInt(a[0] as number),
   int4_bool: (a) => a[0] !== 0,

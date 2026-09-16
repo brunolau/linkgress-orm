@@ -22,6 +22,7 @@ import {
 import { NsItem, ParseState } from './parse-state';
 import { analyzeSelectStmt, analyzeStatementAsSubquery } from './select';
 import { atPosition } from './location';
+import { containsVarsOfLevel } from './walk';
 
 export interface FromResult {
   node: JoinTreeNode;
@@ -335,7 +336,11 @@ function transformRangeFunction(an: Analyzer, pstate: ParseState, item: A.RangeF
     alias: item.alias?.name,
     eref: { aliasname: aliasName, colnames: finalNames },
     colTypes,
-    lateral: item.lateral,
+    // transformRangeFunction: `is_lateral = r->lateral || contain_vars_of_level(funcexprs, 0)` — a
+    // function in FROM whose arguments read a preceding FROM item is LATERAL whether or not the
+    // keyword is written, so `FROM t, unnest(t.arr)` re-evaluates the function per row of t.
+    // (A reference to an enclosing QUERY level is levelsUp > 0 and does NOT make it lateral.)
+    lateral: item.lateral || functions.some((f) => containsVarsOfLevel(f.expr, 0)),
   };
 }
 

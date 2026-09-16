@@ -330,6 +330,19 @@ function jsonbArrayElementAt(v: JsonbValue, idx: number): JsonbValue | null {
   return v[i];
 }
 
+/**
+ * `jsonb -> int` / `->> int`: jsonb stores a top-level SCALAR as a one-element array carrying the
+ * scalar flag, so `JB_ROOT_IS_ARRAY` holds for it and `'5'::jsonb -> 0` (and `-> -1`) is the scalar
+ * itself. Only these two operators see it — `#>`, the `[...]` subscript and the `json` (text) type
+ * all return NULL for the same input.
+ */
+function jsonbElementOrScalar(v: JsonbValue, idx: number): JsonbValue | null {
+  if (!Array.isArray(v) && !isJsonbObject(v)) {
+    return idx === 0 || idx === -1 ? v : null;
+  }
+  return jsonbArrayElementAt(v, idx);
+}
+
 function jsonbPath(v: JsonbValue, path: (string | null)[]): JsonbValue | null {
   let cur: JsonbValue | null = v;
   for (const p of path) {
@@ -726,9 +739,9 @@ export const JSON_FUNCS: Record<string, FnImpl> = {
     const r = v.get(a[1] as string);
     return r === undefined ? null : jsonbAsText(r);
   },
-  jsonb_array_element: (a) => jsonbArrayElementAt(jsonbArg(a[0]), a[1] as number),
+  jsonb_array_element: (a) => jsonbElementOrScalar(jsonbArg(a[0]), a[1] as number),
   jsonb_array_element_text: (a) => {
-    const r = jsonbArrayElementAt(jsonbArg(a[0]), a[1] as number);
+    const r = jsonbElementOrScalar(jsonbArg(a[0]), a[1] as number);
     return r === null ? null : jsonbAsText(r);
   },
   jsonb_extract_path: (a) => jsonbPath(jsonbArg(a[0]), flatTextArray(a[1])),

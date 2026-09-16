@@ -40,6 +40,12 @@ function substrChars(s: string, start: number, len: number | null): string {
     .join('');
 }
 
+/**
+ * A value as its type's OUTPUT function writes it — the text the wire protocol sends for a column.
+ * This is what `format()`'s %s / %I / %L and `concat()` use (`OidOutputFunctionCall`), so
+ * `format('%L', true)` is `'t'` and `format('%L', 'a  '::char(4))` keeps the padding.
+ * A value CAST to text is a different thing: see {@link castToText}.
+ */
 function valueToText(v: unknown, type: number, fc: FnCall): string {
   if (type === TypeOid.text || type === TypeOid.varchar || type === TypeOid.unknown || type === TypeOid.name) {
     return v as string;
@@ -48,6 +54,43 @@ function valueToText(v: unknown, type: number, fc: FnCall): string {
     return v as string;
   }
   return outputValue(type, v, fc.st.session.io);
+}
+
+/**
+ * Casts to `text` that pg_cast implements with a FUNCTION instead of the type's output function.
+ * Shared with the cast pathway (`CAST_SRC` in registry.ts) so each has one definition.
+ */
+export const TEXT_CAST_SRC: Record<string, (v: unknown) => string> = {
+  booltext: (v) => (v ? 'true' : 'false'),
+  rtrim1: (v) => (v as string).replace(/ +$/, ''),
+  char_text: (v) => v as string,
+  name_text: (v) => v as string,
+};
+
+/**
+ * `value::pg_catalog.text`, as the SQL body of a builtin writes it: the `||` operators with one
+ * non-text side (`textanycat` / `anytextcat`) and `quote_literal` / `quote_nullable` over
+ * `anyelement` all cast, they do not call the output function. The two disagree wherever pg_cast
+ * has a function for the conversion — `true::text` is `true` while a boolean COLUMN goes over the
+ * wire as `t`, and `'a  '::char(4)::text` is `a` while its output keeps the padding.
+ */
+export function castToText(v: unknown, type: number, fc: FnCall): string {
+  const catalog = fc.st.catalog;
+  let base = type;
+  for (let guard = 0; guard < 16; guard++) {
+    const t = catalog.getType(base);
+    if (!t || t.typtype !== 'd') {
+      break;
+    }
+    base = t.baseType;
+  }
+  if (base === TypeOid.text || base === TypeOid.varchar || base === TypeOid.unknown) {
+    return v as string;
+  }
+  const cast = catalog.builtin.casts.get(base + ':' + TypeOid.text);
+  const impl = cast && cast.method === 'f' ? TEXT_CAST_SRC[cast.funcSrc] : undefined;
+  // no pg_cast function: the conversion is COERCE_VIA_IO, which IS the output function
+  return impl ? impl(v) : outputValue(type, v, fc.st.session.io);
 }
 
 // ---------------------------------------------------------------------------
@@ -647,8 +690,10 @@ export const TEXT_FUNCS: Record<string, FnImpl> = {
   to_ascii_encname: (a) => toAscii(a[0] as string, a[1] as string),
   to_ascii_enc: (a) => toAscii(a[0] as string, ({ 6: 'UTF8', 8: 'LATIN1', 9: 'LATIN2', 29: 'WIN1250' } as Record<number, string>)[a[1] as number] ?? String(a[1])),
   textcat: (a) => (a[0] as string) + (a[1] as string),
-  anytextcat: (a, fc) => valueToText(a[0], fc.argTypes[0], fc) + (a[1] as string),
-  textanycat: (a, fc) => (a[0] as string) + valueToText(a[1], fc.argTypes[1], fc),
+  // `select $1::pg_catalog.text operator(pg_catalog.||) $2` / `select $1 operator(pg_catalog.||) $2::pg_catalog.text`
+  // — the non-text side is CAST to text, never passed through its output function ('x' || true is "xtrue")
+  anytextcat: (a, fc) => castToText(a[0], fc.argTypes[0], fc) + (a[1] as string),
+  textanycat: (a, fc) => (a[0] as string) + castToText(a[1], fc.argTypes[1], fc),
   textlen: (a) => charLength(a[0] as string),
   bpcharlen: (a) => charLength((a[0] as string).replace(/ +$/, '')),
   textoctetlen: (a) => Buffer.byteLength(a[0] as string, 'utf8'),
@@ -813,8 +858,10 @@ export const TEXT_FUNCS: Record<string, FnImpl> = {
     return String.fromCodePoint(n);
   },
   quote_ident: (a) => quoteIdentifier(a[0] as string),
-  quote_literal: (a) => quoteLiteral(a[0] as string),
-  quote_nullable: (a) => (a[0] === null ? 'NULL' : quoteLiteral(a[0] as string)),
+  // quote_literal / quote_nullable over anyelement are `quote_literal($1::pg_catalog.text)`: a CAST,
+  // so quote_literal(true) is 'true' where format('%L', true) — the output function — is 't'
+  quote_literal: (a, fc) => (a[0] === null ? null : quoteLiteral(castToText(a[0], fc.argTypes[0], fc))),
+  quote_nullable: (a, fc) => (a[0] === null ? 'NULL' : quoteLiteral(castToText(a[0], fc.argTypes[0], fc))),
   translate: (a) => {
     const from = chars(a[1] as string);
     const to = chars(a[2] as string);
