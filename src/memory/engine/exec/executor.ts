@@ -377,12 +377,22 @@ export class Executor implements SubqueryRunner {
     const nt = tlist.length;
     const evs = tlist.map((te) => plan.ev(te.expr));
     const sc = this.rowCtx(base.row, base);
+    // A target entry that is a plain column of this level is read straight out of the tuple, instead
+    // of calling its evaluator once per row per column (runtime.ts, `VarRead`).
+    const reads = evs.map((ev) => ev.varRead ?? null);
     let outs: unknown[][] = new Array(rows.length);
     for (let i = 0; i < rows.length; i++) {
-      sc.row = rows[i];
+      const row = rows[i];
+      sc.row = row;
       const out = new Array(nt);
       for (let j = 0; j < nt; j++) {
-        out[j] = evs[j](sc);
+        const read = reads[j];
+        if (read === null) {
+          out[j] = evs[j](sc);
+          continue;
+        }
+        const t = row[read.rtIndex] as unknown[] | null | undefined;
+        out[j] = t === null || t === undefined ? null : read.physical < t.length ? t[read.physical] : read.missing;
       }
       outs[i] = out;
     }
@@ -1698,24 +1708,31 @@ export class Executor implements SubqueryRunner {
     const scratch = this.rowCtx(scratchRow, ctx);
     // `tableOid`: the child relation a row read through an inheritance parent comes from (system
     // column tableoid), kept at `2 * nrt + rtIndex`
+    // Hoisted out of the per-tuple path: a scan evaluates these for every tuple it reads.
+    const tupleSlot = nrt + rtIndex;
+    const tableOidSlot = 2 * nrt + rtIndex;
+    const template = ctx.row;
     const emit = (t: Tuple, data: unknown[], tableOid?: number) => {
-      if (filterEvs.length > 0) {
+      const evs = filterEvs;
+      const nf = evs.length;
+      if (nf > 0) {
         scratchRow[rtIndex] = data;
-        scratchRow[nrt + rtIndex] = t;
+        scratchRow[tupleSlot] = t;
         if (tableOid !== undefined) {
-          scratchRow[2 * nrt + rtIndex] = tableOid;
+          scratchRow[tableOidSlot] = tableOid;
         }
-        for (const ev of filterEvs) {
-          if (ev(scratch) !== true) {
+        // Indexed, not `for…of`: the iterator would be allocated once per tuple scanned.
+        for (let fi = 0; fi < nf; fi++) {
+          if (evs[fi](scratch) !== true) {
             return;
           }
         }
       }
-      const row = ctx.row.slice();
+      const row = template.slice();
       row[rtIndex] = data;
-      row[nrt + rtIndex] = t;
+      row[tupleSlot] = t;
       if (tableOid !== undefined) {
-        row[2 * nrt + rtIndex] = tableOid;
+        row[tableOidSlot] = tableOid;
       }
       out.push(row);
     };

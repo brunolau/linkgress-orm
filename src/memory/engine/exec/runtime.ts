@@ -166,7 +166,20 @@ export class EvalCtx {
   }
 }
 
-export type Evaluator = (c: EvalCtx) => unknown;
+/**
+ * How a compiled evaluator reads a plain column of a range-table entry of ITS OWN query level:
+ * `row[rtIndex]` is the tuple's data array, the value is at `physical` in it, and a row written
+ * before the column was added reads `missing`. Attached to the evaluator itself (see `compileVar`)
+ * so a caller that runs it for many rows — the projection, a comparison against a constant — can
+ * read the value inline instead of paying a closure call per row per column.
+ */
+export interface VarRead {
+  rtIndex: number;
+  physical: number;
+  missing: unknown;
+}
+
+export type Evaluator = ((c: EvalCtx) => unknown) & { varRead?: VarRead };
 
 /** Call information passed to builtin function implementations. */
 export interface FnCall {

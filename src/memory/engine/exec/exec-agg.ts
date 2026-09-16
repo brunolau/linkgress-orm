@@ -209,6 +209,11 @@ function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: E
     node: a,
   }));
   const nk = keyEvs.length;
+  // Per key column and per aggregate, resolved once instead of once per row: the hash key function
+  // of the column's type, and the argument array the transition function reads (every aggregate
+  // here is a built-in that reads `a[0]` / `a[1]` during the call and never keeps the array).
+  const hashKeyFns = keyTypes.map((t) => typeOps.hashKeyFn(t));
+  const aggArgs = aggArgEvs.map((evs) => new Array(evs.length));
   const groups: HashGroup[] = [];
   const root = new Map<unknown, unknown>();
   const newGroup = (keyValues: unknown[], rep: Row): HashGroup => {
@@ -246,7 +251,7 @@ function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: E
       let level = root;
       let k = 0;
       if (prevLevel !== null) {
-        while (k < last && typeOps.hashKey(keyTypes[k], kv[k]) === prevKeys[k]) {
+        while (k < last && hashKeyFns[k](kv[k]) === prevKeys[k]) {
           k++;
         }
         if (k === last) {
@@ -257,7 +262,7 @@ function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: E
       }
       if (level === root) {
         for (; k < last; k++) {
-          const hk = typeOps.hashKey(keyTypes[k], kv[k]);
+          const hk = hashKeyFns[k](kv[k]);
           prevKeys[k] = hk;
           let next = level.get(hk) as Map<unknown, unknown> | undefined;
           if (!next) {
@@ -268,7 +273,7 @@ function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: E
         }
         prevLevel = level;
       }
-      const leafKey = typeOps.hashKey(keyTypes[last], kv[last]);
+      const leafKey = hashKeyFns[last](kv[last]);
       let found = level.get(leafKey) as HashGroup | undefined;
       if (!found) {
         found = newGroup(kv.slice(), r);
@@ -283,7 +288,7 @@ function hashAggregate(executor: Executor, plan: QueryPlan, rows: Row[], base: E
       }
       const evs = aggArgEvs[ai];
       const n = evs.length;
-      const args = new Array(n);
+      const args = aggArgs[ai];
       let hasNull = false;
       for (let x = 0; x < n; x++) {
         const v = evs[x](sc);

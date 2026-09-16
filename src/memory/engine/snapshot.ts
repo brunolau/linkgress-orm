@@ -96,6 +96,42 @@ function encode(v: unknown, seen: Map<object, unknown>): unknown {
   return out;
 }
 
+/**
+ * Numerics decoded during the current restore, by scale and signed magnitude. A seeded database
+ * repeats the same amounts thousands of times (prices, VAT rates, zero), and `PgNumeric` is
+ * immutable — readonly fields, a private constructor, every operation returns a new value — so one
+ * instance can back every occurrence. Measured on the gopass test snapshot: 326 k numeric objects
+ * (each holding its own BigInt) collapse to the few thousand distinct values they represent.
+ *
+ * Module scope, set for the duration of one synchronous `restoreDatabase` call, because `decode`
+ * recurses through a dozen call sites that would each have to thread the pool through.
+ */
+let numericPool: Map<number, Map<bigint, PgNumeric>> | null = null;
+
+/** The shared instance for this value, or `n` itself when it is the first of its kind. */
+function internNumeric(n: PgNumeric): PgNumeric {
+  const pool = numericPool;
+  if (pool === null || n.kind !== 'n') {
+    return n;
+  }
+
+  let byMagnitude = pool.get(n.scale);
+  if (byMagnitude === undefined) {
+    byMagnitude = new Map();
+    pool.set(n.scale, byMagnitude);
+  }
+
+  // BigInts compare by VALUE as Map keys, so the sign can ride the key instead of a second level.
+  const key = n.neg ? -n.mag : n.mag;
+  const hit = byMagnitude.get(key);
+  if (hit !== undefined) {
+    return hit;
+  }
+
+  byMagnitude.set(key, n);
+  return n;
+}
+
 function decode(v: unknown, seen: Map<object, unknown>): unknown {
   if (v === null || typeof v !== 'object') {
     return v;
@@ -132,7 +168,7 @@ function decode(v: unknown, seen: Map<object, unknown>): unknown {
       break;
     case 'num': {
       const n = t as Extract<Tagged, { __t: 'num' }>;
-      out = Object.assign(Object.create(PgNumeric.prototype), { kind: n.kind, neg: n.neg, mag: n.mag, scale: n.scale });
+      out = internNumeric(Object.assign(Object.create(PgNumeric.prototype), { kind: n.kind, neg: n.neg, mag: n.mag, scale: n.scale }) as PgNumeric);
       break;
     }
     case 'jo': {
@@ -225,6 +261,7 @@ export function restoreDatabase(data: Buffer | Uint8Array, overrides: InMemoryDa
   }
   const db = new Database({ ...payload.options, ...overrides });
   const seen = new Map<object, unknown>();
+  numericPool = new Map();
   const cat = new Catalog(db.builtin);
   for (const name of CATALOG_MAPS) {
     (cat as unknown as Record<string, unknown>)[name] = decode(payload.catalog[name], seen);
@@ -236,5 +273,8 @@ export function restoreDatabase(data: Buffer | Uint8Array, overrides: InMemoryDa
   for (const [storageId, rows] of payload.heaps) {
     db.store.restoreHeap(storageId, rows.map((r) => decode(r, seen) as unknown[]));
   }
+
+  // The pool itself is scratch: the instances it handed out are referenced by the rows.
+  numericPool = null;
   return db;
 }

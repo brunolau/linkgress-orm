@@ -424,10 +424,12 @@ export function lookupAggregate(agg: AggNode, typeOps: TypeOps): AggImpl | null 
   const name = agg.aggName;
   switch (name) {
     case 'count':
+      // Counted as a double and widened once at the end: a BigInt increment allocates a new BigInt
+      // per row, and `count` is the aggregate a scan runs most. A row count cannot reach 2^53.
       return {
-        init: () => 0n,
-        step: (s) => (s as bigint) + 1n,
-        final: (s) => s,
+        init: () => 0,
+        step: (s) => (s as number) + 1,
+        final: (s) => BigInt(s as number),
       };
     case 'sum':
       return sumAgg(argType, agg.type);

@@ -310,6 +310,19 @@ export class TypeOps {
     return a.values.length - b.values.length;
   }
 
+  /**
+   * {@link TypeOps.hashKey} bound to one type — for a caller that hashes the same column of many
+   * rows (GROUP BY, hash joins): the type switch runs once instead of once per row, and for the
+   * types whose key IS the value it collapses to a null check.
+   */
+  hashKeyFn(typeOid: number): (v: unknown) => unknown {
+    if (IDENTITY_KEY_TYPES.has(typeOid)) {
+      return (v) => (v === null || v === undefined ? NULL_KEY : v);
+    }
+
+    return (v) => this.hashKey(typeOid, v);
+  }
+
   /** Hash key such that values equal under the type's equality operator share the key. */
   hashKey(typeOid: number, v: unknown): unknown {
     if (v === null || v === undefined) {
@@ -463,6 +476,24 @@ export class TypeOps {
 }
 
 export const NULL_KEY = Symbol('null-key');
+
+/** Types whose hash key is the value itself — kept beside the `hashKey` switch that says so. */
+const IDENTITY_KEY_TYPES = new Set<number>([
+  TypeOid.int2,
+  TypeOid.int4,
+  TypeOid.oid,
+  TypeOid.date,
+  TypeOid.timestamp,
+  TypeOid.timestamptz,
+  TypeOid.time,
+  TypeOid.bool,
+  TypeOid.text,
+  TypeOid.varchar,
+  TypeOid.name,
+  TypeOid.char,
+  TypeOid.uuid,
+  TypeOid.unknown,
+]);
 
 function keyToJson(k: unknown): unknown {
   if (k === NULL_KEY) {

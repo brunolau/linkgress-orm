@@ -415,13 +415,20 @@ function compileVar(e: TExpr & { k: 'var' }, env: CompileEnv): Evaluator {
   if (phys) {
     const p = phys[attno];
     const miss = missing ? missing[attno] : null;
-    return (c) => {
+    const read: Evaluator = (c) => {
       const t = getTuple(c);
       if (t === null || t === undefined) {
         return null;
       }
       return p < t.length ? t[p] : miss;
     };
+
+    if (levelsUp === 0 && p !== undefined) {
+      // this level's row holds the tuple directly: callers may read it without calling back here
+      read.varRead = { rtIndex, physical: p, missing: miss };
+    }
+
+    return read;
   }
   return (c) => {
     const t = getTuple(c);
@@ -590,6 +597,28 @@ export function operatorImpl(opName: string, src: string, left: number, right: n
   throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `in-memory engine: operator implementation ${src} (${opName}) is not supported`);
 }
 
+/**
+ * The comparison as a two-argument function — no `args` array, no wrapper hop. Comparisons are the
+ * hottest operator shape in a scan (`col = $1`, `price > 1000`, `active = true`), and on the array
+ * path each row allocated a two-element array whose only consumer read it back immediately.
+ */
+function binaryComparison(op: string, cmp: (a: unknown, b: unknown) => number): (a: unknown, b: unknown) => boolean {
+  switch (op) {
+    case '=':
+      return (a, b) => cmp(a, b) === 0;
+    case '<>':
+      return (a, b) => cmp(a, b) !== 0;
+    case '<':
+      return (a, b) => cmp(a, b) < 0;
+    case '<=':
+      return (a, b) => cmp(a, b) <= 0;
+    case '>':
+      return (a, b) => cmp(a, b) > 0;
+    default:
+      return (a, b) => cmp(a, b) >= 0;
+  }
+}
+
 function comparisonFromComparator(op: string, cmp: (a: unknown, b: unknown) => number): (args: unknown[]) => unknown {
   switch (op) {
     case '=':
@@ -613,6 +642,8 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
   const name = e.k === 'op' ? e.opName : e.funcName;
   const src = e.funcSrc;
   let impl: FnImpl | null = null;
+  /** Set for a two-argument comparison: called directly, bypassing `impl`'s array (see below). */
+  let binary: ((a: unknown, b: unknown) => boolean) | null = null;
   let strict = true;
   if (e.k === 'func' && e.isUser) {
     const proc = env.catalog.getProc(e.funcOid);
@@ -632,6 +663,7 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
     if (!impl && e.k === 'op' && COMPARISON_OPS.has(e.opName) && e.args.length === 2) {
       const cmp = env.typeOps.crossComparator(argTypes[0], argTypes[1], e.inputCollation) ?? env.typeOps.comparator(argTypes[0], e.inputCollation);
       const f = comparisonFromComparator(e.opName, cmp);
+      binary = binaryComparison(e.opName, cmp);
       impl = (vals) => f(vals);
     }
   }
@@ -666,6 +698,38 @@ function compileCall(e: OpNode | FuncNode, env: CompileEnv): Evaluator {
   }
   if (n === 2) {
     const [a0, a1] = args;
+    if (binary !== null) {
+      const f2 = binary;
+      const read = a0.varRead;
+      if (read !== undefined) {
+        // `<column> <cmp> <expr>`, the shape every scan filter and index qual has: the column is read
+        // out of the tuple here, so the row pays one call for the whole comparison.
+        const { rtIndex, physical, missing } = read;
+        return (c) => {
+          const t = c.row[rtIndex] as unknown[] | null | undefined;
+          const v0 = t === null || t === undefined ? null : physical < t.length ? t[physical] : missing;
+          if (strict && v0 === null) {
+            return null;
+          }
+          const v1 = a1(c);
+          if (strict && v1 === null) {
+            return null;
+          }
+          return f2(v0, v1);
+        };
+      }
+      return (c) => {
+        const v0 = a0(c);
+        if (strict && v0 === null) {
+          return null;
+        }
+        const v1 = a1(c);
+        if (strict && v1 === null) {
+          return null;
+        }
+        return f2(v0, v1);
+      };
+    }
     return (c) => {
       const v0 = a0(c);
       if (strict && v0 === null) {

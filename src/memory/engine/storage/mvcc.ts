@@ -183,6 +183,12 @@ export class Visibility {
   visible(t: Tuple, snap: Snapshot): boolean {
     const txns = this.txns;
     const xmin = t.xmin;
+    // Frozen and never deleted — visible to every snapshot, and the majority of a restored
+    // database. Checked first so a sequential scan over untouched rows never reaches the
+    // transaction table (`isOwn` → `topLevel` is a map lookup per tuple).
+    if (xmin === FROZEN_XID && t.xmax === INVALID_XID) {
+      return true;
+    }
     if (this.isOwn(xmin, snap)) {
       if (txns.isAborted(xmin)) {
         return false;
