@@ -4,7 +4,7 @@ import type { Session } from '../session';
 import { EPOCH_DIFF_US } from '../types/datetime';
 import { PgNumeric } from '../types/numeric';
 import { withLowerBound } from '../types/values';
-import { Catalog, Column, NS_PG_CATALOG, PgType, Relation, TypeOid } from './catalog';
+import { Catalog, Column, Constraint, NS_PG_CATALOG, PgType, Relation, TypeOid } from './catalog';
 import { CatalogFunctionsImpl } from './deparse';
 import { viewIsAutoUpdatable } from '../analyze/view-rewrite';
 
@@ -98,9 +98,43 @@ function dataTypeName(types: TypeUtil, cat: Catalog, typeOid: number): string {
   return types.formatType(typeOid, -1, false, false, [NS_PG_CATALOG]);
 }
 
-/** system catalogs whose rows are a function of the catalog alone (no session or storage state) */
-const CATALOG_ONLY_RELATIONS = new Set(['pg_catalog.pg_type', 'pg_catalog.pg_namespace']);
-const catalogOnlyRows = new WeakMap<Catalog, Map<number, { version: number; rows: unknown[][] }>>();
+/**
+ * The catalog views whose rows do NOT follow from the catalog alone — they report live session or
+ * lock state, so they are generated per query. Everything else is a pure function of the catalog and
+ * is cached per catalog version (`catalogRows` below): the other generators reach for the session
+ * only for stable values (the database name, the catalog helper functions).
+ *
+ * Generating them per query is what made a schema migration slow: the schema manager introspects
+ * per TABLE, so a 200-table model re-materialized pg_attribute, pg_index, pg_constraint and
+ * information_schema.columns hundreds of times. Measured on the gopass schema: 70 s of the 110 s
+ * "migrations applied" step was those rebuilds.
+ *
+ * `pg_class` is cached too, even though its `reltuples` is the relation's CURRENT row count: the
+ * rest of the row follows from the catalog, so the cached rows are kept and only that one column is
+ * refreshed per query ({@link refreshRelTuples}). It has to be cached — every introspection query
+ * joins pg_class, so rebuilding it per query rebuilt a row per table, index, sequence and view each
+ * time.
+ */
+const SESSION_DEPENDENT_RELATIONS = new Set([
+  'pg_catalog.pg_stat_activity',
+  'pg_catalog.pg_locks',
+  'pg_catalog.pg_prepared_statements',
+  'pg_catalog.pg_settings',
+  // `last_value` moves with every nextval, which is not a catalog change: caching it froze the
+  // sequence a caller reads back after allocating from it.
+  'pg_catalog.pg_sequences',
+]);
+const PG_CLASS = 'pg_catalog.pg_class';
+const catalogRows = new WeakMap<Catalog, Map<number, { version: number; rows: unknown[][]; live?: { oid: number; reltuples: number } }>>();
+
+/** Puts the CURRENT row count back into cached `pg_class` rows; relations without storage stay at -1. */
+function refreshRelTuples(session: Session, rel: Relation, rows: unknown[][], live: { oid: number; reltuples: number }): void {
+  for (const row of rows) {
+    if (row[live.reltuples] !== -1) {
+      row[live.reltuples] = session.relationRowCount(row[live.oid] as number);
+    }
+  }
+}
 
 
 const viewUpdatable = (session: Session, r: Relation): 'YES' | 'NO' => (viewIsAutoUpdatable(session.makeAnalyzer(), r) ? 'YES' : 'NO');
@@ -117,21 +151,27 @@ export function catalogRelationRows(session: Session, relOid: number, st: Statem
   if (!gen) {
     return [];
   }
-  if (!CATALOG_ONLY_RELATIONS.has(qualified)) {
+  if (SESSION_DEPENDENT_RELATIONS.has(qualified)) {
     return generateCatalogRows(session, cat, rel, gen);
   }
-  // e.g. the type query every postgres.js connection starts with: rebuilt only when the catalog changes
-  let perCatalog = catalogOnlyRows.get(cat);
+  // rebuilt only when the catalog changes (a DDL bumps its version)
+  let perCatalog = catalogRows.get(cat);
   if (!perCatalog) {
     perCatalog = new Map();
-    catalogOnlyRows.set(cat, perCatalog);
+    catalogRows.set(cat, perCatalog);
   }
   const cached = perCatalog.get(relOid);
   if (cached && cached.version === cat.version) {
+    if (cached.live) {
+      refreshRelTuples(session, rel, cached.rows, cached.live);
+    }
     return cached.rows;
   }
   const rows = generateCatalogRows(session, cat, rel, gen);
-  perCatalog.set(relOid, { version: cat.version, rows });
+  const live = qualified === PG_CLASS
+    ? { oid: rel.columns.findIndex((c) => c.name === 'oid'), reltuples: rel.columns.findIndex((c) => c.name === 'reltuples') }
+    : undefined;
+  perCatalog.set(relOid, { version: cat.version, rows, live: live && live.oid >= 0 && live.reltuples >= 0 ? live : undefined });
   return rows;
 }
 
@@ -152,8 +192,20 @@ function generateCatalogRows(session: Session, cat: Catalog, rel: Relation, gen:
 
 const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
   'pg_catalog.pg_namespace': (_s, cat) => allNamespaces(cat).map((ns) => ({ oid: ns.oid, nspname: ns.name, nspowner: 10 })),
-  'pg_catalog.pg_class': (session, cat) =>
-    allRelations(cat).map((r) => ({
+  'pg_catalog.pg_class': (session, cat) => {
+    // One pass for `relhassubclass`: asking it per relation is a scan inside a scan, and pg_class
+    // has a row per table, index, sequence and view.
+    const parents = new Set<number>();
+    for (const r of allRelations(cat)) {
+      if (r.parentOid) {
+        parents.add(r.parentOid);
+      }
+      for (const inherited of r.inheritsFrom) {
+        parents.add(inherited);
+      }
+    }
+
+    return allRelations(cat).map((r) => ({
       oid: r.oid,
       relname: r.name,
       relnamespace: r.nspOid,
@@ -176,7 +228,7 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
       relchecks: cat.constraintsOf(r.oid).filter((c) => c.type === 'c').length,
       relhasrules: false,
       relhastriggers: r.hasTriggers,
-      relhassubclass: allRelations(cat).some((x) => x.parentOid === r.oid || x.inheritsFrom.includes(r.oid)),
+      relhassubclass: parents.has(r.oid),
       relrowsecurity: false,
       relforcerowsecurity: false,
       relispopulated: r.populated,
@@ -188,7 +240,8 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
       relacl: null,
       reloptions: r.options.length ? r.options : null,
       relpartbound: r.partitionBound ? JSON.stringify(r.partitionBound) : null,
-    })),
+    }));
+  },
   'pg_catalog.pg_attribute': (_s, cat) => {
     const out: Row[] = [];
     for (const r of cat.relations.values()) {
@@ -773,11 +826,19 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
   },
   'information_schema.referential_constraints': (session, cat) => {
     const out: Row[] = [];
+    // The unique constraint each foreign key points at, indexed once instead of searched per key.
+    const uniqueByIndex = new Map<number, Constraint>();
+    for (const u of cat.constraints.values()) {
+      if ((u.type === 'p' || u.type === 'u') && !uniqueByIndex.has(u.indexOid)) {
+        uniqueByIndex.set(u.indexOid, u);
+      }
+    }
+
     for (const c of cat.constraints.values()) {
       if (c.type !== 'f') {
         continue;
       }
-      const uniq = [...cat.constraints.values()].find((u) => u.indexOid === c.indexOid && (u.type === 'p' || u.type === 'u'));
+      const uniq = uniqueByIndex.get(c.indexOid);
       out.push({
         constraint_catalog: session.databaseName,
         constraint_schema: cat.namespaceName(c.nspOid),

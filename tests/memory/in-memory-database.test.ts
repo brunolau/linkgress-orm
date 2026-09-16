@@ -221,4 +221,41 @@ describe('in-memory database API', () => {
     expect(await q(`select currval('s') as v`)).toEqual([{ v: '2' }]);
     await client.end();
   });
+
+  test('catalog views that report live state are never served stale', async () => {
+    // Catalog rows are cached per catalog VERSION, which only DDL bumps. Two columns move without
+    // one: `pg_sequences.last_value` (every nextval) and `pg_class.reltuples` (every write). A
+    // caller that allocates from a sequence and reads it back, or counts rows through the catalog,
+    // must see its own work — freezing either is how a cached catalog goes wrong.
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+    const q = async (text: string, params: unknown[] = []) => (await client.query(text, params)).rows;
+    const lastValue = async () => (await q(`select last_value from pg_sequences where sequencename = 'seq_live'`))[0].last_value;
+    const relTuples = async () => Number((await q(`select reltuples from pg_class where relname = 'live'`))[0].reltuples);
+
+    await client.query('create sequence seq_live');
+    await client.query('create table live(id int primary key, n int)');
+
+    // read first, so a cache that froze the row would be populated before the change
+    expect(await lastValue()).toBe(null);
+    await q(`select nextval('seq_live')`);
+    expect(Number(await lastValue())).toBe(1);
+    await q(`select nextval('seq_live')`);
+    expect(Number(await lastValue())).toBe(2);
+
+    expect(await relTuples()).toBe(0);
+    await client.query('insert into live select g, g from generate_series(1, 25) g');
+    expect(await relTuples()).toBe(25);
+    // it counts the versions the heap holds, so a delete shows up only once they are vacuumed —
+    // PostgreSQL is no different here (only VACUUM / ANALYZE move its reltuples)
+    await client.query('insert into live select g, g from generate_series(100, 109) g');
+    expect(await relTuples()).toBe(35);
+
+    // and the rows that DO follow from the catalog still track it across a DDL
+    expect((await q(`select count(*)::int as n from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname = 'live' and a.attnum > 0`))[0].n).toBe(2);
+    await client.query('alter table live add column tag text');
+    expect((await q(`select count(*)::int as n from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname = 'live' and a.attnum > 0`))[0].n).toBe(3);
+    await client.end();
+  });
 });

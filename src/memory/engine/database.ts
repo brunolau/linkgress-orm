@@ -4,6 +4,9 @@ import { parseSql } from './parser-ddl';
 import { Store } from './storage/store';
 import { Session } from './session';
 
+/** Statement texts whose parse tree (and, through it, their analysis) is kept. */
+const PARSE_CACHE_MAX = 8000;
+
 export interface InMemoryDatabaseOptions {
   /** database name reported by current_database() (default "postgres") */
   databaseName?: string;
@@ -141,14 +144,29 @@ export class Database {
   }
 
   parse(sql: string): ParsedStatement[] {
-    let cached = this.parseCache.get(sql);
-    if (!cached) {
-      cached = parseSql(sql);
-      if (this.parseCache.size > 2000) {
-        this.parseCache.clear();
-      }
+    const cached = this.parseCache.get(sql);
+    if (cached) {
+      // Re-inserted so the Map's insertion order is recency order (see the eviction below).
+      this.parseCache.delete(sql);
       this.parseCache.set(sql, cached);
+      return cached;
     }
-    return cached;
+    const parsed = parseSql(sql);
+    this.parseCache.set(sql, parsed);
+    // Evict the least recently used one, never the whole cache: the analyzed form of a statement
+    // hangs off its parse tree, so clearing threw away every prepared statement's analysis at once
+    // and a workload with more distinct texts than the cap re-parsed AND re-analyzed everything it
+    // came back to. A test suite is exactly that workload.
+    while (this.parseCache.size > PARSE_CACHE_MAX) {
+      const oldest = this.parseCache.keys().next().value;
+
+      if (oldest === undefined) {
+        break;
+      }
+
+      this.parseCache.delete(oldest);
+    }
+
+    return parsed;
   }
 }
