@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData, createTestDatabase, setupDatabase, cleanupDatabase } from '../utils/test-database';
-import { gt, lt, gte, lte, eq, and, or, like, not } from '../../src/query/conditions';
+import { gt, lt, gte, lte, eq, and, or, like, not, sql } from '../../src/query/conditions';
 import { assertType } from '../utils/type-tester';
 
 describe('LATERAL Collection Strategy', () => {
@@ -239,6 +239,32 @@ describe('LATERAL Collection Strategy', () => {
       }, { collectionStrategy: 'lateral' });
     });
 
+    test('a count can be used inside a sql fragment (here: cast to int)', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        const results = await db.users
+          .select(u => ({
+            username: u.username,
+            highViewCount: sql<number>`${u.posts!.where(p => gt(p.views!, 100)).count()}::int`,
+          }))
+          .toList();
+
+        expect(results.map(u => [u.username, u.highViewCount]).sort()).toEqual([['alice', 1], ['bob', 1], ['charlie', 0]]);
+
+        // Through a navigation back to the SAME table: the count's own `posts` must not shadow the
+        // outer post the navigation hangs off (every row would count all three posts)
+        const posts = await db.posts
+          .select(p => ({
+            title: p.title,
+            authorPostCount: sql<number>`${p.user!.posts!.count()}::int`,
+          }))
+          .toList();
+
+        expect(posts.map(p => [p.title, p.authorPostCount]).sort()).toEqual([['Alice Post 1', 2], ['Alice Post 2', 2], ['Bob Post', 1]]);
+      }, { collectionStrategy: 'lateral' });
+    });
+
     test('should get max views per user', async () => {
       await withDatabase(async (db) => {
         await seedTestData(db);
@@ -439,6 +465,37 @@ describe('LATERAL Collection Strategy', () => {
 
         const charlie = results.find(u => u.username === 'charlie');
         expect(charlie!.viewCounts).toEqual([]);
+      }, { collectionStrategy: 'lateral' });
+    });
+
+    test('keeps the collection orderBy in an unlimited toStringList / toNumberList', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // DESC runs against insertion order: an array_agg without ORDER BY hands back heap
+        // order (Winter, Family / 1, 2) and fails this. The tag navigation in the selector puts
+        // a second table in the subquery, so the ORDER BY columns must be qualified.
+        const results = await db.products
+          .select(p => ({
+            name: p.name,
+            tagNames: p.productTags!
+              .orderBy(pt => [[pt.sortOrder, 'DESC']])
+              .select(pt => ({ name: pt.tag!.name }))
+              .toStringList('tagNames'),
+            sortOrders: p.productTags!
+              .orderBy(pt => [[pt.sortOrder, 'DESC'], [pt.tagId, 'ASC']])
+              .select(pt => ({ sortOrder: pt.sortOrder }))
+              .toNumberList('sortOrders'),
+          }))
+          .toList();
+
+        results.forEach(p => {
+          assertType<string[], typeof p.tagNames>(p.tagNames);
+          assertType<number[], typeof p.sortOrders>(p.sortOrders);
+        });
+
+        expect(results.find(p => p.name === 'Hardback')).toEqual({ name: 'Hardback', tagNames: ['Family', 'Winter'], sortOrders: [2, 1] });
+        expect(results.find(p => p.name === 'Lift Ticket')).toEqual({ name: 'Lift Ticket', tagNames: ['Summer'], sortOrders: [1] });
       }, { collectionStrategy: 'lateral' });
     });
   });

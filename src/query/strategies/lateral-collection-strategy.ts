@@ -66,6 +66,7 @@ export const lateralShapeKey = (config: CollectionAggregationConfig, context: Qu
     + listKey(config.foreignKeys) + KEY_SEP + listKey(config.matches) + KEY_SEP + (config.foreignKeyTableAlias ?? '') + KEY_SEP
     + config.sourceTable + KEY_SEP + (aliasMap?.get(config.sourceTable) ?? '') + KEY_SEP
     + (config.whereClause ?? '') + KEY_SEP + (config.orderByClause ?? '') + KEY_SEP + (config.orderByClauseAlias ?? '') + KEY_SEP
+    + (config.orderByFields?.map(field => field.table ?? '').join(',') ?? '') + KEY_SEP
     + (config.limitValue ?? '') + KEY_SEP + (config.offsetValue ?? '') + KEY_SEP
     + (config.isDistinct === true ? 'D' : '') + (config.isSingleResult === true ? 'S' : '') + (config.useJsonArrayAggregation === true ? 'J' : '') + KEY_SEP
     + config.aggregationType + KEY_SEP + (config.aggregateField ?? '') + KEY_SEP + (config.aggregateExpression ?? '') + KEY_SEP
@@ -361,7 +362,8 @@ FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL}) "sq")`;
       } else {
-        subquerySQL = `(SELECT COALESCE(${arrayAggFn}(${fieldExpression}), ${defaultValue})
+        const orderBySQL = this.buildOwnColumnsAggregateOrderBy(config, innerTableAlias);
+        subquerySQL = `(SELECT COALESCE(${arrayAggFn}(${fieldExpression}${orderBySQL}), ${defaultValue})
 FROM "${targetTable}" "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
@@ -412,6 +414,30 @@ WHERE ${whereSQL})`;
       selectExpression: subquerySQL,
       isCTE: false,
     };
+  }
+
+  /**
+   * The ` ORDER BY …` inside the aggregate of an unlimited `toNumberList()` / `toStringList()`,
+   * or '' when the collection is not ordered. That shape renders as a correlated subquery with no
+   * inner sorted subquery, so an ordering that is not written into the aggregate itself is simply
+   * lost — the array came back in heap order. The columns are qualified with the inner alias: a
+   * navigation joined for the selector can carry a column of the same name. Only an ordering by
+   * the collection's OWN columns is rendered; any other keeps the previous (unordered) rendering.
+   */
+  private buildOwnColumnsAggregateOrderBy(config: CollectionAggregationConfig, innerTableAlias: string): string {
+    const fields = config.orderByFields;
+
+    if (!fields || fields.length === 0) {
+      return '';
+    }
+
+    const ownMarker = `__collection_${config.targetTable}__`;
+
+    if (!fields.every(field => field.table === undefined || field.table === ownMarker)) {
+      return '';
+    }
+
+    return ' ORDER BY ' + fields.map(field => `"${innerTableAlias}"."${field.field}" ${field.direction}`).join(', ');
   }
 
   /**

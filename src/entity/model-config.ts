@@ -1,6 +1,7 @@
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { EntityConfigBuilder } from './entity-builder';
-import { TableBuilder, ForeignKeyConstraint } from '../schema/table-builder';
+import { ViewConfigBuilder } from './view-builder';
+import { TableBuilder, ForeignKeyConstraint, TableViewDefinition } from '../schema/table-builder';
 import { DbNavigation, DbNavigationCollection } from '../schema/navigation';
 import {
   assertValidDatabaseSettingName,
@@ -24,6 +25,24 @@ export class DbModelConfig {
   ): void {
     const builder = new EntityConfigBuilder(entityClass);
     configure(builder);
+  }
+
+  /**
+   * Declare a model-managed database VIEW. `ensureCreated()` creates it after
+   * the tables; `migrate()` re-creates it whenever its definition changes or a
+   * column change under it forces a drop. Expose it on the context with
+   * `this.view(ViewClass)` — views are read-only.
+   */
+  view<TView extends DbEntity>(
+    viewClass: EntityConstructor<TView>,
+    configure: (builder: ViewConfigBuilder<TView>) => void
+  ): void {
+    configure(new ViewConfigBuilder(viewClass));
+    const view = EntityMetadataStore.getMetadata(viewClass)?.view;
+    const hasSql = view?.definition != null && view.definition.trim().length > 0;
+    if (!hasSql && typeof view?.query !== 'function') {
+      throw new Error(`View ${viewClass.name} has no definition — call definedAs(sql) or definedAs(db => query) inside model.view()`);
+    }
   }
 
   /**
@@ -112,6 +131,7 @@ export class DbModelConfig {
       const tableBuilder = new TableBuilder(metadata.tableName, schema, metadata.indexes || [], [], metadata.schemaName);
       tableBuilder.withStatistics(metadata.statistics || []);
       tableBuilder.withCheckConstraints(metadata.checkConstraints || []);
+      if (metadata.view) tableBuilder.asView(metadata.view);
       tablesWithoutNav.set(metadata.tableName, { table: tableBuilder, entityClass, metadata });
     }
 
@@ -197,6 +217,7 @@ export class DbModelConfig {
         const mergedTable = new TableBuilder(metadata.tableName, { ...existingSchema, ...navSchema }, metadata.indexes || [], [], metadata.schemaName);
         mergedTable.withStatistics(metadata.statistics || []);
         mergedTable.withCheckConstraints(metadata.checkConstraints || []);
+        if (metadata.view) mergedTable.asView(metadata.view);
         if (metadata.partitioning) mergedTable.partitionBy(metadata.partitioning);
         tables.set(metadata.tableName, mergedTable);
       } else {
@@ -269,11 +290,13 @@ export class DbModelConfig {
       const existingPartitioning = (tableBuilder as any).partitioningDef;
       const existingStatistics = (tableBuilder as any).statisticsDefs || [];
       const existingCheckConstraints = (tableBuilder as any).checkConstraintDefs || [];
+      const existingView = (tableBuilder as any).viewDef as TableViewDefinition | undefined;
       const foreignKeys = foreignKeysByTable.get(tableName) || [];
 
       const finalTable = new TableBuilder(tableName, existingSchema, existingIndexes, foreignKeys, existingSchemaName);
       finalTable.withStatistics(existingStatistics);
       finalTable.withCheckConstraints(existingCheckConstraints);
+      if (existingView != null) finalTable.asView(existingView);
       if (existingPartitioning) finalTable.partitionBy(existingPartitioning);
       finalTables.set(tableName, finalTable);
     }

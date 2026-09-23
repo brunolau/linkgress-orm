@@ -343,6 +343,10 @@ You can execute custom SQL after migrations complete by overriding the `onMigrat
 
 ### Example: Custom Functions and Views
 
+> For a view the model can own, prefer `model.view()` ([Schema configuration → Views](./schema-configuration.md#views)):
+> it is created on fresh databases and re-created whenever its definition changes. The hook below remains the way
+> to add objects the model cannot describe (functions, triggers).
+
 ```typescript
 import { DbContext, DbEntityTable, DbModelConfig, DatabaseClient } from 'linkgress-orm';
 import { User } from './entities/user';
@@ -713,6 +717,20 @@ The `DbSchemaManager` analyzes and generates the following migration operations:
   constraintName: 'FK_posts_users'
 }
 ```
+
+#### View Operations (model-managed views, `model.view()`)
+```typescript
+// Runs BEFORE every table operation — a view is dropped when its definition changed or when the
+// migration changes any column or table (PostgreSQL refuses ALTER COLUMN … TYPE under a view).
+// Every view declared after a dropped one is dropped too, before it (a view may read it).
+{ type: 'drop_view', viewName: 'order_summary' }
+// Runs AFTER every table operation — creates the view and stamps its hash marker (COMMENT ON VIEW).
+// A scaffolded file emits DROP VIEW IF EXISTS first, so it also runs where the view already exists.
+{ type: 'create_view', viewName: 'order_summary', definition: 'SELECT …' }
+```
+
+A dropped and re-created view loses its grants, a changed owner and any comment other than the marker —
+see [Schema configuration → Views](./schema-configuration.md#views) for how to keep a reader's access.
 
 ### Operation Analysis
 

@@ -168,6 +168,12 @@ export interface SqlBuildContext {
    * entry for it — both have already been contributed by the hoisting builder.
    */
   hoistedCteNames?: Set<string>;
+  /**
+   * Overrides the client-derived array aggregation style (`array_agg` vs `json_agg`) for a
+   * subquery built under this context. A model-managed view sets `false`: its SQL is schema,
+   * so it must not depend on which driver happens to render it.
+   */
+  useJsonArrayAggregation?: boolean;
 }
 
 /**

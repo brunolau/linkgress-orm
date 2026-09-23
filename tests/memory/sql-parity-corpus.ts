@@ -531,6 +531,25 @@ export const sqlParityCorpus: ParityCase[] = [
     ],
   },
   {
+    // The statements linkgress's model-managed views (`model.view()`) run: create, stamp the
+    // marker comment, read it back through pg_class, drop, re-create without a comment.
+    name: 'model-managed view lifecycle: create, marker comment, drop, re-create',
+    statements: [
+      'CREATE TABLE parity_view_base (id int PRIMARY KEY, amount int NOT NULL)',
+      'INSERT INTO parity_view_base VALUES (1, 1500)',
+      'CREATE VIEW parity_view_v AS SELECT id, amount / 100 AS amount_eur FROM parity_view_base',
+      "COMMENT ON VIEW parity_view_v IS 'linkgress:view:sha256:abc'",
+      "SELECT c.relname, obj_description(c.oid, 'pg_class') AS marker FROM pg_class c WHERE c.relkind = 'v' AND c.relname = 'parity_view_v'",
+      'SELECT id, amount_eur FROM parity_view_v',
+      'DROP VIEW IF EXISTS parity_view_v',
+      "SELECT count(*)::int AS n FROM pg_class WHERE relkind = 'v' AND relname = 'parity_view_v'",
+      'CREATE VIEW parity_view_v AS SELECT id FROM parity_view_base',
+      "SELECT obj_description(c.oid, 'pg_class') AS marker FROM pg_class c WHERE c.relkind = 'v' AND c.relname = 'parity_view_v'",
+      'DROP VIEW parity_view_v',
+      'DROP TABLE parity_view_base',
+    ],
+  },
+  {
     name: 'PL/pgSQL functions',
     statements: [
       `CREATE FUNCTION fact(n int) RETURNS numeric LANGUAGE plpgsql IMMUTABLE AS $$

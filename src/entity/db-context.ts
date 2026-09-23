@@ -11,6 +11,8 @@ import { renumberPlaceholders } from '../query/sql-utils';
 import { PreparedQuery } from '../query/prepared-query';
 import { InferRowType } from '../schema/row-type';
 import { DbSchemaManager } from '../migration/db-schema-manager';
+import { splitViewsFromRegistry } from '../migration/view-sql';
+import { renderViewDefinition } from '../migration/view-query-sql';
 import { DbSequence, SequenceConfig } from '../schema/sequence-builder';
 import type { DbCte } from '../query/cte-builder';
 import { CteRootQueryBuilder } from '../query/cte-root-query';
@@ -2158,11 +2160,13 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * to `false` for the legacy name-only behavior.
    */
   getSchemaManager(options?: { concurrentIndexes?: boolean; recreateChangedIndexes?: boolean }): DbSchemaManager {
-    return new DbSchemaManager(this.client, this.schemaRegistry, {
+    const { tables, views } = splitViewsFromRegistry(this.schemaRegistry, schema => renderViewDefinition(schema, this));
+    return new DbSchemaManager(this.client, tables, {
       logQueries: this.queryOptions?.logQueries,
       logger: this.queryOptions?.logger,
       concurrentIndexes: options?.concurrentIndexes,
       recreateChangedIndexes: options?.recreateChangedIndexes,
+      views,
     });
   }
 
@@ -6927,6 +6931,19 @@ ${extraJoins}${joinClauses.join('\n')}${orderBy}`;
 }
 
 /**
+ * Read-only access to a model-managed VIEW (`model.view()`, exposed with the
+ * context's `view()`): the query surface of {@link DbEntityTable} without its
+ * writes. `update()` / `delete()` on a query over a view also throw at run
+ * time — a single-table view is auto-updatable in PostgreSQL.
+ */
+export type DbViewTable<TEntity extends DbEntity> = Pick<
+  DbEntityTable<TEntity>,
+  | 'toList' | 'first' | 'firstOrDefault' | 'count' | 'exists'
+  | 'orderBy' | 'limit' | 'offset' | 'select' | 'selectDistinct' | 'where'
+  | 'with' | 'leftJoin' | 'innerJoin' | 'getColumns' | 'getColumnKeys' | 'props'
+>;
+
+/**
  * Base database context with entity-first approach
  */
 export abstract class DatabaseContext extends DataContext {
@@ -7080,9 +7097,10 @@ export abstract class DatabaseContext extends DataContext {
    * Get schema manager for create/drop operations with post-migration hook support
    */
   override getSchemaManager(options?: { concurrentIndexes?: boolean; recreateChangedIndexes?: boolean }): DbSchemaManager {
+    const { tables, views } = splitViewsFromRegistry((this as any).schemaRegistry, schema => renderViewDefinition(schema, this));
     return new DbSchemaManager(
       this.client,
-      (this as any).schemaRegistry,
+      tables,
       {
         logQueries: (this as any).queryOptions?.logQueries,
         logger: (this as any).queryOptions?.logger,
@@ -7097,6 +7115,7 @@ export abstract class DatabaseContext extends DataContext {
         databaseSettings: this.modelConfig.getDatabaseSettings(),
         concurrentIndexes: options?.concurrentIndexes,
         recreateChangedIndexes: options?.recreateChangedIndexes,
+        views,
       }
     );
   }
@@ -7119,5 +7138,16 @@ export abstract class DatabaseContext extends DataContext {
       this.entityTables.set(entityClass, table);
     }
     return table as DbEntityTable<TEntity>;
+  }
+
+  /**
+   * Read-only accessor for a model-managed VIEW declared with `model.view()`.
+   * @internal - Use property accessors on derived class instead
+   */
+  protected view<TView extends DbEntity>(viewClass: EntityConstructor<TView>): DbViewTable<TView> {
+    if (EntityMetadataStore.getMetadata(viewClass)?.view == null) {
+      throw new Error(`${viewClass.name} is not a view — declare it with model.view(), or expose a table with table()`);
+    }
+    return this.table(viewClass);
   }
 }

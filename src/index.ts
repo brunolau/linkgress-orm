@@ -293,6 +293,7 @@ export type {
   PartitionStrategy,
   PartitioningConfig,
   StatisticsDefinition,
+  TableViewDefinition,
 } from './schema/table-builder';
 
 export {
@@ -326,6 +327,15 @@ export {
   DbModelConfig,
 } from './entity/model-config';
 
+export {
+  ViewConfigBuilder,
+} from './entity/view-builder';
+
+export type {
+  ViewQueryRow,
+  ViewQuerySource,
+} from './entity/view-builder';
+
 // Main API - DbContext (Entity-first approach)
 export {
   DatabaseContext as DbContext,
@@ -334,6 +344,7 @@ export {
 } from './entity/db-context';
 
 export type {
+  DbViewTable,
   EntityQuery,
   EntityUpsertConfig,
   EntityMergeConfig,

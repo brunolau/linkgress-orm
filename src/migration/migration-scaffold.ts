@@ -9,6 +9,7 @@ import { buildCreateStatisticsStatement, buildDropStatisticsStatement } from './
 import { buildAddCheckConstraintStatement, buildDropCheckConstraintStatement } from './check-constraint-sql';
 import { buildResetDatabaseSettingStatement, buildSetDatabaseSettingStatement } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
+import { buildCreateViewStatements, buildDropViewStatement } from './view-sql';
 import { TableSchema } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { SequenceConfig } from '../schema/sequence-builder';
@@ -143,6 +144,18 @@ export class MigrationScaffold {
         return [`ALTER TABLE ${fkTable} DROP CONSTRAINT IF EXISTS "${op.constraintName}"`];
       }
 
+      case 'drop_view':
+        return [buildDropViewStatement({ name: op.viewName, schema: op.schema })];
+
+      case 'create_view':
+        // Drop-if-exists then create, so the file also runs where the model's own
+        // migrate() already created the view (there is no CREATE VIEW IF NOT EXISTS,
+        // and CREATE OR REPLACE refuses a changed column list) — the index idiom.
+        return [
+          buildDropViewStatement({ name: op.viewName, schema: op.schema }),
+          ...buildCreateViewStatements({ name: op.viewName, schema: op.schema, definition: op.definition }),
+        ];
+
       default:
         return [`-- Unknown operation: ${(op as any).type}`];
     }
@@ -240,6 +253,12 @@ export class MigrationScaffold {
 
       case 'drop_foreign_key':
         return [`-- Cannot auto-generate: recreate foreign key "${op.constraintName}"`];
+
+      case 'create_view':
+        return [buildDropViewStatement({ name: op.viewName, schema: op.schema })];
+
+      case 'drop_view':
+        return [`-- Cannot auto-generate: recreate view "${op.viewName}" from its previous definition`];
 
       default:
         return [`-- Unknown operation reversal: ${(op as any).type}`];

@@ -18,6 +18,7 @@ This guide covers how to configure your database schema using Linkgress ORM's fl
   - [GIN/GiST Indexes](#gingist-indexes)
 - [Collations](#collations)
 - [Constraints](#constraints)
+- [Views](#views)
 - [Sequences](#sequences)
 - [Default Values](#default-values)
 - [Custom Types](#custom-types)
@@ -757,6 +758,98 @@ entity.property(e => e.age)
   .hasType(integer('age'))
   .hasDefaultValue(0);
 ```
+
+## Views
+
+Declare a database VIEW in the model and linkgress keeps it in sync:
+
+```typescript
+class OrderSummary extends DbEntity {
+  id!: DbColumn<number>;
+  label!: DbColumn<string>;
+  amountEur!: DbColumn<number>;
+}
+
+model.view(OrderSummary, view => {
+  view.toView('order_summary');
+  view.definedAs(`SELECT o."id", o."label", o."amount" / 100 AS "amount_eur" FROM "orders" o`);
+  view.property(e => e.id).hasType(integer('id'));
+  view.property(e => e.label).hasType(varchar('label', 50));
+  view.property(e => e.amountEur).hasType(integer('amount_eur'));
+});
+
+// on the context — read-only:
+get orderSummaries(): DbViewTable<OrderSummary> {
+  return this.view(OrderSummary);
+}
+```
+
+- `ensureCreated()` creates views after the tables; `ensureDeleted()` drops them first.
+- `migrate()` stamps each view with `COMMENT ON VIEW … IS 'linkgress:view:sha256:<hash>'` and re-creates it
+  when the definition's hash changes, when the view is missing, or when the migration changes any column or
+  table — PostgreSQL refuses a column type change under a dependent view, so every managed view is dropped
+  first and re-created last.
+- Declare a view AFTER the views it reads: when a view has to be dropped, every view declared after it is
+  dropped before it and re-created after it (PostgreSQL refuses to drop a view another view reads). Removing
+  a view from the model does not drop it — drop it in a migration.
+- A re-create is a `DROP VIEW` + `CREATE VIEW`, so everything attached to the old view object goes with it:
+  privileges granted on it, a changed owner, and any comment other than the linkgress marker (which is
+  written again). `ensureCreated()` re-creates every view. A role that only READS the view — a read-replica
+  user, a reporting tool — should get its access from `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES`
+  for the migrating role (views count as tables there), or from a grant your `onMigrationComplete` re-applies.
+- `DbViewTable` has no insert / update / delete, and `update()` / `delete()` on a query over a view throw.
+
+### Defining a view with a linkgress query
+
+Instead of SQL text, `definedAs` takes the view's query written with the query builder — joins,
+navigations, aggregates, `groupBy`, unions, CTEs and `sql` fragments included:
+
+```typescript
+model.view(OrderStats, view => {
+  view.toView('order_stats');
+  view.definedAs((db: AppDatabase) => db.orders
+    .where(o => gt(o.amount, 0))
+    .select(o => ({
+      id: o.id,
+      label: o.label,
+      amountEur: sql<number>`${o.amount} / 100`,
+      lineCount: o.lines.count(),
+    })));
+  view.property(e => e.id).hasType(integer('id'));
+  view.property(e => e.label).hasType(varchar('label', 50));
+  view.property(e => e.amountEur).hasType(integer('amount_eur'));
+  view.property(e => e.lineCount).hasType(integer('line_count'));
+});
+```
+
+- The projection's keys are the view's property names. The compiler checks that every property is
+  projected; at render time a missing, an extra or a nested key is refused with its name.
+- The context renders the query when a schema manager needs it (`getSchemaManager()`, so
+  `ensureCreated()` / `analyze()` / `migrate()`): the projection is renamed to the properties' column
+  names, in declaration order (`"amountEur"` becomes the `amount_eur` column), and the query's bound
+  values are inlined as SQL literals — a view cannot carry parameters, so `sql.placeholder()` is refused.
+- The rendered SQL is what the marker hashes: changing the query — a constant included — re-creates
+  the view on the next migrate. Array aggregations always render natively, whatever the driver, so
+  the view's SQL does not depend on which client ran the migration.
+- A view can read another view through its `DbViewTable` (`db.orderStats.where(…).select(…)`); declare
+  it after the view it reads.
+- A view that joins the way hand-written SQL does — on a computed key — uses explicit joins. The joined
+  row's navigations and collections work like the root's: a navigation renders as a LEFT JOIN off the
+  join's alias (`posts_0__user`), a collection correlates to that alias. Put a join whose ON clause reads
+  another join after it; to keep a count `integer` (`COUNT(*)` is `bigint`), cast it in a fragment:
+
+  ```typescript
+  view.definedAs((db: AppDatabase) => db.lines
+    .innerJoin(db.orders, (line, order) => eq(order.id, line.orderId), (line, order) => ({
+      lineId: line.id,
+      customer: order.customer.name,                           // a navigation of the joined order
+      orderLineCount: sql<number>`${order.lines.count()}::int`, // a collection of it, cast
+      orderLineQtys: order.lines.orderBy(l => l.qty).select(l => ({ qty: l.qty })).toNumberList(),
+    })));
+  ```
+
+  Each join's selector sees the previous join's projection as FLAT values, so project what later joins
+  need (keys, finished columns) and list the view's columns in the last selector.
 
 ## Sequences
 

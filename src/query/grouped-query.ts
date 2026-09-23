@@ -763,7 +763,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
-        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+        useJsonArrayAggregation: outerContext.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         // See SelectQueryBuilder.asSubquery — the statement-level CTE set must
@@ -2027,7 +2027,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
-        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+        useJsonArrayAggregation: outerContext.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         // See SelectQueryBuilder.asSubquery — the statement-level CTE set must

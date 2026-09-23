@@ -163,3 +163,7 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
 - Supported extensions: `pg_trgm`, `unaccent`, `uuid-ossp`, `pgcrypto` (UUID generation).
 - Object ids, backend pids and temp schema names are allocated by the in-memory database and
   differ from any particular server.
+- `pg_depend` and `pg_rewrite` are empty, and a column type change or drop under a view is not
+  refused (PostgreSQL raises `0A000` / `2BP01`). The schema manager does not rely on either: it drops
+  and re-creates every model-managed view (`model.view()`) whenever a migration changes columns, so
+  both engines behave the same.

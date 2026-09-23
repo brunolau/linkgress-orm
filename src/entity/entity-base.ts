@@ -30,6 +30,21 @@ export abstract class DbEntity {
 export type EntityConstructor<T extends DbEntity = DbEntity> = new () => T;
 
 /**
+ * A model-managed database VIEW declared via `model.view()`. The schema
+ * manager creates it after the tables and reconciles it on every migrate by a
+ * hash of its SQL (see `migration/view-sql.ts`). Exactly one of the two is set.
+ */
+export interface ViewMetadata {
+  /** Raw SELECT — the text after `CREATE VIEW … AS` (`definedAs(sql)`). */
+  definition?: string;
+  /**
+   * A linkgress query that defines the view (`definedAs(db => query)`). The context
+   * renders it to SQL when a schema manager needs it (see `migration/view-query-sql.ts`).
+   */
+  query?: (db: any) => unknown;
+}
+
+/**
  * DbEntity metadata for a single entity
  */
 export interface EntityMetadata<T extends DbEntity> {
@@ -45,6 +60,8 @@ export interface EntityMetadata<T extends DbEntity> {
   checkConstraints?: CheckConstraintMetadata[];
   /** Declarative table partitioning (parent `PARTITION BY`), set via `.hasPartitioning()`. */
   partitioning?: PartitioningConfig;
+  /** Set when this class is a VIEW declared via `model.view()`, not a table. */
+  view?: ViewMetadata;
 }
 
 /**

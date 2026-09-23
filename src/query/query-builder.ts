@@ -4,7 +4,7 @@ import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
 import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
 import { TimeTracer, QueryExecutor } from '../entity/db-context';
-import { assertNoCorrelatedAliasShadowing, isForeignChainRef, parseOrderBy } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, getTableAlias, isForeignChainRef, parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
@@ -226,6 +226,163 @@ export const materializeMockSelection = (result: any): any => {
   }
 
   return out;
+};
+
+/**
+ * The alias of a reference navigation reached from a MANUALLY joined table: `<parent alias>__<relation>`
+ * (`posts_0__user`, `posts_0__user__profile`). Such a hop cannot render under its relation name — that
+ * name is resolved against the ROOT's relations and binds to the root's navigation of the same name.
+ * PostgreSQL truncates an identifier past 63 bytes, and two truncated aliases can collide, so a longer
+ * one is refused rather than emitted.
+ */
+export const explicitNavigationAlias = (parentAlias: string, relationName: string): string => {
+  const alias = `${parentAlias}__${relationName}`;
+  let bytes = 0;
+
+  for (const char of alias) {
+    const code = char.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+
+  if (bytes > 63) {
+    throw new Error(
+      `The navigation "${relationName}" of the joined "${parentAlias}" would render as "${alias}", longer than `
+      + `PostgreSQL's 63-byte identifier limit. Join that table explicitly instead of navigating to it.`
+    );
+  }
+
+  return alias;
+};
+
+/**
+ * The `joins` entries added from an explicit join path. By-name resolution (resolveJoinsForTableAliases)
+ * must never search their schemas: a ROOT chain's next hop (`comment.order.user`) would otherwise bind to
+ * whichever joined table's navigation target happens to have a relation of that name.
+ */
+const explicitJoinEntries = new WeakSet<object>();
+
+/**
+ * Appends the hops of an explicit join path (a `__joinPath`, or a collection's navigation path that
+ * starts at a manually joined table) to `joins`, parent hop first, skipping hops already there.
+ */
+const addExplicitJoinPath = (
+  path: NavigationJoin[] | undefined,
+  joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
+): void => {
+  if (!Array.isArray(path)) {
+    return;
+  }
+
+  for (const hop of path) {
+    if (!joins.some(join => join.alias === hop.alias)) {
+      const entry = {
+        alias: hop.alias,
+        targetTable: hop.targetTable,
+        targetSchema: hop.targetSchema,
+        foreignKeys: hop.foreignKeys,
+        matches: hop.matches,
+        isMandatory: hop.isMandatory,
+        sourceAlias: hop.sourceAlias,
+      };
+      explicitJoinEntries.add(entry);
+      joins.push(entry);
+    }
+  }
+};
+
+/**
+ * The mock row of a MANUALLY joined table (`leftJoin` / `innerJoin` on a table), under the join's
+ * alias. The table's NAME is not in the FROM clause — only the alias is — so its collections
+ * correlate to the alias, and its reference navigations hang off it under explicit aliases whose
+ * refs carry their join path (see explicitNavigationAlias). The schema registry is what gives a
+ * navigation's target its own relations, so a chain (`orderTask.task.level.createdBy`) can go on.
+ */
+export const createJoinedTableMockRow = (
+  schema: TableSchema,
+  alias: string,
+  schemaRegistry: Map<string, TableSchema> | undefined
+): any => {
+  const mock: any = {};
+
+  // Performance: Use pre-computed column name map if available
+  const columnNameMap = getColumnNameMapForSchema(schema);
+
+  // Performance: Lazy-cache FieldRef objects
+  const fieldRefCache: Record<string, any> = {};
+
+  // Add columns as FieldRef objects with table alias
+  for (const [colName, dbColumnName] of columnNameMap) {
+    Object.defineProperty(mock, colName, {
+      get() {
+        let cached = fieldRefCache[colName];
+        if (!cached) {
+          cached = fieldRefCache[colName] = {
+            __fieldName: colName,
+            __dbColumnName: dbColumnName,
+            __tableAlias: alias,
+          };
+        }
+        return cached;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  // Add navigation properties (single references and collections)
+  for (const [relName, relConfig] of getRelationEntriesForSchema(schema)) {
+    const targetSchema = getTargetSchemaForRelation(schema, relName, relConfig);
+
+    if (relConfig.type === 'many') {
+      // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+      Object.defineProperty(mock, relName, {
+        get: () => new CollectionQueryBuilder(
+          relName,
+          relConfig.targetTable,
+          relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
+          alias,
+          targetSchema,
+          schemaRegistry,
+          undefined,
+          relConfig.foreignKeys,  // Propagate composite FK / literal predicates
+          relConfig.matches
+        ),
+        enumerable: false,
+        configurable: true,
+      });
+    } else {
+      // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
+      Object.defineProperty(mock, relName, {
+        get(this: any) {
+          // One mock target row per row and relation (a selector reading `p.user.*` several
+          // times used to mint a builder and a row per access)
+          const slots: MockRowSlots = this;
+          const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
+          const cachedRow = navCache[relName];
+          if (cachedRow !== undefined) {
+            return cachedRow;
+          }
+          const refBuilder = new ReferenceQueryBuilder(
+            relName,
+            relConfig.targetTable,
+            relConfig.foreignKeys || [relConfig.foreignKey || ''],
+            relConfig.matches || [],
+            relConfig.isMandatory ?? false,
+            targetSchema,
+            schemaRegistry,
+            [],
+            alias,
+            explicitNavigationAlias(alias, relName)
+          );
+          return (navCache[relName] = refBuilder.createMockTargetRow(undefined, slots[MOCK_ROW_CHAIN_ID]));
+        },
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+
+  return mock;
 };
 
 /**
@@ -756,7 +913,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         this.manualJoins,
         this.joinCounter,
         false,  // isDistinct defaults to false
-        undefined,  // schemaRegistry
+        this.schemaRegistry,  // a joined table's navigations need its targets' relations
         [],  // ctes
         this.collectionStrategy,
       this.chainId
@@ -808,7 +965,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       updatedJoins,
       newJoinCounter,
       false,  // isDistinct defaults to false
-      undefined,  // schemaRegistry
+      this.schemaRegistry,  // a joined table's navigations need its targets' relations
       [],  // ctes
       this.collectionStrategy,
       this.chainId
@@ -843,7 +1000,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         this.manualJoins,
         this.joinCounter,
         false,  // isDistinct defaults to false
-        undefined,  // schemaRegistry
+        this.schemaRegistry,  // a joined table's navigations need its targets' relations
         [],  // ctes
         this.collectionStrategy,
       this.chainId
@@ -895,7 +1052,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       updatedJoins,
       newJoinCounter,
       false,  // isDistinct defaults to false
-      undefined,  // schemaRegistry
+      this.schemaRegistry,  // a joined table's navigations need its targets' relations
       [],  // ctes
       this.collectionStrategy,
       this.chainId
@@ -906,94 +1063,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
    * Create mock row for a specific table/alias (for joins)
    */
   private createMockRowForTable(schema: TableSchema, alias: string): any {
-    const mock: any = {};
-
-    // Performance: Use pre-computed column name map if available
-    const columnNameMap = getColumnNameMapForSchema(schema);
-
-    // Performance: Lazy-cache FieldRef objects
-    const fieldRefCache: Record<string, any> = {};
-
-    // Add columns as FieldRef objects with table alias
-    for (const [colName, dbColumnName] of columnNameMap) {
-      Object.defineProperty(mock, colName, {
-        get() {
-          let cached = fieldRefCache[colName];
-          if (!cached) {
-            cached = fieldRefCache[colName] = {
-              __fieldName: colName,
-              __dbColumnName: dbColumnName,
-              __tableAlias: alias,
-            };
-          }
-          return cached;
-        },
-        enumerable: true,
-        configurable: true,
-      });
-    }
-
-    // Performance: Use pre-computed relation entries and cached schemas
-    const relationEntries = getRelationEntriesForSchema(schema);
-
-    // Add navigation properties (single references and collections)
-    for (const [relName, relConfig] of relationEntries) {
-      // Performance: Use cached target schema
-      const targetSchema = getTargetSchemaForRelation(schema, relName, relConfig);
-
-      if (relConfig.type === 'many') {
-        // Collection navigation
-        // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
-          get: () => {
-            return new CollectionQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              schema.name,
-              targetSchema,
-              undefined,
-              undefined,
-              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
-              relConfig.matches
-            );
-          },
-          enumerable: false,
-          configurable: true,
-        });
-      } else {
-        // Single reference navigation
-        // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
-          get(this: any) {
-            // One mock target row per row and relation (a selector reading `p.user.*` several
-            // times used to mint a builder and a row per access)
-            const slots: MockRowSlots = this;
-            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
-            const cachedRow = navCache[relName];
-            if (cachedRow !== undefined) {
-              return cachedRow;
-            }
-            const refBuilder = new ReferenceQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKeys || [relConfig.foreignKey || ''],
-              relConfig.matches || [],
-              relConfig.isMandatory ?? false,
-              targetSchema,
-              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
-              [],  // Empty navigation path for first level navigation
-              schema.name  // Pass source table name for lateral join correlation
-            );
-            return (navCache[relName] = refBuilder.createMockTargetRow(undefined, slots[MOCK_ROW_CHAIN_ID]));
-          },
-          enumerable: false,
-          configurable: true,
-        });
-      }
-    }
-
-    return mock;
+    return createJoinedTableMockRow(schema, alias, this.schemaRegistry);
   }
 
   /**
@@ -1800,94 +1870,7 @@ export class SelectQueryBuilder<TSelection> {
    * Create mock row for a specific table/alias (for joins)
    */
   private createMockRowForTable(schema: TableSchema, alias: string): any {
-    const mock: any = {};
-
-    // Performance: Use pre-computed column name map if available
-    const columnNameMap = getColumnNameMapForSchema(schema);
-
-    // Performance: Lazy-cache FieldRef objects
-    const fieldRefCache: Record<string, any> = {};
-
-    // Add columns as FieldRef objects with table alias
-    for (const [colName, dbColumnName] of columnNameMap) {
-      Object.defineProperty(mock, colName, {
-        get() {
-          let cached = fieldRefCache[colName];
-          if (!cached) {
-            cached = fieldRefCache[colName] = {
-              __fieldName: colName,
-              __dbColumnName: dbColumnName,
-              __tableAlias: alias,
-            };
-          }
-          return cached;
-        },
-        enumerable: true,
-        configurable: true,
-      });
-    }
-
-    // Performance: Use pre-computed relation entries and cached schemas
-    const relationEntries = getRelationEntriesForSchema(schema);
-
-    // Add navigation properties (single references and collections)
-    for (const [relName, relConfig] of relationEntries) {
-      // Performance: Use cached target schema
-      const targetSchema = getTargetSchemaForRelation(schema, relName, relConfig);
-
-      if (relConfig.type === 'many') {
-        // Collection navigation
-        // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
-          get: () => {
-            return new CollectionQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              schema.name,
-              targetSchema,
-              undefined,
-              undefined,
-              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
-              relConfig.matches
-            );
-          },
-          enumerable: false,
-          configurable: true,
-        });
-      } else {
-        // Single reference navigation
-        // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
-        Object.defineProperty(mock, relName, {
-          get(this: any) {
-            // One mock target row per row and relation (a selector reading `p.user.*` several
-            // times used to mint a builder and a row per access)
-            const slots: MockRowSlots = this;
-            const navCache = slots[MOCK_ROW_NAV_CACHE] ??= {};
-            const cachedRow = navCache[relName];
-            if (cachedRow !== undefined) {
-              return cachedRow;
-            }
-            const refBuilder = new ReferenceQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKeys || [relConfig.foreignKey || ''],
-              relConfig.matches || [],
-              relConfig.isMandatory ?? false,
-              targetSchema,
-              this.schemaRegistry,  // Pass schema registry for nested navigation resolution
-              [],  // Empty navigation path for first level navigation
-              schema.name  // Pass source table name for lateral join correlation
-            );
-            return (navCache[relName] = refBuilder.createMockTargetRow(undefined, slots[MOCK_ROW_CHAIN_ID]));
-          },
-          enumerable: false,
-          configurable: true,
-        });
-      }
-    }
-
-    return mock;
+    return createJoinedTableMockRow(schema, alias, this.schemaRegistry);
   }
 
   /**
@@ -2308,7 +2291,7 @@ export class SelectQueryBuilder<TSelection> {
     const queryContext: QueryContext = {
       ctes: new Map(),
       cteCounter: 0,
-      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      useJsonArrayAggregation: context.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
       paramCounter: context.paramCounter,
       allParams: context.params,
       collectionStrategy: this.collectionStrategy,
@@ -2757,6 +2740,10 @@ export class SelectQueryBuilder<TSelection> {
 
     let results: any[];
     if (useTempTableStrategy) {
+      for (const collection of collections) {
+        this.assertJoinedCollectionStrategy(collection.builder, context);
+      }
+
       // Two-phase execution for temp table strategy
       results = await this.executeWithTempTables(selectionResult, context, collections, tracer);
     } else {
@@ -3638,7 +3625,15 @@ export class SelectQueryBuilder<TSelection> {
    *   .returning(u => ({ id: u.id, username: u.username }));
    * ```
    */
+  /** A model-managed VIEW is read-only — refuse a write PostgreSQL might accept on a simple view. */
+  private static assertWritable(schema: TableSchema, verb: string): void {
+    if (schema.view != null) {
+      throw new Error(`Cannot ${verb} "${schema.name}": it is a model-managed view (read-only)`);
+    }
+  }
+
   delete(): FluentDelete<TSelection> {
+    SelectQueryBuilder.assertWritable(this.schema, 'delete from');
     const queryBuilder = this;
 
     const executeDelete = async <TResult>(
@@ -3861,6 +3856,7 @@ export class SelectQueryBuilder<TSelection> {
    * ```
    */
   update(data: Partial<Record<string, any>> | ((row: TSelection) => Partial<Record<string, any>>)): FluentQueryUpdate<TSelection> {
+    SelectQueryBuilder.assertWritable(this.schema, 'update');
     const queryBuilder = this;
 
     const executeUpdate = async <TResult>(
@@ -4942,6 +4938,9 @@ ${joinClauses.join('\n')}`;
             if ((value as any).__sourceTable) {
               fieldRef.__sourceTable = (value as any).__sourceTable;
             }
+            if ((value as any).__joinPath) {
+              fieldRef.__joinPath = (value as any).__joinPath;
+            }
             return fieldRef;
           } else {
             // For ORDER BY: use the alias (property name) as the column name
@@ -5264,12 +5263,73 @@ ${joinClauses.join('\n')}`;
       return;
     }
 
+    // Navigations of a manually joined table name their joins themselves — added first, verbatim
+    this.addExplicitJoinPathsFromSelection(selection, joins);
+
     // First pass: collect all table aliases
     const allTableAliases = new Set<string>();
     this.collectTableAliasesFromSelection(selection, allTableAliases);
 
     // Second pass: resolve all joins through the schema graph
     this.resolveJoinsForTableAliases(allTableAliases, joins);
+  }
+
+  /**
+   * A collection of a MANUALLY joined table — or of a navigation below one — correlates to the
+   * join's alias. The LATERAL strategy renders exactly that; the CTE and temp-table strategies
+   * attach their aggregate to the ROOT row's id and would pair it with the wrong parent without an
+   * error, so they refuse it.
+   */
+  private assertJoinedCollectionStrategy(value: unknown, context: QueryContext): void {
+    const strategy = context.collectionStrategy || 'lateral';
+
+    if (strategy === 'lateral' || !(value instanceof CollectionQueryBuilder)) {
+      return;
+    }
+
+    const path = value.getNavigationPath();
+    const anchor = path.length > 0 ? path[0].sourceAlias : value.getSourceAlias();
+
+    if (this.manualJoins.some(join => join.alias === anchor)) {
+      throw new Error(
+        `The collection "${value.getRelationName()}" of the joined table "${value.getSourceAlias()}" needs the 'lateral' `
+        + `collection strategy: the '${strategy}' strategy attaches a collection to the root row.`
+      );
+    }
+  }
+
+  /**
+   * Adds the joins of every navigation hop below a MANUALLY joined table that the selection
+   * reaches: the `__joinPath` of a column read through such a navigation, and the navigation
+   * path of a collection hanging off one. Those hops render under explicit aliases
+   * (explicitNavigationAlias) that the by-name resolution cannot find — and must not: by name,
+   * `post.user` would bind to the root's own `user`.
+   */
+  private addExplicitJoinPathsFromSelection(
+    selection: any,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
+  ): void {
+    for (const value of Object.values(selection)) {
+      if (!value || typeof value !== 'object') {
+        continue;
+      }
+
+      if (value instanceof CollectionQueryBuilder) {
+        const path = value.getNavigationPath();
+
+        if (path.length > 0 && this.manualJoins.some(join => join.alias === path[0].sourceAlias)) {
+          addExplicitJoinPath(path, joins);
+        }
+      } else if (value instanceof SqlFragment) {
+        for (const fieldRef of value.getFieldRefs()) {
+          addExplicitJoinPath((fieldRef as any).__joinPath, joins);
+        }
+      } else if ('__dbColumnName' in value) {
+        addExplicitJoinPath((value as any).__joinPath, joins);
+      } else if (!Array.isArray(value)) {
+        this.addExplicitJoinPathsFromSelection(value, joins);
+      }
+    }
   }
 
   /**
@@ -5375,6 +5435,11 @@ ${joinClauses.join('\n')}`;
       joinedSchemas.set(this.schema.name, this.schema);
 
       for (const join of joins) {
+        // A hop below a manually joined table is not a place to look for a root chain's next hop
+        if (explicitJoinEntries.has(join)) {
+          continue;
+        }
+
         let schema: TableSchema | undefined;
         if (this.schemaRegistry) {
           schema = this.schemaRegistry.get(join.targetTable);
@@ -5501,6 +5566,8 @@ ${joinClauses.join('\n')}`;
           }
         }
       }
+      // A navigation of a manually joined table names its joins itself (see explicitNavigationAlias)
+      addExplicitJoinPath((fieldRef as any).__joinPath, joins);
     }
 
     // Kept for the second, wider check once the SELECT list has added its own joins: the
@@ -5571,6 +5638,7 @@ ${joinClauses.join('\n')}`;
         if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
           // Handle collection - delegate to strategy pattern via buildCTE
           // The strategy handles CTE/LATERAL specifics and returns necessary info
+          this.assertJoinedCollectionStrategy(value, context);
           const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
           const isCTE = cteData.isCTE !== false; // Default to CTE if not specified
 
@@ -5714,6 +5782,26 @@ ${joinClauses.join('\n')}`;
                     const firstValue = (value as any)[tableAlias];
                     if (firstValue && typeof firstValue === 'object' && '__tableAlias' in firstValue) {
                       const alias = firstValue.__tableAlias as string;
+
+                      // A navigation of a manually joined table: no relation of OURS names it, its
+                      // hops carry their joins (see explicitNavigationAlias)
+                      const joinPath: NavigationJoin[] | undefined = (firstValue as any).__joinPath;
+                      const explicitTarget = Array.isArray(joinPath) && joinPath.length > 0
+                        ? this.schemaRegistry?.get(joinPath[joinPath.length - 1].targetTable)
+                        : undefined;
+
+                      if (explicitTarget) {
+                        addExplicitJoinPath(joinPath, joins);
+
+                        const explicitParts: string[] = [];
+                        for (const [colKey, dbColName] of getColumnNameMapForSchema(explicitTarget)) {
+                          explicitParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                        }
+
+                        selectParts.push(`json_build_object(${explicitParts.join(', ')}) as "${key}"`);
+                        continue;
+                      }
+
                       const relConfig = this.relationForRef(firstValue, alias);
 
                       if (relConfig && relConfig.type === 'one') {
@@ -6086,6 +6174,7 @@ ${joinClauses.join('\n')}`;
           //   buildCTE() registers the CTE / produces the joinClause +
           //   selectExpression. We push the selectExpression as the SELECT
           //   slot for this leg and add the joinClause to FROM later.
+          this.assertJoinedCollectionStrategy(value, context);
           const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
           const isCTE = cteData.isCTE !== false;
 
@@ -7158,7 +7247,7 @@ ${joinClauses.join('\n')}`;
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
-        useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+        useJsonArrayAggregation: outerContext.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         placeholders: outerContext.placeholders,  // Pass placeholders through for prepared statements
@@ -7357,6 +7446,10 @@ export class ReferenceQueryBuilder<TItem = any> {
   private navigationPath: NavigationJoin[];
   // Source alias for this reference (the table containing the FK)
   private sourceAlias: string;
+  // Set for a navigation reached from a MANUALLY joined table (and for every hop below it): the
+  // alias this hop renders under. The relation name cannot be the alias there — it is resolved by
+  // name against the root's relations and would bind to the root's navigation of the same name.
+  private explicitAlias?: string;
 
   constructor(
     relationName: string,
@@ -7367,7 +7460,8 @@ export class ReferenceQueryBuilder<TItem = any> {
     targetTableSchema?: TableSchema,
     schemaRegistry?: Map<string, TableSchema>,
     navigationPath?: NavigationJoin[],
-    sourceAlias?: string
+    sourceAlias?: string,
+    explicitAlias?: string
   ) {
     this.relationName = relationName;
     this.targetTable = targetTable;
@@ -7377,6 +7471,7 @@ export class ReferenceQueryBuilder<TItem = any> {
     this.schemaRegistry = schemaRegistry;
     this.navigationPath = navigationPath || [];
     this.sourceAlias = sourceAlias || '';
+    this.explicitAlias = explicitAlias;
 
     // Prefer registry lookup (has full relations) over passed schema
     if (this.schemaRegistry) {
@@ -7392,7 +7487,7 @@ export class ReferenceQueryBuilder<TItem = any> {
    * Get the alias to use for this reference in the query
    */
   getAlias(): string {
-    return this.relationName;
+    return this.explicitAlias ?? this.relationName;
   }
 
   /**
@@ -7458,7 +7553,10 @@ export class ReferenceQueryBuilder<TItem = any> {
 
       if (prototype === undefined) {
         prototype = MockRowCache.getOrBuild(
-          enabled ? `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}` : '',
+          enabled
+            ? `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`
+              + (this.explicitAlias !== undefined ? `|@${this.explicitAlias}` : '')
+            : '',
           () => Object.defineProperties({}, this.buildMockRowDescriptors()),
         );
 
@@ -7470,7 +7568,7 @@ export class ReferenceQueryBuilder<TItem = any> {
       return mintReferenceMockRow(prototype, chainId);
     } else {
       // Fallback: use the shared nested proxy that supports deep property access
-      return createNestedFieldRefProxy(this.relationName);
+      return createNestedFieldRefProxy(this.getAlias());
     }
   }
 
@@ -7482,7 +7580,7 @@ export class ReferenceQueryBuilder<TItem = any> {
   private buildMockRowDescriptors(): PropertyDescriptorMap {
     // Add columns - use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.targetTableSchema!);
-    const tableAlias = this.relationName;
+    const tableAlias = this.getAlias();
 
     // Build a mapper lookup for columns (only when needed)
     const columnMappers: Record<string, any> = {};
@@ -7500,6 +7598,34 @@ export class ReferenceQueryBuilder<TItem = any> {
     // Collect all navigation aliases from the path leading to this reference
     // This is needed for WHERE conditions that use multi-level navigation (e.g., task.level.name)
     const navigationAliases = this.navigationPath.map(nav => nav.alias);
+
+    // Build extended navigation path for nested collections
+    // Only build navigation path if we have a sourceAlias (meaning we're inside a collection's selector)
+    // If sourceAlias is empty, we're in the main query and references are joined in the FROM clause
+    let extendedNavPath: NavigationJoin[] = [];
+    if (this.sourceAlias) {
+      // Build the current navigation step to include in path for nested collections
+      // This represents the join from sourceAlias to this.relationName (this.targetTable)
+      const currentNavStep: NavigationJoin = {
+        alias: tableAlias,
+        targetTable: this.targetTable,
+        foreignKeys: this.foreignKeys,
+        matches: this.matches.length > 0 ? this.matches : ['id'],  // Default to 'id' if not specified
+        // Below a manually joined table every hop is a LEFT JOIN: the join may be a LEFT one
+        // whose row is missing, and a required hop's INNER JOIN would then drop the row it kept.
+        // From a present parent a required hop always matches, so LEFT loses nothing there.
+        isMandatory: this.explicitAlias !== undefined ? false : this.isMandatory,
+        sourceAlias: this.sourceAlias,
+      };
+      if (this.explicitAlias !== undefined && this.targetTableSchema?.schema) {
+        currentNavStep.targetSchema = this.targetTableSchema.schema;
+      }
+      extendedNavPath = [...this.navigationPath, currentNavStep];
+    }
+
+    // A hop below a manually joined table cannot be found by its name (see explicitAlias), so its
+    // columns carry the whole path from the join; the query emits exactly those joins.
+    const joinPath = this.explicitAlias !== undefined ? extendedNavPath : undefined;
 
     const descriptors: PropertyDescriptorMap = {};
 
@@ -7522,6 +7648,9 @@ export class ReferenceQueryBuilder<TItem = any> {
               __sqlType: columnSqlTypes[colName],  // Column SQL type — lets flag* emit width-exact mask casts
               __navigationAliases: navigationAliases,  // All intermediate navigation aliases for JOIN resolution
             };
+            if (joinPath !== undefined) {
+              cached.__joinPath = joinPath;
+            }
           }
           return cached;
         },
@@ -7530,29 +7659,12 @@ export class ReferenceQueryBuilder<TItem = any> {
       };
     }
 
-    // Build extended navigation path for nested collections
-    // Only build navigation path if we have a sourceAlias (meaning we're inside a collection's selector)
-    // If sourceAlias is empty, we're in the main query and references are joined in the FROM clause
-    let extendedNavPath: NavigationJoin[] = [];
-    if (this.sourceAlias) {
-      // Build the current navigation step to include in path for nested collections
-      // This represents the join from sourceAlias to this.relationName (this.targetTable)
-      const currentNavStep: NavigationJoin = {
-        alias: this.relationName,
-        targetTable: this.targetTable,
-        foreignKeys: this.foreignKeys,
-        matches: this.matches.length > 0 ? this.matches : ['id'],  // Default to 'id' if not specified
-        isMandatory: this.isMandatory,
-        sourceAlias: this.sourceAlias,
-      };
-      extendedNavPath = [...this.navigationPath, currentNavStep];
-    }
-
     // Values captured at descriptor-build time — identical for every row of this
     // signature (the registry is the process-wide schema registry; `sourceAlias`
     // determines whether nested references track their join path).
     const schemaRegistry = this.schemaRegistry;
     const parentSourceAlias = this.sourceAlias;
+    const explicitParent = this.explicitAlias !== undefined;
 
     // Add navigation properties (both collections and references)
     if (this.targetTableSchema!.relations) {
@@ -7628,7 +7740,8 @@ export class ReferenceQueryBuilder<TItem = any> {
                     nestedTargetSchema,  // Pass the target schema directly
                     schemaRegistry,  // Pass schema registry for nested resolution
                     extendedNavPath,  // Pass navigation path for nested collections
-                    parentSourceAlias ? tableAlias : ''  // Only set source if tracking path
+                    parentSourceAlias ? tableAlias : '',  // Only set source if tracking path
+                    explicitParent ? explicitNavigationAlias(tableAlias, relName) : undefined
                   );
                   cached = navCache[relName] = refBuilder.createMockTargetRow(holder, slots[MOCK_ROW_CHAIN_ID]);
                 }
@@ -7669,7 +7782,9 @@ export class CollectionQueryBuilder<TItem = any> {
   private whereCond?: Condition;
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  // `table` is the alias the ordered column rendered under: the collection marker for an own
+  // column, a relation name for a navigation column.
+  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC'; table?: string }> = [];
   private asName?: string;
   private isMarkedAsList: boolean = false;
   private isDistinct: boolean = false;
@@ -8049,7 +8164,7 @@ export class CollectionQueryBuilder<TItem = any> {
     this.writtenInPlace = true;
     const mockItem = this.createMockItem();
     const result = selector(mockItem);
-    parseOrderBy(result, this.orderByFields);
+    parseOrderBy(result, this.orderByFields, undefined, getTableAlias);
     return this;
   }
 
@@ -8274,6 +8389,16 @@ export class CollectionQueryBuilder<TItem = any> {
     return this.navigationPath;
   }
 
+  /** The alias this collection correlates to (its parent row's table alias). */
+  getSourceAlias(): string {
+    return this.sourceTable;
+  }
+
+  /** The relation this collection navigates. */
+  getRelationName(): string {
+    return this.relationName;
+  }
+
   /**
    * Check if this collection uses array aggregation (for flattened results)
    */
@@ -8331,18 +8456,31 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
-   * Build SQL for this collection as a correlated EXISTS subquery.
-   * Produces: EXISTS (SELECT 1 FROM "table" [JOINs] WHERE correlation AND conditions)
+   * Build SQL for this collection as a correlated subquery — the form it takes inside a condition
+   * or a `sql` fragment.
+   * EXISTS produces: EXISTS (SELECT 1 FROM "table" [JOINs] WHERE correlation AND conditions)
+   * COUNT produces:  SELECT COUNT(*) FROM "table" [JOINs] WHERE correlation AND conditions
+   *                  (a fragment wraps it in parentheses), e.g. sql`${u.posts.count()}::int`
    * Required for duck-typing compatibility with Condition interface when used in WHERE clauses.
    */
   buildSql(context: SqlBuildContext): string {
-    if (this.aggregationType !== 'EXISTS') {
-      throw new Error('buildSql() on CollectionQueryBuilder is only supported for EXISTS aggregation');
+    if (this.aggregationType !== 'EXISTS' && this.aggregationType !== 'COUNT') {
+      throw new Error('buildSql() on CollectionQueryBuilder is only supported for EXISTS and COUNT aggregations');
     }
 
     const targetTable = this.targetTable;
     const foreignKey = this.foreignKey;
     const sourceTable = this.sourceTable;
+
+    // COUNT names its own table: a count reached through a navigation back to the SAME table
+    // (`post.user.posts`) would otherwise shadow the outer row that navigation hangs off — the
+    // bridge join and the correlation would both bind to the inner row, and every row would count
+    // everything. EXISTS keeps its historical unaliased form; a selectMany bridge addresses the raw
+    // table name, so it keeps it too.
+    const ownAlias = this.aggregationType === 'COUNT' && this.selectManyJoins.length === 0
+      ? `${this.relationName}__count`
+      : targetTable;
+    const ownRef = (alias: string): string => (alias === targetTable ? ownAlias : alias);
 
     // Build JOINs needed inside the EXISTS subquery
     const allJoins: string[] = [];
@@ -8385,7 +8523,7 @@ export class CollectionQueryBuilder<TItem = any> {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${ownRef(nav.sourceAlias)}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     const navJoinsSQL = allJoins.join('\n');
@@ -8393,7 +8531,7 @@ export class CollectionQueryBuilder<TItem = any> {
     // Build WHERE clause: correlation + additional conditions
     // Use full composite-FK / literal-predicate form when navigation declared
     // multiple key pairs (e.g. SCD2 `[productId, isCurrent] / [id, true]`).
-    const fkTableAlias = this.foreignKeyTableAlias || targetTable;
+    const fkTableAlias = this.foreignKeyTableAlias || ownAlias;
     // Root-attached collections correlate on the λ-root itself, which a lateral
     // exposes only under its generated alias; nav-derived collections correlate on
     // the bridge's terminal alias, which this subquery emits itself — never remap it.
@@ -8417,9 +8555,17 @@ export class CollectionQueryBuilder<TItem = any> {
 
       // Rewrite collection marker aliases to actual table names
       const markerPattern = collectionMarkerPattern(targetTable, false);
-      const rewrittenCondSql = condSql.replace(markerPattern, `"${targetTable}"`);
+      const rewrittenCondSql = condSql.replace(markerPattern, `"${ownAlias}"`);
 
       whereSQL += ` AND ${rewrittenCondSql}`;
+    }
+
+    if (this.aggregationType === 'COUNT') {
+      const countParts = [ownAlias === targetTable ? `SELECT COUNT(*) FROM "${targetTable}"` : `SELECT COUNT(*) FROM "${targetTable}" "${ownAlias}"`];
+      if (navJoinsSQL) countParts.push(navJoinsSQL);
+      countParts.push(`WHERE ${whereSQL}`);
+
+      return countParts.join('\n');
     }
 
     const parts = [`EXISTS (SELECT 1 FROM "${targetTable}"`];

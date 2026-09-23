@@ -17,6 +17,7 @@ import { buildCreateStatisticsStatement } from './statistics-sql';
 import { buildAddCheckConstraintStatement } from './check-constraint-sql';
 import { buildSetDatabaseSettingStatement, parseDbRoleSettingEntry } from './dbsetting-sql';
 import { buildPartitionByClause, validatePartitioningPrimaryKey } from './partition-sql';
+import { buildCreateViewStatements, buildDropViewStatement, qualifiedViewName, viewMarker, ViewSqlSpec } from './view-sql';
 
 /**
  * Database column information from pg
@@ -76,7 +77,9 @@ export type MigrationOperation =
   | { type: 'create_check_constraint'; tableName: string; schema?: string; constraintName: string; expression: string }
   | { type: 'set_database_setting'; name: string; value: string }
   | { type: 'create_foreign_key'; tableName: string; schema?: string; constraint: any }
-  | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string };
+  | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string }
+  | { type: 'create_view'; viewName: string; schema?: string; definition: string }
+  | { type: 'drop_view'; viewName: string; schema?: string };
 
 /**
  * Database schema manager - handles schema creation, deletion, and automatic migrations
@@ -91,6 +94,8 @@ export class DbSchemaManager {
   private recreateChangedIndexes: boolean;
   private searchNormalizeRequired: boolean;
   private databaseSettings: Map<string, string>;
+  /** Model-managed views (`model.view()`), in declaration order — never in `schemaRegistry`. */
+  private views: ViewSqlSpec[];
   /** Monotonic counter for unique temp object names during index confirmation. */
   private indexCheckSeq = 0;
   private rl: readline.Interface | null = null;
@@ -136,6 +141,11 @@ export class DbSchemaManager {
        * index is marked `.concurrent()` or `concurrentIndexes: true` is set.
        */
       recreateChangedIndexes?: boolean;
+      /**
+       * Model-managed views (`model.view()`), in declaration order. Kept OUT of
+       * `schemaRegistry` so no table loop of this manager ever sees one.
+       */
+      views?: ViewSqlSpec[];
     }
   ) {
     this.logQueries = options?.logQueries ?? false;
@@ -147,6 +157,7 @@ export class DbSchemaManager {
     this.recreateChangedIndexes = options?.recreateChangedIndexes ?? true;
     this.searchNormalizeRequired = options?.searchNormalizeRequired ?? false;
     this.databaseSettings = options?.databaseSettings ?? new Map();
+    this.views = options?.views ?? [];
   }
 
   /**
@@ -778,6 +789,10 @@ $$`;
     // never the DDL above.
     await this.applyDatabaseSettings();
 
+    // Model-managed views LAST — they read the tables above. Drop-then-create
+    // keeps ensureCreated idempotent and converges a stale definition.
+    await this.createViews();
+
     if (this.logQueries) {
       this.logger('✓ Database schema created successfully\n');
     }
@@ -902,6 +917,11 @@ $$`;
   async ensureDeleted(): Promise<void> {
     if (this.logQueries) {
       this.logger('Dropping database schema...\n');
+    }
+
+    // Views first, in reverse declaration order (a view may read an earlier one).
+    for (const view of [...this.views].reverse()) {
+      await this.client.query(buildDropViewStatement(view, { cascade: true }));
     }
 
     for (const [tableName, tableSchema] of this.schemaRegistry.entries()) {
@@ -1232,7 +1252,89 @@ $$`;
       operations.push(settingOp);
     }
 
+    // Model-managed views — planned AFTER every table operation, because a column
+    // change forces them out of the way. Drops go FIRST (a file scaffold runs them
+    // before its ALTERs), creates go LAST.
+    const viewPlan = await this.analyzeViews(operations);
+    operations.unshift(...viewPlan.drops);
+    operations.push(...viewPlan.creates);
+
     return operations;
+  }
+
+  /**
+   * The marker comment of every existing view in the schemas the model's views
+   * live in, keyed `schema.name`. `null` = the view exists without a comment.
+   */
+  private async getExistingViewMarkers(): Promise<Map<string, string | null>> {
+    const markers = new Map<string, string | null>();
+    const schemas = new Set(this.views.map(view => view.schema ?? 'public'));
+    for (const schemaName of schemas) {
+      const result = await this.client.query(
+        `SELECT c.relname AS name, obj_description(c.oid, 'pg_class') AS marker
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind = 'v' AND n.nspname = $1`,
+        [schemaName]
+      );
+      for (const row of result.rows) {
+        markers.set(`${schemaName}.${row.name}`, row.marker ?? null);
+      }
+    }
+    return markers;
+  }
+
+  /**
+   * Plan the model-managed views: create a missing one; drop + re-create one
+   * whose marker differs from the model's definition; and when the plan alters,
+   * drops or retypes a column or table, drop + re-create EVERY existing managed
+   * view — PostgreSQL refuses `ALTER COLUMN … TYPE` / `DROP COLUMN` under a
+   * dependent view, `migrate()` runs without a transaction, and the in-memory
+   * engine has no `pg_depend`, so "drop all, recreate all" replaces dependency
+   * tracking. For the same reason a view that is DROPPED takes every view
+   * declared after it along (a view is declared after the views it reads, and
+   * PostgreSQL refuses to drop a view another one depends on). Drops in reverse
+   * declaration order, creates in declaration order.
+   */
+  private async analyzeViews(tableOperations: MigrationOperation[]): Promise<{ drops: MigrationOperation[]; creates: MigrationOperation[] }> {
+    if (this.views.length === 0) {
+      return { drops: [], creates: [] };
+    }
+    const existing = await this.getExistingViewMarkers();
+    let dropAllFromHere = tableOperations.some(op =>
+      op.type === 'alter_column' || op.type === 'drop_column' || op.type === 'drop_table');
+    const drops: MigrationOperation[] = [];
+    const creates: MigrationOperation[] = [];
+    for (const view of this.views) {
+      const key = `${view.schema ?? 'public'}.${view.name}`;
+      const exists = existing.has(key);
+      const stale = !exists || dropAllFromHere || existing.get(key) !== viewMarker(view.definition);
+      if (exists && stale) {
+        drops.push({ type: 'drop_view', viewName: view.name, schema: view.schema });
+        dropAllFromHere = true;
+      }
+      if (stale) {
+        creates.push({ type: 'create_view', viewName: view.name, schema: view.schema, definition: view.definition });
+      }
+    }
+    return { drops: drops.reverse(), creates };
+  }
+
+  /** `ensureCreated()` half: (re)create every model-managed view. */
+  private async createViews(): Promise<void> {
+    for (const view of [...this.views].reverse()) {
+      await this.client.query(buildDropViewStatement(view));
+    }
+    for (const view of this.views) {
+      await this.executeCreateView(view);
+    }
+  }
+
+  private async executeCreateView(view: ViewSqlSpec): Promise<void> {
+    this.logger(`  Creating view ${qualifiedViewName(view)}...`);
+    for (const statement of buildCreateViewStatements(view)) {
+      await this.client.query(statement);
+    }
+    this.logger(`  ✓ View ${qualifiedViewName(view)} created\n`);
   }
 
   /**
@@ -1265,12 +1367,20 @@ $$`;
       const phase1Ops: MigrationOperation[] = [];
       const phase2Ops: MigrationOperation[] = [];
       const phase3Ops: MigrationOperation[] = [];
+      // Views that would stand in the way of phase 1's column changes go FIRST;
+      // views are created LAST, over the tables the phases shaped.
+      const viewDropOps: MigrationOperation[] = [];
+      const viewCreateOps: MigrationOperation[] = [];
 
       // Track which tables are being created so we can add their FKs later
       const tablesToCreate = new Set<string>();
 
       for (const op of operations) {
-        if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'add_enum_value' || op.type === 'create_sequence') {
+        if (op.type === 'drop_view') {
+          viewDropOps.push(op);
+        } else if (op.type === 'create_view') {
+          viewCreateOps.push(op);
+        } else if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'add_enum_value' || op.type === 'create_sequence') {
           phase1Ops.push(op);
         } else if (op.type === 'create_table') {
           phase1Ops.push(op);
@@ -1355,15 +1465,22 @@ $$`;
         }
       }
 
-      const totalOps = phase1Ops.length + phase2Ops.length + phase3Ops.length;
+      const totalOps = viewDropOps.length + phase1Ops.length + phase2Ops.length + phase3Ops.length + viewCreateOps.length;
       this.logger(`📋 Found ${totalOps} operations to perform:\n`);
 
       // Show all operations
       let opNum = 1;
-      for (const op of [...phase1Ops, ...phase2Ops, ...phase3Ops]) {
+      for (const op of [...viewDropOps, ...phase1Ops, ...phase2Ops, ...phase3Ops, ...viewCreateOps]) {
         this.logger(`${opNum++}. ${this.describeOperation(op)}`);
       }
       this.logger('');
+
+      if (viewDropOps.length > 0) {
+        this.logger('🪟 Dropping model-managed views (re-created last)...\n');
+        for (const operation of viewDropOps) {
+          await this.executeOperation(operation);
+        }
+      }
 
       // Phase 1: Create schemas, enums, tables (without FKs), column changes
       if (phase1Ops.length > 0) {
@@ -1385,6 +1502,14 @@ $$`;
       if (phase3Ops.length > 0) {
         this.logger('📇 Phase 3: Creating indexes...\n');
         for (const operation of phase3Ops) {
+          await this.executeOperation(operation);
+        }
+      }
+
+      // Views last — they read the tables the phases above just shaped.
+      if (viewCreateOps.length > 0) {
+        this.logger('🪟 Creating model-managed views...\n');
+        for (const operation of viewCreateOps) {
           await this.executeOperation(operation);
         }
       }
@@ -1518,6 +1643,14 @@ $$`;
         } else {
           this.logger(`  ⊘ Skipped dropping foreign key "${operation.constraintName}"\n`, 'warn');
         }
+        break;
+
+      case 'drop_view':
+        await this.client.query(buildDropViewStatement({ name: operation.viewName, schema: operation.schema }));
+        break;
+
+      case 'create_view':
+        await this.executeCreateView({ name: operation.viewName, schema: operation.schema, definition: operation.definition });
         break;
     }
   }
@@ -2401,6 +2534,10 @@ $$`;
         return desc;
       case 'drop_foreign_key':
         return `Drop foreign key "${operation.constraintName}" (DESTRUCTIVE)`;
+      case 'create_view':
+        return `Create view "${operation.viewName}"`;
+      case 'drop_view':
+        return `Drop view "${operation.viewName}" (re-created from the model)`;
     }
   }
 

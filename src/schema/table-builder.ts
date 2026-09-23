@@ -176,6 +176,14 @@ export interface ColumnMetadataCache {
   config: ColumnConfig;
 }
 
+/** A model-managed VIEW's definition (`model.view()`): raw SQL, or a linkgress query the context renders. */
+export interface TableViewDefinition {
+  /** The view's SELECT — the text after `CREATE VIEW … AS` (`definedAs(sql)`). */
+  definition?: string;
+  /** A linkgress query that defines the view (`definedAs(db => query)`), rendered by the context. */
+  query?: (db: any) => unknown;
+}
+
 /**
  * Table schema definition
  */
@@ -192,6 +200,8 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   checkConstraints?: CheckConstraintDefinition[];
   /** Declarative partitioning config for this table (parent `PARTITION BY`). */
   partitioning?: PartitioningConfig;
+  /** Set when this entry is a model-managed VIEW, not a table. */
+  view?: TableViewDefinition;
   /**
    * Performance optimization: Pre-computed map of property names to database column names
    * Avoids repeated .build().name calls during query building
@@ -260,6 +270,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private statisticsDefs: StatisticsDefinition[] = [];
   private checkConstraintDefs: CheckConstraintDefinition[] = [];
   private partitioningDef?: PartitioningConfig;
+  private viewDef?: TableViewDefinition;
 
   constructor(name: string, schema: TSchema, indexes?: IndexDefinition[], foreignKeys?: ForeignKeyConstraint[], schemaName?: string) {
     this.tableName = name;
@@ -330,6 +341,16 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   }
 
   /**
+   * Mark this entry as a model-managed VIEW defined by raw SQL or a linkgress query: the
+   * schema manager creates it with `CREATE VIEW`, never `CREATE TABLE`.
+   */
+  asView(view: TableViewDefinition): this {
+    this.viewDef = { ...view };
+    this._cachedSchema = undefined; // invalidate cached schema
+    return this;
+  }
+
+  /**
    * Build the final table schema
    */
   build(): TableSchema<any> {
@@ -373,6 +394,8 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       statistics: this.statisticsDefs,
       checkConstraints: this.checkConstraintDefs,
       partitioning: this.partitioningDef,
+      // Only a view's entry gets the key — a table's schema keeps exactly the shape it had before views existed.
+      ...(this.viewDef != null ? { view: this.viewDef } : {}),
       columnNameMap,
       relationEntries,
       relationSchemaCache,

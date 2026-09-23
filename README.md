@@ -25,6 +25,7 @@ A type-safe ORM for PostgreSQL and TypeScript with automatic type inference and 
 - **Transaction Support** - Safe, type-checked transactions
 - **Production Diagnostics** - Failed-statement logging, slow-query reports with the calling stack, per-query timeouts
 - **Manual Migrations** - File-based migrations with journal tracking, up/down support, and scaffolding
+- **Model-Managed Views** - Declare a database view with `model.view()` — as SQL, or as a typed linkgress query; migrate creates it and re-creates it on change, and it is read-only in queries
 - **Multiple Clients** - Works with the `pg` and `postgres` npm packages, Bun's built-in SQL, and PGlite (PostgreSQL in WASM, in-process — no server)
 
 ## Table of Contents
