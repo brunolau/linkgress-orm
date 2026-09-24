@@ -1,13 +1,31 @@
 import { DatabaseClient, QueryResult, TransactionalClient, QueryExecutionOptions } from '../database/database-client.interface';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
-import { UnwrapDbColumns, InsertData, UpdateData, UpsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
+import { DbColumn, UnwrapDbColumns, InsertData, UpdateData, UpsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
-import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, UnwrapSelection, FieldRef } from '../query/conditions';
+import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, UnwrapSelection, FieldRef, WhereConditionBase, inArray } from '../query/conditions';
 import { LinkgressConfig } from '../config/linkgress-config';
-import { ResolveCollectionResults, CollectionQueryBuilder, ReferenceQueryBuilder, SelectQueryBuilder, QueryBuilder, QueryContext } from '../query/query-builder';
+import {
+  ResolveCollectionResults,
+  CollectionQueryBuilder,
+  ReferenceQueryBuilder,
+  SelectQueryBuilder,
+  QueryBuilder,
+  QueryContext,
+  RETURNING_PLACEHOLDER_COLUMN,
+  classifyReturningValue,
+  fragmentReadMapper,
+  readReturningRows,
+  renderPlainReturning,
+  renderReturningExpression,
+  returningSelection,
+  type ReturningReadPlan,
+  type ReturningShape,
+} from '../query/query-builder';
+import { NavigationAliasPlan, type NavigationPathNode } from '../query/join-utils';
 import { renumberPlaceholders } from '../query/sql-utils';
+import { numericZeroScaleMapper, toPgArrayLiteral } from '../types/custom-types';
 import { PreparedQuery } from '../query/prepared-query';
 import { InferRowType } from '../schema/row-type';
 import { DbSchemaManager } from '../migration/db-schema-manager';
@@ -40,7 +58,65 @@ import {
  * computed once per schema instead of per row (WeakMap: dropped together
  * with the schema when a context is released).
  */
-const entityMappingPlanCache = new WeakMap<object, Array<{ propName: string; dbColumnName: string; mapper?: any }>>();
+const entityMappingPlanCache = new WeakMap<object, Array<{ propName: string; dbColumnName: string; mapper?: any; zeroScale?: any }>>();
+
+/**
+ * The alias the mutated rows render under in a RETURNING that reads navigations: `insert`,
+ * `upsert` and `insertWithChildren` wrap their statement in a data-modifying CTE of this name and
+ * join the navigations onto it.
+ */
+const MUTATION_ROW_ALIAS = '__mutation__';
+
+/** A join a navigation RETURNING adds onto the mutation CTE — the shape every navigation resolver builds. */
+type ReturningNavigationJoin = {
+  alias: string;
+  targetTable: string;
+  targetSchema?: string;
+  foreignKeys: string[];
+  matches: string[];
+  isMandatory: boolean;
+  sourceAlias?: string;
+};
+
+/** A navigation column a RETURNING selector reads, keyed by its result alias (`a.b` inside nested objects). */
+interface ReturningNavigationField {
+  /** The alias the column renders under — its path alias when another path owns the relation name. */
+  tableAlias: string;
+  dbColumnName: string;
+  schemaTable?: string;
+  /** The column's own mapper: the one of the table it belongs to, whichever path reached it. */
+  mapper?: { fromDriver(value: any): any };
+}
+
+/** What a navigation RETURNING's rendering reads from its detection. */
+interface ReturningNavigationRenderInfo {
+  selection: any;
+  joins: ReturningNavigationJoin[];
+  navigationFields: Map<string, ReturningNavigationField>;
+  nestedObjects?: Map<string, any>;
+  collectionFields?: Map<string, any>;
+}
+
+/** Composition hooks of a navigation RETURNING, used by `insertWithChildren` and `mergeBulk`. */
+interface ReturningNavigationRenderOptions {
+  /**
+   * Alias the mutation's RETURNING qualifies its columns with. MERGE needs its target's: both the
+   * target and the source alias are in scope there, so a bare column name is ambiguous.
+   */
+  returningQualifier?: string;
+  prefixCtes?: string;
+  extraJoins?: string[];
+  extraSelects?: string[];
+  extraCteReturningCols?: string[];
+  orderByCteColumn?: string;
+  /**
+   * Navigation joins whose target TABLE appears here read from the mapped FROM item (SQL) instead —
+   * how `insertWithChildren` / `insertBulkWithChildren` make a child→parent reference nav see the
+   * parent row inserted in the SAME statement (the real table is snapshot-stale for data-modifying
+   * CTE siblings) as well as the table's existing rows.
+   */
+  joinTableOverrides?: Map<string, string>;
+}
 
 /**
  * Per-schema prototype carrying a select-all row's NAVIGATION getters.
@@ -168,7 +244,11 @@ export interface ColumnInfo<TEntity = any> {
 /**
  * Order direction for orderBy clauses
  */
-export type OrderDirection = 'ASC' | 'DESC';
+/**
+ * A sort direction: `ASC` / `DESC`, optionally with where NULLs sort (PostgreSQL's default is NULLS
+ * LAST for ASC and NULLS FIRST for DESC). Any case is accepted and normalized.
+ */
+export type OrderDirection = 'ASC' | 'DESC' | 'ASC NULLS FIRST' | 'ASC NULLS LAST' | 'DESC NULLS FIRST' | 'DESC NULLS LAST';
 
 /**
  * A single field that can be used in orderBy.
@@ -1027,8 +1107,72 @@ export interface FluentInsert<TEntity extends DbEntity> extends PromiseLike<void
   /** Return all columns from the inserted row */
   returning(): PromiseLike<UnwrapDbColumns<TEntity>>;
   /** Return selected columns from the inserted row */
-  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<UnwrapDbColumns<TResult>>;
+  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>>;
 }
+
+/**
+ * The row a mutation's `.returning(selector)` resolves to. Columns unwrap exactly as
+ * {@link UnwrapDbColumns} unwraps them; what a RETURNING projects besides them resolves the way a
+ * SELECT row does — an `sql` expression or a collection aggregate (`b.editions.count()`) to its
+ * value, a condition to a boolean, a collection (`.toList()`) to its items, a nested object field by
+ * field. A selector returning ONE value (`ln => ln.note`, `ln => sql\`…\``) resolves to that value.
+ */
+export type ReturningRow<T> = T extends SqlFragment<infer V>
+  ? V
+  : T extends WhereConditionBase
+    ? boolean
+    : T extends DbColumn<any>
+      ? UnwrapDbColumns<T>
+      : T extends object
+        ? IsValueType<T> extends true
+          ? T
+          : true extends HoldsReturningWrapper<T>
+            ? UnwrapDbColumns<{ [K in keyof T]: ReturningField<T[K]> }>
+            // Nothing to resolve in it: exactly as 1.0.x typed every RETURNING row
+            : UnwrapDbColumns<T>
+        : T;
+
+/**
+ * Whether a value a RETURNING projects holds something the read resolves — an `sql` expression, a
+ * condition, a column — at any depth (up to 4 levels). Only such an object is resolved field by
+ * field: any other object — a value type no type test recognizes as one (a Temporal type declared
+ * only through augmentations: its methods were mapped to `{}`), a mapped column's object value —
+ * stays as it is.
+ */
+type HoldsReturningWrapper<F, Depth extends unknown[] = []> = Depth['length'] extends 4
+  ? false
+  : F extends SqlFragment<any> | WhereConditionBase | DbColumn<any>
+    ? true
+    : F extends (...args: any[]) => any
+      ? false
+      : F extends readonly (infer U)[]
+        ? HoldsReturningWrapper<U, [...Depth, unknown]>
+        : F extends object
+          ? true extends { [K in keyof F]-?: HoldsReturningWrapper<F[K], [...Depth, unknown]> }[keyof F] ? true : false
+          : false;
+
+/**
+ * One field of a {@link ReturningRow}: what {@link UnwrapDbColumns} does not resolve by itself.
+ * Distributes over a union — a nullable column (`DbColumn<Date> | null`, a `firstOrDefault()`'s
+ * value) resolves to `Date | null`, where it used to keep the `DbColumn` wrapper.
+ */
+type ReturningField<F> = F extends SqlFragment<infer V>
+  ? V
+  : F extends WhereConditionBase
+    ? boolean
+    : F extends DbColumn<infer V>
+      ? V
+      : F extends DbEntity | null | undefined
+        ? F
+        : F extends readonly (infer U)[]
+          ? ReturningRow<U>[]
+          : F extends object
+            ? IsValueType<F> extends true
+              ? F
+              : true extends HoldsReturningWrapper<F>
+                ? ReturningRow<F>
+                : F
+            : F;
 
 /**
  * Fluent insert many operation
@@ -1037,7 +1181,7 @@ export interface FluentInsertMany<TEntity extends DbEntity> extends PromiseLike<
   /** Return all columns from the inserted rows */
   returning(): PromiseLike<UnwrapDbColumns<TEntity>[]>;
   /** Return selected columns from the inserted rows */
-  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<UnwrapDbColumns<TResult>[]>;
+  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>[]>;
 }
 
 /**
@@ -1047,7 +1191,7 @@ export interface FluentUpdate<TEntity extends DbEntity> extends PromiseLike<void
   /** Return all columns from the updated rows */
   returning(): PromiseLike<UnwrapDbColumns<TEntity>[]>;
   /** Return selected columns from the updated rows */
-  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<UnwrapDbColumns<TResult>[]>;
+  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>[]>;
 }
 
 /**
@@ -1057,7 +1201,7 @@ export interface FluentBulkUpdate<TEntity extends DbEntity> extends PromiseLike<
   /** Return all columns from the updated rows */
   returning(): PromiseLike<UnwrapDbColumns<TEntity>[]>;
   /** Return selected columns from the updated rows */
-  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<UnwrapDbColumns<TResult>[]>;
+  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>[]>;
 }
 
 /**
@@ -1067,7 +1211,7 @@ export interface FluentUpsert<TEntity extends DbEntity> extends PromiseLike<void
   /** Return all columns from the upserted rows */
   returning(): PromiseLike<UnwrapDbColumns<TEntity>[]>;
   /** Return selected columns from the upserted rows */
-  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<UnwrapDbColumns<TResult>[]>;
+  returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>[]>;
 }
 
 /**
@@ -1079,14 +1223,18 @@ export type FluentMerge<TEntity extends DbEntity> = FluentUpsert<TEntity>;
 /**
  * Fluent delete operation for SelectQueryBuilder
  * Used with db.table.where(...).delete()
+ *
+ * `TRow` is what a `.returning(selector)` reads the deleted row as: over an entity table its
+ * columns, navigations and collections (`EntityQuery`), so conditions, `sql` expressions and
+ * collection aggregates over them type-check — it was typed as the row's plain values.
  */
-export interface FluentDelete<TSelection> extends PromiseLike<void> {
+export interface FluentDelete<TSelection, TRow = TSelection> extends PromiseLike<void> {
   /** Return the number of deleted rows */
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the deleted rows */
   returning(): PromiseLike<TSelection[]>;
   /** Return selected columns from the deleted rows (SqlFragment fields unwrap to their value type) */
-  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  returning<TResult>(selector: (row: TRow) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
   /**
    * Compile this DELETE into `{ sql, params }` WITHOUT executing it — same
    * WHERE/USING semantics as execution (navigation joins in the WHERE become
@@ -1094,7 +1242,7 @@ export interface FluentDelete<TSelection> extends PromiseLike<void> {
    * is not supported here). Attach the result as a data-modifying CTE via
    * {@link DbCteBuilder.withMutation}.
    */
-  toStatement<TResult>(selector?: (row: TSelection) => TResult): {
+  toStatement<TResult>(selector?: (row: TRow) => TResult): {
     sql: string;
     params: any[];
   };
@@ -1103,21 +1251,23 @@ export interface FluentDelete<TSelection> extends PromiseLike<void> {
 /**
  * Fluent update operation for SelectQueryBuilder
  * Used with db.table.where(...).update(data)
+ *
+ * `TRow` is what a `.returning(selector)` reads the updated row as (see {@link FluentDelete}).
  */
-export interface FluentQueryUpdate<TSelection> extends PromiseLike<void> {
+export interface FluentQueryUpdate<TSelection, TRow = TSelection> extends PromiseLike<void> {
   /** Return the number of updated rows */
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the updated rows */
   returning(): PromiseLike<TSelection[]>;
   /** Return selected columns from the updated rows (SqlFragment fields unwrap to their value type) */
-  returning<TResult>(selector: (row: TSelection) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  returning<TResult>(selector: (row: TRow) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
   /**
    * Compile this UPDATE into `{ sql, params }` WITHOUT executing it — same
    * SET/WHERE semantics as execution (SqlFragment values, fragment-capable
    * RETURNING; navigation RETURNING unsupported). Attach the result as a
    * data-modifying CTE via {@link DbCteBuilder.withMutation}.
    */
-  toStatement<TResult>(selector?: (row: TSelection) => TResult): { sql: string; params: any[] };
+  toStatement<TResult>(selector?: (row: TRow) => TResult): { sql: string; params: any[] };
 }
 
 /**
@@ -1129,6 +1279,8 @@ export class InsertBuilder<TSchema extends TableSchema> {
   private conflictAction: 'nothing' | 'update' = 'nothing';
   private updateColumns?: string[];
   private updateColumnFilter?: (columnName: string) => boolean;
+  /** `doUpdate({ set })`: the values a conflicting row is updated TO, by property name */
+  private setValues?: Record<string, unknown>;
   private targetWhereClause?: string;
   private setWhereClause?: string;
   private overridingSystemValue: boolean = false;
@@ -1168,7 +1320,11 @@ export class InsertBuilder<TSchema extends TableSchema> {
   }
 
   /**
-   * Update on conflict (upsert)
+   * Update on conflict (upsert). Without options every inserted non-key column takes the proposed
+   * row's value (`EXCLUDED`). `set` updates exactly its columns to its values — a value (through
+   * the column's mapper), or an `sql` expression, which can read the proposed row as
+   * `EXCLUDED."column"`. `set` used to name the columns only: they took the INSERTED values, and the
+   * values given were dropped.
    */
   doUpdate(options?: {
     set?: Partial<InferTableType<TSchema>>;
@@ -1178,6 +1334,7 @@ export class InsertBuilder<TSchema extends TableSchema> {
   }): this {
     this.conflictAction = 'update';
     if (options?.set) {
+      this.setValues = options.set as Record<string, unknown>;
       this.updateColumns = Object.keys(options.set);
     }
     if (options?.updateColumns) {
@@ -1233,21 +1390,14 @@ export class InsertBuilder<TSchema extends TableSchema> {
     const columns = Array.from(columnSet);
     const values: any[] = [];
     const valuePlaceholders: string[] = [];
-    let paramIndex = 1;
+    const cellContext: SqlBuildContext = { paramCounter: 1, params: values };
 
     // Build placeholders for each row
     for (const data of this.dataArray) {
       const rowPlaceholders: string[] = [];
       for (const key of columns) {
-        const value = (data as any)[key];
         const column = this.schema.columns[key as string];
-        const config = column.build();
-        // Apply toDriver mapper if present
-        const mappedValue = config.mapper
-          ? config.mapper.toDriver(value !== undefined ? value : null)
-          : (value !== undefined ? value : null);
-        values.push(mappedValue);
-        rowPlaceholders.push(`$${paramIndex++}`);
+        rowPlaceholders.push(renderValuesCell((data as any)[key], column.build().mapper, cellContext));
       }
       valuePlaceholders.push(`(${rowPlaceholders.join(', ')})`);
     }
@@ -1308,7 +1458,18 @@ export class InsertBuilder<TSchema extends TableSchema> {
 
         const updateParts = columnsToUpdate.map(col => {
           const column = this.schema.columns[col];
+
+          if (!column) {
+            throw new Error(`doUpdate(): "${col}" is not a column of "${this.schema.name}"`);
+          }
+
           const config = column.build();
+
+          // A value `set` gives — numbered after the VALUES rows' parameters, as it follows them
+          if (this.setValues && Object.prototype.hasOwnProperty.call(this.setValues, col)) {
+            return `"${config.name}" = ${renderValuesCell(this.setValues[col], config.mapper, cellContext)}`;
+          }
+
           return `"${config.name}" = EXCLUDED."${config.name}"`;
         });
         sql += updateParts.join(', ');
@@ -1471,7 +1632,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
    * Left join with another table and selector
    */
   leftJoin<TRight, TSelection>(
-    rightTable: { _getSchema: () => TableSchema } | import('../query/subquery').Subquery<TRight, 'table'>,
+    rightTable: { _getSchema: () => TableSchema } | import('../query/subquery').Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: InferRowType<TBuilder>, right: TRight) => Condition,
     selector: (left: InferRowType<TBuilder>, right: TRight) => TSelection,
     alias?: string
@@ -1484,7 +1645,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
    * Inner join with another table or subquery and selector
    */
   innerJoin<TRight, TSelection>(
-    rightTable: { _getSchema: () => TableSchema } | import('../query/subquery').Subquery<TRight, 'table'>,
+    rightTable: { _getSchema: () => TableSchema } | import('../query/subquery').Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: InferRowType<TBuilder>, right: TRight) => Condition,
     selector: (left: InferRowType<TBuilder>, right: TRight) => TSelection,
     alias?: string
@@ -1521,7 +1682,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     const columns: string[] = [];
     const values: any[] = [];
     const placeholders: string[] = [];
-    let paramIndex = 1;
+    const cellContext: SqlBuildContext = { paramCounter: 1, params: values };
 
     for (const [key, value] of Object.entries(data)) {
       const column = this.schema.columns[key];
@@ -1536,12 +1697,8 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
           continue;
         }
         columns.push(`"${config.name}"`);
-        // Apply toDriver mapper if present
-        const mappedValue = config.mapper
-          ? config.mapper.toDriver(value)
-          : value;
-        values.push(mappedValue);
-        placeholders.push(`$${paramIndex++}`);
+        // An sql fragment inline, anything else through the column's toDriver mapper
+        placeholders.push(renderValuesCell(value, config.mapper, cellContext));
       }
     }
 
@@ -1757,7 +1914,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
   async update(id: any, data: Partial<InferTableType<TableSchema>>): Promise<InferTableType<TableSchema> | null> {
     const setClauses: string[] = [];
     const values: any[] = [];
-    let paramIndex = 1;
+    const setContext: SqlBuildContext = { paramCounter: 1, params: values };
 
     // Find primary key
     let pkColumnName: string | undefined;
@@ -1778,12 +1935,8 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       if (column) {
         const config = column.build();
         if (!config.primaryKey) {
-          setClauses.push(`"${config.name}" = $${paramIndex++}`);
-          // Apply toDriver mapper if present
-          const mappedValue = config.mapper
-            ? config.mapper.toDriver(value)
-            : value;
-          values.push(mappedValue);
+          // An sql fragment / condition / column inline, a value through the column's toDriver mapper
+          setClauses.push(`"${config.name}" = ${renderAssignedValue(value, config.mapper, setContext)}`);
         }
       }
     }
@@ -1792,6 +1945,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       return null;
     }
 
+    const paramIndex = setContext.paramCounter;
     values.push(id);
 
     const returningColumns = Object.entries(this.schema.columns)
@@ -1879,6 +2033,93 @@ function renderRawFragment(fragment: SqlFragment): { sql: string; params: any[] 
 /**
  * DataContext - main entry point for database operations
  */
+/**
+ * Render the value of a SET assignment written as an expression (upsert `updateSet`, bulk
+ * update `set`): a fragment inline, a column ref qualified by its alias, a condition as a
+ * boolean value, a plain value as a parameter through the column's mapper.
+ */
+function renderAssignedValue(value: unknown, mapper: any, context: SqlBuildContext): string {
+  if (value instanceof SqlFragment) {
+    return value.buildSql(context);
+  }
+
+  if (value instanceof WhereConditionBase) {
+    return `(${value.buildSql(context)})`;
+  }
+
+  if (value && typeof value === 'object' && '__dbColumnName' in (value as object)) {
+    const ref = value as { __tableAlias?: string; __dbColumnName: string };
+    return ref.__tableAlias ? `"${ref.__tableAlias}"."${ref.__dbColumnName}"` : `"${ref.__dbColumnName}"`;
+  }
+
+  const bound = value === undefined ? null : value;
+  context.params.push(mapper && typeof mapper.toDriver === 'function' ? mapper.toDriver(bound) : bound);
+  return `$${context.paramCounter++}`;
+}
+
+/**
+ * One cell of a VALUES row: an `sql` fragment inline, its parameters numbered in the statement's
+ * sequence (`insert({ createdAt: sql\`now()\` })` — no table is in scope, so it must be
+ * self-contained); anything else a parameter through the column's mapper. `cast` types the cell
+ * (`::integer`). A fragment used to be bound AS a parameter: its JSON serialization was stored in
+ * the column.
+ */
+function renderValuesCell(value: unknown, mapper: any, context: SqlBuildContext, cast: string = ''): string {
+  if (value instanceof SqlFragment) {
+    return `(${value.buildSql(context)})${cast}`;
+  }
+
+  const bound = value === undefined ? null : value;
+  context.params.push(mapper && typeof mapper.toDriver === 'function' ? mapper.toDriver(bound) : bound);
+  return `$${context.paramCounter++}${cast}`;
+}
+
+/** The column refs an assigned value reads (a bare ref, or the refs of a fragment / condition). */
+function collectRefsOf(value: unknown): FieldRef[] {
+  if (value instanceof WhereConditionBase) {
+    return value.getFieldRefs();
+  }
+
+  if (value && typeof value === 'object' && '__dbColumnName' in (value as object)) {
+    return [value as FieldRef];
+  }
+
+  return [];
+}
+
+/**
+ * An advisory lock key: an integer, or a string hashed with PostgreSQL's `hashtext()`.
+ * Single keys span the int8 range; each half of a (classId, key) pair the int4 range.
+ */
+export type AdvisoryLockKey = number | bigint | string;
+
+const INT4_MIN = -2147483648;
+const INT4_MAX = 2147483647;
+const INT8_MIN = -(2n ** 63n);
+const INT8_MAX = 2n ** 63n - 1n;
+
+function assertInt4(name: string, value: unknown): void {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < INT4_MIN || value > INT4_MAX) {
+    throw new RangeError(`${name} must be an integer in the int4 range, got ${String(value)}`);
+  }
+}
+
+/** A single advisory key as its exact decimal text (bound, then cast to bigint). */
+function int8Param(name: string, value: unknown): string {
+  if (typeof value === 'bigint') {
+    if (value < INT8_MIN || value > INT8_MAX) {
+      throw new RangeError(`${name} is outside the int8 range: ${value}`);
+    }
+    return value.toString();
+  }
+
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new RangeError(`${name} must be a safe integer, a bigint or a string, got ${String(value)}`);
+  }
+
+  return String(value);
+}
+
 export class DataContext<TSchema extends ContextSchema = any> {
   protected client: DatabaseClient;
   private schemaRegistry = new Map<string, TableSchema>();
@@ -1985,6 +2226,146 @@ export class DataContext<TSchema extends ContextSchema = any> {
       : { sql: sqlOrFragment, params };
     const result = await this.client.query(statement.sql, statement.params);
     return result.rows as T[];
+  }
+
+  // --------------------------------------------------------------------------
+  // Transaction-scoped advisory locks
+  // --------------------------------------------------------------------------
+
+  /**
+   * `pg_advisory_xact_lock(key)` / `pg_advisory_xact_lock(classId, key)` — wait for and take an
+   * exclusive advisory lock that is released automatically at COMMIT / ROLLBACK.
+   *
+   * Serializes concurrent units of work on a key that is not a row (an order being settled, an
+   * import per partner) without a lock table. Must be called on the context
+   * `db.transaction()` hands you: outside a transaction the lock would be released the moment
+   * the statement ends, so it throws instead of silently locking nothing.
+   *
+   * Keys: one integer in the int8 range, or a pair of a class id and a key in the int4 range.
+   * A string key is hashed with `hashtext()` — use it for natural keys (`'invoice-42'`), and
+   * the pair form to keep unrelated lock families apart.
+   *
+   * @example
+   * await db.transaction(async tx => {
+   *   await tx.advisoryXactLock(LockClass.Invoice, invoiceId);
+   *   // … check-then-write safely against every other holder of this lock
+   * });
+   */
+  advisoryXactLock(key: AdvisoryLockKey): Promise<void>;
+  advisoryXactLock(classId: number, key: AdvisoryLockKey): Promise<void>;
+  async advisoryXactLock(first: AdvisoryLockKey, second?: AdvisoryLockKey): Promise<void> {
+    const call = this.advisoryLockCall('advisoryXactLock', 'pg_advisory_xact_lock', first, second);
+    await this.runLockStatement(`SELECT ${call.sql}`, call.params);
+  }
+
+  /**
+   * `pg_try_advisory_xact_lock(…)` — take the lock if it is free, without waiting; `true` when
+   * this transaction now holds it (or already did — advisory locks are re-entrant), `false`
+   * when another session holds it. Same keys and transaction requirement as
+   * {@link advisoryXactLock}.
+   */
+  tryAdvisoryXactLock(key: AdvisoryLockKey): Promise<boolean>;
+  tryAdvisoryXactLock(classId: number, key: AdvisoryLockKey): Promise<boolean>;
+  async tryAdvisoryXactLock(first: AdvisoryLockKey, second?: AdvisoryLockKey): Promise<boolean> {
+    const call = this.advisoryLockCall('tryAdvisoryXactLock', 'pg_try_advisory_xact_lock', first, second);
+    const result = await this.runLockStatement(`SELECT ${call.sql} AS "acquired"`, call.params);
+    return result.rows[0]?.acquired === true;
+  }
+
+  /**
+   * Take the transaction-scoped advisory lock of every key in ONE statement, in a fixed order
+   * (duplicates removed, numbers ascending / strings in code-unit order), so two transactions
+   * locking overlapping key sets can never deadlock on each other. All keys of one call must
+   * be of one kind: integers (int4) or strings (hashed with `hashtext()`).
+   *
+   * @example
+   * await db.transaction(async tx => {
+   *   await tx.advisoryXactLockAll(LockClass.Order, orderIds);
+   * });
+   */
+  async advisoryXactLockAll(classId: number, keys: readonly AdvisoryLockKey[]): Promise<void> {
+    this.assertAdvisoryTransaction('advisoryXactLockAll');
+    assertInt4('advisoryXactLockAll: classId', classId);
+
+    if (!Array.isArray(keys)) {
+      throw new TypeError('advisoryXactLockAll: keys must be an array');
+    }
+
+    if (keys.length === 0) {
+      return;
+    }
+
+    const allStrings = keys.every(key => typeof key === 'string');
+    const allNumbers = keys.every(key => typeof key === 'number' || typeof key === 'bigint');
+
+    if (!allStrings && !allNumbers) {
+      throw new TypeError('advisoryXactLockAll: keys must be all integers or all strings');
+    }
+
+    if (allStrings) {
+      const unique = Array.from(new Set(keys as string[])).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      await this.runLockStatement(
+        'SELECT pg_advisory_xact_lock($1, hashtext(k)) FROM unnest(CAST($2 AS text[])) AS t(k)',
+        [classId, toPgArrayLiteral(unique)]
+      );
+      return;
+    }
+
+    const numbers = (keys as Array<number | bigint>).map((key) => {
+      const value = Number(key);
+      assertInt4('advisoryXactLockAll: key', value);
+      return value;
+    });
+    const unique = Array.from(new Set(numbers)).sort((a, b) => a - b);
+
+    await this.runLockStatement(
+      'SELECT pg_advisory_xact_lock($1, k) FROM unnest(CAST($2 AS integer[])) AS t(k)',
+      [classId, toPgArrayLiteral(unique)]
+    );
+  }
+
+  /** Run a lock statement through the context's executor (logging, slow-query hooks) when it has one. */
+  private runLockStatement(sql: string, params: any[]): Promise<QueryResult> {
+    return this.executor ? this.executor.query(sql, params) : this.client.query(sql, params);
+  }
+
+  private assertAdvisoryTransaction(method: string): void {
+    if (!this.client.isInTransaction()) {
+      throw new Error(
+        `${method}() takes a TRANSACTION-scoped lock — call it on the context db.transaction() hands you. `
+        + 'Outside a transaction the lock would be released as soon as the statement ends.'
+      );
+    }
+  }
+
+  /** The `fn(…)` call text and params of an advisory lock over one key or a (classId, key) pair. */
+  private advisoryLockCall(
+    method: string,
+    fn: string,
+    first: AdvisoryLockKey,
+    second: AdvisoryLockKey | undefined
+  ): { sql: string; params: any[] } {
+    this.assertAdvisoryTransaction(method);
+
+    if (second === undefined) {
+      if (typeof first === 'string') {
+        return { sql: `${fn}(hashtext($1))`, params: [first] };
+      }
+      return { sql: `${fn}(CAST($1 AS bigint))`, params: [int8Param(`${method}: key`, first)] };
+    }
+
+    if (typeof first !== 'number') {
+      throw new TypeError(`${method}: the class id of a key pair must be an integer`);
+    }
+    assertInt4(`${method}: classId`, first);
+
+    if (typeof second === 'string') {
+      return { sql: `${fn}($1, hashtext($2))`, params: [first, second] };
+    }
+
+    const key = Number(second);
+    assertInt4(`${method}: key`, key);
+    return { sql: `${fn}($1, $2)`, params: [first, key] };
   }
 
   /**
@@ -2222,7 +2603,54 @@ export type EntityUpsertConfig<TEntity extends DbEntity> = {
    * Filter function to determine if column should be updated on conflict
    */
   updateColumnFilter?: (columnName: string) => boolean;
+
+  /**
+   * SET expressions for the conflict arm, computed from the row that is already there
+   * (`existing`) and the row proposed for insertion (`excluded`):
+   *
+   * ```typescript
+   * db.counters.upsertBulk(rows, {
+   *   primaryKey: 'key',
+   *   updateSet: (existing, excluded) => ({
+   *     hits: add(existing.hits, excluded.hits),               // accumulate
+   *     firstSeen: coalesce(existing.firstSeen, excluded.firstSeen), // keep the first non-null
+   *   }),
+   * });
+   * // → ON CONFLICT ("key") DO UPDATE SET "hits" = ("counters"."hits" + "excluded"."hits"), …
+   * ```
+   *
+   * Without `updateColumns` / `updateColumnFilter`, ONLY the columns named here are updated.
+   * With them, the listed columns keep their `= EXCLUDED."col"` assignment and the ones named
+   * here take their expression (an expression wins over a list entry for the same column).
+   * Plain values bind through the column's mapper. Navigations are not available here.
+   */
+  updateSet?: (existing: EntityQuery<TEntity>, excluded: EntityQuery<TEntity>) => { [K in keyof ExtractDbColumns<TEntity>]?: unknown };
+
+  /**
+   * A typed `DO UPDATE … WHERE` condition over (`existing`, `excluded`): the conflicting row is
+   * only updated when it holds — e.g. keep the newer version:
+   * `(existing, excluded) => lt(existing.version, excluded.version)`. ANDed with `setWhere`.
+   */
+  updateWhere?: (existing: EntityQuery<TEntity>, excluded: EntityQuery<TEntity>) => Condition;
 };
+
+/**
+ * Typed SET / WHERE expressions of an upsert's conflict arm (see
+ * {@link EntityUpsertConfig.updateSet}). @internal
+ */
+interface UpsertExpressionConfig {
+  updateSet?: (existing: any, excluded: any) => Record<string, unknown>;
+  updateWhere?: (existing: any, excluded: any) => Condition;
+}
+
+/**
+ * Typed SET / WHERE expressions of a bulk update (see {@link DbEntityTable.bulkUpdate}):
+ * `target` is the row being updated (alias `t`), `values` the incoming VALUES row (alias `v`).
+ */
+export interface BulkUpdateExpressionConfig<TEntity extends DbEntity> {
+  set?: (target: EntityQuery<TEntity>, values: EntityQuery<TEntity>) => { [K in keyof ExtractDbColumns<TEntity>]?: unknown };
+  where?: (target: EntityQuery<TEntity>, values: EntityQuery<TEntity>) => Condition;
+}
 
 /**
  * Merge configuration for entity-level {@link DbEntityTable.mergeBulk}
@@ -2600,7 +3028,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Delete records matching the current WHERE condition
    * Returns a fluent builder that can be awaited directly or chained with .returning()
    */
-  delete(): FluentDelete<UnwrapDbColumns<TEntity>>;
+  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>>;
 
   /**
    * Update records matching the current WHERE condition
@@ -2615,7 +3043,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   update(
     data: UpdateData<TEntity>
       | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
-  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>>;
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>>;
 
   /**
    * Create a prepared query for efficient reusable parameterized execution
@@ -2927,7 +3355,14 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
  * DbEntity insert builder for upsert operations with proper typing
  */
 export class EntityInsertBuilder<TEntity extends DbEntity> {
-  constructor(private builder: InsertBuilder<TableSchema>) {}
+  /**
+   * @param mapRows Reads the inserted rows as entities: property names, column mappers. The rows
+   *   used to come back as the statement returned them — keyed by the COLUMN names, unmapped.
+   */
+  constructor(
+    private builder: InsertBuilder<TableSchema>,
+    private mapRows: (rows: any[]) => UnwrapDbColumns<TEntity>[] = rows => rows
+  ) {}
 
   /**
    * Specify conflict target (columns or constraint name)
@@ -2946,9 +3381,12 @@ export class EntityInsertBuilder<TEntity extends DbEntity> {
   }
 
   /**
-   * Update on conflict (upsert)
+   * Update on conflict (upsert): every inserted non-key column to the proposed row's value, or —
+   * with `set` — exactly the given columns to the given values (an `sql` expression can read the
+   * proposed row as `EXCLUDED."column"`), or — with `updateColumns` — exactly those columns to the
+   * proposed row's values. `where` is the DO UPDATE's condition, as SQL.
    */
-  doUpdate(options?: { set?: InsertData<TEntity>; where?: string }): this {
+  doUpdate(options?: { set?: UpdateData<TEntity>; updateColumns?: Array<keyof InsertData<TEntity> & string>; where?: string }): this {
     this.builder.doUpdate(options as any);
     return this;
   }
@@ -2957,7 +3395,7 @@ export class EntityInsertBuilder<TEntity extends DbEntity> {
    * Execute the insert/upsert
    */
   async execute(): Promise<UnwrapDbColumns<TEntity>[]> {
-    return this.builder.execute() as Promise<UnwrapDbColumns<TEntity>[]>;
+    return this.mapRows(await this.builder.execute());
   }
 }
 
@@ -3517,51 +3955,34 @@ export class DbEntityTable<TEntity extends DbEntity> {
   orderBy<T>(selector: (row: EntityQuery<TEntity>) => T[]): IEntityQueryable<TEntity>;
   orderBy<T>(selector: (row: EntityQuery<TEntity>) => Array<[T, OrderDirection]>): IEntityQueryable<TEntity>;
   orderBy<T>(selector: (row: EntityQuery<TEntity>) => OrderByResult<T>): IEntityQueryable<TEntity> {
-    const schema = this._getSchema();
-    const allColumnsSelector = (e: any) => {
-      const result: any = {};
-      for (const colName of Object.keys(schema.columns)) {
-        result[colName] = e[colName];
-      }
-      return result;
-    };
-
-    const qb = this.context.getTable(this.tableName).select(allColumnsSelector) as any;
-    return qb.orderBy(selector) as IEntityQueryable<TEntity>;
+    return (this.selectAllQuery() as any).orderBy(selector) as IEntityQueryable<TEntity>;
   }
 
   /**
    * Limit results
    */
   limit(count: number): IEntityQueryable<TEntity> {
-    const schema = this._getSchema();
-    const allColumnsSelector = (e: any) => {
-      const result: any = {};
-      for (const colName of Object.keys(schema.columns)) {
-        result[colName] = e[colName];
-      }
-      return result;
-    };
-
-    const qb = this.context.getTable(this.tableName).select(allColumnsSelector) as any;
-    return qb.limit(count) as IEntityQueryable<TEntity>;
+    return (this.selectAllQuery() as any).limit(count) as IEntityQueryable<TEntity>;
   }
 
   /**
    * Offset results
    */
   offset(count: number): IEntityQueryable<TEntity> {
-    const schema = this._getSchema();
-    const allColumnsSelector = (e: any) => {
-      const result: any = {};
-      for (const colName of Object.keys(schema.columns)) {
-        result[colName] = e[colName];
-      }
-      return result;
-    };
+    return (this.selectAllQuery() as any).offset(count) as IEntityQueryable<TEntity>;
+  }
 
-    const qb = this.context.getTable(this.tableName).select(allColumnsSelector) as any;
-    return qb.offset(count) as IEntityQueryable<TEntity>;
+  /**
+   * The select-all query `orderBy` / `limit` / `offset` continue from — the same row `where` starts
+   * with (see createSelectAllRow): the columns as the default projection, and every navigation still
+   * reachable from the next `orderBy` / `where` / `select`. The columns-only object these used to
+   * start from dropped the navigations: an ORDER BY through one silently vanished (`ln.book.name`
+   * read `undefined`) or threw (`ln.edition.book`), and so did a chained `.select(m => m.loans…)`.
+   */
+  private selectAllQuery(): unknown {
+    const schema = this._getSchema();
+
+    return this.context.getTable(this.tableName).select((e: any) => createSelectAllRow(schema, e));
   }
 
   /**
@@ -3577,15 +3998,17 @@ export class DbEntityTable<TEntity extends DbEntity> {
 
   /**
    * Select distinct
+   * UnwrapSelection extracts the value types, as for select() — a distinct column (`e => e.bookId`)
+   * reads as its values
    */
   selectDistinct<TSelection>(
     selector: (entity: EntityQuery<TEntity>) => TSelection
-  ): EntitySelectQueryBuilder<TEntity, TSelection> {
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>> {
     const queryBuilder = this.context.getTable(this.tableName);
     // First select, then call selectDistinct to get a new builder with isDistinct=true
     const selectBuilder = queryBuilder.select(selector as any);
     const distinctBuilder = selectBuilder.selectDistinct((x: any) => x);
-    return distinctBuilder as any as EntitySelectQueryBuilder<TEntity, TSelection>;
+    return distinctBuilder as any as EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
   }
 
   /**
@@ -4016,11 +4439,17 @@ export class DbEntityTable<TEntity extends DbEntity> {
    *    concurrent statements cannot see each other's uncommitted rows);
    *  - single-statement atomicity: any failing leg rolls back both inserts.
    *
-   * Restrictions: single-column auto/serial parent primary key; the parent
-   * `returning` selector supports FLAT parent columns only; child rows must
+   * Restrictions: single-column auto/serial parent primary key; child rows must
    * NOT carry the foreign-key property; `children.rows` must be non-empty and
-   * fit one statement (no chunking). The child `returning` selector supports
-   * the full navigation/collection projection surface of `.returning()`.
+   * fit one statement (no chunking).
+   *
+   * RETURNING: the child selector supports the full navigation/collection
+   * projection surface of `.returning()` — a child → parent navigation reads the
+   * parent inserted in the SAME statement, as well as the parent table's other
+   * rows. A parent selector of the parent's own columns rides the statement; one
+   * reading anything else (a navigation, a collection — which then counts the new
+   * children —, a nested object, an expression) is read back by the parent's key
+   * with a SELECT after the statement.
    */
   insertWithChildren<TChildEntity extends DbEntity, TParentResult, TChildResult>(config: {
     row: InsertData<TEntity>;
@@ -4036,7 +4465,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       parent: (entity: EntityQuery<TEntity>) => TParentResult;
       children: (entity: EntityQuery<TChildEntity>) => TChildResult;
     };
-  }): Promise<{ parent: UnwrapDbColumns<TParentResult> | null; children: UnwrapDbColumns<TChildResult>[] }> {
+  }): Promise<{ parent: ReturningRow<TParentResult> | null; children: ReturningRow<TChildResult>[] }> {
     const { rows, foreignKey } = config.children;
 
     if (rows.length === 0) {
@@ -4101,22 +4530,11 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const parentSelectCols = parentCompiled.columns.map(c => `v."${c.dbName}"`).join(', ');
     const params: any[] = [...parentCompiled.params];
 
-    // Parent RETURNING: the selector's flat columns plus the pk (child FK source).
-    const parentMock = this.createMockEntity();
-    const parentSelection = config.returning.parent(parentMock) as Record<string, any>;
-    const parentSelCols: Array<{ prop: string; dbName: string; mapper?: any }> = [];
-
-    for (const [prop, field] of Object.entries(parentSelection)) {
-      const tableAlias = (field as any)?.__tableAlias as string | undefined;
-      const dbColumnName = (field as any)?.__dbColumnName as string | undefined;
-
-      if (dbColumnName == null || (tableAlias && tableAlias !== parentSchema.name)) {
-        throw new Error(`insertWithChildren: parent returning supports flat parent columns only — "${prop}" is not one`);
-      }
-
-      const colEntry = Object.entries(parentSchema.columns).find(([, colBuilder]) => (colBuilder as any).build().name === dbColumnName);
-      parentSelCols.push({ prop, dbName: dbColumnName, mapper: colEntry ? (colEntry[1] as any).build().mapper : undefined });
-    }
+    // Parent RETURNING: a selector of the parent's own columns rides the statement; one that reads
+    // anything else — a navigation, a collection, a nested object, an expression — reads the
+    // inserted parent back by its key once the statement ran (and so sees its children too)
+    const parentPkProp = pkEntries[0][0];
+    const parentSelCols = this.flatReturningColumns(config.returning.parent);
 
     let parentSql = `INSERT INTO ${this._getQualifiedTableName()} (${parentColNames})
 SELECT ${parentSelectCols} FROM (VALUES (${parentCompiled.valueRows[0]})) AS v(${parentColNames})`;
@@ -4160,7 +4578,12 @@ ORDER BY v."__iwc_ord"`;
 ${parentSql}
 )`;
     const extraJoins = ['CROSS JOIN "__iwc_parent__" AS "__iwc_parent_j__"'];
-    const extraSelects = parentSelCols.map(c => `"__iwc_parent_j__"."${c.dbName}" AS "__iwc_parent__.${c.prop}"`);
+    // The parent's key rides along when the parent is read back by it — and when the selector
+    // projects nothing, so the select list is never left with a dangling comma
+    const extraSelects = [
+      ...(parentSelCols === undefined || parentSelCols.length === 0 ? [`"__iwc_parent_j__"."${parentPkDbName}" AS "__iwc_parent__.__pk"`] : []),
+      ...(parentSelCols ?? []).map(c => `"__iwc_parent_j__"."${c.dbName}" AS "__iwc_parent__.${c.prop}"`),
+    ];
 
     const navigationInfo = (childTable as any).detectNavigationInReturning(config.returning.children);
     let rawRows: any[];
@@ -4180,16 +4603,16 @@ ${parentSql}
           orderByCteColumn: childPkDbName ?? undefined,
           joinTableOverrides: new Map([[
             parentSchema.name,
-            '__iwc_parent__',
+            this.insertedRowsUnionTable('__iwc_parent__'),
           ]]),
         }
       );
       // Per-call VALUES list ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
       const result = executor ? await executor.query(built.sql, built.params, { prepare: false }) : await client.query(built.sql, built.params);
       rawRows = result.rows;
-      mapChildren = stripped => (childTable as any).mapReturningResultsWithNavigation(stripped, navigationInfo.navigationFields, built.nestedPaths);
+      mapChildren = stripped => (childTable as any).readReturning(stripped, built.read);
     } else {
-      const returningClause = (childTable as any).buildReturningClause(config.returning.children);
+      const returningClause = (childTable as any).buildReturningClause(config.returning.children, undefined, { paramCounter: params.length + 1, params });
       const pkExtra = childPkDbName ? `, "${childPkDbName}" AS "__iwc_child_pk__"` : '';
       const orderBy = childPkDbName ? '\nORDER BY "__mutation__"."__iwc_child_pk__"' : '';
       const sql = `WITH ${prefixCtes},
@@ -4203,10 +4626,7 @@ ${extraJoins.join('\n')}${orderBy}`;
       // Per-call VALUES list ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
       const result = executor ? await executor.query(sql, params, { prepare: false }) : await client.query(sql, params);
       rawRows = result.rows;
-      mapChildren = stripped => (childTable as any).mapReturningResults(
-        stripped.map(({ __iwc_child_pk__: _pk, ...rest }: Record<string, any>) => rest),
-        returningClause.aliasToProperty
-      );
+      mapChildren = stripped => (childTable as any).mapReturningResults(stripped, returningClause);
     }
 
     if (rawRows.length === 0) {
@@ -4215,11 +4635,18 @@ ${extraJoins.join('\n')}${orderBy}`;
       return { parent: null, children: [] };
     }
 
-    const parentRow: any = {};
+    let parentRow: any;
 
-    for (const col of parentSelCols) {
-      const raw = rawRows[0][`__iwc_parent__.${col.prop}`];
-      parentRow[col.prop] = col.mapper ? col.mapper.fromDriver(raw) : raw;
+    if (parentSelCols) {
+      parentRow = {};
+
+      for (const col of parentSelCols) {
+        const raw = rawRows[0][`__iwc_parent__.${col.prop}`];
+        parentRow[col.prop] = col.mapper ? col.mapper.fromDriver(raw) : raw;
+      }
+    } else {
+      const [readBack] = await this.readRowsByPrimaryKey(parentPkProp, [rawRows[0]['__iwc_parent__.__pk']], config.returning.parent);
+      parentRow = readBack ?? null;
     }
 
     const strippedRows = rawRows.map((row) => {
@@ -4266,13 +4693,17 @@ ${extraJoins.join('\n')}${orderBy}`;
    * Single-statement atomicity: a failing leg rolls back both inserts. Parents come
    * back in input order; children in child-input order.
    *
-   * v1 restrictions: FLAT returning selectors on BOTH sides (no navigation
-   * projections); single-column auto/serial primary keys on both tables; no
+   * Restrictions: single-column auto/serial primary keys on both tables; no
    * `unlessExists` guard; child rows must NOT carry the foreign-key property; EVERY
    * parent must be referenced by at least one child (parents are returned through
    * the child join — a childless parent would insert but vanish from the result, so
    * it is rejected up front; use plain `insertBulk` for childless rows); the whole
    * shape must fit one statement (no chunking).
+   *
+   * RETURNING: as {@link insertWithChildren} — the children's navigations and
+   * collections in the same statement (a child → parent navigation reads the new
+   * parents and the table's other rows), the parents' own columns in the same
+   * statement and anything else read back by their keys, in input order.
    */
   insertBulkWithChildren<TChildEntity extends DbEntity, TParentResult, TChildResult>(config: {
     rows: InsertData<TEntity>[];
@@ -4286,7 +4717,7 @@ ${extraJoins.join('\n')}${orderBy}`;
       parents: (entity: EntityQuery<TEntity>) => TParentResult;
       children: (entity: EntityQuery<TChildEntity>) => TChildResult;
     };
-  }): Promise<{ parents: UnwrapDbColumns<TParentResult>[]; children: UnwrapDbColumns<TChildResult>[] }> {
+  }): Promise<{ parents: ReturningRow<TParentResult>[]; children: ReturningRow<TChildResult>[] }> {
     const { rows: childRows, foreignKey } = config.children;
 
     if (config.rows.length === 0) {
@@ -4362,21 +4793,10 @@ ${extraJoins.join('\n')}${orderBy}`;
     const parentValueRows = parentCompiled.valueRows.map((row, ix) => `(${ix}, ${row})`).join(', ');
     const params: any[] = [...parentCompiled.params];
 
-    const parentMock = this.createMockEntity();
-    const parentSelection = config.returning.parents(parentMock) as Record<string, any>;
-    const parentSelCols: Array<{ prop: string; dbName: string; mapper?: any }> = [];
-
-    for (const [prop, field] of Object.entries(parentSelection)) {
-      const tableAlias = (field as any)?.__tableAlias as string | undefined;
-      const dbColumnName = (field as any)?.__dbColumnName as string | undefined;
-
-      if (dbColumnName == null || (tableAlias && tableAlias !== parentSchema.name)) {
-        throw new Error(`insertBulkWithChildren: parents returning supports flat parent columns only — "${prop}" is not one`);
-      }
-
-      const colEntry = Object.entries(parentSchema.columns).find(([, colBuilder]) => (colBuilder as any).build().name === dbColumnName);
-      parentSelCols.push({ prop, dbName: dbColumnName, mapper: colEntry ? (colEntry[1] as any).build().mapper : undefined });
-    }
+    // Parents RETURNING: own columns ride the statement; a selector reading anything else is read
+    // back by key once the statement ran (see insertWithChildren)
+    const parentPkProp = pkEntries[0][0];
+    const parentSelCols = this.flatReturningColumns(config.returning.parents);
 
     const parentSql = `INSERT INTO ${this._getQualifiedTableName()} (${parentColNames})
 SELECT ${parentSelectCols} FROM (VALUES ${parentValueRows}) AS v("__ibwc_ord", ${parentColNames})
@@ -4405,11 +4825,7 @@ ORDER BY v."__ibwc_cord"`;
     childSql = childOffset === 0 ? childSql : renumberPlaceholders(childSql, childOffset);
     params.push(...childCompiled.params);
 
-    // ---- assembly: flat child returning + parent cols through the fk join ----
-    if ((childTable as any).detectNavigationInReturning(config.returning.children)) {
-      throw new Error('insertBulkWithChildren: children returning supports flat child columns only (v1)');
-    }
-
+    // ---- assembly: child returning + parent cols through the fk join ----
     const childPkEntries = Object.entries(childSchema.columns).filter(([, colBuilder]) => (colBuilder as any).build().primaryKey);
 
     if (childPkEntries.length !== 1) {
@@ -4417,18 +4833,52 @@ ORDER BY v."__ibwc_cord"`;
     }
 
     const childPkDbName = (childPkEntries[0][1] as any).build().name;
-    const returningClause = (childTable as any).buildReturningClause(config.returning.children);
     const parentJoinSelects = [
       `"__ibwc_pj__"."__ibwc_ord" AS "__ibwc_parent__.__ord"`,
-      ...parentSelCols.map(c => `"__ibwc_pj__"."${c.dbName}" AS "__ibwc_parent__.${c.prop}"`),
+      // The parents' keys ride along when they are read back by them
+      ...(parentSelCols === undefined ? [`"__ibwc_pj__"."${parentPkDbName}" AS "__ibwc_parent__.__pk"`] : []),
+      ...(parentSelCols ?? []).map(c => `"__ibwc_pj__"."${c.dbName}" AS "__ibwc_parent__.${c.prop}"`),
     ];
-    const sql = `WITH "__ibwc_parent__" AS (
+    const prefixCtes = `"__ibwc_parent__" AS (
 ${parentSql}
 ),
 "__ibwc_pord__" AS (
   SELECT p.*, row_number() OVER (ORDER BY p."${parentPkDbName}") - 1 AS "__ibwc_ord"
   FROM "__ibwc_parent__" p
-),
+)`;
+
+    const navigationInfo = (childTable as any).detectNavigationInReturning(config.returning.children);
+    let rawRows: any[];
+    let mapChildren: (stripped: any[]) => any[];
+
+    if (navigationInfo) {
+      // Navigations and collections of the children, in the same statement: the child insert runs
+      // as the navigation RETURNING's "__mutation__" CTE, after the parent legs; a child → parent
+      // navigation reads the parents just inserted as well as the table's other rows
+      const built = (childTable as any).buildReturningWithNavigation(
+        childSql,
+        params,
+        config.returning.children,
+        navigationInfo,
+        {
+          prefixCtes,
+          extraJoins: [`JOIN "__ibwc_pord__" "__ibwc_pj__" ON "__ibwc_pj__"."${parentPkDbName}" = "__mutation__"."${fkDbName}"`],
+          extraSelects: parentJoinSelects,
+          extraCteReturningCols: [fkDbName, childPkDbName],
+          orderByCteColumn: childPkDbName,
+          joinTableOverrides: new Map([[
+            parentSchema.name,
+            this.insertedRowsUnionTable('__ibwc_parent__'),
+          ]]),
+        }
+      );
+      // Per-call VALUES lists ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
+      const result = executor ? await executor.query(built.sql, built.params, { prepare: false }) : await client.query(built.sql, built.params);
+      rawRows = result.rows;
+      mapChildren = stripped => (childTable as any).readReturning(stripped, built.read);
+    } else {
+      const returningClause = (childTable as any).buildReturningClause(config.returning.children, undefined, { paramCounter: params.length + 1, params });
+      const sql = `WITH ${prefixCtes},
 "__mutation__" AS (
 ${childSql}
 RETURNING ${returningClause.sql}, "${fkDbName}" AS "__ibwc_child_fk__", "${childPkDbName}" AS "__ibwc_child_pk__"
@@ -4438,11 +4888,14 @@ FROM "__mutation__"
 JOIN "__ibwc_pord__" "__ibwc_pj__" ON "__ibwc_pj__"."${parentPkDbName}" = "__mutation__"."__ibwc_child_fk__"
 ORDER BY "__mutation__"."__ibwc_child_pk__"`;
 
-    // Per-call VALUES lists ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
-    const result = executor ? await executor.query(sql, params, { prepare: false }) : await client.query(sql, params);
-    const rawRows: any[] = result.rows;
+      // Per-call VALUES lists ⇒ unique text ⇒ never a prepared statement (see QueryOptions.preparedStatements).
+      const result = executor ? await executor.query(sql, params, { prepare: false }) : await client.query(sql, params);
+      rawRows = result.rows;
+      mapChildren = stripped => (childTable as any).mapReturningResults(stripped, returningClause);
+    }
 
     const parentsByOrd = new Map<number, any>();
+    const parentPks = new Map<number, unknown>();
     const strippedRows: Array<Record<string, any>> = [];
 
     for (const row of rawRows) {
@@ -4451,12 +4904,13 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       if (!parentsByOrd.has(ord)) {
         const parentRow: Record<string, any> = {};
 
-        for (const col of parentSelCols) {
+        for (const col of parentSelCols ?? []) {
           const raw = row[`__ibwc_parent__.${col.prop}`];
           parentRow[col.prop] = col.mapper ? col.mapper.fromDriver(raw) : raw;
         }
 
         parentsByOrd.set(ord, parentRow);
+        parentPks.set(ord, row['__ibwc_parent__.__pk']);
       }
 
       const clean: Record<string, any> = {};
@@ -4470,10 +4924,74 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       strippedRows.push(clean);
     }
 
-    const parents = [...parentsByOrd.entries()].sort((a, b) => a[0] - b[0]).map(([, parentRow]) => parentRow);
-    const children = (childTable as any).mapReturningResults(strippedRows, returningClause.aliasToProperty);
+    const ords = [...parentsByOrd.keys()].sort((a, b) => a - b);
+    const parents = parentSelCols
+      ? ords.map(ord => parentsByOrd.get(ord))
+      // Read back in key order — the input order, since the parent keys ascend in it
+      : await this.readRowsByPrimaryKey(parentPkProp, ords.map(ord => parentPks.get(ord)), config.returning.parents);
+    const children = mapChildren(strippedRows);
 
     return { parents, children };
+  }
+
+  /**
+   * The columns of a RETURNING selector when it reads nothing but this table's own columns (one
+   * top-level field per column): what a composed insert can return from its own statement.
+   * `undefined` when it reads anything else — a navigation, a collection, a nested object, an
+   * expression.
+   * @internal
+   */
+  private flatReturningColumns(selector: (entity: EntityQuery<TEntity>) => any): Array<{ prop: string; dbName: string; mapper?: any }> | undefined {
+    const schema = this._getSchema();
+    const selection = selector(this.createMockEntity() as EntityQuery<TEntity>);
+    const columns: Array<{ prop: string; dbName: string; mapper?: any }> = [];
+
+    if (selection === null || typeof selection !== 'object' || Array.isArray(selection)) {
+      return undefined;
+    }
+
+    for (const [prop, field] of Object.entries(selection)) {
+      if (field === null || typeof field !== 'object' || !('__dbColumnName' in field) || field instanceof WhereConditionBase) {
+        return undefined;
+      }
+
+      const tableAlias = (field as any).__tableAlias as string | undefined;
+      const dbColumnName = (field as any).__dbColumnName as string;
+
+      if (tableAlias && tableAlias !== schema.name) {
+        return undefined;
+      }
+
+      const colEntry = Object.entries(schema.columns).find(([, colBuilder]) => (colBuilder as any).build().name === dbColumnName);
+      columns.push({ prop, dbName: dbColumnName, mapper: colEntry ? (colEntry[1] as any).build().mapper : undefined });
+    }
+
+    return columns;
+  }
+
+  /**
+   * This table's rows with the given primary-key values, projected by `selector` (navigations and
+   * collections included), in key order. How a composed insert reads back a parent it inserted when
+   * its RETURNING selector reaches beyond the parent's own columns.
+   * @internal
+   */
+  private async readRowsByPrimaryKey(pkProp: string, pkValues: unknown[], selector: (entity: EntityQuery<TEntity>) => any): Promise<any[]> {
+    return await (this as any)
+      .where((row: any) => inArray(row[pkProp], pkValues))
+      .orderBy((row: any) => row[pkProp])
+      .select(selector)
+      .toList();
+  }
+
+  /**
+   * The FROM item a composed insert's navigation RETURNING reads this table through: the rows its
+   * CTE `cteName` just inserted (RETURNING *) together with the table's other rows. The table
+   * alone is snapshot-stale inside the statement — it does not show the new rows — and the CTE
+   * alone does not show the old ones, which a navigation to an existing row of this table needs.
+   * @internal
+   */
+  private insertedRowsUnionTable(cteName: string): string {
+    return `(SELECT * FROM "${cteName}" UNION ALL SELECT * FROM ${this._getQualifiedTableName()})`;
   }
 
   /**
@@ -4528,20 +5046,27 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
 
     const valueRows: string[] = [];
     const params: any[] = [];
-    let paramIndex = 1;
+    const cellContext: SqlBuildContext = { paramCounter: 1, params };
 
     for (const record of data) {
       const cells: string[] = [];
 
       for (const col of columns) {
         const rawValue = record[col.propName];
+
+        // An sql fragment inline (typed like the column), as a plain insert renders it
+        if (rawValue instanceof SqlFragment) {
+          cells.push(renderValuesCell(rawValue, col.mapper, cellContext, `::${col.pgType}`));
+          continue;
+        }
+
         const normalized = rawValue === undefined ? null : rawValue;
         const mapped = col.mapper ? col.mapper.toDriver(normalized) : normalized;
 
         if (mapped === undefined || mapped === null) {
           cells.push(`NULL::${col.pgType}`);
         } else {
-          cells.push(`$${paramIndex++}::${col.pgType}`);
+          cells.push(`$${cellContext.paramCounter++}::${col.pgType}`);
           params.push(mapped);
         }
       }
@@ -4578,7 +5103,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
 
     if (navigationInfo) {
       // Use CTE-based approach for navigation properties
-      const { sql, params: queryParams, nestedPaths } = this.buildReturningWithNavigation(
+      const { sql, params: queryParams, read } = this.buildReturningWithNavigation(
         built.sql,
         built.params,
         returning as any,
@@ -4589,11 +5114,11 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
         ? await executor.query(sql, queryParams)
         : await client.query(sql, queryParams);
 
-      return this.mapReturningResultsWithNavigation(result.rows, navigationInfo.navigationFields, nestedPaths);
+      return this.readReturning(result.rows, read);
     }
 
     // Standard RETURNING (no navigation properties)
-    const returningClause = this.buildReturningClause(returning as any);
+    const returningClause = this.buildReturningClause(returning as any, undefined, { paramCounter: built.params.length + 1, params: built.params });
 
     let sql = built.sql;
     if (returningClause) {
@@ -4608,7 +5133,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
+    return this.mapReturningResults(result.rows, returningClause);
   }
 
   /**
@@ -4674,18 +5199,12 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     // Build VALUES clauses
     const valuesClauses: string[] = [];
     const params: any[] = [];
-    let paramIndex = 1;
+    const cellContext: SqlBuildContext = { paramCounter: 1, params };
 
     for (const record of data) {
-      const rowValues: string[] = [];
-      for (const col of columnConfigs) {
-        const value = (record as any)[col.propName];
-        // Convert undefined to null - undefined values are not allowed by postgres drivers
-        const normalizedValue = value === undefined ? null : value;
-        const mappedValue = col.mapper ? col.mapper.toDriver(normalizedValue) : normalizedValue;
-        rowValues.push(`$${paramIndex++}`);
-        params.push(mappedValue);
-      }
+      // An sql fragment inline, anything else through the column's mapper (undefined → NULL:
+      // undefined values are not allowed by postgres drivers)
+      const rowValues = columnConfigs.map(col => renderValuesCell((record as any)[col.propName], col.mapper, cellContext));
       valuesClauses.push(`(${rowValues.join(', ')})`);
     }
 
@@ -4875,6 +5394,11 @@ WHERE ${guardPredicate}`,
         }
       }
 
+      // Typed conflict-arm expressions (updateSet / updateWhere)
+      const upsertExpressions: UpsertExpressionConfig | undefined = config?.updateSet || config?.updateWhere
+        ? { updateSet: config.updateSet as any, updateWhere: config.updateWhere as any }
+        : undefined;
+
       // Calculate chunk size
       let chunkSize = config?.chunkSize;
       if (chunkSize == null) {
@@ -4891,7 +5415,7 @@ WHERE ${guardPredicate}`,
           const chunk = values.slice(i, i + chunkSize);
           const chunkResults = await table.upsertBulkSingle(
             chunk, primaryKeys, updateColumns, config?.updateColumnFilter,
-            overridingSystemValue || false, config?.targetWhere, config?.setWhere, returning
+            overridingSystemValue || false, config?.targetWhere, config?.setWhere, returning, upsertExpressions
           );
           if (chunkResults) allResults.push(...chunkResults);
         }
@@ -4900,7 +5424,7 @@ WHERE ${guardPredicate}`,
 
       return table.upsertBulkSingle(
         values, primaryKeys, updateColumns, config?.updateColumnFilter,
-        overridingSystemValue || false, config?.targetWhere, config?.setWhere, returning
+        overridingSystemValue || false, config?.targetWhere, config?.setWhere, returning, upsertExpressions
       );
     };
 
@@ -4938,7 +5462,8 @@ WHERE ${guardPredicate}`,
     updateColumnFilter: ((colId: string) => boolean) | undefined,
     overridingSystemValue: boolean,
     targetWhere: string | undefined,
-    setWhere: string | undefined
+    setWhere: string | undefined,
+    expressions?: UpsertExpressionConfig
   ): { sql: string; params: any[] } {
     const schema = this._getSchema();
     const qualifiedTableName = this._getQualifiedTableName();
@@ -5025,41 +5550,120 @@ WHERE ${guardPredicate}`,
       sql += ` WHERE ${targetWhere}`;
     }
 
+    // Typed conflict-arm expressions: `existing` reads the target row by its table name,
+    // `excluded` the row proposed for insertion.
+    const expressionSet = expressions?.updateSet
+      ? expressions.updateSet(
+          this.createColumnRowProxy(schema.name, 'upsertBulk updateSet'),
+          this.createColumnRowProxy('excluded', 'upsertBulk updateSet')
+        )
+      : undefined;
+    const expressionWhere = expressions?.updateWhere
+      ? expressions.updateWhere(
+          this.createColumnRowProxy(schema.name, 'upsertBulk updateWhere'),
+          this.createColumnRowProxy('excluded', 'upsertBulk updateWhere')
+        )
+      : undefined;
+
     // Determine columns to update
     let columnsToUpdate: string[];
     if (updateColumns) {
       columnsToUpdate = updateColumns;
     } else if (updateColumnFilter) {
       columnsToUpdate = Array.from(columnSet).filter(updateColumnFilter);
+    } else if (expressionSet) {
+      // updateSet alone names exactly the columns to update
+      columnsToUpdate = [];
     } else {
       columnsToUpdate = Array.from(columnSet).filter(key => !primaryKeys.includes(key));
     }
 
-    if (columnsToUpdate.length === 0) {
+    const expressionEntries = expressionSet ? Object.entries(expressionSet).filter(([, value]) => value !== undefined) : [];
+    const expressionProps = new Set(expressionEntries.map(([propName]) => propName));
+
+    if (columnsToUpdate.length === 0 && expressionEntries.length === 0) {
       sql += ' DO NOTHING';
     } else {
-      const updateSetClauses = columnsToUpdate.map(propName => {
-        const col = columnConfigs.find(c => c.propName === propName);
-        let dbName: string;
-        if (col) {
-          dbName = col.dbName;
-        } else {
-          // Column not in insert values, look up from schema
-          const schemaCol = schema.columns[propName];
-          const config = schemaCol ? (schemaCol as any).build() : null;
-          dbName = config ? config.name : propName;
+      const updateSetClauses = columnsToUpdate
+        .filter(propName => !expressionProps.has(propName))
+        .map(propName => {
+          const col = columnConfigs.find(c => c.propName === propName);
+          let dbName: string;
+          if (col) {
+            dbName = col.dbName;
+          } else {
+            // Column not in insert values, look up from schema
+            const schemaCol = schema.columns[propName];
+            const config = schemaCol ? (schemaCol as any).build() : null;
+            dbName = config ? config.name : propName;
+          }
+          return `"${dbName}" = EXCLUDED."${dbName}"`;
+        });
+
+      const context: SqlBuildContext = { paramCounter: paramIndex, params };
+      for (const [propName, value] of expressionEntries) {
+        const column = schema.columns[propName];
+        if (!column) {
+          throw new Error(`upsertBulk updateSet: unknown column property "${propName}" on entity "${schema.name}"`);
         }
-        return `"${dbName}" = EXCLUDED."${dbName}"`;
-      });
+        const config = (column as any).build();
+        updateSetClauses.push(`"${config.name}" = ${renderAssignedValue(value, config.mapper, context)}`);
+      }
+      paramIndex = context.paramCounter;
 
       sql += ` DO UPDATE SET ${updateSetClauses.join(', ')}`;
 
+      const whereParts: string[] = [];
       if (setWhere) {
-        sql += ` WHERE ${setWhere}`;
+        whereParts.push(setWhere);
+      }
+      if (expressionWhere) {
+        whereParts.push(expressionWhere.buildSql(context));
+        paramIndex = context.paramCounter;
+      }
+
+      if (whereParts.length === 1) {
+        sql += ` WHERE ${whereParts[0]}`;
+      } else if (whereParts.length > 1) {
+        sql += ` WHERE ${whereParts.map(part => `(${part})`).join(' AND ')}`;
       }
     }
 
     return { sql, params };
+  }
+
+  /**
+   * A column-only row proxy whose FieldRefs render qualified by `alias` — the `existing` /
+   * `excluded` rows of an upsert's conflict arm and the `t` / `v` rows of a bulk update.
+   * Navigations are not in scope in those statements, so they throw on access.
+   * @internal
+   */
+  private createColumnRowProxy(alias: string, usage: string): any {
+    const schema = this._getSchema();
+    const row: any = {};
+
+    for (const [propName, colBuilder] of Object.entries(schema.columns)) {
+      const config = (colBuilder as any).build();
+      const ref = {
+        __fieldName: propName,
+        __dbColumnName: config.name,
+        __tableAlias: alias,
+        __mapper: config.mapper,
+        __sqlType: config.type,
+      };
+      Object.defineProperty(row, propName, { get: () => ref, enumerable: true });
+    }
+
+    for (const relName of Object.keys(schema.relations)) {
+      Object.defineProperty(row, relName, {
+        get: () => {
+          throw new Error(`${usage}: navigation "${relName}" is not available — only the row's own columns are in scope`);
+        },
+        enumerable: false,
+      });
+    }
+
+    return row;
   }
 
   /**
@@ -5139,7 +5743,12 @@ WHERE ${guardPredicate}`,
    */
   _buildUpsertBulkStatement(
     values: Array<Record<string, any>>,
-    config: { primaryKey: string | string[]; updateColumns?: string[] }
+    config: {
+      primaryKey: string | string[];
+      updateColumns?: string[];
+      updateSet?: (existing: any, excluded: any) => Record<string, unknown>;
+      updateWhere?: (existing: any, excluded: any) => Condition;
+    }
   ): { sql: string; params: any[] } | null {
     if (values.length === 0) {
       return null;
@@ -5154,7 +5763,10 @@ WHERE ${guardPredicate}`,
       undefined,
       false,
       undefined,
-      undefined
+      undefined,
+      config.updateSet || config.updateWhere
+        ? { updateSet: config.updateSet, updateWhere: config.updateWhere }
+        : undefined
     );
   }
 
@@ -5302,7 +5914,8 @@ RETURNING 1`;
     overridingSystemValue: boolean,
     targetWhere: string | undefined,
     setWhere: string | undefined,
-    returning: TReturning
+    returning: TReturning,
+    expressions?: UpsertExpressionConfig
   ): Promise<any[] | void> {
     const executor = this._getExecutor();
     const client = this._getClient();
@@ -5314,7 +5927,8 @@ RETURNING 1`;
       updateColumnFilter,
       overridingSystemValue,
       targetWhere,
-      setWhere
+      setWhere,
+      expressions
     );
     let sql = built.sql;
     const params = built.params;
@@ -5326,7 +5940,7 @@ RETURNING 1`;
 
     if (navigationInfo) {
       // Use CTE-based approach for navigation properties
-      const { sql: cteSql, params: queryParams, nestedPaths } = this.buildReturningWithNavigation(
+      const { sql: cteSql, params: queryParams, read } = this.buildReturningWithNavigation(
         sql,
         params,
         returning as any,
@@ -5337,11 +5951,11 @@ RETURNING 1`;
         ? await executor.query(cteSql, queryParams)
         : await client.query(cteSql, queryParams);
 
-      return this.mapReturningResultsWithNavigation(result.rows, navigationInfo.navigationFields, nestedPaths);
+      return this.readReturning(result.rows, read);
     }
 
     // Standard RETURNING (no navigation properties)
-    const returningClause = this.buildReturningClause(returning as any);
+    const returningClause = this.buildReturningClause(returning as any, undefined, { paramCounter: params.length + 1, params });
     if (returningClause) {
       sql += ` RETURNING ${returningClause.sql}`;
     }
@@ -5354,7 +5968,7 @@ RETURNING 1`;
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
+    return this.mapReturningResults(result.rows, returningClause);
   }
 
   /**
@@ -5389,8 +6003,10 @@ RETURNING 1`;
    *    merges can both take the NOT MATCHED arm (duplicate rows, or a unique
    *    violation if an index exists). Prefer `upsertBulk` for hot concurrent
    *    paths; MERGE suits single-writer sync/batch flows;
-   *  - `.returning()` requires PostgreSQL 17+ and does not support navigation
-   *    properties.
+   *  - `.returning()` requires PostgreSQL 17+. A selector reading navigations or
+   *    collections runs the MERGE in a CTE the navigations are joined onto, as
+   *    insertBulk / upsertBulk do; a row's navigation reads its values AFTER the
+   *    merge (an updated foreign key reaches the new row).
    */
   mergeBulk(
     values: UpsertData<TEntity>[],
@@ -5610,15 +6226,31 @@ RETURNING 1`;
     sql += ` WHEN NOT MATCHED THEN INSERT (${sourceColumnList})`
       + ` VALUES (${columnConfigs.map(c => `s."${c.dbName}"`).join(', ')})`;
 
-    // RETURNING (PostgreSQL 17+). Navigation properties are not supported here.
-    // Columns are target-qualified (`t.`): in MERGE … RETURNING both the target
-    // and source aliases are in scope, so unqualified names are ambiguous.
-    if (returning && returning !== true && typeof returning === 'function'
-      && this.detectNavigationInReturning(returning as any)) {
-      throw new Error('mergeBulk .returning() does not support navigation properties');
+    // RETURNING (PostgreSQL 17+). Columns are target-qualified (`t.`): in MERGE … RETURNING both
+    // the target and source aliases are in scope, so unqualified names are ambiguous.
+    const navigationInfo = returning && returning !== true && typeof returning === 'function'
+      ? this.detectNavigationInReturning(returning as any)
+      : null;
+
+    if (navigationInfo) {
+      // Navigations and collections: the MERGE runs in a CTE the outer SELECT joins them to, as
+      // insertBulk / upsertBulk do (MERGE … RETURNING is a valid WITH query)
+      const { sql: cteSql, params: queryParams, read } = this.buildReturningWithNavigation(
+        sql,
+        params,
+        returning as any,
+        navigationInfo,
+        { returningQualifier: 't' }
+      );
+
+      const result = executor
+        ? await executor.query(cteSql, queryParams)
+        : await client.query(cteSql, queryParams);
+
+      return this.readReturning(result.rows, read);
     }
 
-    const returningClause = this.buildReturningClause(returning as any, 't');
+    const returningClause = this.buildReturningClause(returning as any, 't', { paramCounter: params.length + 1, params });
     if (returningClause) {
       sql += ` RETURNING ${returningClause.sql}`;
     }
@@ -5631,7 +6263,7 @@ RETURNING 1`;
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
+    return this.mapReturningResults(result.rows, returningClause);
   }
 
   /**
@@ -5659,14 +6291,14 @@ RETURNING 1`;
   }
 
   /** Lazily built + schema-cached column plan for {@link mapResultToEntity}. */
-  private getEntityMappingPlan(): Array<{ propName: string; dbColumnName: string; mapper?: any }> {
+  private getEntityMappingPlan(): Array<{ propName: string; dbColumnName: string; mapper?: any; zeroScale?: any }> {
     const schema = this._getSchema();
     let plan = entityMappingPlanCache.get(schema);
 
     if (!plan) {
       plan = Object.entries(schema.columns).map(([propName, colBuilder]) => {
         const config = (colBuilder as any).build();
-        return { propName, dbColumnName: config.name, mapper: config.mapper };
+        return { propName, dbColumnName: config.name, mapper: config.mapper, zeroScale: numericZeroScaleMapper(config) };
       });
       entityMappingPlanCache.set(schema, plan);
     }
@@ -5686,7 +6318,11 @@ RETURNING 1`;
       return [];
     }
 
-    const presentPlan = this.getEntityMappingPlan().filter(entry => entry.dbColumnName in results[0]);
+    // A numeric(p, s) zero read through a client that drops its scale gets it back
+    const restoreZeroScale = this._getClient().losesNumericZeroScale();
+    const presentPlan = this.getEntityMappingPlan()
+      .filter(entry => entry.dbColumnName in results[0])
+      .map(entry => ({ ...entry, mapper: entry.mapper ?? (restoreZeroScale ? entry.zeroScale : undefined) }));
     const mapped: UnwrapDbColumns<TEntity>[] = new Array(results.length);
 
     for (let rowIndex = 0; rowIndex < results.length; rowIndex++) {
@@ -5734,7 +6370,7 @@ RETURNING 1`;
    */
   values(data: InsertData<TEntity> | InsertData<TEntity>[]): EntityInsertBuilder<TEntity> {
     const builder = this.context.getTable(this.tableName).values(data as any);
-    return new EntityInsertBuilder<TEntity>(builder);
+    return new EntityInsertBuilder<TEntity>(builder, rows => this.mapResultsToEntities(rows));
   }
 
   /**
@@ -5749,115 +6385,13 @@ RETURNING 1`;
   update(
     data: UpdateData<TEntity>
       | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
-  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>> {
-    const table = this;
-
-    const executeUpdate = async <TResult>(
-      returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult) | 'count'
-    ): Promise<any> => {
-      const schema = table._getSchema();
-      const executor = table._getExecutor();
-      const client = table._getClient();
-
-      // Resolve the data object - if a function, invoke it with the column proxy so that
-      // expressions like `update(p => ({ col: sql`... ${p.col} ...` }))` resolve the
-      // SqlFragment column references against the actual table.
-      const resolvedData = typeof data === 'function'
-        ? (data as (row: any) => UpdateData<TEntity>)(table.props())
-        : data;
-
-      // Build SET clause
-      const setClauses: string[] = [];
-      const values: any[] = [];
-      let paramIndex = 1;
-
-      for (const [key, value] of Object.entries(resolvedData as Record<string, any>)) {
-        const column = schema.columns[key];
-        if (column) {
-          const config = (column as any).build();
-
-          // If the value is a SqlFragment, inline it as a SQL expression (with its own
-          // params merged into our values array). This allows expressions like
-          // `update({ jsonbCol: sql\`COALESCE(...) || ${patch}::jsonb\` })` to execute
-          // as SQL instead of being JSON-serialised as a literal.
-          if (value instanceof SqlFragment) {
-            const sqlBuildContext: SqlBuildContext = {
-              paramCounter: paramIndex,
-              params: values,
-            };
-            const fragmentSql = value.buildSql(sqlBuildContext);
-            paramIndex = sqlBuildContext.paramCounter;
-            setClauses.push(`"${config.name}" = ${fragmentSql}`);
-            continue;
-          }
-
-          setClauses.push(`"${config.name}" = $${paramIndex++}`);
-          values.push(value);
-        }
-      }
-
-      if (setClauses.length === 0) {
-        throw new Error('No valid columns to update');
-      }
-
-      // No WHERE clause - updates all records
-
-      // Build RETURNING clause (not needed for count-only)
-      const returningClause = returning !== 'count'
-        ? table.buildReturningClause(returning)
-        : undefined;
-
-      const qualifiedTableName = table._getQualifiedTableName();
-      let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
-      if (returningClause) {
-        sql += ` RETURNING ${returningClause.sql}`;
-      }
-
-      const result = executor
-        ? await executor.query(sql, values)
-        : await client.query(sql, values);
-
-      // Return affected count
-      if (returning === 'count') {
-        return result.rowCount ?? 0;
-      }
-
-      if (!returningClause) {
-        return undefined;
-      }
-
-      return table.mapReturningResults(result.rows, returningClause.aliasToProperty);
-    };
-
-    return {
-      then<TResult1 = void, TResult2 = never>(
-        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
-        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
-      ): PromiseLike<TResult1 | TResult2> {
-        return executeUpdate(undefined).then(onfulfilled, onrejected);
-      },
-      affectedCount() {
-        return {
-          then<T1 = number, T2 = never>(
-            onfulfilled?: ((value: number) => T1 | PromiseLike<T1>) | null,
-            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
-          ): PromiseLike<T1 | T2> {
-            return executeUpdate('count').then(onfulfilled, onrejected);
-          }
-        };
-      },
-      returning<TResult>(selector?: (row: UnwrapDbColumns<TEntity>) => TResult) {
-        const returningConfig = selector ?? true;
-        return {
-          then<T1 = any, T2 = never>(
-            onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
-            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
-          ): PromiseLike<T1 | T2> {
-            return executeUpdate(returningConfig as any).then(onfulfilled, onrejected);
-          }
-        };
-      }
-    } as FluentQueryUpdate<UnwrapDbColumns<TEntity>>;
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>> {
+    // Every row: the query update over a condition every row meets — the same SET rendering
+    // (column mappers, sql fragments), RETURNING (navigations, collections, sql expressions),
+    // affected count and toStatement() as `where(...).update()`. This path used to bind values
+    // without their column mappers, render a navigation column in RETURNING as the root's column
+    // of that name, and drop the RETURNING's sql expressions.
+    return (this.where(() => new SqlFragment<boolean>(['TRUE'], [])) as any).update(data);
   }
 
   /**
@@ -5897,9 +6431,12 @@ RETURNING 1`;
       primaryKey?: string | string[];
       /** Chunk size for large batches. Auto-calculated if not specified */
       chunkSize?: number;
-    }
+    } & BulkUpdateExpressionConfig<TEntity>
   ): FluentBulkUpdate<TEntity> {
     const table = this;
+    const expressions: BulkUpdateExpressionConfig<TEntity> | undefined = config?.set || config?.where
+      ? { set: config.set, where: config.where }
+      : undefined;
 
     const executeBulkUpdate = async <TResult>(
       returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
@@ -5925,13 +6462,13 @@ RETURNING 1`;
         const allResults: any[] = [];
         for (let i = 0; i < data.length; i += chunkSize) {
           const chunk = data.slice(i, i + chunkSize);
-          const chunkResults = await table.bulkUpdateSingle(chunk, primaryKeys, returning);
+          const chunkResults = await table.bulkUpdateSingle(chunk, primaryKeys, returning, expressions);
           if (chunkResults) allResults.push(...chunkResults);
         }
         return returning === undefined ? undefined : allResults;
       }
 
-      return table.bulkUpdateSingle(data, primaryKeys, returning);
+      return table.bulkUpdateSingle(data, primaryKeys, returning, expressions);
     };
 
     return {
@@ -5995,15 +6532,38 @@ RETURNING 1`;
   private async bulkUpdateSingle<TReturning>(
     data: Array<Partial<InsertData<TEntity>> & Record<string, any>>,
     primaryKeys: string[],
-    returning: TReturning
+    returning: TReturning,
+    expressions?: BulkUpdateExpressionConfig<TEntity>
   ): Promise<any[] | void> {
     const executor = this._getExecutor();
     const client = this._getClient();
 
-    const built = this._buildBulkUpdateStatement(data, primaryKeys);
+    const built = this._buildBulkUpdateStatement(data, primaryKeys, expressions);
+
+    // Navigations and collections: the UPDATE runs in a CTE the outer SELECT joins them to, as the
+    // other mutations do — they rendered as the target row's column of the same name (`t."name"`)
+    const navigationInfo = returning && returning !== true && typeof returning === 'function'
+      ? this.detectNavigationInReturning(returning as any)
+      : null;
+
+    if (navigationInfo) {
+      const { sql: cteSql, params: queryParams, read } = this.buildReturningWithNavigation(
+        built.sql,
+        built.params,
+        returning as any,
+        navigationInfo,
+        { returningQualifier: 't' }
+      );
+
+      const result = executor
+        ? await executor.query(cteSql, queryParams)
+        : await client.query(cteSql, queryParams);
+
+      return this.readReturning(result.rows, read);
+    }
 
     // Build RETURNING clause
-    const returningClause = this.buildReturningClause(returning as any, 't');
+    const returningClause = this.buildReturningClause(returning as any, 't', { paramCounter: built.params.length + 1, params: built.params });
 
     let sql = built.sql;
     if (returningClause) {
@@ -6018,7 +6578,7 @@ RETURNING 1`;
       return undefined;
     }
 
-    return this.mapReturningResults(result.rows, returningClause.aliasToProperty);
+    return this.mapReturningResults(result.rows, returningClause);
   }
 
   /**
@@ -6071,7 +6631,8 @@ RETURNING 1`;
    */
   _buildBulkUpdateStatement(
     data: Array<Partial<InsertData<TEntity>> & Record<string, any>>,
-    primaryKeys: string[]
+    primaryKeys: string[],
+    expressions?: BulkUpdateExpressionConfig<TEntity>
   ): { sql: string; params: any[] } {
     const schema = this._getSchema();
     const qualifiedTableName = this._getQualifiedTableName();
@@ -6092,7 +6653,41 @@ RETURNING 1`;
       }
     }
 
-    if (updateColumnsSet.size === 0) {
+    // Typed SET / WHERE over the target row (`t`) and the incoming VALUES row (`v`)
+    const expressionSet = expressions?.set
+      ? expressions.set(this.createColumnRowProxy('t', 'bulkUpdate set'), this.createColumnRowProxy('v', 'bulkUpdate set'))
+      : undefined;
+    const expressionWhere = expressions?.where
+      ? expressions.where(this.createColumnRowProxy('t', 'bulkUpdate where'), this.createColumnRowProxy('v', 'bulkUpdate where'))
+      : undefined;
+    const expressionEntries = expressionSet
+      ? Object.entries(expressionSet as Record<string, unknown>).filter(([, value]) => value !== undefined)
+      : [];
+
+    for (const [propName] of expressionEntries) {
+      if (!schema.columns[propName]) {
+        throw new Error(`bulkUpdate set: unknown column property "${propName}" on entity "${schema.name}"`);
+      }
+      if (primaryKeySet.has(propName)) {
+        throw new Error(`bulkUpdate set: "${propName}" is a match key and cannot be assigned`);
+      }
+    }
+
+    // A `v` column is only in scope when some row provides it
+    const providedDbNames = new Set(Array.from(allColumnsSet).map(prop => (schema.columns[prop] as any).build().name));
+    const valueRefs = [
+      ...expressionEntries.flatMap(([, value]) => collectRefsOf(value)),
+      ...(expressionWhere ? expressionWhere.getFieldRefs() : []),
+    ];
+    for (const ref of valueRefs) {
+      if ((ref as any).__tableAlias === 'v' && !providedDbNames.has(ref.__dbColumnName)) {
+        throw new Error(
+          `bulkUpdate set/where reads values.${(ref as any).__fieldName}, but no row provides "${(ref as any).__fieldName}"`
+        );
+      }
+    }
+
+    if (updateColumnsSet.size === 0 && expressionEntries.length === 0) {
       throw new Error('No columns to update (only primary keys provided)');
     }
 
@@ -6129,13 +6724,23 @@ RETURNING 1`;
     // Build VALUES clause with parameters - single pass over data
     const valuesClauses: string[] = [];
     const params: any[] = [];
-    let paramIndex = 1;
+    const cellContext: SqlBuildContext = { paramCounter: 1, params };
 
     for (const record of data) {
       const rowValues: string[] = [];
       for (const col of columnInfoList) {
         const hasKey = col.propName in record;
         const rawValue = record[col.propName];
+
+        // An sql fragment inline, typed like the column (it used to be bound AS a parameter)
+        if (rawValue instanceof SqlFragment) {
+          rowValues.push(renderValuesCell(rawValue, col.mapper, cellContext, `::${col.pgType}`));
+          if (!col.isPK) {
+            rowValues.push(hasKey ? 'true' : 'false');
+          }
+          continue;
+        }
+
         // Apply the column's toDriver mapper (e.g. Temporal -> driver string) so bulk
         // updates serialize values the same way insert and `where().update()` do.
         // Without this, class instances such as Temporal.PlainDateTime reach the pg
@@ -6147,7 +6752,7 @@ RETURNING 1`;
         if (value === undefined || value === null) {
           rowValues.push(`NULL::${col.pgType}`);
         } else {
-          rowValues.push(`$${paramIndex++}::${col.pgType}`);
+          rowValues.push(`$${cellContext.paramCounter++}::${col.pgType}`);
           params.push(value);
         }
 
@@ -6159,11 +6764,35 @@ RETURNING 1`;
       valuesClauses.push(`(${rowValues.join(', ')})`);
     }
 
+    let effectiveSetClauses = setClauses;
+    let effectiveWhereClause = whereClause;
+
+    if (expressionEntries.length > 0 || expressionWhere) {
+      // The expressions continue the VALUES cells' parameter numbering
+      const context = cellContext;
+      const assigned = new Map<string, string>();
+
+      for (const [propName, value] of expressionEntries) {
+        const colConfig = (schema.columns[propName] as any).build();
+        assigned.set(colConfig.name, `"${colConfig.name}" = ${renderAssignedValue(value, colConfig.mapper, context)}`);
+      }
+
+      // An expression replaces the provided-flag CASE of its column; other columns keep theirs
+      effectiveSetClauses = columnInfoList
+        .filter(col => !col.isPK && !assigned.has(col.dbName))
+        .map(col => `"${col.dbName}" = CASE WHEN v."${col.dbName}__provided" THEN v."${col.dbName}" ELSE t."${col.dbName}" END`)
+        .concat(Array.from(assigned.values()));
+
+      if (expressionWhere) {
+        effectiveWhereClause = `${whereClause} AND (${expressionWhere.buildSql(context)})`;
+      }
+    }
+
     const sql = `
 UPDATE ${qualifiedTableName} AS t
-SET ${setClauses.join(', ')}
+SET ${effectiveSetClauses.join(', ')}
 FROM (VALUES ${valuesClauses.join(', ')}) AS v(${valueColumnList})
-WHERE ${whereClause}`.trim();
+WHERE ${effectiveWhereClause}`.trim();
 
     return { sql, params };
   }
@@ -6177,79 +6806,24 @@ WHERE ${whereClause}`.trim();
    *   await db.users.where(u => eq(u.id, 1)).delete() // Delete with condition
    *   const deleted = await db.users.where(u => eq(u.id, 1)).delete().returning()
    */
-  delete(): FluentDelete<UnwrapDbColumns<TEntity>> {
-    const schema = this._getSchema();
-    const executor = this._getExecutor();
-    const client = this._getClient();
-    const qualifiedTableName = this._getQualifiedTableName();
-
-    // No WHERE condition - deletes all records
-    const baseSql = `DELETE FROM ${qualifiedTableName}`;
-
-    const table = this;
-
-    const executeDelete = async (returningConfig?: true | ((row: any) => any) | 'count'): Promise<any> => {
-      if (!returningConfig || returningConfig === 'count') {
-        const sql = baseSql;
-        const result = executor
-          ? await executor.query(sql, [])
-          : await client.query(sql, []);
-
-        if (returningConfig === 'count') {
-          return result.rowCount ?? 0;
-        }
-        return;
-      }
-
-      // Build RETURNING clause
-      const returningClause = table.buildReturningClause(returningConfig);
-      const sql = returningClause ? `${baseSql} RETURNING ${returningClause.sql}` : baseSql;
-
-      const result = executor
-        ? await executor.query(sql, [])
-        : await client.query(sql, []);
-
-      if (returningClause && result.rows) {
-        return table.mapReturningResults(result.rows, returningClause.aliasToProperty);
-      }
-    };
-
-    const fluent: FluentDelete<UnwrapDbColumns<TEntity>> = {
-      then: (resolve, reject) => {
-        return executeDelete().then(resolve, reject);
-      },
-      affectedCount: () => {
-        return {
-          then: (resolve: any, reject: any) => {
-            return executeDelete('count').then(resolve, reject);
-          }
-        };
-      },
-      toStatement: (selector?: (row: UnwrapDbColumns<TEntity>) => any) => {
-        // The bare-table delete has no WHERE — compile is the base text plus
-        // RETURNING when a selector asks for one.
-        const returningClause = selector ? table.buildReturningClause(selector as any) : null;
-        const stmtSql = returningClause ? `${baseSql} RETURNING ${returningClause.sql}` : baseSql;
-
-        return { sql: stmtSql, params: [] };
-      },
-      returning: ((selector?: (row: UnwrapDbColumns<TEntity>) => any) => {
-        const returningConfig = selector ?? true;
-        return {
-          then: (resolve: any, reject: any) => {
-            return executeDelete(returningConfig as any).then(resolve, reject);
-          }
-        };
-      }) as any
-    };
-
-    return fluent;
+  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>> {
+    // Every row: the query delete over a condition every row meets — the same RETURNING
+    // (navigations, collections, sql expressions), affected count and toStatement() as
+    // `where(...).delete()`
+    return (this.where(() => new SqlFragment<boolean>(['TRUE'], [])) as any).delete();
   }
 
   /**
    * Create a mock entity for type inference in lambdas
+   *
+   * @param pathAnchor The alias the row renders under, for a build that reads navigations off it —
+   *   a navigation RETURNING passes MUTATION_ROW_ALIAS. With it, a reference navigation records the
+   *   path it is reached by (a field ref carries the relation names of the hops above its own in
+   *   `__navigationAliases`; without them `ln.book` and `ln.edition.book` mint identical refs), a
+   *   collection hanging off a navigation carries that path with its first hop anchored on this
+   *   alias, and a collection of the row itself correlates to this alias.
    */
-  private createMockEntity(): EntityQuery<TEntity> {
+  private createMockEntity(pathAnchor?: string): EntityQuery<TEntity> {
     const schema = this._getSchema();
     const schemaRegistry = this._getSchemaRegistry();
     const mock: any = {};
@@ -6281,7 +6855,7 @@ WHERE ${whereClause}`.trim();
               relName,
               relConfig.targetTable,
               relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              schema.name,
+              pathAnchor ?? schema.name,
               targetSchema,
               schemaRegistry,  // Pass schema registry for nested navigation
               undefined,
@@ -6303,7 +6877,9 @@ WHERE ${whereClause}`.trim();
               relConfig.matches || [],
               relConfig.isMandatory ?? false,
               targetSchema,
-              schemaRegistry  // Pass schema registry for nested navigation
+              schemaRegistry,  // Pass schema registry for nested navigation
+              pathAnchor === undefined ? undefined : [],
+              pathAnchor  // A source alias makes every hop below record its path
             );
             return refBuilder.createMockTargetRow();
           },
@@ -6321,8 +6897,13 @@ WHERE ${whereClause}`.trim();
    */
   private buildReturningClause<TResult>(
     returning: ReturningConfig<EntityQuery<TEntity>, TResult>,
-    tableAlias?: string
-  ): { sql: string; columns: string[]; aliasToProperty?: Map<string, string> } | null {
+    tableAlias: string | undefined,
+    /**
+     * The statement's parameters: an `sql` expression's append here (RETURNING ends the statement
+     * text). Without it an expression's parameters had nowhere to go.
+     */
+    paramContext: SqlBuildContext
+  ): { sql: string; columns: string[]; read?: ReturningReadPlan } | null {
     if (returning === undefined) {
       return null; // No RETURNING
     }
@@ -6337,93 +6918,65 @@ WHERE ${whereClause}`.trim();
       return { sql, columns };
     }
 
-    // Selector function - extract selected columns
-    const mockEntity = this.createMockEntity();
-    const selection = returning(mockEntity as any);
+    // Selector function: the row's own columns, `sql` expressions over them (a column they read
+    // renders qualified like a selected one — under MERGE's / bulkUpdate's alias, a bare or
+    // table-qualified name is ambiguous or out of scope), literals, or ONE of those
+    const { selection, scalar } = returningSelection(returning(this.createMockEntity() as any));
+    const rendered = renderPlainReturning(selection, {
+      isOwnColumn: ref => this.isMutatedRowColumn(ref),
+      columnSql: ref => `${prefix}"${ref.__dbColumnName}"`,
+      columnMapper: ref => this.returningColumnMapper(ref),
+      context: paramContext,
+    });
 
-    if (typeof selection === 'object' && selection !== null) {
-      const columns: string[] = [];
-      const sqlParts: string[] = [];
-      const aliasToProperty = new Map<string, string>();
+    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar } };
+  }
 
-      for (const [alias, field] of Object.entries(selection)) {
-        if (field && typeof field === 'object' && '__dbColumnName' in field) {
-          const dbName = (field as any).__dbColumnName;
-          const propName = (field as any).__fieldName; // Property name on entity
-          columns.push(alias);
-          sqlParts.push(`${prefix}"${dbName}" AS "${alias}"`);
-          // Track alias -> property name mapping for mapper lookup
-          if (propName) {
-            aliasToProperty.set(alias, propName);
-          }
-        }
-      }
+  /** Whether a RETURNING ref reads the mutated row itself — not a navigation's table. */
+  private isMutatedRowColumn(ref: FieldRef): boolean {
+    const tableAlias = (ref as any).__tableAlias as string | undefined;
 
-      return { sql: sqlParts.join(', '), columns, aliasToProperty };
+    return !tableAlias || tableAlias === this._getSchema().name || tableAlias === MUTATION_ROW_ALIAS;
+  }
+
+  /**
+   * The mapper a RETURNING column reads back through: a column of the mutated row its own — or,
+   * through a client that drops a numeric(p, s) zero's scale, the one restoring it — and a
+   * navigation's column the mapper of the table it belongs to, whichever path reached it.
+   */
+  private returningColumnMapper(ref: FieldRef): { fromDriver(value: any): any } | undefined {
+    const fieldRef = ref as any;
+
+    if (!this.isMutatedRowColumn(ref)) {
+      return fieldRef.__mapper;
     }
 
-    // Single field selection
-    if (selection && typeof selection === 'object' && '__dbColumnName' in selection) {
-      const dbName = (selection as any).__dbColumnName;
-      return { sql: `${prefix}"${dbName}"`, columns: [dbName] };
+    const colBuilder = this._getSchema().columns[fieldRef.__fieldName];
+
+    if (!colBuilder) {
+      return fieldRef.__mapper;
     }
 
-    return null;
+    const config = (colBuilder as any).build();
+
+    return config.mapper ?? (this._getClient().losesNumericZeroScale() ? numericZeroScaleMapper(config) : undefined);
   }
 
   /**
    * Map row results applying custom mappers
    * @internal
    * @param rows - Raw database rows
-   * @param aliasToProperty - Optional mapping from result aliases to entity property names.
-   *                          If undefined, assumes full entity mapping (db column names -> property names)
+   * @param clause - The RETURNING clause the rows came from: a selector's rows are read through the
+   *                 plan its rendering built (never by matching their keys against the table's
+   *                 columns); `returning()` rows map as whole entities.
    */
   private mapReturningResults(
     rows: any[],
-    aliasToProperty?: Map<string, string>
+    clause: { read?: ReturningReadPlan }
   ): any[] {
-    // If no alias mapping provided, use full entity mapping
-    // This handles the `returning === true` case where we want proper db column -> property name mapping
-    if (!aliasToProperty || aliasToProperty.size === 0) {
-      return this.mapResultsToEntities(rows);
-    }
-
-    const schema = this._getSchema();
-
-    return rows.map(row => {
-      const mapped: any = {};
-      for (const [key, value] of Object.entries(row)) {
-        // Check if this key is an alias that maps to a property name
-        const propName = aliasToProperty.get(key);
-
-        if (propName) {
-          // Found via alias mapping - use the property name to look up the column
-          const colBuilder = schema.columns[propName];
-          if (colBuilder) {
-            const config = (colBuilder as any).build();
-            // Apply fromDriver mapper if present
-            mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-          } else {
-            mapped[key] = value;
-          }
-        } else {
-          // Try to find column by direct property name or db column name match
-          const colEntry = Object.entries(schema.columns).find(([pName, col]) => {
-            const config = (col as any).build();
-            return pName === key || config.name === key;
-          });
-
-          if (colEntry) {
-            const config = (colEntry[1] as any).build();
-            // Apply fromDriver mapper if present
-            mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-          } else {
-            mapped[key] = value;
-          }
-        }
-      }
-      return mapped;
-    });
+    return clause.read === undefined
+      ? this.mapResultsToEntities(rows)
+      : readReturningRows(rows, clause.read, this._getSchemaRegistry());
   }
 
   /**
@@ -6436,8 +6989,8 @@ WHERE ${whereClause}`.trim();
   ): {
     hasNavigation: boolean;
     selection: any;
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
-    navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>;
+    joins: ReturningNavigationJoin[];
+    navigationFields: Map<string, ReturningNavigationField>;
     nestedObjects: Map<string, any>;
     collectionFields: Map<string, any>;
   } | null {
@@ -6445,82 +6998,224 @@ WHERE ${whereClause}`.trim();
       return null;
     }
 
+    const { selection } = returningSelection(returning(this.createMockEntity(MUTATION_ROW_ALIAS)));
+
+    // Joined under the navigation plan of the selection; buildReturningWithNavigation renders a
+    // second evaluation of the same selector under the same (deterministic) plan
+    return this.withReturningNavigationPlan(selection, plan => this.resolveReturningNavigation(selection, plan));
+  }
+
+  /** The body of {@link detectNavigationInReturning}, run under the selection's navigation plan. */
+  private resolveReturningNavigation(
+    selection: any,
+    plan: NavigationAliasPlan | undefined
+  ): {
+    hasNavigation: boolean;
+    selection: any;
+    joins: ReturningNavigationJoin[];
+    navigationFields: Map<string, ReturningNavigationField>;
+    nestedObjects: Map<string, any>;
+    collectionFields: Map<string, any>;
+  } | null {
     const schema = this._getSchema();
-    const mockEntity = this.createMockEntity();
-    const selection = returning(mockEntity);
-
-    if (typeof selection !== 'object' || selection === null) {
-      return null;
-    }
-
-    const navigationFields = new Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>();
+    const navigationFields = new Map<string, ReturningNavigationField>();
     const allTableAliases = new Set<string>();
     const nestedObjects = new Map<string, any>();
     const collectionFields = new Map<string, any>();
+    let expressionReadsNavigation = false;
 
     // Recursively collect field refs and table aliases from selection
     const collectFieldRefs = (obj: any, path: string = '') => {
       for (const [key, field] of Object.entries(obj)) {
         const fieldPath = path ? `${path}.${key}` : key;
+        const classified = classifyReturningValue(field, fieldPath);
 
-        if (field && typeof field === 'object') {
-          if ('__dbColumnName' in field) {
-            // Direct field reference (either main table or navigation)
-            const tableAlias = (field as any).__tableAlias as string | undefined;
-            if (tableAlias && tableAlias !== schema.name) {
-              // Navigation field
+        if (classified.kind === 'column') {
+          // Direct field reference (either main table or navigation)
+          const fieldRef = classified.ref as any;
+          const tableAlias = fieldRef.__tableAlias as string | undefined;
+          // A navigation of the plan collects the aliases of its whole path
+          const planned = this.collectPlannedAliases(plan?.nodeOf(fieldRef), allTableAliases);
+
+          if (tableAlias && tableAlias !== schema.name) {
+            // Navigation field
+            if (!planned) {
               allTableAliases.add(tableAlias);
-              navigationFields.set(fieldPath, {
-                tableAlias,
-                dbColumnName: (field as any).__dbColumnName,
-                schemaTable: (field as any).__sourceTable,
-              });
             }
-            // Main table field - don't add to navigationFields
-            if ('__navigationAliases' in field && Array.isArray((field as any).__navigationAliases)) {
-              for (const navAlias of (field as any).__navigationAliases) {
+            navigationFields.set(fieldPath, {
+              tableAlias,
+              dbColumnName: fieldRef.__dbColumnName,
+              schemaTable: fieldRef.__sourceTable,
+              mapper: fieldRef.__mapper,
+            });
+          }
+          // Main table field - don't add to navigationFields
+          if (!planned && Array.isArray(fieldRef.__navigationAliases)) {
+            for (const navAlias of fieldRef.__navigationAliases) {
+              if (navAlias && navAlias !== schema.name) {
+                allTableAliases.add(navAlias);
+              }
+            }
+          }
+        } else if (classified.kind === 'collection' && field instanceof CollectionQueryBuilder) {
+          // CollectionQueryBuilder (.toList(), .firstOrDefault())
+          collectionFields.set(fieldPath, field);
+          // The path the collection hangs off is joined as well: its first hop's foreign key must
+          // reach the CTE's RETURNING list, and the correlated form binds to the path's last hop
+          if (!this.collectPlannedAliases(this.plannedCollectionNode(plan, field), allTableAliases)) {
+            for (const navJoin of field.getNavigationPath()) {
+              if (navJoin.alias && navJoin.alias !== schema.name) {
+                allTableAliases.add(navJoin.alias);
+              }
+            }
+            // Also add the source table alias (a collection of the row itself correlates to the CTE)
+            const sourceAlias = field.getSourceAlias();
+            if (sourceAlias && sourceAlias !== schema.name && sourceAlias !== MUTATION_ROW_ALIAS) {
+              allTableAliases.add(sourceAlias);
+            }
+          }
+        } else if (classified.kind === 'collection') {
+          collectionFields.set(fieldPath, field);
+        } else if (classified.kind === 'expression') {
+          // An `sql` expression (or condition) reading a navigation renders from the navigation
+          // RETURNING's CTE, which joins the navigation like a projected one — the plain RETURNING
+          // has no join for it
+          for (const ref of classified.fragment.getFieldRefs()) {
+            if (this.isMutatedRowColumn(ref)) {
+              continue;
+            }
+
+            expressionReadsNavigation = true;
+
+            if (!this.collectPlannedAliases(plan?.nodeOf(ref), allTableAliases)) {
+              allTableAliases.add((ref as any).__tableAlias);
+              for (const navAlias of (ref as any).__navigationAliases ?? []) {
                 if (navAlias && navAlias !== schema.name) {
                   allTableAliases.add(navAlias);
                 }
               }
             }
-          } else if (field instanceof CollectionQueryBuilder) {
-            // CollectionQueryBuilder (.toList(), .firstOrDefault())
-            collectionFields.set(fieldPath, field);
-            // Also extract the navigation path from the collection builder
-            // so we can add the necessary joins to reach the collection's source table
-            const collectionBuilder = field as any;
-            if (collectionBuilder.navigationPath && Array.isArray(collectionBuilder.navigationPath)) {
-              for (const navJoin of collectionBuilder.navigationPath) {
-                if (navJoin.alias && navJoin.alias !== schema.name) {
-                  allTableAliases.add(navJoin.alias);
-                }
-              }
-            }
-            // Also add the source table alias
-            if (collectionBuilder.sourceTable && collectionBuilder.sourceTable !== schema.name) {
-              allTableAliases.add(collectionBuilder.sourceTable);
-            }
-          } else if (!Array.isArray(field)) {
-            // Nested plain object - recurse into it
-            nestedObjects.set(fieldPath, field);
-            collectFieldRefs(field, fieldPath);
           }
+        } else if (classified.kind === 'nested') {
+          // Nested plain object - recurse into it
+          nestedObjects.set(fieldPath, field);
+          collectFieldRefs(field, fieldPath);
         }
       }
     };
 
     collectFieldRefs(selection);
 
-    if (navigationFields.size === 0 && nestedObjects.size === 0 && collectionFields.size === 0) {
+    if (navigationFields.size === 0 && nestedObjects.size === 0 && collectionFields.size === 0 && !expressionReadsNavigation) {
       return null;
     }
 
     // Resolve navigation joins
-    const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
-    this.resolveJoinsForTableAliases(allTableAliases, joins, schema);
+    const joins: ReturningNavigationJoin[] = [];
+    this.resolveJoinsForTableAliases(allTableAliases, joins, schema, plan);
 
     return { hasNavigation: true, selection, joins, navigationFields, nestedObjects, collectionFields };
+  }
+
+  /**
+   * Runs one step of a navigation RETURNING — the detection or the rendering — under the navigation
+   * plan of `selection` (see NavigationAliasPlan): every reference-navigation path the selection
+   * traverses is joined on its own parent, and the refs of a path that lost its plain alias to
+   * another path ending in the same relation name render under a path alias until `build` returns.
+   * `build` gets `undefined` when the plan could not change the SQL (every path one hop deep); the
+   * step then resolves the joins by name, exactly as before.
+   *
+   * The plan is a function of the selection's shape, so the detection and the rendering — two
+   * evaluations of one selector — get the same aliases.
+   */
+  private withReturningNavigationPlan<T>(selection: unknown, build: (plan: NavigationAliasPlan | undefined) => T): T {
+    const schema = this._getSchema();
+    // The mock mints refs without a chain id: every ref of the selection belongs to this build
+    const plan = new NavigationAliasPlan(schema, schema.name, this._getSchemaRegistry(), undefined);
+    const collectionPaths: string[][] = [];
+    this.addSelectionToNavigationPlan(selection, plan, collectionPaths);
+
+    // After every ref: at equal depth, a path a field reads keeps the plain alias
+    for (const path of collectionPaths) {
+      plan.addPath(path);
+    }
+
+    const sealed = plan.seal();
+    const restore = sealed?.apply();
+
+    try {
+      return build(sealed);
+    } finally {
+      restore?.();
+    }
+  }
+
+  /**
+   * Records the navigation paths a RETURNING selection traverses — the values the detection and the
+   * rendering walk: field refs, nested objects, and the path a collection hangs off (collected into
+   * `collectionPaths`). A collection's own selector plans its own paths when it is built.
+   */
+  private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan, collectionPaths: string[][]): void {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return;
+    }
+
+    if ('__dbColumnName' in value) {
+      plan.addRef(value);
+
+      return;
+    }
+
+    // An `sql` expression's navigations are joined — and aliased — like projected ones
+    if (value instanceof SqlFragment) {
+      for (const ref of value.getFieldRefs()) {
+        plan.addRef(ref);
+      }
+
+      return;
+    }
+
+    if (value instanceof CollectionQueryBuilder) {
+      const path = value.getNavigationPath();
+
+      if (path.length > 0 && path[0].sourceAlias === MUTATION_ROW_ALIAS) {
+        collectionPaths.push(path.map(step => step.alias));
+      }
+
+      return;
+    }
+
+    for (const field of Object.values(value)) {
+      this.addSelectionToNavigationPlan(field, plan, collectionPaths);
+    }
+  }
+
+  /** The planned hop a collection hangs off, or `undefined` (no plan, or a collection of the row itself). */
+  private plannedCollectionNode(plan: NavigationAliasPlan | undefined, collection: CollectionQueryBuilder<any>): NavigationPathNode | undefined {
+    const path = collection.getNavigationPath();
+
+    if (plan === undefined || path.length === 0 || path[0].sourceAlias !== MUTATION_ROW_ALIAS) {
+      return undefined;
+    }
+
+    return plan.nodeForPath(path.map(step => step.alias));
+  }
+
+  /**
+   * Adds the aliases of a planned hop's path — its own first, then its ancestors' from the root
+   * down, the order `__tableAlias` + `__navigationAliases` have always been collected in. False
+   * when there is no planned hop, and the caller collects the aliases by name.
+   */
+  private collectPlannedAliases(node: NavigationPathNode | undefined, allTableAliases: Set<string>): boolean {
+    if (node === undefined) {
+      return false;
+    }
+
+    for (const alias of node.collectOrder) {
+      allTableAliases.add(alias);
+    }
+
+    return true;
   }
 
   /**
@@ -6529,8 +7224,9 @@ WHERE ${whereClause}`.trim();
    */
   private resolveJoinsForTableAliases(
     allTableAliases: Set<string>,
-    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>,
-    schema: TableSchema
+    joins: ReturningNavigationJoin[],
+    schema: TableSchema,
+    plan?: NavigationAliasPlan
   ): void {
     if (allTableAliases.size === 0) {
       return;
@@ -6563,6 +7259,19 @@ WHERE ${whereClause}`.trim();
       for (const alias of allTableAliases) {
         if (resolved.has(alias) || joins.some(j => j.alias === alias)) {
           resolved.add(alias);
+          continue;
+        }
+
+        // A path of the navigation plan hangs off its OWN parent, once that is joined — never off
+        // whichever joined table happens to have a relation of the same name
+        const planned = plan?.nodeForAlias(alias);
+
+        if (planned !== undefined) {
+          if (planned.parent === undefined || joinedSchemas.has(planned.parent.alias)) {
+            joins.push(plan!.joinOf(planned));
+            resolved.add(alias);
+          }
+
           continue;
         }
 
@@ -6606,41 +7315,37 @@ WHERE ${whereClause}`.trim();
     mutationSql: string,
     mutationParams: any[],
     returning: true | ((entity: EntityQuery<TEntity>) => TResult),
-    navigationInfo: {
-      selection: any;
-      joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
-      navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>;
-      nestedObjects?: Map<string, any>;
-      collectionFields?: Map<string, any>;
-    },
+    navigationInfo: ReturningNavigationRenderInfo,
     /**
      * Composition hooks for `insertWithChildren`: CTEs prepended before
      * "__mutation__" (whose SQL may reference them), extra joins/select parts
      * on the outer statement, extra columns forced into the CTE's RETURNING
      * list, and a deterministic outer ORDER BY on a CTE column.
      */
-    options?: {
-      prefixCtes?: string;
-      extraJoins?: string[];
-      extraSelects?: string[];
-      extraCteReturningCols?: string[];
-      orderByCteColumn?: string;
-      /**
-       * Navigation joins whose target TABLE appears here read from the mapped
-       * CTE instead — how `insertWithChildren` makes a child→parent reference
-       * nav see the parent row inserted in the SAME statement (the real table
-       * is snapshot-stale for data-modifying CTE siblings).
-       */
-      joinTableOverrides?: Map<string, string>;
-    }
-  ): { sql: string; params: any[]; nestedPaths?: Set<string> } {
+    options?: ReturningNavigationRenderOptions
+  ): { sql: string; params: any[]; nestedPaths?: Set<string>; read: ReturningReadPlan } {
+    const { selection, scalar } = returningSelection((returning as Function)(this.createMockEntity(MUTATION_ROW_ALIAS)));
+
+    // The navigation plan detectNavigationInReturning resolved navigationInfo.joins under — the
+    // plan is a function of the selection's shape, so this evaluation gets the same aliases
+    return this.withReturningNavigationPlan(selection, plan => this.renderReturningWithNavigation(mutationSql, mutationParams, selection, scalar, plan, navigationInfo, options));
+  }
+
+  /** The body of {@link buildReturningWithNavigation}, run under the selection's navigation plan. */
+  private renderReturningWithNavigation(
+    mutationSql: string,
+    mutationParams: any[],
+    selection: any,
+    scalar: boolean,
+    plan: NavigationAliasPlan | undefined,
+    navigationInfo: ReturningNavigationRenderInfo,
+    options: ReturningNavigationRenderOptions | undefined
+  ): { sql: string; params: any[]; nestedPaths?: Set<string>; read: ReturningReadPlan } {
     const schema = this._getSchema();
     const schemaRegistry = this._getSchemaRegistry();
     const mainTableColumns = new Set<string>();
     const selectParts: string[] = [];
     const nestedPaths = new Set<string>();
-    const mockEntity = this.createMockEntity();
-    const selection = (returning as Function)(mockEntity);
 
     // Helper to get FK db column name from a schema
     const getFkDbColumnName = (sourceSchema: TableSchema, fkPropName: string): string => {
@@ -6657,14 +7362,6 @@ WHERE ${whereClause}`.trim();
     aliasToSourceTable.set(schema.name, schema.name);
     for (const join of navigationInfo.joins) {
       aliasToSourceTable.set(join.alias, join.targetTable);
-    }
-
-    // Build a map of table name -> alias for collection subquery rewriting
-    // This allows us to rewrite collection subqueries to use the correct joined aliases
-    const tableToAlias = new Map<string, string>();
-    tableToAlias.set(schema.name, '__mutation__'); // Main table uses mutation CTE
-    for (const join of navigationInfo.joins) {
-      tableToAlias.set(join.targetTable, join.alias);
     }
 
     // Track collection subqueries for LATERAL JOINs
@@ -6688,70 +7385,102 @@ WHERE ${whereClause}`.trim();
       collectionStrategy: 'lateral',
     });
 
-    // Recursively process selection to build SELECT parts
-    const processSelection = (obj: any, path: string = '') => {
-      for (const [key, field] of Object.entries(obj)) {
-        const fieldPath = path ? `${path}.${key}` : key;
+    // A column of the mutated row reads off the CTE, which returns it
+    const mutationColumnSql = (ref: FieldRef): string => {
+      mainTableColumns.add(ref.__dbColumnName);
 
-        if (field && typeof field === 'object') {
-          if ('__dbColumnName' in field) {
-            // Direct field reference
-            const tableAlias = (field as any).__tableAlias as string;
-            const dbColumnName = (field as any).__dbColumnName as string;
-
-            if (!tableAlias || tableAlias === schema.name) {
-              mainTableColumns.add(dbColumnName);
-              selectParts.push(`"__mutation__"."${dbColumnName}" AS "${fieldPath}"`);
-            } else {
-              selectParts.push(`"${tableAlias}"."${dbColumnName}" AS "${fieldPath}"`);
-            }
-          } else if (field instanceof CollectionQueryBuilder || '__collectionResult' in field) {
-            // CollectionQueryBuilder (.toList(), .firstOrDefault())
-            // Build a correlated subquery that references joined tables from the main query
-            const collectionBuilder = field as CollectionQueryBuilder<any>;
-            const context = buildCollectionContext();
-
-            // Build the CTE/subquery using lateral strategy
-            const cteResult = collectionBuilder.buildCTE(context);
-            lateralCounter = context.cteCounter;
-            currentParamCounter = context.paramCounter; // Track new param index after collection subquery
-
-            // The lateral strategy returns either:
-            // 1. A correlated subquery in selectExpression (no join needed)
-            // 2. A LATERAL JOIN with joinClause and selectExpression
-            if (cteResult.joinClause && cteResult.joinClause.trim()) {
-              // LATERAL JOIN needed - rewrite all table references to use correct aliases
-              // The join clause references tables by their original names, but in the mutation context
-              // we need to use the aliases from the main query's JOINs
-              const rewrittenJoinClause = this.rewriteCollectionTableReferences(
-                cteResult.joinClause,
-                tableToAlias
-              );
-              collectionSubqueries.push({
-                fieldPath,
-                lateralAlias: cteResult.tableName || `lateral_${lateralCounter - 1}`,
-                joinClause: rewrittenJoinClause,
-                selectExpression: cteResult.selectExpression || `"${cteResult.tableName}".data`,
-              });
-              selectParts.push(`${cteResult.selectExpression || `"${cteResult.tableName}".data`} AS "${fieldPath}"`);
-            } else if (cteResult.selectExpression) {
-              // Correlated subquery in SELECT - rewrite all table references
-              const rewrittenExpr = this.rewriteCollectionTableReferences(
-                cteResult.selectExpression,
-                tableToAlias
-              );
-              selectParts.push(`${rewrittenExpr} AS "${fieldPath}"`);
-            }
-          } else if (!Array.isArray(field)) {
-            // Nested plain object - recurse into it and mark as nested path
-            nestedPaths.add(fieldPath);
-            processSelection(field, fieldPath);
-          }
-        }
-      }
+      return `"__mutation__"."${ref.__dbColumnName}"`;
     };
 
-    processSelection(selection);
+    // Recursively process selection to build SELECT parts — and the shape the rows are read by
+    const processSelection = (obj: any, path: string = ''): ReturningShape => {
+      const shape: ReturningShape = [];
+
+      for (const [key, field] of Object.entries(obj)) {
+        const fieldPath = path ? `${path}.${key}` : key;
+        const classified = classifyReturningValue(field, fieldPath);
+
+        if (classified.kind === 'constant') {
+          // A literal reads back as it is — it used to be dropped from the row
+          shape.push({ key, read: { kind: 'constant', value: classified.value } });
+        } else if (classified.kind === 'expression') {
+          // Columns of the mutated row read off the CTE; a navigation's, off its join
+          const context: SqlBuildContext = { paramCounter: currentParamCounter, params: allParams };
+          const expressionSql = renderReturningExpression(classified.fragment, context, ref => this.isMutatedRowColumn(ref), mutationColumnSql);
+          currentParamCounter = context.paramCounter;
+          selectParts.push(`${expressionSql} AS "${fieldPath}"`);
+          shape.push({ key, read: { kind: 'value', column: fieldPath, mapper: fragmentReadMapper(classified.fragment) } });
+        } else if (classified.kind === 'column') {
+          // Direct field reference
+          const tableAlias = (field as any).__tableAlias as string;
+          const dbColumnName = (field as any).__dbColumnName as string;
+
+          if (this.isMutatedRowColumn(classified.ref)) {
+            selectParts.push(`${mutationColumnSql(classified.ref)} AS "${fieldPath}"`);
+          } else {
+            selectParts.push(`"${tableAlias}"."${dbColumnName}" AS "${fieldPath}"`);
+          }
+
+          shape.push({ key, read: { kind: 'value', column: fieldPath, mapper: this.returningColumnMapper(classified.ref) } });
+        } else if (classified.kind === 'collection') {
+          // CollectionQueryBuilder (.toList(), .firstOrDefault())
+          // Build a correlated subquery that references joined tables from the main query. The
+          // mock anchors it on the CTE: a collection of the row correlates to "__mutation__", and
+          // one hanging off a navigation carries its path from "__mutation__" — so its SQL is used
+          // as built (table names in it are its own subqueries' tables, never the outer joins)
+          const collectionBuilder = field as CollectionQueryBuilder<any>;
+          const context = buildCollectionContext();
+          // When the plan renders the last hop of the path the collection hangs off under a path
+          // alias (another path owns the relation name), the correlated form must join that path
+          // itself instead of binding to the join of that name — the other path's row
+          const joinOwnPath = field instanceof CollectionQueryBuilder
+            && CollectionQueryBuilder.pathRenamedIn(field, plan, MUTATION_ROW_ALIAS);
+
+          // Build the CTE/subquery using lateral strategy
+          const cteResult = collectionBuilder.buildCTE(context, undefined, undefined, joinOwnPath);
+          lateralCounter = context.cteCounter;
+          currentParamCounter = context.paramCounter; // Track new param index after collection subquery
+
+          // The mapping reads what the build learned about the collection (a collection selecting
+          // ONE value unwraps its items) off the builder that was built
+          if (collectionBuilder instanceof CollectionQueryBuilder) {
+            navigationInfo.collectionFields?.set(fieldPath, collectionBuilder);
+          }
+
+          // The lateral strategy returns either:
+          // 1. A correlated subquery in selectExpression (no join needed)
+          // 2. A LATERAL JOIN with joinClause and selectExpression
+          if (cteResult.joinClause && cteResult.joinClause.trim()) {
+            collectionSubqueries.push({
+              fieldPath,
+              lateralAlias: cteResult.tableName || `lateral_${lateralCounter - 1}`,
+              joinClause: cteResult.joinClause,
+              selectExpression: cteResult.selectExpression || `"${cteResult.tableName}".data`,
+            });
+            selectParts.push(`${cteResult.selectExpression || `"${cteResult.tableName}".data`} AS "${fieldPath}"`);
+          } else if (cteResult.selectExpression) {
+            // Correlated subquery in SELECT
+            selectParts.push(`${cteResult.selectExpression} AS "${fieldPath}"`);
+          }
+
+          // Its items read through their columns' mappers, as a SELECT reads them
+          shape.push({ key, read: { kind: 'collection', column: fieldPath, collection: collectionBuilder } });
+        } else if (classified.kind === 'nested') {
+          // Nested plain object - recurse into it and mark as nested path
+          nestedPaths.add(fieldPath);
+          shape.push({ key, read: { kind: 'nested', shape: processSelection(field, fieldPath) } });
+        }
+      }
+
+      return shape;
+    };
+
+    const shape = processSelection(selection);
+
+    if (selectParts.length === 0 && !options?.extraSelects?.length) {
+      // Only literals: the statement still yields one row per mutated row
+      selectParts.push(`NULL AS "${RETURNING_PLACEHOLDER_COLUMN}"`);
+    }
 
     // Include foreign keys needed for joins - only for joins from main table
     for (const join of navigationInfo.joins) {
@@ -6777,7 +7506,18 @@ WHERE ${whereClause}`.trim();
       }
     }
 
-    const cteReturningCols = Array.from(mainTableColumns).map(col => `"${col}"`).join(', ');
+    // Columns the caller reads off the CTE itself (insertWithChildren orders by the child key,
+    // which the selector need not project)
+    for (const col of options?.extraCteReturningCols ?? []) {
+      mainTableColumns.add(col);
+    }
+
+    const qualifier = options?.returningQualifier ? `${options.returningQualifier}.` : '';
+    // A data-modifying CTE the outer SELECT reads needs a RETURNING list even when the selection
+    // reads no column of the row (only literals)
+    const cteReturningCols = mainTableColumns.size > 0
+      ? Array.from(mainTableColumns).map(col => `${qualifier}"${col}"`).join(', ')
+      : `NULL AS "${RETURNING_PLACEHOLDER_COLUMN}"`;
     const mutationWithReturning = `${mutationSql} RETURNING ${cteReturningCols}`;
 
     // Build JOINs
@@ -6787,9 +7527,10 @@ WHERE ${whereClause}`.trim();
       if (join.targetSchema) {
         qualifiedJoinTable = `"${join.targetSchema}"."${join.targetTable}"`;
       }
-      const cteOverride = options?.joinTableOverrides?.get(join.targetTable);
-      if (cteOverride) {
-        qualifiedJoinTable = `"${cteOverride}"`;
+      // A FROM item standing in for the table (see insertedRowsUnionTable)
+      const tableOverride = options?.joinTableOverrides?.get(join.targetTable);
+      if (tableOverride) {
+        qualifiedJoinTable = tableOverride;
       }
 
       const joinConditions: string[] = [];
@@ -6831,100 +7572,19 @@ SELECT ${selectParts.join(', ')}${extraSelects}
 FROM "__mutation__"
 ${extraJoins}${joinClauses.join('\n')}${orderBy}`;
 
-    return { sql, params: allParams, nestedPaths };
+    return { sql, params: allParams, nestedPaths, read: { shape, scalar } };
   }
 
   /**
-   * Rewrite table references in a collection subquery to use the correct aliases
-   * from the main query's JOINs. This handles multi-level navigation where the
-   * collection is accessed through intermediate joined tables.
-   *
-   * @param expression - The SQL expression (join clause or select expression) to rewrite
-   * @param tableToAlias - Map of table names to their aliases in the main query
-   * @returns The rewritten expression with all table references updated
+   * Map RETURNING results with navigation properties, through the read plan the rendering built:
+   * a column through the mapper of the table it belongs to (whichever path reached it), an `sql`
+   * expression through its own, a collection's items as a SELECT reads them, nested objects field
+   * by field. Rows used to be mapped by their KEYS — an aliased column of the row lost its mapper,
+   * and a value under a column's name got that column's.
    * @internal
    */
-  private rewriteCollectionTableReferences(
-    expression: string,
-    tableToAlias: Map<string, string>
-  ): string {
-    let result = expression;
-
-    // Rewrite each table reference to use the correct alias
-    // Pattern: "tableName"."columnName" -> "alias"."columnName"
-    for (const [tableName, alias] of tableToAlias) {
-      const pattern = new RegExp(`"${tableName}"\\."`, 'g');
-      result = result.replace(pattern, `"${alias}"."`);
-    }
-
-    return result;
-  }
-
-  /**
-   * Map RETURNING results with navigation properties
-   * Reconstructs nested objects from flat column paths
-   * @internal
-   */
-  private mapReturningResultsWithNavigation<TResult>(
-    rows: any[],
-    navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>,
-    nestedPaths?: Set<string>
-  ): any[] {
-    const schema = this._getSchema();
-
-    return rows.map(row => {
-      const mapped: any = {};
-
-      for (const [key, value] of Object.entries(row)) {
-        // Handle nested paths (e.g., "borrower.id" -> { borrower: { id: value } })
-        if (key.includes('.')) {
-          const parts = key.split('.');
-          let current = mapped;
-          for (let i = 0; i < parts.length - 1; i++) {
-            const part = parts[i];
-            if (!(part in current)) {
-              current[part] = {};
-            }
-            current = current[part];
-          }
-          const finalKey = parts[parts.length - 1];
-          current[finalKey] = value;
-          continue;
-        }
-
-        const navInfo = navigationFields.get(key);
-        if (navInfo && navInfo.schemaTable) {
-          // Try to find mapper from navigation target schema
-          const relation = schema.relations[navInfo.tableAlias];
-          if (relation?.targetTableBuilder) {
-            const targetSchema = relation.targetTableBuilder.build();
-            const colEntry = Object.entries(targetSchema.columns).find(([_, col]) => {
-              const config = (col as any).build();
-              return config.name === navInfo.dbColumnName;
-            });
-            if (colEntry) {
-              const config = (colEntry[1] as any).build();
-              mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-              continue;
-            }
-          }
-        }
-
-        // Try main schema
-        const colEntry = Object.entries(schema.columns).find(([propName, col]) => {
-          const config = (col as any).build();
-          return propName === key || config.name === key;
-        });
-
-        if (colEntry) {
-          const config = (colEntry[1] as any).build();
-          mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-        } else {
-          mapped[key] = value;
-        }
-      }
-      return mapped;
-    });
+  private readReturning(rows: any[], read: ReturningReadPlan): any[] {
+    return readReturningRows(rows, read, this._getSchemaRegistry());
   }
 
   // Note: findById not yet implemented on TableAccessor

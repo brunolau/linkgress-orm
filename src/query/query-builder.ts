@@ -1,14 +1,16 @@
-import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder } from './conditions';
+import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
+import { pgTypeOfValue, selectorProjectingConditions } from './sql-functions';
+import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
 import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
 import { TimeTracer, QueryExecutor } from '../entity/db-context';
-import { assertNoCorrelatedAliasShadowing, getTableAlias, isForeignChainRef, parseOrderBy } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, forEachOrderByKey, getTableAlias, isForeignChainRef, parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
-import { DbCte, isCte } from './cte-builder';
+import { DbCte, isCte, projectedValueRef } from './cte-builder';
 import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
@@ -16,7 +18,8 @@ import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } fro
 import type { ColumnConfig } from '../schema/column-builder';
 import { MockRowCache } from './mock-row-cache';
 import { NavigationPathCache } from './navigation-path-cache';
-import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere } from './join-utils';
+import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, NavigationAliasPlan, quoteTableReference } from './join-utils';
+import type { NavigationPathNode } from './join-utils';
 
 /**
  * Field type categories for optimized result transformation
@@ -33,7 +36,149 @@ const enum FieldType {
   FIELD_REF_NO_MAPPER = 7,
   SIMPLE = 8,
   COLLECTION_SINGLE = 9,  // firstOrDefault() - single item or null
+  LITERAL = 10,           // a literal of the projection - reads back as itself
+  NESTED = 11,            // a nested object or a navigation row - each of its values read its own way
 }
+
+/**
+ * Whether a projection value is a literal — a string, a number, a boolean, `null`, a Date, a list of
+ * values — rather than a column, an expression, a collection or a nested projection.
+ */
+const isProjectionLiteral = (value: unknown): boolean => {
+  if (value === null || typeof value !== 'object') {
+    return value !== undefined;
+  }
+
+  if (value instanceof Date) {
+    return true;
+  }
+
+  return Array.isArray(value) && value.length > 0 && value.every(item => item === null || typeof item !== 'object' || item instanceof Date);
+};
+
+/**
+ * Whether a selector returned ONE literal (`select(() => 'x')`, `select(() => 7)`, a Date, `null`)
+ * rather than an object of fields: the query reads as that value on every row. A string used to be
+ * walked as an object of its characters (`[{ "0": "x" }]`), a number projected no field at all.
+ */
+export const isScalarLiteralSelection = (selection: unknown): boolean =>
+  selection === null
+  || selection instanceof Date
+  || (selection !== undefined && typeof selection !== 'object' && typeof selection !== 'function');
+
+/**
+ * A plain nested projection object (no markers) — the kind `tryBuildFlatNestedSelect` flattens. A
+ * select-all row (the `u` of `where(...).select(u => ({ me: u }))`: its columns own properties, its
+ * navigations inherited from a prototype of its own, see createSelectAllRow) is one too: it was
+ * flattened into columns and then read back unmapped, or — nested deeper — bound as a parameter.
+ */
+const isPlainNestedProjection = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+
+  return (proto === Object.prototype || proto === null || (value as any).constructor === Object)
+    && !('__dbColumnName' in value)
+    && !('__collectionResult' in value)
+    && !('__isAggregationArray' in value);
+};
+
+/** How one key of a `withAggregation` CTE's item reads back (see aggregatedItemReads). */
+interface AggregatedItemRead {
+  /** A column's / an expression's mapper */
+  mapper?: { fromDriver(value: any): any };
+  /** A literal of the aggregated projection: read back as itself (its JSON form: a Date as text) */
+  literal?: boolean;
+  value?: unknown;
+  /** A nested object (a navigation row): the reads of its own keys */
+  nested?: Record<string, AggregatedItemRead>;
+}
+
+/** The read of one value of an aggregated projection, `undefined` when it reads as JSON delivers it. */
+const aggregatedItemRead = (value: unknown): AggregatedItemRead | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === null || typeof value !== 'object' || value instanceof Date || (Array.isArray(value) && !holdsSqlValue(value))) {
+    return { literal: true, value };
+  }
+
+  const fields = materializeMockSelection(value);
+
+  if (isPlainNestedProjection(fields)) {
+    const nested = aggregatedItemReads(fields);
+
+    return nested === undefined ? undefined : { nested };
+  }
+
+  const meta = value as any;
+  const mapper = fromDriverMapper(meta.__mapper)
+    ?? (typeof meta.getMapper === 'function' ? fromDriverMapper(meta.getMapper()) : undefined);
+
+  return mapper === undefined ? undefined : { mapper };
+};
+
+/**
+ * How each key of a `withAggregation` CTE's items reads back: through the aggregated query's OWN
+ * mappers — a column's (`__mapper`), an expression's `mapWith` — a literal as itself, a nested
+ * object key by key. The mappers used to be looked up by NAME among the columns of the table reading
+ * the CTE: another table's mapper, or none at all. `undefined` when every key reads as delivered.
+ * @internal
+ */
+export const aggregatedItemReads = (innerMetadata: Record<string, any> | undefined): Record<string, AggregatedItemRead> | undefined => {
+  let reads: Record<string, AggregatedItemRead> | undefined;
+
+  for (const key in innerMetadata) {
+    const read = aggregatedItemRead(innerMetadata[key]);
+
+    if (read !== undefined) {
+      (reads ??= {})[key] = read;
+    }
+  }
+
+  return reads;
+};
+
+/** One aggregated item (or a nested object of one) read as `reads` says. */
+const readAggregatedItem = (item: any, reads: Record<string, AggregatedItemRead>): any => {
+  if (item === null || typeof item !== 'object') {
+    return item;
+  }
+
+  const transformedItem: any = {};
+
+  for (const key in item) {
+    const read = reads[key];
+    const value = item[key];
+
+    // Mappers handle null internally (mapWith wraps user functions)
+    transformedItem[key] = read === undefined
+      ? value
+      : read.literal
+        ? read.value
+        : read.mapper !== undefined
+          ? read.mapper.fromDriver(value)
+          : readAggregatedItem(value, read.nested!);
+  }
+
+  return transformedItem;
+};
+
+/** Reads a `withAggregation` CTE's items (see aggregatedItemReads). @internal */
+export const mapAggregatedItems = (items: any[], reads: Record<string, AggregatedItemRead>): any[] => {
+  // Transform items using while(i--) loop - decrement and compare to 0 is fastest
+  const results: any[] = new Array(items.length);
+  let i = items.length;
+
+  while (i--) {
+    results[i] = readAggregatedItem(items[i], reads);
+  }
+
+  return results;
+};
 
 /**
  * Performance utility: Get column name map from schema, using cached version if available
@@ -226,6 +371,124 @@ export const materializeMockSelection = (result: any): any => {
   }
 
   return out;
+};
+
+/**
+ * One ORDER BY key of a root query (`SelectQueryBuilder` / `QueryBuilder`). `field` names the key
+ * the way the projection it was written against named it: an output alias, or a column name.
+ */
+interface RootOrderByField {
+  field: string;
+  direction: OrderDirection;
+  /**
+   * The ordered column's own ref. The key renders as the output alias `field` only while the
+   * projection being built still selects this very column under that alias; otherwise — a column
+   * read through a navigation row, a nested object's leaf, or a key a later `select()` renamed or
+   * dropped — it renders as the qualified column, and a navigation it reads is joined like a
+   * projected one. Keys that are not columns (a projected `sql` fragment, a literal) have no ref.
+   */
+  ref?: FieldRef;
+  /** `field` is the flattened output alias of a nested object's leaf: `__nested__<key>__<leaf>`. */
+  nestedAlias?: boolean;
+  /**
+   * A key that is an SQL expression — a `sql` fragment, a condition, a `count()` / `exists()` over a
+   * collection — rendered (parenthesized) in the query's parameter sequence; its columns are joined
+   * like projected ones. `field` is empty. Such keys used to be dropped from the ORDER BY silently.
+   */
+  expression?: Condition;
+}
+
+/** What {@link SelectQueryBuilder.createOrderByProxy} attaches to the keys it hands out. */
+const ORDER_KEY = Symbol('linkgress.orderKey');
+
+interface OrderKeyMeta {
+  ref?: FieldRef;
+  nested: boolean;
+  /** The output alias the key names (a nested leaf's flattened alias). */
+  alias: string;
+}
+
+/** The ORDER BY key of an `orderBy` selector's result entry (see createOrderByProxy). */
+const rootOrderByFieldOf = (key: any, direction: OrderDirection): RootOrderByField => {
+  const meta: OrderKeyMeta | undefined = key[ORDER_KEY];
+
+  if (meta === undefined) {
+    // A column read through a navigation row IS its ref
+    return { field: key.__dbColumnName ?? key.__fieldName, direction, ref: key };
+  }
+
+  const entry: RootOrderByField = { field: meta.alias, direction };
+
+  if (meta.ref !== undefined) {
+    entry.ref = meta.ref;
+  }
+
+  if (meta.nested) {
+    entry.nestedAlias = true;
+  }
+
+  return entry;
+};
+
+/** The column an expression key's ref stands for: a projected column's key (see createOrderByProxy) stands for its column. */
+const orderKeyColumnRef = (ref: any): FieldRef => (ref?.[ORDER_KEY] as OrderKeyMeta | undefined)?.ref ?? ref;
+
+/** The parenthesized SQL of an ORDER BY expression key, built in `context`'s parameter sequence. */
+const buildOrderByExpressionSql = (
+  expression: Condition,
+  context: { paramCounter: number; allParams: any[]; placeholders?: Map<string, number>; hoistedCteNames?: Set<string> },
+  lateralTableAliasMap?: Map<string, string>,
+  localParams?: any[]
+): string => {
+  const { sql, params, placeholders, paramCounter } = new ConditionBuilder().build(
+    expression,
+    context.paramCounter,
+    context.placeholders,
+    context.hoistedCteNames,
+    lateralTableAliasMap
+  );
+  context.paramCounter = paramCounter;
+  context.allParams.push(...params);
+  localParams?.push(...params);
+
+  if (placeholders) {
+    context.placeholders = placeholders;
+  }
+
+  return `(${sql})`;
+};
+
+/**
+ * The value a scalar collection aggregate (`count()`, `min()`, `max()`, `sum()`, `exists()`) reads
+ * back as, the way a SELECT reads it (see transformResults): a numeric string (a bigint COUNT / SUM)
+ * as a number, NULL as null. A RETURNING that projected one used to hand back the driver's string.
+ */
+export const scalarCollectionValue = (aggregationType: string | undefined, rawValue: unknown): unknown => {
+  if (rawValue === null || rawValue === undefined) {
+    return aggregationType === 'COUNT' ? 0 : aggregationType === 'EXISTS' ? false : null;
+  }
+
+  return typeof rawValue === 'string' && aggregationType !== 'EXISTS' && NUMERIC_REGEX.test(rawValue) ? +rawValue : rawValue;
+};
+
+/** Whether the projected `value` is the column `ref` names: same column, same table alias, same path. */
+const isSameColumnRef = (value: any, ref: any): boolean => {
+  if (value === ref) {
+    return true;
+  }
+
+  if (!value || typeof value !== 'object' || !('__dbColumnName' in value) || value.__dbColumnName !== ref.__dbColumnName) {
+    return false;
+  }
+
+  if ((value.__tableAlias ?? '') !== (ref.__tableAlias ?? '')) {
+    return false;
+  }
+
+  const left: readonly string[] = Array.isArray(value.__navigationAliases) ? value.__navigationAliases : [];
+  const right: readonly string[] = Array.isArray(ref.__navigationAliases) ? ref.__navigationAliases : [];
+
+  return left.length === right.length && left.every((alias, index) => alias === right[index]);
 };
 
 /**
@@ -524,6 +787,100 @@ export interface QueryContext {
    * listed here contribute neither params nor a `WITH` entry from this builder.
    */
   hoistedCteNames?: Set<string>;
+  /**
+   * Render the projection's literals typed from their JS type — set for a projection other queries
+   * read as columns (a CTE body, a table subquery). See {@link SqlBuildContext.typedLiterals}.
+   */
+  typedLiterals?: boolean;
+}
+
+/**
+ * A literal of a projection as SQL, its parameter appended to `context`: `$n`, or — when the
+ * projection is read by another query as columns (`context.typedLiterals`) — typed from its JS type
+ * (`CAST($n AS boolean)`, a timestamptz for a Date, jsonb for a list of values). `null` is `NULL`.
+ * @internal
+ */
+export function projectionLiteralSql(value: unknown, context: { paramCounter: number; allParams: any[]; typedLiterals?: boolean }): string {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  }
+
+  const pgType = context.typedLiterals ? pgTypeOfValue(value) : undefined;
+
+  if (pgType === undefined) {
+    context.allParams.push(value);
+    return `$${context.paramCounter++}`;
+  }
+
+  const buildContext: SqlBuildContext = { paramCounter: context.paramCounter, params: context.allParams };
+  const sqlText = castTo(value, pgType).buildSql(buildContext);
+  context.paramCounter = buildContext.paramCounter;
+
+  return sqlText;
+}
+
+/**
+ * Whether a value holds a column, an expression or a collection anywhere in it (an array, a plain
+ * object) — no single SQL value to project for it as a literal. @internal
+ */
+export function holdsSqlValue(value: unknown, depth: number = 0): boolean {
+  if (value === null || typeof value !== 'object' || depth > 16) {
+    return false;
+  }
+
+  // A row (a navigation row, the root row) is a row of columns
+  if ('__dbColumnName' in value || value instanceof WhereConditionBase || value instanceof CollectionQueryBuilder
+    || value instanceof Subquery || '__collectionResult' in value || isReferenceMockRow(value)) {
+    return true;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(item => holdsSqlValue(item, depth + 1));
+  }
+
+  // A plain object — a select-all row's own columns included (see isPlainNestedProjection)
+  const proto = Object.getPrototypeOf(value);
+
+  return (proto === Object.prototype || proto === null || (value as any).constructor === Object)
+    && Object.values(value).some(item => holdsSqlValue(item, depth + 1));
+}
+
+/** Refuses a projected array that holds columns or expressions (see {@link holdsSqlValue}). @internal */
+export function assertProjectionArrayOfValues(value: unknown, path: string, where: string): void {
+  if (Array.isArray(value) && holdsSqlValue(value)) {
+    throw new Error(
+      `${where}: "${path}" is an array of columns or expressions, which has no single SQL value to select — `
+      + 'select them as an object, or build the array in SQL (sql`ARRAY[...]`, jsonbBuildArray(...))'
+    );
+  }
+}
+
+/**
+ * A mock row of a CTE's columns: a proxy handing out, for each column, the ref that carries how it
+ * reads — its own mapper, a json_agg column's inner metadata, a literal's type, a nested object's
+ * flattened columns (see DbCte.columnRef).
+ * @internal
+ */
+export function createCteMockRow<TCteColumns extends Record<string, any>>(cte: DbCte<TCteColumns>): TCteColumns {
+  return new Proxy({} as any, {
+    get(_target, prop: string | symbol) {
+      if (typeof prop === 'symbol') return undefined;
+
+      return cte.columnRef(prop);
+    },
+    has() {
+      return true;
+    },
+    ownKeys() {
+      return cte.columnDefs ? Object.keys(cte.columnDefs) : [];
+    },
+    getOwnPropertyDescriptor() {
+      return {
+        enumerable: true,
+        configurable: true,
+      };
+    }
+  }) as TCteColumns;
 }
 
 /**
@@ -538,6 +895,55 @@ type SelectionDef = {
  * Used to convert PostgreSQL NUMERIC/BIGINT strings to numbers
  */
 const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
+
+/** SQL types whose values a numeric string read back for them stands for (a numeric, an int8). */
+const NUMERIC_SQL_TYPE_REGEX = /^\s*(smallint|integer|int|int2|int4|int8|bigint|smallserial|serial|serial4|bigserial|serial8|decimal|numeric|real|float4|float8|double precision|money)\b/i;
+
+/**
+ * Whether a value read back for a column of `sqlType` turns from a numeric string into a number:
+ * for a numeric type, and for a value of unknown type (an expression). Never for a text, uuid, enum
+ * or json column: '01234' is a name there, not the number 1234.
+ */
+export const coercesNumericText = (sqlType: unknown): boolean =>
+  typeof sqlType !== 'string' || NUMERIC_SQL_TYPE_REGEX.test(sqlType);
+
+/**
+ * How a bigint literal a CTE body (or a subquery) projected reads back through the reading query:
+ * the driver may hand its int8 column back as text or as a number — it is the bigint it was.
+ * @internal
+ */
+export const BIGINT_LITERAL_READ = {
+  fromDriver: (value: unknown): unknown =>
+    value === null || value === undefined || typeof value === 'bigint' ? value : BigInt(value as string | number),
+};
+
+/** A column mapper normalized to the object that has `fromDriver` (a custom type builder unwrapped). */
+export const fromDriverMapper = (mapper: any): any | undefined => {
+  const type = mapper && typeof mapper.getType === 'function' ? mapper.getType() : mapper;
+
+  return type && typeof type.fromDriver === 'function' ? type : undefined;
+};
+
+/**
+ * How one value of a projection reads back from the column (or JSON value) delivered for it —
+ * compiled once per query by `SelectQueryBuilder.compileFieldRead`, applied per row.
+ */
+interface FieldRead {
+  key: string;
+  type: FieldType;
+  value: any;
+  mapper?: any;
+  aggregationType?: string;
+  collectionBuilder?: CollectionQueryBuilder<any>;
+  /** SIMPLE: a numeric string becomes a number (not for a text column, see coercesNumericText) */
+  coerce?: boolean;
+  /** SIMPLE: NULL stays null — a nested object's value — instead of reading as undefined */
+  keepNull?: boolean;
+  /** NESTED: the reads of the nested object's own values */
+  children?: FieldRead[];
+  /** CTE_AGGREGATION: the mapper of each aggregated item's key */
+  itemReads?: Record<string, any>;
+}
 
 /**
  * Query builder for a table
@@ -571,7 +977,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   private selection?: (row: any) => SelectionDef;
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: RootOrderByField[] = [];
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
@@ -581,7 +987,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   // Performance: Cache the mock row to avoid recreating it
   private _cachedMockRow?: any;
 
-  constructor(schema: TSchema, client: DatabaseClient, whereCond?: Condition, limit?: number, offset?: number, orderBy?: Array<{ field: string; direction: 'ASC' | 'DESC' }>, executor?: QueryExecutor, manualJoins?: ManualJoinDefinition[], joinCounter?: number, collectionStrategy?: CollectionStrategyType, schemaRegistry?: Map<string, TableSchema>) {
+  constructor(schema: TSchema, client: DatabaseClient, whereCond?: Condition, limit?: number, offset?: number, orderBy?: RootOrderByField[], executor?: QueryExecutor, manualJoins?: ManualJoinDefinition[], joinCounter?: number, collectionStrategy?: CollectionStrategyType, schemaRegistry?: Map<string, TableSchema>) {
     this.schema = schema;
     this.client = client;
     this.whereCond = whereCond;
@@ -890,11 +1296,16 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
    * UnwrapSelection extracts the value types from SqlFragment<T> expressions
    */
   leftJoin<TRight, TSelection>(
-    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'>,
+    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: TRow, right: TRight) => Condition,
     selector: (left: TRow, right: TRight) => TSelection,
     alias?: string
   ): SelectQueryBuilder<UnwrapSelection<TSelection>> {
+    // A CTE (the typings of db.<table>.leftJoin offer it; it used to throw "_getSchema is not a function")
+    if (isCte(rightTable)) {
+      return this.joinCteFromRoot('LEFT', rightTable, condition, selector);
+    }
+
     // Check if rightTable is a Subquery
     if (rightTable instanceof Subquery) {
       if (!alias) {
@@ -973,15 +1384,63 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   }
 
   /**
+   * A JOIN of a CTE straight off the table: the CTE's columns on the right, the CTE attached to the
+   * statement's WITH list (as `.with(cte)` would — see SelectQueryBuilder.joinCte).
+   */
+  private joinCteFromRoot<TRight, TSelection>(
+    type: JoinType,
+    cte: DbCte<TRight>,
+    condition: (left: TRow, right: TRight) => Condition,
+    selector: (left: TRow, right: TRight) => TSelection
+  ): SelectQueryBuilder<UnwrapSelection<TSelection>> {
+    const joinCondition = condition(this._createMockRow(), createCteMockRow(cte as DbCte<any>) as TRight);
+    const updatedJoins = [...this.manualJoins, {
+      type,
+      table: cte.name,
+      alias: cte.name,
+      schema: null as any,
+      condition: joinCondition,
+      cte: cte as DbCte<any>,
+    }];
+
+    // Fresh mocks for every selector invocation
+    const wrappedSelector = () =>
+      materializeMockSelection(selector(this._createMockRow() as TRow, createCteMockRow(cte as DbCte<any>) as TRight));
+
+    return new SelectQueryBuilder(
+      this.schema,
+      this.client,
+      wrappedSelector,
+      this.whereCond,
+      this.limitValue,
+      this.offsetValue,
+      this.orderByFields,
+      this.executor,
+      updatedJoins,
+      this.joinCounter + 1,
+      false,  // isDistinct defaults to false
+      this.schemaRegistry,
+      [cte as DbCte<any>],
+      this.collectionStrategy,
+      this.chainId
+    ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
+  }
+
+  /**
    * Add an INNER JOIN to the query with a selector (supports both tables and subqueries)
    * UnwrapSelection extracts the value types from SqlFragment<T> expressions
    */
   innerJoin<TRight, TSelection>(
-    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'>,
+    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: TRow, right: TRight) => Condition,
     selector: (left: TRow, right: TRight) => TSelection,
     alias?: string
   ): SelectQueryBuilder<UnwrapSelection<TSelection>> {
+    // A CTE (see leftJoin)
+    if (isCte(rightTable)) {
+      return this.joinCteFromRoot('INNER', rightTable, condition, selector);
+    }
+
     // Check if rightTable is a Subquery
     if (rightTable instanceof Subquery) {
       if (!alias) {
@@ -1095,7 +1554,14 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   orderBy<T>(selector: (row: TRow) => OrderByResult<T>): this {
     const mockRow = this._createMockRow();
     const result = materializeMockSelection(selector(mockRow));
-    parseOrderBy(result, this.orderByFields);
+    // Every key is a column of the row or of one of its navigations: it keeps its ref, so the
+    // projection chosen later renders it qualified — and joins the navigation it reads. A key that
+    // is an expression over them (`sql` fragment, condition, a collection's count) renders as such.
+    forEachOrderByKey(result, (key, direction) => {
+      this.orderByFields.push({ field: key.__dbColumnName || key.__fieldName, direction, ref: key });
+    }, (expression, direction) => {
+      this.orderByFields.push({ field: '', direction, expression });
+    });
     return this;
   }
 }
@@ -1111,6 +1577,11 @@ export class SelectQueryBuilder<TSelection> {
    * so the shadow check can be re-run after the SELECT list has contributed its joins.
    */
   private correlatedAliasesFromCondition: Set<string> = new Set();
+  /**
+   * @internal The navigation plan of the build in progress (see {@link withNavigationPlan}), read by
+   * the join collectors and resolvers; `undefined` between builds and for builds it cannot change.
+   */
+  private navigationPlan?: NavigationAliasPlan;
   private schema: TableSchema;
   private client: DatabaseClient;
   private selector: (row: any) => TSelection;
@@ -1118,7 +1589,7 @@ export class SelectQueryBuilder<TSelection> {
   private limitValue?: number;
   private offsetValue?: number;
   private lockClause?: string;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: RootOrderByField[] = [];
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
@@ -1142,7 +1613,7 @@ export class SelectQueryBuilder<TSelection> {
     whereCond?: Condition,
     limit?: number,
     offset?: number,
-    orderBy?: Array<{ field: string; direction: 'ASC' | 'DESC' }>,
+    orderBy?: RootOrderByField[],
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
@@ -1154,7 +1625,8 @@ export class SelectQueryBuilder<TSelection> {
   ) {
     this.schema = schema;
     this.client = client;
-    this.selector = selector;
+    // A condition value in the projection selects as a boolean column
+    this.selector = selectorProjectingConditions(selector);
     this.chainId = chainId ?? ++chainIdSeq;
     this.whereCond = whereCond;
     this.limitValue = limit;
@@ -1479,15 +1951,136 @@ export class SelectQueryBuilder<TSelection> {
   orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
     const mockRow = this._createMockRow();
     const selectedMock = materializeMockSelection(this.selector(mockRow));
-    // Wrap selectedMock in a proxy that returns FieldRefs for property access
-    const fieldRefProxy = this.createFieldRefProxy(selectedMock);
-    const result = selector(fieldRefProxy);
+    const result = selector(this.createOrderByProxy(selectedMock));
 
     // Clear previous orderBy - last one takes precedence
     this.orderByFields = [];
-    parseOrderBy(result, this.orderByFields);
+    forEachOrderByKey(result, (key, direction) => {
+      this.orderByFields.push(rootOrderByFieldOf(key, direction));
+    }, (expression, direction) => {
+      // An expression reads columns; a projected `sql` fragment or literal has only its output alias
+      for (const ref of expression.getFieldRefs()) {
+        const meta: OrderKeyMeta | undefined = (ref as any)?.[ORDER_KEY];
+
+        if (meta !== undefined && meta.ref === undefined) {
+          throw new Error(
+            `orderBy(): an expression cannot read the projected value "${meta.alias}", which is not a column — `
+            + 'order by that value itself, or build the expression from the columns it is computed from.'
+          );
+        }
+      }
+
+      this.orderByFields.push({ field: '', direction, expression });
+    });
 
     return this;
+  }
+
+  /**
+   * The row an `orderBy` selector reads. A top-level value names its output alias (and, for a
+   * column, keeps the column's ref — see RootOrderByField); a nested object's leaf names its
+   * flattened alias (`__nested__<key>__<leaf>`) and, for a column, its ref; a navigation row — one
+   * projected whole, or reached through a select-all row — is handed out as is, so a column read
+   * through it IS that column's ref, joined and qualified like a projected one.
+   */
+  private createOrderByProxy(selectedMock: any, nestedPrefix?: string): any {
+    if (!selectedMock || typeof selectedMock !== 'object' || ('__fieldName' in selectedMock && '__dbColumnName' in selectedMock)) {
+      return selectedMock;
+    }
+
+    // A projected column's key inherits the column's ref: inside an expression
+    // (`sql\`lower(${r.name})\``) it renders — and is joined and re-aliased — as that column, which is
+    // all an expression can read (an output alias is visible to ORDER BY only standing alone)
+    const orderKey = (fieldName: string, alias: string, meta: Omit<OrderKeyMeta, 'alias'>): any => {
+      const key: any = meta.ref !== undefined ? Object.create(meta.ref) : { __dbColumnName: alias };
+      key.__fieldName = fieldName;
+      key[ORDER_KEY] = { ...meta, alias };
+
+      return key;
+    };
+
+    return new Proxy(selectedMock, {
+      get: (target, prop) => {
+        if (typeof prop === 'symbol' || prop === 'constructor' || prop === 'then') {
+          return target[prop];
+        }
+
+        const value = target[prop];
+        const nested = nestedPrefix !== undefined;
+        const alias = nested ? `${nestedPrefix}__${prop}` : prop;
+
+        if (value && typeof value === 'object' && '__fieldName' in value && '__dbColumnName' in value) {
+          return orderKey(prop, alias, { ref: value, nested });
+        }
+
+        // Navigation builders pass through untouched (see createFieldRefProxy)
+        if (
+          value instanceof CollectionQueryBuilder
+          || value instanceof ReferenceQueryBuilder
+          || value instanceof QueryBuilder
+          || value instanceof SelectQueryBuilder
+        ) {
+          return value;
+        }
+
+        // A navigation row: its columns are ordered by their own refs
+        if (isReferenceMockRow(value)) {
+          return value;
+        }
+
+        if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof SqlFragment)) {
+          return this.createOrderByProxy(value, nested ? alias : `__nested__${prop}`);
+        }
+
+        // A projected `sql` fragment or literal: ordered by its output alias
+        return orderKey(prop, alias, { nested });
+      },
+    });
+  }
+
+  /** The refs of the ORDER BY keys' columns (an expression key's included) — joined and planned like the projection's. */
+  private orderByRefs(): FieldRef[] {
+    const refs: FieldRef[] = [];
+
+    for (const entry of this.orderByFields) {
+      if (entry.ref !== undefined) {
+        refs.push(entry.ref);
+      }
+
+      if (entry.expression !== undefined) {
+        for (const ref of entry.expression.getFieldRefs()) {
+          refs.push(orderKeyColumnRef(ref));
+        }
+      }
+    }
+
+    return refs;
+  }
+
+  /**
+   * One ORDER BY key's SQL (without the direction): the output alias while the projection being built
+   * still selects the key's column under it, else the qualified column; keys without a column ref keep
+   * their previous rendering (an output alias, or a column of the root table).
+   */
+  private orderByKeySql(entry: RootOrderByField, selection: any, colNameMap: Map<string, string>): string {
+    const { field, ref } = entry;
+    const projected = selection && typeof selection === 'object' && !Array.isArray(selection) ? selection : undefined;
+
+    if (ref !== undefined) {
+      if (!entry.nestedAlias && projected !== undefined && field in projected && isSameColumnRef(projected[field], ref)) {
+        return `"${field}"`;
+      }
+
+      return `"${(ref as any).__tableAlias || this.schema.name}"."${ref.__dbColumnName}"`;
+    }
+
+    if (entry.nestedAlias || (projected !== undefined && field in projected)) {
+      // Output alias of the projection (a nested leaf's flattened alias)
+      return `"${field}"`;
+    }
+
+    // Not in the projection: a column of the root table
+    return `"${this.schema.name}"."${colNameMap.get(field) ?? field}"`;
   }
 
   /**
@@ -1687,6 +2280,21 @@ export class SelectQueryBuilder<TSelection> {
     condition: (left: TSelection, right: TRight) => Condition,
     selector: (left: TSelection, right: TRight) => TNewSelection
   ): SelectQueryBuilder<UnwrapSelection<TNewSelection>> {
+    return this.joinCte('LEFT', cte, condition, selector);
+  }
+
+  /**
+   * Add a JOIN with a CTE. A CTE the query does not carry yet is attached to its WITH list (as
+   * `.with(cte)` would), like joinFilter does — an INNER JOIN of a CTE used to throw
+   * "rightTable._getSchema is not a function", though the typings offer it.
+   * @internal
+   */
+  joinCte<TRight extends Record<string, any>, TNewSelection>(
+    type: JoinType,
+    cte: DbCte<TRight>,
+    condition: (left: TSelection, right: TRight) => Condition,
+    selector: (left: TSelection, right: TRight) => TNewSelection
+  ): SelectQueryBuilder<UnwrapSelection<TNewSelection>> {
     const newJoinCounter = this.joinCounter + 1;
 
     // Create mock for the current selection (left side)
@@ -1701,13 +2309,14 @@ export class SelectQueryBuilder<TSelection> {
 
     // Add the CTE join
     const updatedJoins = [...this.manualJoins, {
-      type: 'LEFT' as JoinType,
+      type,
       table: cte.name,
       alias: cte.name,
       schema: null as any,
       condition: joinCondition,
       cte: cte,
     }];
+    const ctes = this.ctes.some(existing => existing.name === cte.name) ? this.ctes : [...this.ctes, cte];
 
     // Create a new selector
     const composedSelector = (row: any) => {
@@ -1729,7 +2338,7 @@ export class SelectQueryBuilder<TSelection> {
       newJoinCounter,
       this.isDistinct,
       this.schemaRegistry,
-      this.ctes,
+      ctes,
       this.collectionStrategy,
       this.chainId
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
@@ -1803,11 +2412,16 @@ export class SelectQueryBuilder<TSelection> {
    * UnwrapSelection extracts the value types from SqlFragment<T> expressions
    */
   innerJoin<TRight, TNewSelection>(
-    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'>,
+    rightTable: { _getSchema: () => TableSchema } | Subquery<TRight, 'table'> | DbCte<TRight>,
     condition: (left: TSelection, right: TRight) => Condition,
     selector: (left: TSelection, right: TRight) => TNewSelection,
     alias?: string
   ): SelectQueryBuilder<UnwrapSelection<TNewSelection>> {
+    // A CTE: its columns, as a LEFT JOIN of one reads them
+    if (isCte(rightTable)) {
+      return this.joinCte('INNER', rightTable as DbCte<any>, condition as any, selector as any);
+    }
+
     // Check if rightTable is a Subquery
     if (rightTable instanceof Subquery) {
       if (!alias) {
@@ -1874,6 +2488,21 @@ export class SelectQueryBuilder<TSelection> {
   }
 
   /**
+   * Whether a projected value is a row of OURS projected whole — a navigation row (`p.user`), the
+   * root row itself — which renders as its columns, flattened like a nested object's, and reads back
+   * as the object of them. A row of an enclosing query (a correlation) is not ours to render.
+   */
+  private isFlattenedNavigationRow(value: unknown): boolean {
+    if (!isReferenceMockRow(value)) {
+      return false;
+    }
+
+    const firstKey = findFirstGetterKey(value as object);
+
+    return firstKey !== undefined && !isForeignChainRef((value as any)[firstKey], this.chainId);
+  }
+
+  /**
    * Create mock row for a subquery result (for subquery joins)
    * The subquery result type defines the shape - we create FieldRefs for each property
    */
@@ -1885,41 +2514,21 @@ export class SelectQueryBuilder<TSelection> {
 
     // We need to infer the structure from TSubqueryResult
     // Since we can't iterate over a type at runtime, we create a proxy that
-    // returns FieldRefs for any property access
+    // returns FieldRefs for any property access — each carrying how its column reads
+    // (see projectedColumnRef)
     return new Proxy(mock, {
-      get(target, prop: string | symbol) {
+      get(_target, prop: string | symbol) {
         if (typeof prop === 'symbol') return undefined;
 
-        // If we have selection metadata, check if this property has a mapper
-        if (selectionMetadata && prop in selectionMetadata) {
-          const value = selectionMetadata[prop];
-
-          // If it's a SqlFragment with a mapper, preserve it
-          if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-            // Create a SqlFragment-like object that preserves the mapper
-            return {
-              __fieldName: prop,
-              __dbColumnName: prop,
-              __tableAlias: alias,
-              getMapper: () => (value as any).getMapper(),
-            };
-          }
-        }
-
-        // Return a regular FieldRef for any property accessed
-        return {
-          __fieldName: prop,
-          __dbColumnName: prop, // Assume property name matches column name
-          __tableAlias: alias,
-        };
+        return projectedValueRef(prop, alias, selectionMetadata ? selectionMetadata[prop] : undefined);
       },
-      has(target, prop) {
+      has() {
         return true; // All properties "exist"
       },
-      ownKeys(target) {
+      ownKeys() {
         return []; // We don't know the keys ahead of time
       },
-      getOwnPropertyDescriptor(target, prop) {
+      getOwnPropertyDescriptor() {
         return {
           enumerable: true,
           configurable: true,
@@ -1932,60 +2541,7 @@ export class SelectQueryBuilder<TSelection> {
    * Create a mock row for CTE columns
    */
   private createMockRowForCte<TCteColumns extends Record<string, any>>(cte: DbCte<TCteColumns>): TCteColumns {
-    const mock: any = {};
-
-    // Create a proxy that returns FieldRefs for CTE columns
-    return new Proxy(mock, {
-      get(target, prop: string | symbol) {
-        if (typeof prop === 'symbol') return undefined;
-
-        // If we have selection metadata, check if this property has a mapper or is an aggregation array
-        if (cte.selectionMetadata && prop in cte.selectionMetadata) {
-          const value = cte.selectionMetadata[prop];
-
-          // If it's a SqlFragment with a mapper, preserve it
-          if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-            // Create a SqlFragment-like object that preserves the mapper
-            return {
-              __fieldName: prop,
-              __dbColumnName: prop,
-              __tableAlias: cte.name,
-              getMapper: () => (value as any).getMapper(),
-            };
-          }
-
-          // If it's a CTE aggregation array marker, preserve it with inner metadata
-          if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
-            return {
-              __fieldName: prop,
-              __dbColumnName: prop,
-              __tableAlias: cte.name,
-              __isAggregationArray: true,
-              __innerSelectionMetadata: (value as any).__innerSelectionMetadata,
-            };
-          }
-        }
-
-        // Return a regular FieldRef for any property accessed
-        return {
-          __fieldName: prop,
-          __dbColumnName: prop,
-          __tableAlias: cte.name,
-        };
-      },
-      has(target, prop) {
-        return true;
-      },
-      ownKeys(target) {
-        return cte.columnDefs ? Object.keys(cte.columnDefs) : [];
-      },
-      getOwnPropertyDescriptor(target, prop) {
-        return {
-          enumerable: true,
-          configurable: true,
-        };
-      }
-    }) as TCteColumns;
+    return createCteMockRow(cte);
   }
 
   /**
@@ -2359,7 +2915,9 @@ export class SelectQueryBuilder<TSelection> {
     if (meta.nestedPaths.size > 0) {
       processed = rows.map(row => this.reconstructNestedObjects(row, meta.nestedPaths));
     }
-    return this.transformResults(processed, meta.selectionResult);
+    // Every leg's rows go through the FIRST leg's selection here: a literal is read from its row,
+    // as each leg projects its own
+    return this.transformResults(processed, meta.selectionResult, true);
   }
 
   /**
@@ -2525,7 +3083,11 @@ export class SelectQueryBuilder<TSelection> {
   private buildBatchMeta(selection: any, hasNestedPaths: boolean): FutureBatchMeta {
     const revivals: Array<{ key: string; revive: (value: any) => any }> = [];
     const textColumns: string[] = [];
-    this.collectJsonRowRevivals(selection, undefined, revivals, textColumns);
+    // A selector returning one column: its row key is the column's name (see transformResults)
+    const revivalSelection = isScalarSelection(selection) && '__dbColumnName' in selection
+      ? { [(selection as FieldRef).__dbColumnName]: selection }
+      : selection;
+    this.collectJsonRowRevivals(revivalSelection, undefined, revivals, textColumns);
 
     const reviveJsonRow = revivals.length === 0
       ? undefined
@@ -2732,8 +3294,12 @@ export class SelectQueryBuilder<TSelection> {
     const mockRow = tracer.trace('createMockRow', () => this._createMockRow());
     const selectionResult = tracer.trace('evaluateSelector', () => materializeMockSelection(this.selector(mockRow)));
 
-    // Check if we're using temp table strategy and have collections
-    const collections = tracer.trace('detectCollections', () => this.detectCollections(selectionResult));
+    // Check if we're using temp table strategy and have collections. A collection reading its
+    // parent row beyond the relation key stays in the base query, where it renders as LATERAL
+    // (see CollectionQueryBuilder.getOuterFieldRefs): an aggregate over temp-table parent ids
+    // cannot see that row.
+    const collections = tracer.trace('detectCollections', () => this.detectCollections(selectionResult))
+      .filter(collection => this.collectionStrategy !== 'temptable' || collection.builder.getOuterFieldRefs().length === 0);
     const useTempTableStrategy = this.collectionStrategy === 'temptable' && collections.length > 0;
 
     tracer.endPhase();
@@ -2810,18 +3376,25 @@ export class SelectQueryBuilder<TSelection> {
     collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
     tracer: TimeTracer
   ): Promise<any[]> {
-    // Build base selection (excludes collections, includes foreign keys)
+    // Build base selection (excludes collections, includes each collection's parent key)
     tracer.startPhase('queryBuild');
+    const parentKeyAliases = new Map<CollectionQueryBuilder<any>, string>();
     const baseSelection = tracer.trace('buildBaseSelection', () =>
-      this.buildBaseSelection(selectionResult, collections)
+      this.buildBaseSelection(selectionResult, collections, parentKeyAliases)
     );
-    const { sql: baseSql, params: baseParams } = tracer.trace('buildBaseQuery', () =>
+    const { sql: baseSql, params: baseParams, nestedPaths: baseNestedPaths } = tracer.trace('buildBaseQuery', () =>
       this.buildQuery(baseSelection, {
         ...context,
         ctes: new Map(), // Clear CTEs since we're not using them for collections
       })
     );
     tracer.endPhase();
+
+    // The base rows' nested objects (and navigation rows) arrive as flattened path aliases: they are
+    // rebuilt before the collections are merged into them. They used to stay flat — a nested object
+    // came back without its columns, or not at all
+    const rebuildNested = (rows: any[]): any[] =>
+      baseNestedPaths.size === 0 ? rows : rows.map(row => this.reconstructNestedObjects(row, baseNestedPaths));
 
     // Check if we can use fully optimized single-query approach
     // Requirements: PostgresClient with querySimpleMulti support AND no parameters in base query
@@ -2840,7 +3413,7 @@ export class SelectQueryBuilder<TSelection> {
       collections.every(c => this.isNaiveCollectionFastPathSafe(c.builder));
 
     if (canUseFullOptimization) {
-      return this.executeFullyOptimized(baseSql, baseSelection, selectionResult, context, collections, tracer);
+      return this.executeFullyOptimized(baseSql, baseSelection, selectionResult, context, collections, tracer, rebuildNested);
     }
 
     // Legacy two-phase approach: execute base query first
@@ -2862,20 +3435,32 @@ export class SelectQueryBuilder<TSelection> {
       return [];
     }
 
-    // Extract parent IDs from base results (using the known alias we added in buildBaseSelection)
-    const parentIds = baseResult.rows.map(row => row.__pk_id);
-
     // Phase 2: Execute collection aggregations using temp tables
-    // For each collection, call buildCTE with parent IDs
-    const collectionResults = new Map<string, Map<number, any>>();
+    // For each collection, call buildCTE with the ids of ITS parents: the values of the parent key
+    // buildBaseSelection selected for it (the root row's key, or the key of the navigation it hangs off)
+    const collectionResults = new Map<string, Map<any, any>>();
 
     for (const collection of collections) {
       const builder = collection.builder;
+      const keyAlias = parentKeyAliases.get(builder) ?? '__pk_id';
+      const parentIds = baseResult.rows.map(row => row[keyAlias]);
+
+      // Each aggregation runs as a statement of its own: its parameters are numbered from $1
+      const collectionContext: QueryContext = {
+        ctes: new Map(),
+        cteCounter: context.cteCounter,
+        paramCounter: 1,
+        allParams: [],
+        collectionStrategy: context.collectionStrategy,
+        executor: context.executor,
+        useJsonArrayAggregation: context.useJsonArrayAggregation,
+      };
 
       // Call buildCTE with parent IDs - this will use the temp table strategy
       const aggResult = await tracer.traceAsync(`buildCTE:${collection.name}`, async () =>
-        builder.buildCTE(context, this.client, parentIds)
+        builder.buildCTE(collectionContext, this.client, parentIds)
       );
+      context.cteCounter = collectionContext.cteCounter;
 
       // aggResult is a Promise<CollectionAggregationResult> for temp table strategy
       const result = await (aggResult as any as Promise<any>);
@@ -2917,12 +3502,12 @@ export class SelectQueryBuilder<TSelection> {
     // Phase 3: Merge base results with collection results
     tracer.startPhase('resultProcessing');
     const mergedRows = tracer.trace('mergeResults', () =>
-      baseResult.rows.map(baseRow => {
+      rebuildNested(baseResult.rows).map(baseRow => {
         const merged = { ...baseRow };
         for (const collection of collections) {
           const resultMap = collectionResults.get(collection.name);
-          const parentId = baseRow.__pk_id;
-          const rawData = resultMap?.get(parentId);
+          const parentId = baseRow[parentKeyAliases.get(collection.builder) ?? '__pk_id'];
+          const rawData = parentId === null || parentId === undefined ? undefined : resultMap?.get(parentId);
 
           // Check if this is a single result (firstOrDefault) - return first item or null
           const isSingleResult = collection.builder.isSingleResult();
@@ -2960,8 +3545,11 @@ export class SelectQueryBuilder<TSelection> {
             merged[collection.name] = collectionData;
           }
         }
-        // Remove the internal __pk_id field before returning
+        // Remove the internal parent-key fields before returning
         delete merged.__pk_id;
+        for (const keyAlias of parentKeyAliases.values()) {
+          delete merged[keyAlias];
+        }
         return merged;
       }),
       { rowCount: baseResult.rows.length }
@@ -3015,6 +3603,14 @@ export class SelectQueryBuilder<TSelection> {
       return false;
     }
 
+    // The naive SQL names bare columns of the collection's own table: a column read through a
+    // navigation — in the projection or the ORDER BY — would silently read the own column of the
+    // same name (`ln.edition.id` as the loan's id), or fail
+    const ownMarker = `__collection_${b.targetTable}__`;
+    if ((b.orderByFields ?? []).some((field: any) => field.fragment !== undefined || (field.table !== undefined && field.table !== ownMarker && field.table !== b.targetTable))) {
+      return false;
+    }
+
     // Single-column `fk = parent.id` correlation only; composite keys and
     // `__LIT:` constant predicates (SCD2 is_current etc.) need the strategies.
     const hasLiteralMarker = (arr?: string[]) =>
@@ -3060,8 +3656,17 @@ export class SelectQueryBuilder<TSelection> {
     try {
       const selected = materializeMockSelection(b.selector(b.createMockItem()));
 
+      // The rows carry the parent key as `parent_id` next to the projection: a projected
+      // `parent_id` would collide with it
+      if (Object.prototype.hasOwnProperty.call(selected, 'parent_id')) {
+        return false;
+      }
+
       for (const value of Object.values(selected)) {
         if (!(value && typeof value === 'object' && '__dbColumnName' in (value as any))) {
+          return false;
+        }
+        if ((value as any).__tableAlias !== ownMarker) {
           return false;
         }
         if ((value as any).__mapper) {
@@ -3095,7 +3700,8 @@ export class SelectQueryBuilder<TSelection> {
     selectionResult: any,
     context: QueryContext,
     collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
-    tracer: TimeTracer
+    tracer: TimeTracer,
+    rebuildNested: (rows: any[]) => any[]
   ): Promise<any[]> {
     tracer.startPhase('queryBuild');
     const baseTempTable = `tmp_base_${context.cteCounter++}`;
@@ -3126,14 +3732,15 @@ export class SelectQueryBuilder<TSelection> {
           selectedFieldsSQL = fieldParts.join(', ');
         }
 
-        // Build ORDER BY
+        // Build ORDER BY. Every key names its table: a bare name binds to an OUTPUT column first, so
+        // `ORDER BY "id"` next to `"book_id" as "id"` ordered by the projected book id.
         let orderBySQL: string;
         const targetSchema = builderAny.targetTableSchema;
         if (orderByFields.length > 0) {
           const colNameMap = targetSchema ? getColumnNameMapForSchema(targetSchema) : null;
           orderBySQL = ` ORDER BY ${orderByFields.map(({ field, direction }: any) => {
             const dbColumnName = colNameMap?.get(field) ?? field;
-            return `"${dbColumnName}" ${direction}`;
+            return `"${targetTable}"."${dbColumnName}" ${direction}`;
           }).join(', ')}`;
         } else {
           // Find primary key column from schema, fallback to "id" if not found
@@ -3148,13 +3755,14 @@ export class SelectQueryBuilder<TSelection> {
           }
 
           if (pkColumn) {
-            orderBySQL = ` ORDER BY "${pkColumn}" DESC`;
+            orderBySQL = ` ORDER BY "${targetTable}"."${pkColumn}" DESC`;
           } else {
             orderBySQL = ' ';
           }
         }
 
-        const collectionSQL = `SELECT "${foreignKey}" as parent_id, ${selectedFieldsSQL} FROM "${targetTable}" WHERE "${foreignKey}" IN (SELECT "__pk_id" FROM ${baseTempTable})${orderBySQL}`;
+        const fromTable = quoteTableReference(targetTable, targetSchema?.schema);
+        const collectionSQL = `SELECT "${foreignKey}" as parent_id, ${selectedFieldsSQL} FROM ${fromTable} WHERE "${foreignKey}" IN (SELECT "__pk_id" FROM ${baseTempTable})${orderBySQL}`;
         sqls.push(collectionSQL);
       }
       return sqls;
@@ -3222,9 +3830,9 @@ export class SelectQueryBuilder<TSelection> {
       return results;
     });
 
-    // Merge base results with collection results
+    // Merge base results with collection results (the base rows' nested objects rebuilt first)
     const mergedRows = tracer.trace('mergeResults', () =>
-      baseResult.rows.map((baseRow: any) => {
+      rebuildNested(baseResult.rows).map((baseRow: any) => {
         const merged = { ...baseRow };
         for (const collection of collections) {
           const resultMap = collectionResults.get(collection.name);
@@ -3321,7 +3929,11 @@ export class SelectQueryBuilder<TSelection> {
    * Build base selection excluding collections but including necessary foreign keys.
    * Handles nested collections by removing them from nested structures.
    */
-  private buildBaseSelection(selection: any, collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>): any {
+  private buildBaseSelection(
+    selection: any,
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
+    parentKeyAliases?: Map<CollectionQueryBuilder<any>, string>
+  ): any {
     const baseSelection: any = {};
 
     // Build a set of top-level collection names (for backward compatibility)
@@ -3332,6 +3944,34 @@ export class SelectQueryBuilder<TSelection> {
     // Always ensure we have the primary key in the base selection with a known alias
     const mockRow = this._createMockRow();
     baseSelection['__pk_id'] = mockRow.id; // Add primary key with a known alias
+
+    // A collection whose parents are not identified by the root row's `id` — it hangs off a
+    // navigation (`ln.edition.book.editions`: the edition's BOOK), or its relation names another
+    // principal key — gets a key column of its own
+    if (parentKeyAliases !== undefined) {
+      for (const [index, collection] of collections.entries()) {
+        const path = collection.builder.getNavigationPath();
+        const key = collection.builder.getParentKeyColumn();
+
+        if (path.length === 0 && key === 'id') {
+          continue;
+        }
+
+        const alias = `__pk_${index}`;
+        const rootAnchored = path.length === 0 || path[0].sourceAlias !== this.schema.name;
+        baseSelection[alias] = rootAnchored
+          ? { __fieldName: key, __dbColumnName: key, __tableAlias: this.schema.name, __chainId: this.chainId }
+          : {
+            // The key column of the path's last hop — joined and aliased like a column read through it
+            __fieldName: key,
+            __dbColumnName: key,
+            __tableAlias: path[path.length - 1].alias,
+            __navigationAliases: path.slice(0, -1).map(step => step.alias),
+            __chainId: this.chainId,
+          };
+        parentKeyAliases.set(collection.builder, alias);
+      }
+    }
 
     for (const [key, value] of Object.entries(selection)) {
       if (!topLevelCollectionNames.has(key)) {
@@ -3632,6 +4272,25 @@ export class SelectQueryBuilder<TSelection> {
     }
   }
 
+  /**
+   * The WHERE of an UPDATE / DELETE: the joins of its navigations (rendered as `FROM` / `USING`) and
+   * its SQL, built under ONE navigation plan so that both name the same aliases.
+   */
+  private buildMutationWhere(startParam: number): {
+    whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
+    whereSql: string;
+    whereParams: any[];
+  } {
+    return this.withNavigationPlan(undefined, this.whereCond, () => {
+      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
+      this.detectAndAddJoinsFromCondition(this.whereCond, whereJoins);
+
+      const { sql, params } = new ConditionBuilder().build(this.whereCond!, startParam);
+
+      return { whereJoins, whereSql: sql, whereParams: params };
+    });
+  }
+
   delete(): FluentDelete<TSelection> {
     SelectQueryBuilder.assertWritable(this.schema, 'delete from');
     const queryBuilder = this;
@@ -3644,12 +4303,8 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Delete requires a WHERE condition. Use where() before delete().');
       }
 
-      // Detect navigation property joins from WHERE condition
-      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
-      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
-
-      const condBuilder = new ConditionBuilder();
-      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, 1);
+      // Detect navigation property joins from WHERE condition (and build it under the same plan)
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(1);
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
 
@@ -3692,7 +4347,7 @@ export class SelectQueryBuilder<TSelection> {
         }
         deleteSql += ` WHERE ${fullWhereClause}`;
 
-        const { sql, params, nestedPaths } = queryBuilder.buildReturningWithNavigation(
+        const { sql, params, read } = queryBuilder.buildReturningWithNavigation(
           deleteSql,
           whereParams,
           returning as ((row: TSelection) => TResult),
@@ -3703,12 +4358,7 @@ export class SelectQueryBuilder<TSelection> {
           ? await queryBuilder.executor.query(sql, params)
           : await queryBuilder.client.query(sql, params);
 
-        return queryBuilder.mapReturningResultsWithNavigation(
-          result.rows,
-          returning as ((row: TSelection) => TResult),
-          navigationInfo.navigationFields,
-          nestedPaths
-        );
+        return readReturningRows(result.rows, read, queryBuilder.schemaRegistry);
       }
 
       // Standard RETURNING (no navigation properties)
@@ -3740,7 +4390,7 @@ export class SelectQueryBuilder<TSelection> {
         return undefined;
       }
 
-      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.read);
     };
 
     /**
@@ -3756,11 +4406,7 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Delete requires a WHERE condition. Use where() before delete().');
       }
 
-      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
-      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
-
-      const condBuilder = new ConditionBuilder();
-      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, 1);
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(1);
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
 
@@ -3787,7 +4433,7 @@ export class SelectQueryBuilder<TSelection> {
 
       // Qualify columns with table name when using USING clause to avoid ambiguity.
       const returningClause = returning
-        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: whereParams.length + 1, params: whereParams })
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: whereParams.length + 1, params: whereParams }, true)
         : null;
 
       let sql = `DELETE FROM ${qualifiedTableName}`;
@@ -3867,10 +4513,6 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Update requires a WHERE condition. Use where() before update().');
       }
 
-      // Detect navigation property joins from WHERE condition
-      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
-      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
-
       // Resolve the data object - if a function, invoke it with the column proxy so that
       // expressions like `update(p => ({ col: sql`... ${p.col} ...` }))` resolve the
       // SqlFragment column references against the actual table.
@@ -3916,8 +4558,8 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('No valid columns to update');
       }
 
-      const condBuilder = new ConditionBuilder();
-      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, paramIndex);
+      // Detect navigation property joins from WHERE condition (and build it under the same plan)
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(paramIndex);
       values.push(...whereParams);
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
@@ -3961,7 +4603,7 @@ export class SelectQueryBuilder<TSelection> {
         }
         updateSql += ` WHERE ${fullWhereClause}`;
 
-        const { sql, params, nestedPaths } = queryBuilder.buildReturningWithNavigation(
+        const { sql, params, read } = queryBuilder.buildReturningWithNavigation(
           updateSql,
           values,
           returning as ((row: TSelection) => TResult),
@@ -3972,12 +4614,7 @@ export class SelectQueryBuilder<TSelection> {
           ? await queryBuilder.executor.query(sql, params)
           : await queryBuilder.client.query(sql, params);
 
-        return queryBuilder.mapReturningResultsWithNavigation(
-          result.rows,
-          returning as ((row: TSelection) => TResult),
-          navigationInfo.navigationFields,
-          nestedPaths
-        );
+        return readReturningRows(result.rows, read, queryBuilder.schemaRegistry);
       }
 
       // Standard RETURNING (no navigation properties)
@@ -4009,7 +4646,7 @@ export class SelectQueryBuilder<TSelection> {
         return undefined;
       }
 
-      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.fragmentMappers);
+      return queryBuilder.mapDeleteReturningResults(result.rows, returning, returningClause.read);
     };
 
     /**
@@ -4023,9 +4660,6 @@ export class SelectQueryBuilder<TSelection> {
       if (!queryBuilder.whereCond) {
         throw new Error('Update requires a WHERE condition. Use where() before update().');
       }
-
-      const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
-      queryBuilder.detectAndAddJoinsFromCondition(queryBuilder.whereCond, whereJoins);
 
       const resolvedData = typeof data === 'function'
         ? (data as (row: TSelection) => Partial<Record<string, any>>)(queryBuilder._createMockRow() as TSelection)
@@ -4060,8 +4694,7 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('No valid columns to update');
       }
 
-      const condBuilder = new ConditionBuilder();
-      const { sql: whereSql, params: whereParams } = condBuilder.build(queryBuilder.whereCond, paramIndex);
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(paramIndex);
       values.push(...whereParams);
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
@@ -4082,8 +4715,14 @@ export class SelectQueryBuilder<TSelection> {
         ? `${joinConditions.join(' AND ')} AND ${whereSql}`
         : whereSql;
 
+      // A navigation read renders from the navigation RETURNING's CTE, which a compiled statement
+      // does not have — it rendered as the mutated table's column of the same name
+      if (returning != null && queryBuilder.detectNavigationInReturning(returning)) {
+        throw new Error('toStatement(): navigation RETURNING is not supported in compiled UPDATE statements — select plain or fragment columns only.');
+      }
+
       const returningClause = returning != null
-        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: values.length + 1, params: values })
+        ? queryBuilder.buildUpdateDeleteReturningClause(returning, whereJoins.length > 0, { paramCounter: values.length + 1, params: values }, true)
         : null;
 
       let sql = `UPDATE ${qualifiedTableName} SET ${setClauses.join(', ')}`;
@@ -4144,8 +4783,9 @@ export class SelectQueryBuilder<TSelection> {
   private buildUpdateDeleteReturningClause<TResult>(
     returning: undefined | true | ((row: TSelection) => TResult),
     qualifyWithTable: boolean = false,
-    paramContext?: { paramCounter: number; params: any[] }
-  ): { sql: string; columns: string[]; fragmentMappers?: Map<string, any> } | null {
+    paramContext?: { paramCounter: number; params: any[] },
+    compiled: boolean = false
+  ): { sql: string; columns: string[]; read?: ReturningReadPlan } | null {
     if (returning === undefined) {
       return null;
     }
@@ -4159,98 +4799,100 @@ export class SelectQueryBuilder<TSelection> {
       return { sql, columns };
     }
 
-    // Selector function - extract selected columns
-    const mockRow = this._createMockRow();
-    const selectedMock = materializeMockSelection(this.selector(mockRow));
-    const selection = returning(selectedMock as TSelection);
+    const { selection, scalar } = this.evaluateReturning(returning);
 
-    if (typeof selection === 'object' && selection !== null) {
-      const columns: string[] = [];
-      const sqlParts: string[] = [];
-      let fragmentMappers: Map<string, any> | undefined;
-
-      for (const [alias, field] of Object.entries(selection)) {
-        if (field instanceof SqlFragment) {
-          // Raw fragment under its selector key (the key is the alias — a
-          // fragment-side .as() is ignored here). Params append to the
-          // statement's array; headline use case: PG18 `old."col"` capture.
-          if (!paramContext) {
-            throw new Error(
-              `Returning selector field "${alias}" is a SqlFragment, which this mutation path does not support`
-            );
-          }
-
-          const fragmentSql = field.buildSql(paramContext);
-          columns.push(alias);
-          sqlParts.push(`${fragmentSql} AS "${alias}"`);
-          fragmentMappers = fragmentMappers ?? new Map<string, any>();
-          fragmentMappers.set(alias, field.getMapper());
-        } else if (field && typeof field === 'object' && '__dbColumnName' in field) {
-          const dbName = (field as any).__dbColumnName;
-          columns.push(alias);
-          sqlParts.push(`${tablePrefix}"${dbName}" AS "${alias}"`);
-        }
-      }
-
-      return { sql: sqlParts.join(', '), columns, fragmentMappers };
+    if (compiled && scalar) {
+      throw new Error('toStatement(): the RETURNING selector must return an object — its keys name the columns the compiled statement returns.');
     }
 
-    return null;
+    // Expressions append their parameters to the statement's (RETURNING ends the statement text);
+    // headline use case: PG18 `old."col"` capture
+    const rendered = renderPlainReturning(selection, {
+      isOwnColumn: ref => this.isMutatedRowColumn(ref),
+      columnSql: ref => `${tablePrefix}"${ref.__dbColumnName}"`,
+      columnMapper: ref => this.returningColumnMapper(ref),
+      context: paramContext ?? { paramCounter: 1, params: [] },
+      constantsAsParams: compiled,
+    });
+
+    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar } };
+  }
+
+  /**
+   * A RETURNING selector's selection over the mutated row (see returningSelection) — evaluated over
+   * this query's projection when it has one.
+   */
+  private evaluateReturning(returning: (row: TSelection) => unknown): { selection: Record<string, unknown>; scalar: boolean } {
+    const mockRow = this._createMockRow();
+    const selectedMock = materializeMockSelection(this.selector(mockRow));
+
+    return returningSelection(returning(selectedMock as TSelection));
+  }
+
+  /** Whether a ref reads the mutated row itself (not a navigation's table, not another query's row). */
+  private isMutatedRowColumn(ref: FieldRef): boolean {
+    const tableAlias = (ref as any).__tableAlias as string | undefined;
+
+    return (!tableAlias || tableAlias === this.schema.name) && !isForeignChainRef(ref, this.chainId);
+  }
+
+  /**
+   * The mapper a RETURNING column reads back through: a column of the mutated row its own — or,
+   * through a client that drops a numeric(p, s) zero's scale, the one restoring it — and a
+   * navigation's column the mapper of the table it belongs to.
+   */
+  private returningColumnMapper(ref: FieldRef): { fromDriver(value: any): any } | undefined {
+    const fieldRef = ref as any;
+
+    if (!this.isMutatedRowColumn(ref)) {
+      return fieldRef.__mapper;
+    }
+
+    const cached = this.schema.columnMetadataCache?.get(fieldRef.__fieldName);
+
+    if (cached === undefined) {
+      return fieldRef.__mapper;
+    }
+
+    if (cached.hasMapper) {
+      return cached.mapper;
+    }
+
+    return this.client.losesNumericZeroScale() ? numericZeroScaleMapper(cached.config) : undefined;
   }
 
   /**
    * Map row results for delete/update RETURNING clause
-   * @param fragmentMappers - Per-alias mapWith mappers for SqlFragment selector fields; a
-   *                          fragment alias bypasses the schema-column mapper scan entirely
-   *                          (its value is the fragment's, not any column's).
+   * @param read - The read plan the RETURNING rendering built (a selector's rows are read through
+   *               it, never by matching their keys against the table's columns).
    * @internal
    */
   private mapDeleteReturningResults<TResult>(
     rows: any[],
     returning: undefined | true | ((row: TSelection) => TResult),
-    fragmentMappers?: Map<string, any>
+    read?: ReturningReadPlan
   ): any[] {
-    if (returning === true) {
-      // Full entity mapping - apply fromDriver mappers
-      // getSchemaColumnMeta: `colBuilder.build()` per column PER ROW was pure waste for an
-      // immutable schema — the per-schema meta map is computed once.
-      const columnMeta = getSchemaColumnMeta(this.schema);
+    if (returning === true || read === undefined) {
+      // Full entity mapping - apply fromDriver mappers (a numeric(p, s) zero gets back the scale a
+      // client dropped). Computed once per call, not per row.
+      const restoreZeroScale = this.client.losesNumericZeroScale();
+      const columns = [...getSchemaColumnMeta(this.schema)].map(([propName, meta]) => ({
+        propName,
+        dbName: meta.name!,
+        mapper: meta.mapper ?? (restoreZeroScale ? numericZeroScaleMapper(this.schema.columnMetadataCache?.get(propName)?.config ?? {}) : undefined),
+      }));
+
       return rows.map(row => {
         const mapped: any = {};
-        for (const [propName, meta] of columnMeta) {
-          const dbValue = row[meta.name!];
-          mapped[propName] = meta.mapper ? meta.mapper.fromDriver(dbValue) : dbValue;
+        for (const { propName, dbName, mapper } of columns) {
+          const dbValue = row[dbName];
+          mapped[propName] = mapper ? mapper.fromDriver(dbValue) : dbValue;
         }
         return mapped;
       });
     }
 
-    // For selector functions, rows are already in the correct shape
-    // Just apply any type mappers needed
-    return rows.map(row => {
-      const mapped: any = {};
-      for (const [key, value] of Object.entries(row)) {
-        if (fragmentMappers?.has(key)) {
-          const fragmentMapper = fragmentMappers.get(key);
-          mapped[key] = fragmentMapper?.fromDriver ? fragmentMapper.fromDriver(value) : value;
-          continue;
-        }
-
-        // Try to find column by alias or name
-        const colEntry = [...getSchemaColumnMeta(this.schema)].find(([propName, meta]) => {
-          return propName === key || meta.name === key;
-        });
-
-        if (colEntry) {
-          const [, meta] = colEntry;
-          // Apply fromDriver mapper if present
-          mapped[key] = meta.mapper ? meta.mapper.fromDriver(value) : value;
-        } else {
-          mapped[key] = value;
-        }
-      }
-      return mapped;
-    });
+    return readReturningRows(rows, read, this.schemaRegistry);
   }
 
   /**
@@ -4274,80 +4916,122 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     // Analyze the returning selector
-    const mockRow = this._createMockRow();
-    const selectedMock = materializeMockSelection(this.selector(mockRow));
-    const selection = returning(selectedMock as TSelection);
+    const { selection } = this.evaluateReturning(returning);
 
-    if (typeof selection !== 'object' || selection === null) {
-      return null;
-    }
+    // Joined under the navigation plan of the selection; buildReturningWithNavigation renders a
+    // second evaluation of the same selector under the same (deterministic) plan
+    return this.withNavigationPlan(selection, undefined, () => this.resolveReturningNavigation(selection));
+  }
 
+  /** The body of {@link detectNavigationInReturning}, run under the selection's navigation plan. */
+  private resolveReturningNavigation(selection: any): {
+    hasNavigation: boolean;
+    selection: any;
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
+    navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>;
+    nestedObjects?: Map<string, any>;
+    collectionFields?: Map<string, any>;
+  } | null {
     const navigationFields = new Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>();
     const allTableAliases = new Set<string>();
     const nestedObjects = new Map<string, any>();
     const collectionFields = new Map<string, any>();
+    let expressionReadsNavigation = false;
+
+    // A navigation of the mutated row read by a ref (of a collection, of an `sql` expression) is
+    // joined like a projected one
+    const collectNavigationRef = (ref: FieldRef): boolean => {
+      if (this.isMutatedRowColumn(ref) || isForeignChainRef(ref, this.chainId)) {
+        return false;
+      }
+
+      if (!this.collectPlannedAliases(ref, allTableAliases)) {
+        const refAlias = (ref as any).__tableAlias;
+        if (refAlias && refAlias !== this.schema.name) {
+          allTableAliases.add(refAlias);
+        }
+        for (const navAlias of (ref as any).__navigationAliases ?? []) {
+          if (navAlias && navAlias !== this.schema.name) {
+            allTableAliases.add(navAlias);
+          }
+        }
+      }
+
+      return true;
+    };
 
     // Recursively collect field refs and table aliases from selection
     const collectFieldRefs = (obj: any, path: string = '') => {
       for (const [key, field] of Object.entries(obj)) {
         const fieldPath = path ? `${path}.${key}` : key;
+        const classified = classifyReturningValue(field, fieldPath);
 
-        if (field && typeof field === 'object') {
-          if ('__dbColumnName' in field) {
-            // Direct field reference (either main table or navigation)
-            const tableAlias = (field as any).__tableAlias as string | undefined;
-            if (tableAlias && tableAlias !== this.schema.name) {
-              // Navigation field
+        if (classified.kind === 'column') {
+          // Direct field reference (either main table or navigation)
+          const fieldRef = classified.ref as any;
+          const tableAlias = fieldRef.__tableAlias as string | undefined;
+          // A navigation of the plan collects the aliases of its whole path
+          const planned = this.collectPlannedAliases(fieldRef, allTableAliases);
+          if (tableAlias && tableAlias !== this.schema.name) {
+            // Navigation field
+            if (!planned) {
               allTableAliases.add(tableAlias);
-              navigationFields.set(fieldPath, {
-                tableAlias,
-                dbColumnName: (field as any).__dbColumnName,
-                schemaTable: (field as any).__sourceTable,
-              });
             }
-            // Also collect intermediate navigation aliases for multi-level navigation
-            if ('__navigationAliases' in field && Array.isArray((field as any).__navigationAliases)) {
-              for (const navAlias of (field as any).__navigationAliases) {
-                if (navAlias && navAlias !== this.schema.name) {
-                  allTableAliases.add(navAlias);
-                }
-              }
-            }
-          } else if (field instanceof CollectionQueryBuilder) {
-            // CollectionQueryBuilder (.toList(), .firstOrDefault())
-            collectionFields.set(fieldPath, field);
-            // Also extract the navigation path from the collection builder
-            // so we can add the necessary joins to reach the collection's source table
-            const collectionBuilder = field as any;
-            if (collectionBuilder.navigationPath && Array.isArray(collectionBuilder.navigationPath)) {
-              for (const navJoin of collectionBuilder.navigationPath) {
-                if (navJoin.alias && navJoin.alias !== this.schema.name) {
-                  allTableAliases.add(navJoin.alias);
-                }
-              }
-            }
-            // Also add the source table alias
-            if (collectionBuilder.sourceTable && collectionBuilder.sourceTable !== this.schema.name) {
-              allTableAliases.add(collectionBuilder.sourceTable);
-            }
-          } else if (field instanceof SqlFragment) {
-            // Raw SQL fragment — rendered verbatim by the plain returning-clause
-            // builder; it never implies navigation. Without this skip it would
-            // fall into the nested-object branch and derail the whole selector
-            // onto the CTE navigation path. (v1: FieldRefs inside returning
-            // fragments are unsupported — reference columns as raw quoted SQL.)
-          } else if (!Array.isArray(field)) {
-            // Nested plain object - recurse into it
-            nestedObjects.set(fieldPath, field);
-            collectFieldRefs(field, fieldPath);
+            navigationFields.set(fieldPath, {
+              tableAlias,
+              dbColumnName: fieldRef.__dbColumnName,
+              schemaTable: fieldRef.__sourceTable,
+            });
           }
+          // Also collect intermediate navigation aliases for multi-level navigation
+          if (!planned && Array.isArray(fieldRef.__navigationAliases)) {
+            for (const navAlias of fieldRef.__navigationAliases) {
+              if (navAlias && navAlias !== this.schema.name) {
+                allTableAliases.add(navAlias);
+              }
+            }
+          }
+        } else if (classified.kind === 'collection') {
+          // CollectionQueryBuilder (.toList(), .firstOrDefault())
+          collectionFields.set(fieldPath, field);
+          // Also extract the navigation path from the collection builder
+          // so we can add the necessary joins to reach the collection's source table
+          const collectionBuilder = field as any;
+          if (collectionBuilder.navigationPath && Array.isArray(collectionBuilder.navigationPath)) {
+            for (const navJoin of collectionBuilder.navigationPath) {
+              if (navJoin.alias && navJoin.alias !== this.schema.name) {
+                allTableAliases.add(navJoin.alias);
+              }
+            }
+          }
+          // Also add the source table alias
+          if (collectionBuilder.sourceTable && collectionBuilder.sourceTable !== this.schema.name) {
+            allTableAliases.add(collectionBuilder.sourceTable);
+          }
+          // A navigation of the mutated row the collection reads (in its WHERE, projection or
+          // ORDER BY) is joined here like a projected one
+          if (field instanceof CollectionQueryBuilder) {
+            for (const ref of field.getOuterFieldRefs()) {
+              collectNavigationRef(ref);
+            }
+          }
+        } else if (classified.kind === 'expression') {
+          // An `sql` expression (or condition) reading a navigation renders from the navigation
+          // RETURNING's CTE — the plain RETURNING has no join for it ("missing FROM-clause entry")
+          for (const ref of classified.fragment.getFieldRefs()) {
+            expressionReadsNavigation = collectNavigationRef(ref) || expressionReadsNavigation;
+          }
+        } else if (classified.kind === 'nested') {
+          // Nested plain object - recurse into it
+          nestedObjects.set(fieldPath, field);
+          collectFieldRefs(field, fieldPath);
         }
       }
     };
 
     collectFieldRefs(selection);
 
-    if (navigationFields.size === 0 && nestedObjects.size === 0 && collectionFields.size === 0) {
+    if (navigationFields.size === 0 && nestedObjects.size === 0 && collectionFields.size === 0 && !expressionReadsNavigation) {
       return null;
     }
 
@@ -4373,15 +5057,33 @@ export class SelectQueryBuilder<TSelection> {
       nestedObjects?: Map<string, any>;
       collectionFields?: Map<string, any>;
     }
-  ): { sql: string; params: any[]; nestedPaths?: Set<string> } {
+  ): { sql: string; params: any[]; nestedPaths?: Set<string>; read: ReturningReadPlan } {
+    const { selection, scalar } = this.evaluateReturning(returning as (row: TSelection) => TResult);
+
+    // The navigation plan detectNavigationInReturning resolved navigationInfo.joins under — the
+    // plan is a function of the selection's shape, so this evaluation gets the same aliases
+    return this.withNavigationPlan(selection, undefined, () => this.renderReturningWithNavigation(mutationSql, mutationParams, selection, scalar, navigationInfo));
+  }
+
+  /** The body of {@link buildReturningWithNavigation}, run under the selection's navigation plan. */
+  private renderReturningWithNavigation(
+    mutationSql: string,
+    mutationParams: any[],
+    selection: any,
+    scalar: boolean,
+    navigationInfo: {
+      selection: any;
+      joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
+      navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>;
+      nestedObjects?: Map<string, any>;
+      collectionFields?: Map<string, any>;
+    }
+  ): { sql: string; params: any[]; nestedPaths?: Set<string>; read: ReturningReadPlan } {
     // Build the CTE wrapping the mutation
     // First, collect all columns needed from the main table in the mutation's RETURNING
     const mainTableColumns = new Set<string>();
     const selectParts: string[] = [];
     const nestedPaths = new Set<string>();
-    const mockRow = this._createMockRow();
-    const selectedMock = materializeMockSelection(this.selector(mockRow));
-    const selection = (returning as Function)(selectedMock as TSelection);
 
     // Helper to get FK db column name from a schema
     const getFkDbColumnName = (sourceSchema: TableSchema, fkPropName: string): string => {
@@ -4400,14 +5102,6 @@ export class SelectQueryBuilder<TSelection> {
       aliasToSourceTable.set(join.alias, join.targetTable);
     }
 
-    // Build a map of table name -> alias for collection subquery rewriting
-    // This allows us to rewrite collection subqueries to use the correct joined aliases
-    const tableToAlias = new Map<string, string>();
-    tableToAlias.set(this.schema.name, '__mutation__'); // Main table uses mutation CTE
-    for (const join of navigationInfo.joins) {
-      tableToAlias.set(join.targetTable, join.alias);
-    }
-
     // Track collection subqueries for LATERAL JOINs
     const collectionSubqueries: Array<{
       fieldPath: string;
@@ -4420,77 +5114,138 @@ export class SelectQueryBuilder<TSelection> {
     const allParams = [...mutationParams];
     let currentParamCounter = mutationParams.length + 1;
 
-    // Build a QueryContext for collection subquery building
+    // Build a QueryContext for collection subquery building. The mutated row is the "__mutation__"
+    // CTE: a collection correlates to it under that name, through the lateral alias map every
+    // correlation (and the first hop of a path it hangs off) already resolves the root table by. The
+    // collection's SQL used to be rewritten afterwards, table name → alias, which also rewrote the
+    // tables of subqueries NESTED in it (an exists() over the root table, or over a joined table's)
+    // and was ambiguous for two joins to one table.
     const buildCollectionContext = (): QueryContext => ({
       ctes: new Map(),
       cteCounter: lateralCounter,
       paramCounter: currentParamCounter,
       allParams: allParams,
       collectionStrategy: 'lateral',
+      lateralTableAliasMap: new Map([[this.schema.name, '__mutation__']]),
     });
 
-    // Recursively process selection to build SELECT parts
-    const processSelection = (obj: any, path: string = '') => {
-      for (const [key, field] of Object.entries(obj)) {
-        const fieldPath = path ? `${path}.${key}` : key;
+    // A column of the mutated row reads off the CTE, which returns it
+    const mutationColumnSql = (ref: FieldRef): string => {
+      mainTableColumns.add(ref.__dbColumnName);
 
-        if (field && typeof field === 'object') {
-          if ('__dbColumnName' in field) {
-            // Direct field reference
-            const tableAlias = (field as any).__tableAlias as string;
-            const dbColumnName = (field as any).__dbColumnName as string;
-
-            if (!tableAlias || tableAlias === this.schema.name) {
-              mainTableColumns.add(dbColumnName);
-              selectParts.push(`"__mutation__"."${dbColumnName}" AS "${fieldPath}"`);
-            } else {
-              selectParts.push(`"${tableAlias}"."${dbColumnName}" AS "${fieldPath}"`);
-            }
-          } else if (field instanceof CollectionQueryBuilder) {
-            // CollectionQueryBuilder (.toList(), .firstOrDefault())
-            // Build a correlated subquery that references joined tables from the main query
-            const collectionBuilder = field as CollectionQueryBuilder<any>;
-            const context = buildCollectionContext();
-
-            // Build the CTE/subquery using lateral strategy
-            const cteResult = collectionBuilder.buildCTE(context);
-            lateralCounter = context.cteCounter;
-            currentParamCounter = context.paramCounter; // Track new param index after collection subquery
-
-            // The lateral strategy returns either:
-            // 1. A correlated subquery in selectExpression (no join needed)
-            // 2. A LATERAL JOIN with joinClause and selectExpression
-            if (cteResult.joinClause && cteResult.joinClause.trim()) {
-              // LATERAL JOIN needed - rewrite all table references to use correct aliases
-              const rewrittenJoinClause = this.rewriteCollectionTableReferences(
-                cteResult.joinClause,
-                tableToAlias
-              );
-              collectionSubqueries.push({
-                fieldPath,
-                lateralAlias: cteResult.tableName || `lateral_${lateralCounter - 1}`,
-                joinClause: rewrittenJoinClause,
-                selectExpression: cteResult.selectExpression || `"${cteResult.tableName}".data`,
-              });
-              selectParts.push(`${cteResult.selectExpression || `"${cteResult.tableName}".data`} AS "${fieldPath}"`);
-            } else if (cteResult.selectExpression) {
-              // Correlated subquery in SELECT - rewrite all table references
-              const rewrittenExpr = this.rewriteCollectionTableReferences(
-                cteResult.selectExpression,
-                tableToAlias
-              );
-              selectParts.push(`${rewrittenExpr} AS "${fieldPath}"`);
-            }
-          } else if (!Array.isArray(field)) {
-            // Nested plain object - recurse into it and mark as nested path
-            nestedPaths.add(fieldPath);
-            processSelection(field, fieldPath);
-          }
-        }
-      }
+      return `"__mutation__"."${ref.__dbColumnName}"`;
     };
 
-    processSelection(selection);
+    // Recursively process selection to build SELECT parts — and the shape the rows are read by
+    const processSelection = (obj: any, path: string = ''): ReturningShape => {
+      const shape: ReturningShape = [];
+
+      for (const [key, field] of Object.entries(obj)) {
+        const fieldPath = path ? `${path}.${key}` : key;
+        const classified = classifyReturningValue(field, fieldPath);
+
+        if (classified.kind === 'constant') {
+          // A literal reads back as it is — it used to be dropped from the row
+          shape.push({ key, read: { kind: 'constant', value: classified.value } });
+        } else if (classified.kind === 'expression') {
+          // Columns of the mutated row read off the CTE; a navigation's, off its join
+          const context: SqlBuildContext = {
+            paramCounter: currentParamCounter,
+            params: allParams,
+            lateralTableAliasMap: new Map([[this.schema.name, '__mutation__']]),
+          };
+          const expressionSql = renderReturningExpression(classified.fragment, context, ref => this.isMutatedRowColumn(ref), mutationColumnSql);
+          currentParamCounter = context.paramCounter;
+          selectParts.push(`${expressionSql} AS "${fieldPath}"`);
+          shape.push({ key, read: { kind: 'value', column: fieldPath, mapper: fragmentReadMapper(classified.fragment) } });
+        } else if (classified.kind === 'column') {
+          // Direct field reference
+          const tableAlias = (field as any).__tableAlias as string;
+          const dbColumnName = (field as any).__dbColumnName as string;
+
+          if (this.isMutatedRowColumn(classified.ref)) {
+            selectParts.push(`${mutationColumnSql(classified.ref)} AS "${fieldPath}"`);
+          } else {
+            selectParts.push(`"${tableAlias}"."${dbColumnName}" AS "${fieldPath}"`);
+          }
+
+          shape.push({ key, read: { kind: 'value', column: fieldPath, mapper: this.returningColumnMapper(classified.ref) } });
+        } else if (classified.kind === 'collection') {
+          if (!(field instanceof CollectionQueryBuilder)) {
+            throw new Error(`RETURNING field "${fieldPath}" is a collection result this RETURNING cannot build`);
+          }
+
+          // CollectionQueryBuilder (.toList(), .firstOrDefault())
+          // Build a correlated subquery that references joined tables from the main query
+          const collectionBuilder = field as CollectionQueryBuilder<any>;
+          const context = buildCollectionContext();
+
+          // A column of the mutated row the collection reads renders under "__mutation__" as well,
+          // for the build — and the CTE returns it
+          const mutatedRowRefs = collectionBuilder.getOuterFieldRefs()
+            .filter(ref => (ref as any).__tableAlias === this.schema.name && !isForeignChainRef(ref, this.chainId));
+          for (const ref of mutatedRowRefs) {
+            mainTableColumns.add(ref.__dbColumnName);
+            (ref as any).__tableAlias = '__mutation__';
+          }
+
+          // Build the CTE/subquery using lateral strategy. A collection hanging off a path the plan
+          // renders under a path alias joins that path itself — bound by name, its correlated form
+          // would read the other path's join (see buildProjectedCollection)
+          let cteResult: ReturnType<CollectionQueryBuilder<any>['buildCTE']>;
+          try {
+            cteResult = collectionBuilder.buildCTE(
+              context,
+              undefined,
+              undefined,
+              CollectionQueryBuilder.pathRenamedIn(collectionBuilder, this.navigationPlan, this.schema.name)
+            );
+          } finally {
+            for (const ref of mutatedRowRefs) {
+              (ref as any).__tableAlias = this.schema.name;
+            }
+          }
+          lateralCounter = context.cteCounter;
+          currentParamCounter = context.paramCounter; // Track new param index after collection subquery
+
+          // The mapping reads what the build learned about the collection (a collection selecting
+          // ONE value unwraps its items) off the builder that was built
+          navigationInfo.collectionFields?.set(fieldPath, collectionBuilder);
+
+          // The lateral strategy returns either:
+          // 1. A correlated subquery in selectExpression (no join needed)
+          // 2. A LATERAL JOIN with joinClause and selectExpression
+          if (cteResult.joinClause && cteResult.joinClause.trim()) {
+            collectionSubqueries.push({
+              fieldPath,
+              lateralAlias: cteResult.tableName || `lateral_${lateralCounter - 1}`,
+              joinClause: cteResult.joinClause,
+              selectExpression: cteResult.selectExpression || `"${cteResult.tableName}".data`,
+            });
+            selectParts.push(`${cteResult.selectExpression || `"${cteResult.tableName}".data`} AS "${fieldPath}"`);
+          } else if (cteResult.selectExpression) {
+            // Correlated subquery in SELECT
+            selectParts.push(`${cteResult.selectExpression} AS "${fieldPath}"`);
+          }
+
+          // Its items read through their columns' mappers, as a SELECT reads them
+          shape.push({ key, read: { kind: 'collection', column: fieldPath, collection: collectionBuilder } });
+        } else if (classified.kind === 'nested') {
+          // Nested plain object - recurse into it and mark as nested path
+          nestedPaths.add(fieldPath);
+          shape.push({ key, read: { kind: 'nested', shape: processSelection(field, fieldPath) } });
+        }
+      }
+
+      return shape;
+    };
+
+    const shape = processSelection(selection);
+
+    if (selectParts.length === 0) {
+      // Only literals: the statement still yields one row per mutated row
+      selectParts.push(`NULL AS "${RETURNING_PLACEHOLDER_COLUMN}"`);
+    }
 
     // Include foreign keys needed for joins - only for joins from main table
     for (const join of navigationInfo.joins) {
@@ -4517,8 +5272,12 @@ export class SelectQueryBuilder<TSelection> {
       }
     }
 
-    // Build RETURNING clause for CTE with all needed columns from main table
-    const cteReturningCols = Array.from(mainTableColumns).map(col => `"${col}"`).join(', ');
+    // Build RETURNING clause for CTE with all needed columns from main table. Qualified by the table:
+    // a WHERE reading a navigation joins it into the statement (UPDATE … FROM / DELETE … USING), and a
+    // bare column that table has too ("id") was ambiguous
+    const cteReturningCols = mainTableColumns.size > 0
+      ? Array.from(mainTableColumns).map(col => `"${this.schema.name}"."${col}"`).join(', ')
+      : `NULL AS "${RETURNING_PLACEHOLDER_COLUMN}"`;
 
     // Add RETURNING to the mutation SQL for CTE
     const mutationWithReturning = `${mutationSql} RETURNING ${cteReturningCols}`;
@@ -4571,117 +5330,7 @@ SELECT ${selectParts.join(', ')}
 FROM "__mutation__"
 ${joinClauses.join('\n')}`;
 
-    return { sql, params: allParams, nestedPaths };
-  }
-
-  /**
-   * Rewrite table references in a collection subquery to use the correct aliases
-   * from the main query's JOINs. This handles multi-level navigation where the
-   * collection is accessed through intermediate joined tables.
-   *
-   * @param expression - The SQL expression (join clause or select expression) to rewrite
-   * @param tableToAlias - Map of table names to their aliases in the main query
-   * @returns The rewritten expression with all table references updated
-   * @internal
-   */
-  private rewriteCollectionTableReferences(
-    expression: string,
-    tableToAlias: Map<string, string>
-  ): string {
-    let result = expression;
-
-    // Rewrite each table reference to use the correct alias
-    // Pattern: "tableName"."columnName" -> "alias"."columnName"
-    for (const [tableName, alias] of tableToAlias) {
-      const pattern = new RegExp(`"${tableName}"\\."`, 'g');
-      result = result.replace(pattern, `"${alias}"."`);
-    }
-
-    return result;
-  }
-
-  /**
-   * Map RETURNING results with navigation properties
-   * Applies type mappers based on source table schemas
-   * Reconstructs nested objects from flat column paths
-   * @internal
-   */
-  private mapReturningResultsWithNavigation<TResult>(
-    rows: any[],
-    returning: (row: TSelection) => TResult,
-    navigationFields: Map<string, { tableAlias: string; dbColumnName: string; schemaTable?: string }>,
-    nestedPaths?: Set<string>
-  ): any[] {
-    return rows.map(row => {
-      const mapped: any = {};
-
-      for (const [key, value] of Object.entries(row)) {
-        // Handle nested paths (e.g., "borrower.id" -> { borrower: { id: value } })
-        if (key.includes('.')) {
-          const parts = key.split('.');
-          let current = mapped;
-          for (let i = 0; i < parts.length - 1; i++) {
-            if (!current[parts[i]]) {
-              current[parts[i]] = {};
-            }
-            current = current[parts[i]];
-          }
-          const finalKey = parts[parts.length - 1];
-
-          // Check if this is a navigation field
-          const navInfo = navigationFields.get(key);
-          if (navInfo && navInfo.schemaTable && this.schemaRegistry) {
-            const targetSchema = this.schemaRegistry.get(navInfo.schemaTable);
-            if (targetSchema) {
-              const colEntry = Object.entries(targetSchema.columns).find(([_, col]) => {
-                const config = (col as any).build();
-                return config.name === navInfo.dbColumnName;
-              });
-              if (colEntry) {
-                const config = (colEntry[1] as any).build();
-                current[finalKey] = config.mapper ? config.mapper.fromDriver(value) : value;
-                continue;
-              }
-            }
-          }
-          current[finalKey] = value;
-        } else {
-          // Check if this is a navigation field
-          const navInfo = navigationFields.get(key);
-          if (navInfo && navInfo.schemaTable && this.schemaRegistry) {
-            // Try to get mapper from the navigation target's schema
-            const targetSchema = this.schemaRegistry.get(navInfo.schemaTable);
-            if (targetSchema) {
-              // Find the column and its mapper
-              const colEntry = Object.entries(targetSchema.columns).find(([_, col]) => {
-                const config = (col as any).build();
-                return config.name === navInfo.dbColumnName;
-              });
-              if (colEntry) {
-                const config = (colEntry[1] as any).build();
-                mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-                continue;
-              }
-            }
-          }
-
-          // Try to find column by alias or name in main schema
-          const colEntry = Object.entries(this.schema.columns).find(([propName, col]) => {
-            const config = (col as any).build();
-            return propName === key || config.name === key;
-          });
-
-          if (colEntry) {
-            const [, col] = colEntry;
-            const config = (col as any).build();
-            mapped[key] = config.mapper ? config.mapper.fromDriver(value) : value;
-          } else {
-            mapped[key] = value;
-          }
-        }
-      }
-      return mapped;
-    });
+    return { sql, params: allParams, nestedPaths, read: { shape, scalar } };
   }
 
   /**
@@ -5028,77 +5677,93 @@ ${joinClauses.join('\n')}`;
       return false;
     }
 
-    // First pass: check if this object contains any CollectionQueryBuilder instances
-    // If so, this is NOT a plain nested object and needs special handling elsewhere
-    for (const [, nestedValue] of entries) {
-      if (nestedValue instanceof CollectionQueryBuilder) {
-        return false; // Contains collections - let the main loop handle this
-      }
-      if (nestedValue && typeof nestedValue === 'object' && '__collectionResult' in nestedValue) {
-        return false; // Contains collection result marker
-      }
+    // A collection at ANY depth takes the caller's collection-aware path — decided before anything
+    // is emitted. A collection found half-way used to return false after the siblings' columns were
+    // already in the SELECT list.
+    if (this.hasNestedCollections(obj)) {
+      return false;
     }
 
     // Track this path as a nested object
     nestedPaths.add(pathPrefix);
 
     for (const [nestedKey, nestedValue] of entries) {
-      const fieldPath = `${pathPrefix}__${nestedKey}`;
-
-      if (nestedValue instanceof SqlFragment) {
-        // SQL Fragment - build the SQL expression
-        const sqlBuildContext = {
-          paramCounter: context.paramCounter,
-          params: context.allParams,
-        };
-        const fragmentSql = nestedValue.buildSql(sqlBuildContext);
-        context.paramCounter = sqlBuildContext.paramCounter;
-        selectParts.push(`${fragmentSql} as "${fieldPath}"`);
-      } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
-        // FieldRef - extract table alias and column name
-        const tableAlias = ('__tableAlias' in nestedValue && nestedValue.__tableAlias)
-          ? nestedValue.__tableAlias as string
-          : this.schema.name;
-        const columnName = nestedValue.__dbColumnName as string;
-
-        // Add JOIN if needed for navigation fields
-        if (tableAlias !== this.schema.name) {
-          const relConfig = this.relationForRef(nestedValue, tableAlias);
-          if (relConfig && !joins.find(j => j.alias === tableAlias)) {
-            let targetSchema: string | undefined;
-            if (relConfig.targetTableBuilder) {
-              const targetTableSchema = relConfig.targetTableBuilder.build();
-              targetSchema = targetTableSchema.schema;
-            }
-            joins.push({
-              alias: tableAlias,
-              targetTable: relConfig.targetTable,
-              targetSchema,
-              foreignKeys: relConfig.foreignKeys || [relConfig.foreignKey || ''],
-              matches: relConfig.matches || [],
-              isMandatory: relConfig.isMandatory ?? false,
-            });
-          }
-        }
-
-        selectParts.push(`"${tableAlias}"."${columnName}" as "${fieldPath}"`);
-      } else if (typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)) {
-        // Recursively handle deeper nested objects
-        const handled = this.tryBuildFlatNestedSelect(nestedValue, context, joins, selectParts, fieldPath, nestedPaths);
-        if (!handled) {
-          // Not a valid nested object structure - return false to let caller handle
-          return false;
-        }
-      } else if (nestedValue === undefined || nestedValue === null) {
-        selectParts.push(`NULL as "${fieldPath}"`);
-      } else {
-        // Literal value (string, number, boolean)
-        selectParts.push(`$${context.paramCounter++} as "${fieldPath}"`);
-        context.allParams.push(nestedValue);
-      }
+      this.renderFlatNestedLeaf(nestedValue, `${pathPrefix}__${nestedKey}`, context, joins, selectParts, (inner, innerPath) => {
+        // An empty nested object has no column to read (and is left out)
+        this.tryBuildFlatNestedSelect(inner, context, joins, selectParts, innerPath, nestedPaths);
+      });
     }
 
     return true;
+  }
+
+  /**
+   * One value of a flattened nested object: an `sql` expression (a subquery renders as one), a
+   * column (its navigation joined), NULL, a nested object flattened further by `recurse` (a
+   * navigation row projected whole flattens as its columns), or a value bound as a parameter — a
+   * Date or any class instance included. A Date used to be walked as a nested object: with no own
+   * keys it made the whole object fall off the flat path after its siblings' columns were emitted,
+   * and the object was then bound as ONE parameter, mock column refs and all.
+   */
+  private renderFlatNestedLeaf(
+    nestedValue: unknown,
+    fieldPath: string,
+    context: QueryContext,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>,
+    selectParts: string[],
+    recurse: (inner: Record<string, unknown>, fieldPath: string) => void
+  ): void {
+    if (nestedValue instanceof SqlFragment || nestedValue instanceof Subquery) {
+      // SQL Fragment - build the SQL expression
+      const sqlBuildContext = {
+        paramCounter: context.paramCounter,
+        params: context.allParams,
+      };
+      const fragment = nestedValue instanceof SqlFragment ? nestedValue : new SqlFragment(['', ''], [nestedValue]);
+      const fragmentSql = fragment.buildSql(sqlBuildContext);
+      context.paramCounter = sqlBuildContext.paramCounter;
+      selectParts.push(`${fragmentSql} as "${fieldPath}"`);
+    } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
+      // FieldRef - extract table alias and column name
+      const ref = nestedValue as any;
+      const tableAlias = ref.__tableAlias ? ref.__tableAlias as string : this.schema.name;
+      const columnName = ref.__dbColumnName as string;
+
+      // Add JOIN if needed for navigation fields
+      if (tableAlias !== this.schema.name) {
+        const relConfig = this.relationForRef(ref, tableAlias);
+        if (relConfig && !joins.find(j => j.alias === tableAlias)) {
+          let targetSchema: string | undefined;
+          if (relConfig.targetTableBuilder) {
+            const targetTableSchema = relConfig.targetTableBuilder.build();
+            targetSchema = targetTableSchema.schema;
+          }
+          joins.push({
+            alias: tableAlias,
+            targetTable: relConfig.targetTable,
+            targetSchema,
+            foreignKeys: relConfig.foreignKeys || [relConfig.foreignKey || ''],
+            matches: relConfig.matches || [],
+            isMandatory: relConfig.isMandatory ?? false,
+          });
+        }
+      }
+
+      selectParts.push(`"${tableAlias}"."${columnName}" as "${fieldPath}"`);
+    } else if (nestedValue === undefined || nestedValue === null) {
+      selectParts.push(`NULL as "${fieldPath}"`);
+    } else if (typeof nestedValue === 'object' && isReferenceMockRow(nestedValue)) {
+      // A navigation row projected whole: its columns
+      recurse(materializeMockSelection(nestedValue), fieldPath);
+    } else if (isPlainNestedProjection(nestedValue)) {
+      // Recursively handle deeper nested objects
+      recurse(nestedValue, fieldPath);
+    } else {
+      // Literal value (string, number, boolean, Date, a list of values) — a list of columns has no
+      // one SQL value: it used to be bound as a parameter, the mock column refs serialized into it
+      assertProjectionArrayOfValues(nestedValue, fieldPath.substring('__nested__'.length).split('__').join('.'), 'select()');
+      selectParts.push(`${projectionLiteralSql(nestedValue, context)} as "${fieldPath}"`);
+    }
   }
 
   /**
@@ -5106,7 +5771,9 @@ ${joinClauses.join('\n')}`;
    * Transforms { "__nested__address__street": "Main St", "__nested__address__city": "NYC" }
    * into { address: { street: "Main St", city: "NYC" } }
    * Also handles nested collections with paths like "__nested__content__posts"
-   * Converts numeric strings to numbers for scalar aggregation results.
+   * Values are left as the driver read them: each is read through its own field's read by
+   * transformResults (a count's numeric string becomes a number there, a text column's '01234' stays
+   * text — every nested numeric-looking string used to become a number here).
    */
   private reconstructNestedObjects(row: any, nestedPaths: Set<string>): any {
     if (nestedPaths.size === 0) {
@@ -5128,13 +5795,7 @@ ${joinClauses.join('\n')}`;
           }
           current = current[part];
         }
-        // Convert numeric strings to numbers (for scalar aggregations like COUNT)
-        // This handles values like "2" -> 2, "3.14" -> 3.14
-        let finalValue = value;
-        if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) {
-          finalValue = +value;
-        }
-        current[pathParts[pathParts.length - 1]] = finalValue;
+        current[pathParts[pathParts.length - 1]] = value;
       } else {
         // Regular field
         result[key] = value;
@@ -5180,7 +5841,7 @@ ${joinClauses.join('\n')}`;
     selectParts: string[],
     pathPrefix: string,
     nestedPaths: Set<string>,
-    collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }>
+    collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string; parentKey?: string }>
   ): void {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
       return;
@@ -5195,7 +5856,7 @@ ${joinClauses.join('\n')}`;
       // Check if this is a collection - handle it separately
       if (nestedValue instanceof CollectionQueryBuilder || (nestedValue && typeof nestedValue === 'object' && '__collectionResult' in nestedValue)) {
         // Build CTE for collection and add to collectionFields
-        const cteData = (nestedValue as any).buildCTE ? (nestedValue as any).buildCTE(context) : (nestedValue as CollectionQueryBuilder<any>).buildCTE(context);
+        const cteData = this.buildProjectedCollection(nestedValue, context);
         const isCTE = cteData.isCTE !== false;
 
         collectionFields.push({
@@ -5204,63 +5865,145 @@ ${joinClauses.join('\n')}`;
           isCTE,
           joinClause: cteData.joinClause,
           selectExpression: cteData.selectExpression,
+          parentKey: cteData.parentKey,
         });
         continue;
       }
 
-      if (nestedValue instanceof SqlFragment) {
-        // SQL Fragment - build the SQL expression
-        const sqlBuildContext = {
-          paramCounter: context.paramCounter,
-          params: context.allParams,
-        };
-        const fragmentSql = nestedValue.buildSql(sqlBuildContext);
-        context.paramCounter = sqlBuildContext.paramCounter;
-        selectParts.push(`${fragmentSql} as "${fieldPath}"`);
-      } else if (typeof nestedValue === 'object' && nestedValue !== null && '__dbColumnName' in nestedValue) {
-        // FieldRef - extract table alias and column name
-        const tableAlias = ('__tableAlias' in nestedValue && nestedValue.__tableAlias)
-          ? nestedValue.__tableAlias as string
-          : this.schema.name;
-        const columnName = nestedValue.__dbColumnName as string;
+      this.renderFlatNestedLeaf(nestedValue, fieldPath, context, joins, selectParts, (inner, innerPath) => {
+        this.tryBuildFlatNestedSelectExcludingCollections(inner, context, joins, selectParts, innerPath, nestedPaths, collectionFields);
+      });
+    }
+  }
 
-        // Add JOIN if needed for navigation fields
-        if (tableAlias !== this.schema.name) {
-          const relConfig = this.relationForRef(nestedValue, tableAlias);
-          if (relConfig && !joins.find(j => j.alias === tableAlias)) {
-            let targetSchema: string | undefined;
-            if (relConfig.targetTableBuilder) {
-              const targetTableSchema = relConfig.targetTableBuilder.build();
-              targetSchema = targetTableSchema.schema;
-            }
-            joins.push({
-              alias: tableAlias,
-              targetTable: relConfig.targetTable,
-              targetSchema,
-              foreignKeys: relConfig.foreignKeys || [relConfig.foreignKey || ''],
-              matches: relConfig.matches || [],
-              isMandatory: relConfig.isMandatory ?? false,
-            });
-          }
-        }
+  /**
+   * Runs one build under the navigation plan of `selection` (the projection, when the build has one),
+   * `condition` (its WHERE) and `extraRefs`: every reference-navigation path they traverse is joined
+   * on its own parent, and the refs of a path that lost its plain alias to another path ending in the
+   * same relation name render under a path alias until `build` returns. See NavigationAliasPlan.
+   */
+  private withNavigationPlan<T>(
+    selection: unknown,
+    condition: Condition | undefined,
+    build: () => T,
+    extraRefs?: readonly unknown[]
+  ): T {
+    const plan = new NavigationAliasPlan(this.schema, this.schema.name, this.schemaRegistry, this.chainId);
+    const collectionPaths: string[][] = [];
+    this.addSelectionToNavigationPlan(selection, plan, collectionPaths);
 
-        selectParts.push(`"${tableAlias}"."${columnName}" as "${fieldPath}"`);
-      } else if (typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)) {
-        // Recursively handle deeper nested objects
-        this.tryBuildFlatNestedSelectExcludingCollections(nestedValue, context, joins, selectParts, fieldPath, nestedPaths, collectionFields);
-      } else if (nestedValue === undefined || nestedValue === null) {
-        selectParts.push(`NULL as "${fieldPath}"`);
-      } else {
-        // Literal value (string, number, boolean)
-        selectParts.push(`$${context.paramCounter++} as "${fieldPath}"`);
-        context.allParams.push(nestedValue);
+    if (condition) {
+      for (const ref of condition.getFieldRefs()) {
+        plan.addRef(ref);
       }
+    }
+
+    if (extraRefs) {
+      for (const ref of extraRefs) {
+        plan.addRef(ref);
+      }
+    }
+
+    // After every ref: at equal depth, a path a field reads keeps the plain alias
+    for (const path of collectionPaths) {
+      plan.addPath(path);
+    }
+
+    const sealed = plan.seal();
+    const previous = this.navigationPlan;
+    this.navigationPlan = sealed;
+    const restore = sealed?.apply();
+
+    try {
+      return build();
+    } finally {
+      restore?.();
+      this.navigationPlan = previous;
+    }
+  }
+
+  /**
+   * Records the navigation paths a projection traverses: its field refs, the refs inside its `sql`
+   * fragments and nested objects, and navigation rows projected whole (which render from the table
+   * their first column's ref names). Collections and subqueries plan their own; the path a collection
+   * hangs off (when it starts at the root) goes to `collectionPaths`.
+   */
+  private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan, collectionPaths: string[][]): void {
+    if (value === null || typeof value !== 'object') {
+      return;
+    }
+
+    if ('__dbColumnName' in value) {
+      plan.addRef(value);
+      return;
+    }
+
+    if (value instanceof SqlFragment) {
+      for (const ref of value.getFieldRefs()) {
+        plan.addRef(ref);
+      }
+      return;
+    }
+
+    if (value instanceof CollectionQueryBuilder) {
+      // The refs by which it reads our row are ours to join (and alias)
+      for (const ref of value.getOuterFieldRefs()) {
+        plan.addRef(ref);
+      }
+
+      const path = value.getNavigationPath();
+
+      if (path.length > 0 && path[0].sourceAlias === this.schema.name) {
+        collectionPaths.push(path.map(step => step.alias));
+      }
+      return;
+    }
+
+    if (Array.isArray(value) || value instanceof ReferenceQueryBuilder || value instanceof Subquery) {
+      return;
+    }
+
+    // A navigation row projected whole renders as its columns: each is a ref of its path (a path
+    // alias renames them all — naming only the first left the others under the plain alias)
+    if (isReferenceMockRow(value)) {
+      const columns = materializeMockSelection(value);
+
+      for (const key in columns) {
+        plan.addRef(columns[key]);
+      }
+      return;
+    }
+
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        this.addSelectionToNavigationPlan((value as any)[key], plan, collectionPaths);
+      }
+    }
+  }
+
+  /** Adds the joins of a planned navigation hop and of every hop above it, each on its own parent. */
+  private addPlannedJoins(
+    node: NavigationPathNode,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
+  ): void {
+    if (node.parent !== undefined) {
+      this.addPlannedJoins(node.parent, joins);
+    }
+
+    if (!joins.some(join => join.alias === node.alias)) {
+      joins.push(this.navigationPlan!.joinOf(node));
     }
   }
 
   private detectAndAddJoinsFromSelection(selection: any, joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>): void {
     if (!selection || typeof selection !== 'object') {
       return;
+    }
+
+    // A selector returning one column or expression: its navigations are joined like a field's
+    // (`e => e.book.name` used to render without the join — "missing FROM-clause entry")
+    if (isScalarSelection(selection)) {
+      selection = { value: selection };
     }
 
     // Navigations of a manually joined table name their joins themselves — added first, verbatim
@@ -5272,6 +6015,95 @@ ${joinClauses.join('\n')}`;
 
     // Second pass: resolve all joins through the schema graph
     this.resolveJoinsForTableAliases(allTableAliases, joins);
+  }
+
+  /**
+   * Builds a projected collection. When the build's navigation plan renders the last hop of the path
+   * the collection hangs off under another alias (another path owns the relation name), the collection
+   * must not correlate to the root's join of that name — see CollectionQueryBuilder.buildCTE.
+   */
+  private buildProjectedCollection(value: any, context: QueryContext): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string; memoId?: number; parentKey?: string } {
+    const joinOwnPath = value instanceof CollectionQueryBuilder
+      && CollectionQueryBuilder.pathRenamedIn(value, this.navigationPlan, this.schema.name);
+    const built = value.buildCTE(context, undefined, undefined, joinOwnPath);
+
+    return value instanceof CollectionQueryBuilder ? { ...built, parentKey: this.collectionParentKeySql(value) } : built;
+  }
+
+  /**
+   * The parent key a CTE aggregate of `collection` joins back on: the collection's principal key
+   * column (`withPrincipalKey`, `id` by default) of the row it hangs off — the root row, or the last
+   * hop of the navigation path it hangs off, under that hop's (planned) alias. The CTE join used to
+   * name the root's `id` for every collection, pairing a path's aggregate with the ROOT row's id.
+   */
+  private collectionParentKeySql(collection: CollectionQueryBuilder<any>): string {
+    const qualifiedTableName = this.getQualifiedTableName(this.schema.name, this.schema.schema);
+    const key = collection.getParentKeyColumn();
+    const path = collection.getNavigationPath();
+
+    if (path.length === 0 || path[0].sourceAlias !== this.schema.name) {
+      return key === 'id' ? `${qualifiedTableName}.id` : `${qualifiedTableName}."${key}"`;
+    }
+
+    const node = this.navigationPlan?.nodeForPath(path.map(step => step.alias));
+
+    return `"${node?.alias ?? path[path.length - 1].alias}"."${key}"`;
+  }
+
+  /**
+   * Joins the navigation path of every projected collection whose SQL reads the path's last hop
+   * from THIS scope (see CollectionQueryBuilder.correlatesThroughEnclosingPath): a count, flat list
+   * or CTE / temp-table aggregate over `ln.edition.book.editions` correlates to `"book"."id"`, which
+   * used to be joined only when the projection happened to read `book` too (`missing FROM-clause
+   * entry for table "book"`).
+   */
+  private addCollectionPathJoins(
+    selection: any,
+    joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>,
+    strategy: CollectionStrategyType
+  ): void {
+    if (!selection || typeof selection !== 'object' || Array.isArray(selection) || selection instanceof SqlFragment || '__dbColumnName' in selection || isReferenceMockRow(selection)) {
+      return;
+    }
+
+    for (const key in selection) {
+      if (!Object.prototype.hasOwnProperty.call(selection, key)) {
+        continue;
+      }
+
+      const value = selection[key];
+
+      if (value instanceof CollectionQueryBuilder) {
+        const path = value.getNavigationPath();
+
+        if (path.length === 0 || path[0].sourceAlias !== this.schema.name || !value.correlatesThroughEnclosingPath(strategy)) {
+          continue;
+        }
+
+        const node = this.navigationPlan?.nodeForPath(path.map(step => step.alias));
+
+        if (node !== undefined) {
+          this.addPlannedJoins(node, joins);
+          continue;
+        }
+
+        for (const step of path) {
+          if (!joins.some(join => join.alias === step.alias)) {
+            joins.push({
+              alias: step.alias,
+              targetTable: step.targetTable,
+              targetSchema: step.targetSchema,
+              foreignKeys: step.foreignKeys,
+              matches: step.matches,
+              isMandatory: step.isMandatory,
+              sourceAlias: step.sourceAlias,
+            });
+          }
+        }
+      } else if (value && typeof value === 'object' && !(value instanceof Subquery)) {
+        this.addCollectionPathJoins(value, joins, strategy);
+      }
+    }
   }
 
   /**
@@ -5309,7 +6141,8 @@ ${joinClauses.join('\n')}`;
     selection: any,
     joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>
   ): void {
-    for (const value of Object.values(selection)) {
+    // A navigation row projected whole renders as its columns (own-property walks see none of them)
+    for (const value of Object.values(materializeMockSelection(selection))) {
       if (!value || typeof value !== 'object') {
         continue;
       }
@@ -5340,7 +6173,8 @@ ${joinClauses.join('\n')}`;
       return;
     }
 
-    for (const [_key, value] of Object.entries(selection)) {
+    // A navigation row projected whole renders as its columns (own-property walks see none of them)
+    for (const [_key, value] of Object.entries(materializeMockSelection(selection))) {
       // A ref from another chain is a correlation to an enclosing query, which already has
       // that table in scope — resolving it here would join a second copy of it into this
       // subquery. Same rule as the WHERE path; see isForeignChainRef.
@@ -5349,6 +6183,11 @@ ${joinClauses.join('\n')}`;
       }
 
       if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
+        // A navigation of the build's plan collects the aliases of its own path, in the same order
+        if (this.collectPlannedAliases(value, allTableAliases)) {
+          continue;
+        }
+
         // This is a FieldRef with a table alias
         const tableAlias = value.__tableAlias as string;
         if (tableAlias && tableAlias !== this.schema.name) {
@@ -5370,6 +6209,10 @@ ${joinClauses.join('\n')}`;
             continue;
           }
 
+          if (this.collectPlannedAliases(fieldRef, allTableAliases)) {
+            continue;
+          }
+
           if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
             const tableAlias = fieldRef.__tableAlias as string;
             if (tableAlias && tableAlias !== this.schema.name) {
@@ -5385,11 +6228,34 @@ ${joinClauses.join('\n')}`;
             }
           }
         }
-      } else if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof CollectionQueryBuilder)) {
+      } else if (value instanceof CollectionQueryBuilder) {
+        // What a projected collection reads from OUR row — a column of a navigation of ours, in its
+        // WHERE, projection or ORDER BY — must be in scope for its subquery to bind
+        this.collectTableAliasesFromSelection(value.getOuterFieldRefs(), allTableAliases);
+      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
         // Recursively check nested objects
         this.collectTableAliasesFromSelection(value, allTableAliases);
       }
     }
+  }
+
+  /**
+   * Adds the aliases of the path `ref` navigates — its own first, then its ancestors' from the root
+   * down, the order `__tableAlias` + `__navigationAliases` have always been collected in — when the
+   * build's navigation plan knows the path. False for any other ref.
+   */
+  private collectPlannedAliases(ref: unknown, allTableAliases: Set<string>): boolean {
+    const planned = this.navigationPlan?.nodeOf(ref);
+
+    if (planned === undefined) {
+      return false;
+    }
+
+    for (const alias of planned.collectOrder) {
+      allTableAliases.add(alias);
+    }
+
+    return true;
   }
 
   /**
@@ -5453,6 +6319,17 @@ ${joinClauses.join('\n')}`;
       for (const alias of allTableAliases) {
         if (resolved.has(alias) || joins.some(j => j.alias === alias)) {
           resolved.add(alias);
+          continue;
+        }
+
+        // A path of the build's navigation plan hangs off its OWN parent, once that is joined —
+        // never off whichever joined table happens to have a relation of the same name
+        const planned = this.navigationPlan?.nodeForAlias(alias);
+        if (planned !== undefined) {
+          if (planned.parent === undefined || joinedSchemas.has(planned.parent.alias)) {
+            joins.push(this.navigationPlan!.joinOf(planned));
+            resolved.add(alias);
+          }
           continue;
         }
 
@@ -5551,6 +6428,11 @@ ${joinClauses.join('\n')}`;
         continue;
       }
 
+      // A navigation of the build's plan collects the aliases of its own path
+      if (this.collectPlannedAliases(fieldRef, allTableAliases)) {
+        continue;
+      }
+
       if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
         const tableAlias = fieldRef.__tableAlias as string;
         if (tableAlias !== this.schema.name) {
@@ -5582,9 +6464,14 @@ ${joinClauses.join('\n')}`;
   }
 
   /**
-   * Build SQL query
+   * Build SQL query — under the navigation plan of the projection and the WHERE (see withNavigationPlan)
    */
   private buildQuery(selection: any, context: QueryContext): { sql: string; params: any[]; nestedPaths: Set<string> } {
+    return this.withNavigationPlan(selection, this.whereCond, () => this.buildQueryBody(selection, context), this.orderByRefs());
+  }
+
+  /** The body of {@link buildQuery}. */
+  private buildQueryBody(selection: any, context: QueryContext): { sql: string; params: any[]; nestedPaths: Set<string> } {
     // Handle user-defined CTEs first - their params need to come before main query params
     for (const cte of this.ctes) {
       context.allParams.push(...cte.params);
@@ -5592,7 +6479,7 @@ ${joinClauses.join('\n')}`;
     }
 
     const selectParts: string[] = [];
-    const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }> = [];
+    const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string; parentKey?: string }> = [];
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     const nestedPaths: Set<string> = new Set(); // Track nested object paths for JS-side reconstruction
 
@@ -5601,6 +6488,15 @@ ${joinClauses.join('\n')}`;
 
     // Scan WHERE condition for navigation property references and add JOINs
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
+
+    // ORDER BY keys read through a navigation the projection does not select are joined too
+    const orderByRefs = this.orderByRefs();
+    if (orderByRefs.length > 0) {
+      this.detectAndAddJoinsFromSelection(orderByRefs, joins);
+    }
+
+    // So is the path a projected collection correlates through
+    this.addCollectionPathJoins(selection, joins, context.collectionStrategy || 'lateral');
 
     // Repeat the shadow check now that the SELECT list has contributed its joins: the colliding
     // navigation can be named ONLY in the projection, where the WHERE-time check cannot see it.
@@ -5621,13 +6517,17 @@ ${joinClauses.join('\n')}`;
       const fragmentSql = selection.buildSql(sqlBuildContext);
       context.paramCounter = sqlBuildContext.paramCounter;
       selectParts.push(fragmentSql);
+    } else if (isScalarLiteralSelection(selection)) {
+      // A selector returning ONE literal (`() => 'x'`): one column holding it. A string used to be
+      // walked as an object of its characters, a number projected no column at all
+      selectParts.push(`${projectionLiteralSql(selection, context)} as "value"`);
     } else if (typeof selection === 'object' && selection !== null && '__dbColumnName' in selection) {
       // Single FieldRef
       const tableAlias = ('__tableAlias' in selection && selection.__tableAlias) ? selection.__tableAlias as string : this.schema.name;
       selectParts.push(`"${tableAlias}"."${selection.__dbColumnName}"`);
     } else if (selection instanceof CollectionQueryBuilder) {
       // This shouldn't happen in normal flow, but handle it
-      throw new Error('Cannot use CollectionQueryBuilder directly as selection');
+      throw new Error('select(): a collection cannot be the whole selection — project it as a field: select(row => ({ count: row.items.count() }))');
     } else {
       // Process selection object properties
       for (const key in selection) {
@@ -5639,7 +6539,7 @@ ${joinClauses.join('\n')}`;
           // Handle collection - delegate to strategy pattern via buildCTE
           // The strategy handles CTE/LATERAL specifics and returns necessary info
           this.assertJoinedCollectionStrategy(value, context);
-          const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
+          const cteData = this.buildProjectedCollection(value, context);
           const isCTE = cteData.isCTE !== false; // Default to CTE if not specified
 
           // Note: For CTE strategy, context.ctes is already populated by the strategy
@@ -5651,6 +6551,7 @@ ${joinClauses.join('\n')}`;
             isCTE,
             joinClause: cteData.joinClause,
             selectExpression: cteData.selectExpression,
+            parentKey: cteData.parentKey,
           });
         } else if (value instanceof Subquery || (value && typeof value === 'object' && 'buildSql' in value && typeof (value as any).buildSql === 'function' && '__mode' in value)) {
           // Handle Subquery - build SQL and wrap in parentheses
@@ -5714,14 +6615,32 @@ ${joinClauses.join('\n')}`;
             selectParts.push(`"${this.schema.name}"."${value.__dbColumnName}" as "${key}"`);
           }
         } else if (typeof value === 'string') {
-          // Simple column reference (for backward compatibility or direct usage)
-          selectParts.push(`"${this.schema.name}"."${value}" as "${key}"`);
+          // A string is a value, as its type says (`kind: 'loan'`) — a parameter like any other
+          // literal. It used to render as a column of that NAME: an error, or another column's data
+          // (`kind: 'name'` read the name column)
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         } else if (typeof value === 'object' && value !== null) {
           // Check if this is a navigation property mock or placeholder
           if (!('__dbColumnName' in value)) {
             // This is not a FieldRef - check if it's a navigation property mock or array
             if (Array.isArray(value)) {
-              // Skip arrays (empty navigation placeholders)
+              // A list of columns has no one SQL value (it used to vanish from the result)
+              assertProjectionArrayOfValues(value, key, 'select()');
+
+              // A list of values reads back as itself; a projection read as columns (a CTE body)
+              // carries it as a jsonb column
+              if (context.typedLiterals) {
+                selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
+              }
+              continue;
+            }
+
+            // A navigation row projected whole: its columns, flattened like a nested object's, so
+            // each reads back typed and through its own mapper. It used to render as ONE
+            // json_build_object — timestamps came back as strings, mappers never ran, and a
+            // DISTINCT or UNION over it failed (json has no equality operator)
+            if (this.isFlattenedNavigationRow(value)
+              && this.tryBuildFlatNestedSelect(materializeMockSelection(value), context, joins, selectParts, `__nested__${key}`, nestedPaths)) {
               continue;
             }
             // Check if it's a CollectionQueryBuilder or ReferenceQueryBuilder instance
@@ -5782,6 +6701,23 @@ ${joinClauses.join('\n')}`;
                     const firstValue = (value as any)[tableAlias];
                     if (firstValue && typeof firstValue === 'object' && '__tableAlias' in firstValue) {
                       const alias = firstValue.__tableAlias as string;
+
+                      // A navigation row below the root, or one whose relation name another path
+                      // owns: the plan joins it on its own path (a relation of OURS by that name
+                      // would be a different row)
+                      const planned = this.navigationPlan?.nodeOf(firstValue);
+
+                      if (planned !== undefined && planned.targetSchema && (planned.parent !== undefined || planned.alias !== planned.relationName)) {
+                        this.addPlannedJoins(planned, joins);
+
+                        const plannedParts: string[] = [];
+                        for (const [colKey, dbColName] of getColumnNameMapForSchema(planned.targetSchema)) {
+                          plannedParts.push(`'${colKey}', "${planned.alias}"."${dbColName}"`);
+                        }
+
+                        selectParts.push(`json_build_object(${plannedParts.join(', ')}) as "${key}"`);
+                        continue;
+                      }
 
                       // A navigation of a manually joined table: no relation of OURS names it, its
                       // hops carry their joins (see explicitNavigationAlias)
@@ -5869,16 +6805,14 @@ ${joinClauses.join('\n')}`;
               continue;
             }
           }
-          // Otherwise, treat as literal value
-          selectParts.push(`$${context.paramCounter++} as "${key}"`);
-          context.allParams.push(value);
+          // Otherwise, treat as literal value (a Date, a class instance)
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         } else if (value === undefined) {
           // Skip undefined values (navigation property placeholders)
           continue;
         } else {
-          // Literal value or expression
-          selectParts.push(`$${context.paramCounter++} as "${key}"`);
-          context.allParams.push(value);
+          // Literal value (a number, a boolean, a bigint, null)
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         }
       } // End of for loop
     } // End of else block
@@ -5960,21 +6894,9 @@ ${joinClauses.join('\n')}`;
     if (this.orderByFields.length > 0) {
       // Performance: Pre-compute column name map for ORDER BY lookups
       const colNameMap = getColumnNameMapForSchema(this.schema);
-      const orderParts = this.orderByFields.map(
-        ({ field, direction }) => {
-          // Check if the field is in the selection (after a select() call)
-          // If so, reference it as an alias, otherwise use table.column notation
-          if (selection && typeof selection === 'object' && !Array.isArray(selection) && field in selection) {
-            // Field is in the selected output, use it as an alias
-            return `"${field}" ${direction}`;
-          } else {
-            // Field is not in the selection, use table.column notation
-            // Look up the database column name from the schema
-            const dbColumnName = colNameMap.get(field) ?? field;
-            return `"${this.schema.name}"."${dbColumnName}" ${direction}`;
-          }
-        }
-      );
+      const orderParts = this.orderByFields.map(entry => `${entry.expression !== undefined
+        ? buildOrderByExpressionSql(entry.expression, context)
+        : this.orderByKeySql(entry, selection, colNameMap)} ${entry.direction}`);
       orderByClause = `ORDER BY ${orderParts.join(', ')}`;
     }
 
@@ -6065,10 +6987,10 @@ ${joinClauses.join('\n')}`;
     }
 
     // Join CTEs and LATERAL subqueries for collections
-    for (const { cteName, isCTE, joinClause } of collectionFields) {
+    for (const { cteName, isCTE, joinClause, parentKey } of collectionFields) {
       if (isCTE) {
         // CTE strategy - join by parent_id
-        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${qualifiedTableName}.id`;
+        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${parentKey ?? `${qualifiedTableName}.id`}`;
       } else if (joinClause) {
         // LATERAL strategy - use the provided join clause (contains full LATERAL subquery)
         fromClause += `\n${joinClause}`;
@@ -6102,6 +7024,16 @@ ${joinClauses.join('\n')}`;
    * @internal
    */
   private buildQueryCore(selection: any, context: QueryContext, includeOrderLimitOffset: boolean = true): { sql: string; params: any[]; nestedPaths: Set<string> } {
+    return this.withNavigationPlan(
+      selection,
+      this.whereCond,
+      () => this.buildQueryCoreBody(selection, context, includeOrderLimitOffset),
+      includeOrderLimitOffset ? this.orderByRefs() : undefined
+    );
+  }
+
+  /** The body of {@link buildQueryCore}, run under its navigation plan. */
+  private buildQueryCoreBody(selection: any, context: QueryContext, includeOrderLimitOffset: boolean): { sql: string; params: any[]; nestedPaths: Set<string> } {
     // Handle user-defined CTEs first - their params need to come before main query params.
     // A CTE the enclosing builder already hoisted to statement level (UNION) has had both
     // its params and its WITH entry contributed there; pushing them again would duplicate
@@ -6116,7 +7048,7 @@ ${joinClauses.join('\n')}`;
     }
 
     const selectParts: string[] = [];
-    const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string }> = [];
+    const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string; parentKey?: string }> = [];
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     const nestedPaths: Set<string> = new Set();
 
@@ -6125,6 +7057,17 @@ ${joinClauses.join('\n')}`;
 
     // Scan WHERE condition for navigation property references and add JOINs
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
+
+    // ORDER BY keys read through a navigation the projection does not select are joined too
+    if (includeOrderLimitOffset) {
+      const orderByRefs = this.orderByRefs();
+      if (orderByRefs.length > 0) {
+        this.detectAndAddJoinsFromSelection(orderByRefs, joins);
+      }
+    }
+
+    // So is the path a projected collection correlates through
+    this.addCollectionPathJoins(selection, joins, context.collectionStrategy || 'lateral');
 
     // Repeat the shadow check now that the SELECT list has contributed its joins: the colliding
     // navigation can be named ONLY in the projection, where the WHERE-time check cannot see it.
@@ -6144,11 +7087,14 @@ ${joinClauses.join('\n')}`;
       const fragmentSql = selection.buildSql(sqlBuildContext);
       context.paramCounter = sqlBuildContext.paramCounter;
       selectParts.push(fragmentSql);
+    } else if (isScalarLiteralSelection(selection)) {
+      // One literal (`() => 'x'`): one column holding it (see buildQueryBody)
+      selectParts.push(`${projectionLiteralSql(selection, context)} as "value"`);
     } else if (typeof selection === 'object' && selection !== null && '__dbColumnName' in selection) {
       const tableAlias = ('__tableAlias' in selection && selection.__tableAlias) ? selection.__tableAlias as string : this.schema.name;
       selectParts.push(`"${tableAlias}"."${selection.__dbColumnName}"`);
     } else if (selection instanceof CollectionQueryBuilder) {
-      throw new Error('Cannot use CollectionQueryBuilder directly as selection');
+      throw new Error('select(): a collection cannot be the whole selection — project it as a field: select(row => ({ count: row.items.count() }))');
     } else {
       // Process selection object properties
       //
@@ -6175,7 +7121,7 @@ ${joinClauses.join('\n')}`;
           //   selectExpression. We push the selectExpression as the SELECT
           //   slot for this leg and add the joinClause to FROM later.
           this.assertJoinedCollectionStrategy(value, context);
-          const cteData = (value as any).buildCTE ? (value as any).buildCTE(context) : (value as CollectionQueryBuilder<any>).buildCTE(context);
+          const cteData = this.buildProjectedCollection(value, context);
           const isCTE = cteData.isCTE !== false;
 
           collectionFields.push({
@@ -6184,6 +7130,7 @@ ${joinClauses.join('\n')}`;
             isCTE,
             joinClause: cteData.joinClause,
             selectExpression: cteData.selectExpression,
+            parentKey: cteData.parentKey,
           });
         } else if (value instanceof Subquery || (value && typeof value === 'object' && 'buildSql' in value && typeof (value as any).buildSql === 'function' && '__mode' in value)) {
           const sqlBuildContext = {
@@ -6233,16 +7180,30 @@ ${joinClauses.join('\n')}`;
             selectParts.push(`"${this.schema.name}"."${value.__dbColumnName}" as "${key}"`);
           }
         } else if (typeof value === 'string') {
-          selectParts.push(`"${this.schema.name}"."${value}" as "${key}"`);
+          // A string is a value (see buildQuery), not a column name
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         } else if (typeof value === 'object' && value !== null) {
           if (!('__dbColumnName' in value)) {
             if (Array.isArray(value)) {
+              // A list of columns has no one SQL value; a list of values reads back as itself
+              assertProjectionArrayOfValues(value, key, 'select()');
+
+              if (context.typedLiterals) {
+                selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
+              }
               continue;
             }
             if (value instanceof CollectionQueryBuilder) {
               continue;
             } else if (value instanceof ReferenceQueryBuilder) {
               continue; // Skip ReferenceQueryBuilder in union queries
+            }
+
+            // A navigation row projected whole: its columns, flattened (see buildQueryBody). A leg
+            // used to bind the row object itself as a parameter: every leg read back "{}"
+            if (this.isFlattenedNavigationRow(value)
+              && this.tryBuildFlatNestedSelect(materializeMockSelection(value), context, joins, selectParts, `__nested__${key}`, nestedPaths)) {
+              continue;
             }
 
             // Plain nested object containing FieldRefs / SqlFragments /
@@ -6265,13 +7226,11 @@ ${joinClauses.join('\n')}`;
               continue;
             }
           }
-          selectParts.push(`$${context.paramCounter++} as "${key}"`);
-          context.allParams.push(value);
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         } else if (value === undefined) {
           continue;
         } else {
-          selectParts.push(`$${context.paramCounter++} as "${key}"`);
-          context.allParams.push(value);
+          selectParts.push(`${projectionLiteralSql(value, context)} as "${key}"`);
         }
       }
 
@@ -6342,16 +7301,9 @@ ${joinClauses.join('\n')}`;
     let orderByClause = '';
     if (includeOrderLimitOffset && this.orderByFields.length > 0) {
       const colNameMap = getColumnNameMapForSchema(this.schema);
-      const orderParts = this.orderByFields.map(
-        ({ field, direction }) => {
-          if (selection && typeof selection === 'object' && !Array.isArray(selection) && field in selection) {
-            return `"${field}" ${direction}`;
-          } else {
-            const dbColumnName = colNameMap.get(field) ?? field;
-            return `"${this.schema.name}"."${dbColumnName}" ${direction}`;
-          }
-        }
-      );
+      const orderParts = this.orderByFields.map(entry => `${entry.expression !== undefined
+        ? buildOrderByExpressionSql(entry.expression, context)
+        : this.orderByKeySql(entry, selection, colNameMap)} ${entry.direction}`);
       orderByClause = `ORDER BY ${orderParts.join(', ')}`;
     }
 
@@ -6437,9 +7389,9 @@ ${joinClauses.join('\n')}`;
     // Join CTEs / LATERAL subqueries for collection projections inside the UNION
     // leg. Mirror the buildQuery flow at line ~4678. CTE legs join by parent_id;
     // LATERAL legs splice in the pre-built `LEFT JOIN LATERAL (...)` clause.
-    for (const { cteName, isCTE, joinClause } of collectionFields) {
+    for (const { cteName, isCTE, joinClause, parentKey } of collectionFields) {
       if (isCTE) {
-        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${qualifiedTableName}.id`;
+        fromClause += `\nLEFT JOIN "${cteName}" ON "${cteName}".parent_id = ${parentKey ?? `${qualifiedTableName}.id`}`;
       } else if (joinClause) {
         fromClause += `\n${joinClause}`;
       }
@@ -6466,240 +7418,285 @@ ${joinClauses.join('\n')}`;
 
   /**
    * Transform database results
+   * @param literalsFromRows - Read the projection's literals from the rows instead of from
+   *   `selection`: a UNION reads every leg's rows through its FIRST leg's selection, while each leg
+   *   may project its own literal (a discriminator).
    */
-  private transformResults(rows: any[], selection: any): TSelection[] {
+  private transformResults(rows: any[], selection: any, literalsFromRows: boolean = false): TSelection[] {
     if (rows.length === 0) {
       return [];
+    }
+
+    // A selector returning ONE column or expression reads as its values (see isScalarSelection):
+    // each row is transformed as the one-field projection it is, then unwrapped
+    if (isScalarSelection(selection)) {
+      const column = '__dbColumnName' in selection ? (selection as FieldRef).__dbColumnName : undefined;
+      const key = column !== undefined && column in rows[0] ? column : Object.keys(rows[0])[0];
+
+      return this.transformResults(rows, { [key]: selection }).map(row => (row as any)[key]);
+    }
+
+    // A selector returning one literal (`select(() => 'x')`) reads as that literal on every row
+    if (isScalarLiteralSelection(selection)) {
+      if (!literalsFromRows) {
+        return rows.map(() => selection);
+      }
+
+      const valueKey = Object.keys(rows[0])[0];
+      const read: FieldRead = { key: valueKey, type: FieldType.SIMPLE, value: selection, coerce: true };
+
+      return rows.map(row => this.readField(read, row[valueKey], literalsFromRows));
     }
 
     // Check if mappers are disabled for performance
     const disableMappers = this.executor?.getOptions().disableMappers ?? false;
 
-    // Pre-analyze selection structure ONCE and categorize each field
+    // Pre-analyze selection structure ONCE: how each field reads back
     // This moves all type checks out of the per-row loop
-    const schemaColumnCache = this.schema.columnMetadataCache;
-    const fieldConfigs: Array<{
-      key: string;
-      type: number;
-      value: any;
-      mapper?: any;
-      aggregationType?: string;
-      innerMetadata?: any;
-      collectionBuilder?: CollectionQueryBuilder<any>;
-    }> = [];
+    const reads: FieldRead[] = [];
 
-    // Single pass to categorize all fields
     for (const key in selection) {
-      const value = selection[key];
-
-      // Check for navigation placeholders first (most common early exit)
-      if (Array.isArray(value) && value.length === 0) {
-        fieldConfigs.push({ key, type: FieldType.NAVIGATION, value: [] });
-        continue;
-      }
-      if (value === undefined) {
-        fieldConfigs.push({ key, type: FieldType.NAVIGATION, value: undefined });
-        continue;
-      }
-
-      // Check for navigation property mocks (objects with getters)
-      // These are treated as SIMPLE because the actual value comes from json_build_object in the row
-      // The navigation mock is just a placeholder - actual data processing happens via FieldType.SIMPLE
-      if (value && typeof value === 'object' && !('__dbColumnName' in value) && !('__fieldName' in value) && !('__collectionResult' in value) && !('__isAggregationArray' in value)) {
-        // Getter-backed row (own getters on a root mock, inherited ones on a reference mock).
-        if (findFirstGetterKey(value) != null) {
-          // Navigation mock - treat as simple, data will come from row via json_build_object
-          // If row has no data, convertValue will return undefined
-          fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
-          continue;
-        }
-      }
-
-      // Collection types
-      if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
-        const isScalarAgg = value instanceof CollectionQueryBuilder && value.isScalarAggregation();
-        if (isScalarAgg) {
-          const aggregationType = value.getAggregationType();
-          fieldConfigs.push({
-            key,
-            type: FieldType.COLLECTION_SCALAR,
-            value,
-            aggregationType
-          });
-        } else {
-          const isArrayAgg = value && typeof value === 'object' && 'isArrayAggregation' in value && value.isArrayAggregation();
-          const isSingleResult = value instanceof CollectionQueryBuilder && value.isSingleResult();
-          if (isArrayAgg) {
-            fieldConfigs.push({ key, type: FieldType.COLLECTION_ARRAY, value });
-          } else if (isSingleResult) {
-            fieldConfigs.push({
-              key,
-              type: FieldType.COLLECTION_SINGLE,
-              value,
-              collectionBuilder: value
-            });
-          } else {
-            fieldConfigs.push({
-              key,
-              type: FieldType.COLLECTION_JSON,
-              value,
-              collectionBuilder: value instanceof CollectionQueryBuilder ? value : undefined
-            });
-          }
-        }
-        continue;
-      }
-
-      // CTE aggregation array
-      if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
-        fieldConfigs.push({
-          key,
-          type: FieldType.CTE_AGGREGATION,
-          value,
-          innerMetadata: (value as any).__innerSelectionMetadata
-        });
-        continue;
-      }
-
-      // SqlFragment with mapper
-      if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-        let mapper = disableMappers ? null : (value as any).getMapper();
-        if (mapper && typeof mapper.getType === 'function') {
-          mapper = mapper.getType();
-        }
-        if (mapper && typeof mapper.fromDriver === 'function') {
-          fieldConfigs.push({ key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper });
-        } else {
-          fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
-        }
-        continue;
-      }
-
-      // FieldRef with potential mapper
-      if (typeof value === 'object' && value !== null && '__fieldName' in value) {
-        if (disableMappers) {
-          fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
-        } else {
-          const fieldName = value.__fieldName as string;
-          const cached = schemaColumnCache?.get(fieldName);
-          if (cached && cached.hasMapper) {
-            fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: cached.mapper });
-          } else if (cached) {
-            fieldConfigs.push({ key, type: FieldType.FIELD_REF_NO_MAPPER, value });
-          } else {
-            // Not in root schema cache — check FieldRef's own mapper (from navigation properties)
-            const fieldMapper = (value as any).__mapper;
-            if (fieldMapper && typeof fieldMapper.fromDriver === 'function') {
-              fieldConfigs.push({ key, type: FieldType.FIELD_REF_MAPPER, value, mapper: fieldMapper });
-            } else {
-              fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
-            }
-          }
-        }
-        continue;
-      }
-
-      // Default: simple value
-      fieldConfigs.push({ key, type: FieldType.SIMPLE, value });
+      reads.push(this.compileFieldRead(key, selection[key], disableMappers, literalsFromRows, false));
     }
 
-    // Transform each row using pre-analyzed field configs
+    // Transform each row using the compiled reads
     // Using while(i--) for maximum performance - decrement and compare to 0 is faster
     const results: TSelection[] = new Array(rows.length);
-    const configCount = fieldConfigs.length;
+    const readCount = reads.length;
     let rowIdx = rows.length;
 
     while (rowIdx--) {
       const row = rows[rowIdx];
       const result: any = {};
-      let i = configCount;
+      let i = readCount;
 
-      // Process all fields using pre-computed types
       while (i--) {
-        const config = fieldConfigs[i];
-        const key = config.key;
-
-        // Handle navigation placeholders separately
-        if (config.type === FieldType.NAVIGATION) {
-          result[key] = config.value;
-          continue;
-        }
-
-        const rawValue = row[key];
-
-        switch (config.type) {
-          case FieldType.COLLECTION_SCALAR: {
-            if (config.aggregationType === 'COUNT') {
-              result[key] = this.convertValue(rawValue);
-            } else {
-              // MAX/MIN/SUM: preserve NULL, convert numeric strings
-              if (rawValue === null) {
-                result[key] = null;
-              } else if (typeof rawValue === 'string' && NUMERIC_REGEX.test(rawValue)) {
-                result[key] = +rawValue;
-              } else {
-                result[key] = rawValue;
-              }
-            }
-            break;
-          }
-          case FieldType.COLLECTION_ARRAY:
-            result[key] = rawValue || [];
-            break;
-          case FieldType.COLLECTION_JSON: {
-            const items = rawValue || [];
-            if (config.collectionBuilder) {
-              result[key] = this.transformCollectionItems(items, config.collectionBuilder);
-            } else {
-              result[key] = items;
-            }
-            break;
-          }
-          case FieldType.COLLECTION_SINGLE: {
-            // firstOrDefault() - return single object or null
-            // With CTE/LATERAL single result, rawValue is already a single object (not array)
-            if (rawValue === null || rawValue === undefined) {
-              result[key] = null;
-            } else if (config.collectionBuilder) {
-              // Transform the single item using collection mapper if available
-              const transformedItems = this.transformCollectionItems([rawValue], config.collectionBuilder);
-              result[key] = transformedItems[0] ?? null;
-            } else {
-              result[key] = rawValue;
-            }
-            break;
-          }
-          case FieldType.CTE_AGGREGATION: {
-            const items = rawValue || [];
-            if (config.innerMetadata && !disableMappers) {
-              result[key] = this.transformCteAggregationItems(items, config.innerMetadata);
-            } else {
-              result[key] = items;
-            }
-            break;
-          }
-          case FieldType.SQL_FRAGMENT_MAPPER:
-            // mapWith wraps user functions to handle null
-            result[key] = config.mapper.fromDriver(rawValue);
-            break;
-          case FieldType.FIELD_REF_MAPPER:
-            // Column mappers (customType) - null check done here
-            result[key] = config.mapper.fromDriver(rawValue);
-            break;
-          case FieldType.FIELD_REF_NO_MAPPER:
-            result[key] = rawValue;
-            break;
-          case FieldType.SIMPLE:
-          default:
-            result[key] = this.convertValue(rawValue);
-            break;
-        }
+        const read = reads[i];
+        result[read.key] = this.readField(read, row[read.key], literalsFromRows);
       }
 
       results[rowIdx] = result as TSelection;
     }
 
     return results;
+  }
+
+  /**
+   * How one value of a projection reads back — decided once per query (see FieldRead). A value of a
+   * nested object (`nested`) keeps NULL as null, as nested values always did; at the top level a
+   * value that is not a column of the table reads NULL as undefined.
+   */
+  private compileFieldRead(key: string, value: any, disableMappers: boolean, literalsFromRows: boolean, nested: boolean): FieldRead {
+    // Check for navigation placeholders first (most common early exit)
+    if (value === undefined) {
+      // A nested undefined renders as NULL (see renderFlatNestedLeaf)
+      return nested ? { key, type: FieldType.FIELD_REF_NO_MAPPER, value } : { key, type: FieldType.NAVIGATION, value };
+    }
+
+    // A literal reads back as itself — it rides the statement as a parameter, which the database
+    // hands back as text (`true` came back "true", a Date as a string, `null` as undefined). A list
+    // of values (empty ones included) is its own value everywhere: a UNION leg does not select it.
+    if (Array.isArray(value) ? !holdsSqlValue(value) : !literalsFromRows && isProjectionLiteral(value)) {
+      return { key, type: FieldType.LITERAL, value };
+    }
+
+    // A navigation row projected whole reads as the object of its columns, each through its own
+    // mapper — it renders as those columns (see buildQueryBody); a plain nested object as its values
+    const navigationRow = this.isFlattenedNavigationRow(value);
+
+    if (navigationRow || (isPlainNestedProjection(value) && findFirstGetterKey(value) == null)) {
+      const fields = navigationRow ? materializeMockSelection(value) : value;
+      const children: FieldRead[] = [];
+
+      for (const childKey in fields) {
+        children.push(this.compileFieldRead(childKey, fields[childKey], disableMappers, literalsFromRows, true));
+      }
+
+      return { key, type: FieldType.NESTED, value, children };
+    }
+
+    // Getter-backed rows of another kind: their data comes from the row as it is
+    if (value !== null && typeof value === 'object' && !('__dbColumnName' in value) && !('__fieldName' in value)
+      && !('__collectionResult' in value) && !('__isAggregationArray' in value) && findFirstGetterKey(value) != null) {
+      return { key, type: FieldType.SIMPLE, value, coerce: true, keepNull: nested };
+    }
+
+    // Collection types
+    if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
+      if (value instanceof CollectionQueryBuilder && value.isScalarAggregation()) {
+        return { key, type: FieldType.COLLECTION_SCALAR, value, aggregationType: value.getAggregationType() };
+      }
+
+      if ('isArrayAggregation' in value && value.isArrayAggregation()) {
+        return { key, type: FieldType.COLLECTION_ARRAY, value };
+      }
+
+      if (value instanceof CollectionQueryBuilder && value.isSingleResult()) {
+        return { key, type: FieldType.COLLECTION_SINGLE, value, collectionBuilder: value };
+      }
+
+      return { key, type: FieldType.COLLECTION_JSON, value, collectionBuilder: value instanceof CollectionQueryBuilder ? value : undefined };
+    }
+
+    // CTE aggregation array: its items read through the aggregated query's own mappers
+    if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
+      return {
+        key,
+        type: FieldType.CTE_AGGREGATION,
+        value,
+        itemReads: disableMappers ? undefined : aggregatedItemReads((value as any).__innerSelectionMetadata),
+      };
+    }
+
+    // A column of a CTE or a table subquery reads the way the projection that made it says (see
+    // projectedColumnRef) — never through the mapper of a column of OUR table sharing its name
+    if (typeof value === 'object' && value !== null && '__cteKind' in value) {
+      // A literal column (typed from its value, see projectionLiteralSql) reads as the driver hands
+      // its type back, NULL kept — as the literal reads in the body's own result
+      const literal = (value as any).__cteKind === 'literal';
+      const mapper = literal
+        ? ((value as any).__bigintLiteral ? BIGINT_LITERAL_READ : undefined)
+        : disableMappers
+          ? undefined
+          : fromDriverMapper((value as any).__mapper) ?? (typeof (value as any).getMapper === 'function' ? fromDriverMapper((value as any).getMapper()) : undefined);
+
+      return mapper
+        ? { key, type: FieldType.FIELD_REF_MAPPER, value, mapper }
+        : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).__sqlType), keepNull: nested || literal };
+    }
+
+    // SqlFragment with mapper
+    if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
+      const mapper = disableMappers ? undefined : fromDriverMapper((value as any).getMapper());
+
+      return mapper
+        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper }
+        : { key, type: FieldType.SIMPLE, value, coerce: true, keepNull: nested };
+    }
+
+    // FieldRef with potential mapper
+    if (typeof value === 'object' && value !== null && '__fieldName' in value) {
+      if (disableMappers) {
+        return { key, type: FieldType.FIELD_REF_NO_MAPPER, value };
+      }
+
+      const cached = this.schema.columnMetadataCache?.get(value.__fieldName as string);
+      // A navigation's column reads through ITS mapper, also when the root has a column of the
+      // same name (whose mapper — or lack of one — it used to get)
+      const ownTable = value.__sourceTable === undefined || value.__sourceTable === this.schema.name;
+      const cachedMapper = ownTable ? (cached?.hasMapper ? cached.mapper : undefined) : value.__mapper;
+
+      if (cached && cachedMapper && typeof cachedMapper.fromDriver === 'function') {
+        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: cachedMapper };
+      }
+
+      if (cached) {
+        // A numeric(p, s) zero read through a client that drops its scale gets it back
+        const zeroScale = ownTable && this.client.losesNumericZeroScale() ? numericZeroScaleMapper(cached.config) : undefined;
+
+        return zeroScale
+          ? { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: zeroScale }
+          : { key, type: FieldType.FIELD_REF_NO_MAPPER, value };
+      }
+
+      // Not in root schema cache — check FieldRef's own mapper (from navigation properties)
+      const fieldMapper = (value as any).__mapper;
+
+      if (fieldMapper && typeof fieldMapper.fromDriver === 'function') {
+        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: fieldMapper };
+      }
+
+      // A navigation's text column keeps its text: '01234' used to read back as the number 1234
+      return { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).__sqlType), keepNull: nested };
+    }
+
+    // Default: simple value
+    return { key, type: FieldType.SIMPLE, value, coerce: true, keepNull: nested };
+  }
+
+  /** Reads one value of a row as `read` says (see compileFieldRead). */
+  private readField(read: FieldRead, rawValue: any, literalsFromRows: boolean): any {
+    switch (read.type) {
+      case FieldType.NAVIGATION:
+      case FieldType.LITERAL:
+        return read.value;
+      case FieldType.NESTED: {
+        // The object reconstructed from the nested object's flattened columns — a fresh one per row
+        if (rawValue === null || typeof rawValue !== 'object') {
+          return rawValue;
+        }
+
+        const children = read.children!;
+
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          rawValue[child.key] = this.readField(child, rawValue[child.key], literalsFromRows);
+        }
+
+        return rawValue;
+      }
+      case FieldType.COLLECTION_SCALAR:
+        if (read.aggregationType === 'COUNT') {
+          return this.convertValue(rawValue);
+        }
+
+        // MAX/MIN/SUM: preserve NULL, convert numeric strings
+        return typeof rawValue === 'string' && NUMERIC_REGEX.test(rawValue) ? +rawValue : rawValue;
+      case FieldType.COLLECTION_ARRAY:
+        return rawValue || [];
+      case FieldType.COLLECTION_JSON: {
+        const items = rawValue || [];
+
+        if (!read.collectionBuilder) {
+          return items;
+        }
+
+        const transformed = this.transformCollectionItems(items, read.collectionBuilder, literalsFromRows);
+        const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
+
+        return scalarAlias !== undefined ? unwrapScalarItems(transformed, scalarAlias) : transformed;
+      }
+      case FieldType.COLLECTION_SINGLE: {
+        // firstOrDefault() - return single object or null
+        // With CTE/LATERAL single result, rawValue is already a single object (not array)
+        if (rawValue === null || rawValue === undefined) {
+          return null;
+        }
+
+        if (!read.collectionBuilder) {
+          return rawValue;
+        }
+
+        // Transform the single item using collection mapper if available
+        const transformedItems = this.transformCollectionItems([rawValue], read.collectionBuilder, literalsFromRows);
+        const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
+        const item = scalarAlias !== undefined ? unwrapScalarItems(transformedItems, scalarAlias) : transformedItems;
+
+        return item[0] ?? null;
+      }
+      case FieldType.CTE_AGGREGATION: {
+        const items = rawValue || [];
+
+        return read.itemReads ? mapAggregatedItems(items, read.itemReads) : items;
+      }
+      case FieldType.SQL_FRAGMENT_MAPPER:
+        // mapWith wraps user functions to handle null
+        return read.mapper.fromDriver(rawValue);
+      case FieldType.FIELD_REF_MAPPER:
+        // Column mappers (customType) - null check done here
+        return read.mapper.fromDriver(rawValue);
+      case FieldType.FIELD_REF_NO_MAPPER:
+        return rawValue;
+      case FieldType.SIMPLE:
+      default:
+        if (rawValue === null) {
+          return read.keepNull ? null : undefined;
+        }
+
+        // A numeric string (a NUMERIC / BIGINT value — also of an aggregate subquery, AVG, SUM)
+        // becomes a number; the regex validates the format, so `+` always yields a valid number
+        return read.coerce && typeof rawValue === 'string' && NUMERIC_REGEX.test(rawValue) ? +rawValue : rawValue;
+    }
   }
 
   /**
@@ -6721,303 +7718,30 @@ ${joinClauses.join('\n')}`;
   /**
    * Transform collection items applying fromDriver mappers
    */
-  private transformCollectionItems(items: any[], collectionBuilder: CollectionQueryBuilder<any>): any[] {
-    const targetSchema = collectionBuilder.getTargetTableSchema();
-    if (!targetSchema) {
-      return items;
-    }
-
+  private transformCollectionItems(items: any[], collectionBuilder: CollectionQueryBuilder<any>, literalsFromRows: boolean = false): any[] {
     // Check if mappers are disabled for performance
-    const disableMappers = this.executor?.getOptions().disableMappers ?? false;
-
-    if (disableMappers) {
+    if (this.executor?.getOptions().disableMappers ?? false) {
       // Skip mapper transformation for performance - return items as-is
       return items;
     }
 
-    // Use pre-cached column metadata from target schema
-    // This avoids repeated column.build() calls for each item
-    const columnCache = targetSchema.columnMetadataCache;
-
-    // Build alias-to-field-info mapping from selected field configs
-    // This allows us to find the correct mapper when:
-    // 1. alias differs from property name (e.g., reservationExpiry: i.expiresAt)
-    // 2. field comes from navigation (e.g., customerBirthdate: i.member.birthdate)
-    const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
-    interface FieldMapperInfo {
-      propertyName: string;
-      sourceTable?: string;  // If set, look up mapper from this table's schema
-    }
-    const aliasToFieldInfo = new Map<string, FieldMapperInfo>();
-    if (selectedFieldConfigs) {
-      for (const field of selectedFieldConfigs) {
-        if (field.propertyName) {
-          aliasToFieldInfo.set(field.alias, {
-            propertyName: field.propertyName,
-            sourceTable: field.sourceTable,
-          });
-        }
-      }
-    }
-
-    // Pre-build mapper cache for all fields (including navigation fields)
-    // This avoids repeated schema lookups per item
-    const mapperCache = new Map<string, any>();  // alias -> mapper
-    for (const [alias, fieldInfo] of aliasToFieldInfo) {
-      let mapper: any = null;
-      const schemaRegistry = collectionBuilder.getSchemaRegistry() || this.schemaRegistry;
-      if (fieldInfo.sourceTable && schemaRegistry) {
-        // Navigation field - look up mapper from the source table's schema
-        const navSchema = schemaRegistry.get(fieldInfo.sourceTable);
-        if (navSchema?.columnMetadataCache) {
-          const cached = navSchema.columnMetadataCache.get(fieldInfo.propertyName);
-          if (cached?.hasMapper) {
-            mapper = cached.mapper;
-          }
-        }
-      } else {
-        // Regular field from target schema
-        const cached = columnCache?.get(fieldInfo.propertyName);
-        if (cached?.hasMapper) {
-          mapper = cached.mapper;
-        }
-      }
-      if (mapper) {
-        mapperCache.set(alias, mapper);
-      }
-    }
-
-    // Also add direct property matches from target schema (when no alias mapping)
-    if (columnCache) {
-      for (const [propertyName, cached] of columnCache) {
-        if (!mapperCache.has(propertyName) && cached.hasMapper) {
-          mapperCache.set(propertyName, cached.mapper);
-        }
-      }
-    }
-
-    // Build cache of nested collection info (fields that are themselves nested collections)
-    // This is used for recursive transformation of nested collection results
-    const nestedCollectionCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' }>();
-    if (selectedFieldConfigs) {
-      for (const field of selectedFieldConfigs) {
-        if (field.nestedCollectionInfo) {
-          nestedCollectionCache.set(field.alias, field.nestedCollectionInfo);
-        }
-      }
-    }
-
-    // Get schema registry for nested collection transformation
-    const schemaRegistry = collectionBuilder.getSchemaRegistry() || this.schemaRegistry;
-
-    // Transform items using pre-built mapper cache
-    const results: any[] = new Array(items.length);
-    let i = items.length;
-    while (i--) {
-      const item = items[i];
-      const transformedItem: any = {};
-      for (const key in item) {
-        const value = item[key];
-        const mapper = mapperCache.get(key);
-        if (mapper) {
-          transformedItem[key] = mapper.fromDriver(value);
-        } else {
-          // Check if this field is a nested collection that needs recursive transformation
-          const nestedInfo = nestedCollectionCache.get(key);
-          if (nestedInfo && value !== null && value !== undefined && schemaRegistry) {
-            transformedItem[key] = this.transformNestedCollectionValue(value, nestedInfo, schemaRegistry);
-          } else {
-            transformedItem[key] = value;
-          }
-        }
-      }
-      results[i] = transformedItem;
-    }
-    return results;
-  }
-
-  /**
-   * Transform a nested collection value (from firstOrDefault or toList inside another collection)
-   * Applies custom mappers to fields within the nested collection result.
-   */
-  private transformNestedCollectionValue(
-    value: any,
-    nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' },
-    schemaRegistry: Map<string, TableSchema>
-  ): any {
-    // Flattened lists (toNumberList/toStringList) return a primitive array directly
-    // from the driver — no per-element object transformation applies. Iterating with
-    // `for (const key in item)` on a number/string would yield an empty object, so
-    // short-circuit here before touching any elements.
-    if (nestedInfo.flattenResultType) {
-      return value;
-    }
-
-    const nestedSchema = schemaRegistry.get(nestedInfo.targetTable);
-    if (!nestedSchema?.columnMetadataCache) {
-      return value;  // No schema info, return as-is
-    }
-
-    const columnCache = nestedSchema.columnMetadataCache;
-    const selectedFieldConfigs = nestedInfo.selectedFieldConfigs;
-
-    // Build mapper cache for nested collection fields
-    const mapperCache = new Map<string, any>();
-
-    // First, add mappers from selected field configs (for aliased/navigation fields)
-    if (selectedFieldConfigs) {
-      for (const field of selectedFieldConfigs) {
-        if (field.propertyName) {
-          let mapper: any = null;
-          if (field.sourceTable) {
-            // Navigation field - look up from source table's schema
-            const navSchema = schemaRegistry.get(field.sourceTable);
-            if (navSchema?.columnMetadataCache) {
-              const cached = navSchema.columnMetadataCache.get(field.propertyName);
-              if (cached?.hasMapper) {
-                mapper = cached.mapper;
-              }
-            }
-          } else {
-            // Regular field from target schema
-            const cached = columnCache.get(field.propertyName);
-            if (cached?.hasMapper) {
-              mapper = cached.mapper;
-            }
-          }
-          if (mapper) {
-            mapperCache.set(field.alias, mapper);
-          }
-        }
-      }
-    }
-
-    // Also add direct property matches from target schema
-    for (const [propertyName, cached] of columnCache) {
-      if (!mapperCache.has(propertyName) && cached.hasMapper) {
-        mapperCache.set(propertyName, cached.mapper);
-      }
-    }
-
-    // Build cache for any deeply nested collections
-    const deeplyNestedCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string' }>();
-    if (selectedFieldConfigs) {
-      for (const field of selectedFieldConfigs) {
-        if (field.nestedCollectionInfo) {
-          deeplyNestedCache.set(field.alias, field.nestedCollectionInfo);
-        }
-      }
-    }
-
-    // Transform the value(s)
-    const transformItem = (item: any): any => {
-      if (item === null || item === undefined) {
-        return item;
-      }
-      const transformedItem: any = {};
-      for (const key in item) {
-        const fieldValue = item[key];
-        const mapper = mapperCache.get(key);
-        if (mapper) {
-          transformedItem[key] = mapper.fromDriver(fieldValue);
-        } else {
-          // Check for deeply nested collections
-          const deepNestedInfo = deeplyNestedCache.get(key);
-          if (deepNestedInfo && fieldValue !== null && fieldValue !== undefined) {
-            transformedItem[key] = this.transformNestedCollectionValue(fieldValue, deepNestedInfo, schemaRegistry);
-          } else {
-            transformedItem[key] = fieldValue;
-          }
-        }
-      }
-      return transformedItem;
-    };
-
-    if (nestedInfo.isSingleResult) {
-      // Single item (firstOrDefault)
-      return transformItem(value);
-    } else if (Array.isArray(value)) {
-      // Array of items (toList)
-      return value.map(transformItem);
-    } else {
-      // Single object that should be treated as single result
-      return transformItem(value);
-    }
-  }
-
-  /**
-   * Transform CTE aggregation items applying fromDriver mappers from selection metadata
-   */
-  private transformCteAggregationItems(items: any[], selectionMetadata: Record<string, any>): any[] {
-    if (!items || items.length === 0) {
-      return [];
-    }
-
-    // Use pre-cached column metadata from schema
-    const schemaColumnCache = this.schema.columnMetadataCache;
-
-    // Build mapper cache from selection metadata
-    const mapperCache: Record<string, any> = {};
-    for (const key in selectionMetadata) {
-      const value = selectionMetadata[key];
-      // Check if value has getMapper (SqlFragment or field with mapper)
-      if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-        let mapper = (value as any).getMapper();
-        // If mapper is a CustomTypeBuilder, get the actual type
-        if (mapper && typeof mapper.getType === 'function') {
-          mapper = mapper.getType();
-        }
-        if (mapper && typeof mapper.fromDriver === 'function') {
-          mapperCache[key] = mapper;
-        }
-      }
-      // Check if it's a FieldRef with schema column mapper
-      else if (typeof value === 'object' && value !== null && '__fieldName' in value) {
-        const fieldName = (value as any).__fieldName as string;
-        // Use cached column metadata instead of column.build()
-        if (schemaColumnCache) {
-          const cached = schemaColumnCache.get(fieldName);
-          if (cached && cached.hasMapper && typeof cached.mapper.fromDriver === 'function') {
-            mapperCache[key] = cached.mapper;
-          }
-        } else {
-          // Fallback for schemas without cache
-          const column = this.schema.columns[fieldName];
-          if (column) {
-            const config = column.build();
-            if (config.mapper && typeof config.mapper.fromDriver === 'function') {
-              mapperCache[key] = config.mapper;
-            }
-          }
-        }
-      }
-    }
-
-    // Transform items using while(i--) loop - decrement and compare to 0 is fastest
-    const results: any[] = new Array(items.length);
-    let i = items.length;
-    while (i--) {
-      const item = items[i];
-      const transformedItem: any = {};
-      for (const key in item) {
-        const value = item[key];
-        const mapper = mapperCache[key];
-        // Mappers handle null internally (mapWith wraps user functions)
-        if (mapper) {
-          transformedItem[key] = mapper.fromDriver(value);
-        } else {
-          transformedItem[key] = value;
-        }
-      }
-      results[i] = transformedItem;
-    }
-    return results;
+    return transformCollectionItemsOf(items, collectionBuilder, this.schemaRegistry, !literalsFromRows);
   }
 
   /**
    * Build aggregation query (MIN, MAX, SUM)
    */
   private buildAggregationQuery(aggregation: 'MIN' | 'MAX' | 'SUM', fieldToAggregate: any, context: QueryContext): { sql: string; params: any[] } {
+    return this.withNavigationPlan(
+      undefined,
+      this.whereCond,
+      () => this.buildAggregationQueryBody(aggregation, fieldToAggregate, context),
+      [fieldToAggregate]
+    );
+  }
+
+  /** The body of {@link buildAggregationQuery}, run under its navigation plan. */
+  private buildAggregationQueryBody(aggregation: 'MIN' | 'MAX' | 'SUM', fieldToAggregate: any, context: QueryContext): { sql: string; params: any[] } {
     // Extract the field name from FieldRef object
     let fieldName: string;
     let tableAlias: string = this.schema.name;
@@ -7104,6 +7828,11 @@ ${joinClauses.join('\n')}`;
    * Build aggregate query (count or exists)
    */
   private buildAggregateQuery(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
+    return this.withNavigationPlan(undefined, this.whereCond, () => this.buildAggregateQueryBody(context, type));
+  }
+
+  /** The body of {@link buildAggregateQuery}, run under its navigation plan. */
+  private buildAggregateQueryBody(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
     // User-defined CTEs first, exactly as buildQuery does: their params occupy the
     // opening slots of the statement because DbCte bodies carry placeholders numbered
     // from $1. Without this, `.with(cte).count()` / `.exists()` dropped the WITH clause
@@ -7257,6 +7986,9 @@ ${joinClauses.join('\n')}`;
         // level deeper re-declares (and re-materializes) a CTE it was handed.
         hoistedCteNames: outerContext.hoistedCteNames,
         executor: this.executor,
+        // The enclosing query reads the subquery's columns (or its value): its literals render
+        // typed — untyped, a `true` reached it as the text 'true'
+        typedLiterals: true,
       };
 
       // Analyze the selector to extract nested queries
@@ -7276,7 +8008,7 @@ ${joinClauses.join('\n')}`;
     let selectionMetadata: Record<string, any> | undefined;
     if (mode === 'table') {
       const mockRow = this._createMockRow();
-      selectionMetadata = this.selector(mockRow) as any;
+      selectionMetadata = materializeMockSelection(this.selector(mockRow));
     }
 
     // Extract outer field refs from the WHERE condition
@@ -7420,6 +8152,651 @@ export type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
   ? T  // Preserve class instances (Date, Map, Set, Temporal, etc.) as-is
   : { [K in keyof T]: ResolveFieldRefs<T[K]> }
   : T;
+
+/**
+ * Whether a selector returned ONE column or expression (`b => b.name`, `b => b.book.name`,
+ * `b => sql\`upper(${b.name})\``) instead of an object of fields. Such a query — a root query or a
+ * collection — reads as the list of that value, as its type (`string[]`) says. Its rows came back as
+ * objects: empty ones for a root query (the value's own ref keys were read as the projection's
+ * fields) or an expression, `{ <column>: value }` in a collection.
+ */
+export function isScalarSelection(selection: unknown): selection is FieldRef | WhereConditionBase {
+  return typeof selection === 'object'
+    && selection !== null
+    && !(selection instanceof CollectionQueryBuilder)
+    && (selection instanceof WhereConditionBase || ('__dbColumnName' in selection && '__fieldName' in selection));
+}
+
+/** The field an expression a collection selects on its own (`e => sql\`...\``) is projected under. */
+const SCALAR_SELECTION_ALIAS = '__value';
+
+/** Unwraps each item of a scalar collection selection (`{ <alias>: value }` → value). */
+export function unwrapScalarItems(items: any[], alias: string): any[] {
+  return items.map(item => (item !== null && typeof item === 'object' ? item[alias] : item));
+}
+
+/**
+ * Collection items read back through the mappers of the columns they carry (an aliased column, a
+ * navigation's column, a nested collection's items) — how a SELECT reads a collection's items, and
+ * a mutation RETURNING too: it used to hand them back as the driver sent them, a mapped column as
+ * its raw storage value. @internal
+ * @param applyLiterals - Read the projection's literals from its field configs (false: from the items,
+ *   see SelectQueryBuilder.transformResults' literalsFromRows)
+ */
+export function transformCollectionItemsOf(
+  items: any[],
+  collectionBuilder: CollectionQueryBuilder<any>,
+  fallbackRegistry: Map<string, TableSchema> | undefined,
+  applyLiterals: boolean = true
+): any[] {
+  const targetSchema = collectionBuilder.getTargetTableSchema();
+  const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
+  const schemaRegistryForItems = collectionBuilder.getSchemaRegistry() || fallbackRegistry;
+
+  if (!targetSchema) {
+    // No schema to read mappers from — the projection's own reads (literals, expressions) still apply
+    return hasFieldReads(selectedFieldConfigs, applyLiterals)
+      ? items.map(item => applyFieldReads({ ...item }, selectedFieldConfigs, undefined, schemaRegistryForItems, false, applyLiterals))
+      : items;
+  }
+
+  // Use pre-cached column metadata from target schema
+  // This avoids repeated column.build() calls for each item
+  const columnCache = targetSchema.columnMetadataCache;
+
+  // Build alias-to-field-info mapping from selected field configs
+  // This allows us to find the correct mapper when:
+  // 1. alias differs from property name (e.g., reservationExpiry: i.expiresAt)
+  // 2. field comes from navigation (e.g., customerBirthdate: i.member.birthdate)
+  interface FieldMapperInfo {
+    propertyName: string;
+    sourceTable?: string;  // If set, look up mapper from this table's schema
+  }
+  const aliasToFieldInfo = new Map<string, FieldMapperInfo>();
+  if (selectedFieldConfigs) {
+    for (const field of selectedFieldConfigs) {
+      if (field.propertyName) {
+        aliasToFieldInfo.set(field.alias, {
+          propertyName: field.propertyName,
+          sourceTable: field.sourceTable,
+        });
+      }
+    }
+  }
+
+  // Pre-build mapper cache for all fields (including navigation fields)
+  // This avoids repeated schema lookups per item
+  const mapperCache = new Map<string, any>();  // alias -> mapper
+  for (const [alias, fieldInfo] of aliasToFieldInfo) {
+    const mapper = selectedFieldMapper(fieldInfo, columnCache, schemaRegistryForItems);
+    if (mapper) {
+      mapperCache.set(alias, mapper);
+    }
+  }
+
+  // An expression's own mapper (`sql\`…\`.mapWith(...)`); it used to be ignored in a collection
+  for (const field of selectedFieldConfigs ?? []) {
+    if (field.mapper) {
+      mapperCache.set(field.alias, field.mapper);
+    }
+  }
+
+  // Also add direct property matches from target schema (when no alias mapping) — never for a
+  // field the projection describes as something else (an expression, a literal, a nested object):
+  // under a mapped column's NAME it used to go through that column's mapper
+  const describedAliases = new Set((selectedFieldConfigs ?? []).map(field => field.alias));
+  if (columnCache) {
+    for (const [propertyName, cached] of columnCache) {
+      if (!mapperCache.has(propertyName) && !describedAliases.has(propertyName) && cached.hasMapper) {
+        mapperCache.set(propertyName, cached.mapper);
+      }
+    }
+  }
+
+  // Literals and nested objects of the projection read through their own field configs
+  const readsFields = hasFieldReads(selectedFieldConfigs, applyLiterals);
+
+  // Build cache of nested collection info (fields that are themselves nested collections)
+  // This is used for recursive transformation of nested collection results
+  const nestedCollectionCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string }>();
+  if (selectedFieldConfigs) {
+    for (const field of selectedFieldConfigs) {
+      if (field.nestedCollectionInfo) {
+        nestedCollectionCache.set(field.alias, field.nestedCollectionInfo);
+      }
+    }
+  }
+
+  // Get schema registry for nested collection transformation
+  const schemaRegistry = collectionBuilder.getSchemaRegistry() || fallbackRegistry;
+
+  // Transform items using pre-built mapper cache
+  const results: any[] = new Array(items.length);
+  let i = items.length;
+  while (i--) {
+    const item = items[i];
+    const transformedItem: any = {};
+    for (const key in item) {
+      const value = item[key];
+      const mapper = mapperCache.get(key);
+      if (mapper) {
+        transformedItem[key] = mapper.fromDriver(value);
+      } else {
+        // Check if this field is a nested collection that needs recursive transformation
+        const nestedInfo = nestedCollectionCache.get(key);
+        if (nestedInfo && value !== null && value !== undefined && schemaRegistry) {
+          transformedItem[key] = transformNestedCollectionValueOf(value, nestedInfo, schemaRegistry, applyLiterals);
+        } else {
+          transformedItem[key] = value;
+        }
+      }
+    }
+    results[i] = readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
+  }
+  return results;
+}
+
+/** The mapper of a collection field reading a column (of the item's table, or of a navigation's). */
+function selectedFieldMapper(
+  field: { propertyName?: string; sourceTable?: string },
+  columnCache: TableSchema['columnMetadataCache'],
+  schemaRegistry: Map<string, TableSchema> | undefined
+): any {
+  if (!field.propertyName) {
+    return undefined;
+  }
+
+  const cached = field.sourceTable
+    ? schemaRegistry?.get(field.sourceTable)?.columnMetadataCache?.get(field.propertyName)
+    : columnCache?.get(field.propertyName);
+
+  return cached?.hasMapper ? cached.mapper : undefined;
+}
+
+/** Whether a collection projection has fields the item mapping reads by their configs (literals, nested objects). */
+function hasFieldReads(fields: SelectedField[] | undefined, applyLiterals: boolean = true): boolean {
+  return fields !== undefined && fields.some(field => (applyLiterals && field.literal !== undefined) || (field.nested !== undefined && field.nested.length > 0));
+}
+
+/**
+ * Applies what a collection projection's field configs say about an item's fields: a literal reads
+ * back as its value (the database returns an untyped parameter as text — `42` came back "42",
+ * `true` "true"), and a nested object's fields read like top-level ones — a literal as itself, a
+ * column through its mapper, an expression through its own. `topLevelDone` skips the top level's
+ * columns and expressions, which the caller already mapped.
+ */
+function applyFieldReads(
+  item: any,
+  fields: SelectedField[] | undefined,
+  columnCache: TableSchema['columnMetadataCache'],
+  schemaRegistry: Map<string, TableSchema> | undefined,
+  topLevelDone: boolean = false,
+  applyLiterals: boolean = true
+): any {
+  if (fields === undefined || item === null || typeof item !== 'object') {
+    return item;
+  }
+
+  for (const field of fields) {
+    if (field.literal !== undefined) {
+      if (applyLiterals) {
+        item[field.alias] = field.literal.value;
+      }
+    } else if (field.nested !== undefined) {
+      const nested = item[field.alias];
+
+      if (nested !== null && typeof nested === 'object') {
+        item[field.alias] = applyFieldReads({ ...nested }, field.nested, columnCache, schemaRegistry, false, applyLiterals);
+      }
+    } else if (!topLevelDone && field.alias in item) {
+      const mapper = field.mapper ?? selectedFieldMapper(field, columnCache, schemaRegistry);
+
+      if (mapper && typeof mapper.fromDriver === 'function') {
+        item[field.alias] = mapper.fromDriver(item[field.alias]);
+      }
+    }
+  }
+
+  return item;
+}
+
+/**
+ * Transform a nested collection value (from firstOrDefault or toList inside another collection)
+ * Applies custom mappers to fields within the nested collection result.
+ */
+function transformNestedCollectionValueOf(
+  value: any,
+  nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string },
+  schemaRegistry: Map<string, TableSchema>,
+  applyLiterals: boolean = true
+): any {
+  // Flattened lists (toNumberList/toStringList) return a primitive array directly
+  // from the driver — no per-element object transformation applies. Iterating with
+  // `for (const key in item)` on a number/string would yield an empty object, so
+  // short-circuit here before touching any elements.
+  if (nestedInfo.flattenResultType) {
+    return value;
+  }
+
+  // A collection selecting ONE value reads as its values (see isScalarSelection): its items are
+  // transformed as the one-field objects they arrive as, then unwrapped
+  if (nestedInfo.scalarAlias !== undefined) {
+    const { scalarAlias, ...objectInfo } = nestedInfo;
+    const transformed = transformNestedCollectionValueOf(value, objectInfo, schemaRegistry, applyLiterals);
+
+    if (Array.isArray(transformed)) {
+      return unwrapScalarItems(transformed, scalarAlias);
+    }
+
+    return transformed !== null && typeof transformed === 'object' ? transformed[scalarAlias] : transformed;
+  }
+
+  const nestedSchema = schemaRegistry.get(nestedInfo.targetTable);
+  if (!nestedSchema?.columnMetadataCache) {
+    return value;  // No schema info, return as-is
+  }
+
+  const columnCache = nestedSchema.columnMetadataCache;
+  const selectedFieldConfigs = nestedInfo.selectedFieldConfigs;
+
+  // Build mapper cache for nested collection fields
+  const mapperCache = new Map<string, any>();
+
+  // First, add mappers from selected field configs (for aliased/navigation fields, and an
+  // expression's own `mapWith`)
+  if (selectedFieldConfigs) {
+    for (const field of selectedFieldConfigs) {
+      const mapper = field.mapper ?? selectedFieldMapper(field, columnCache, schemaRegistry);
+      if (mapper) {
+        mapperCache.set(field.alias, mapper);
+      }
+    }
+  }
+
+  // Also add direct property matches from target schema — never for a field the projection
+  // describes as something else (see transformCollectionItemsOf)
+  const describedAliases = new Set((selectedFieldConfigs ?? []).map(field => field.alias));
+  for (const [propertyName, cached] of columnCache) {
+    if (!mapperCache.has(propertyName) && !describedAliases.has(propertyName) && cached.hasMapper) {
+      mapperCache.set(propertyName, cached.mapper);
+    }
+  }
+
+  // Literals and nested objects of the projection read through their own field configs
+  const readsFields = hasFieldReads(selectedFieldConfigs, applyLiterals);
+
+  // Build cache for any deeply nested collections
+  const deeplyNestedCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string }>();
+  if (selectedFieldConfigs) {
+    for (const field of selectedFieldConfigs) {
+      if (field.nestedCollectionInfo) {
+        deeplyNestedCache.set(field.alias, field.nestedCollectionInfo);
+      }
+    }
+  }
+
+  // Transform the value(s)
+  const transformItem = (item: any): any => {
+    if (item === null || item === undefined) {
+      return item;
+    }
+    const transformedItem: any = {};
+    for (const key in item) {
+      const fieldValue = item[key];
+      const mapper = mapperCache.get(key);
+      if (mapper) {
+        transformedItem[key] = mapper.fromDriver(fieldValue);
+      } else {
+        // Check for deeply nested collections
+        const deepNestedInfo = deeplyNestedCache.get(key);
+        if (deepNestedInfo && fieldValue !== null && fieldValue !== undefined) {
+          transformedItem[key] = transformNestedCollectionValueOf(fieldValue, deepNestedInfo, schemaRegistry, applyLiterals);
+        } else {
+          transformedItem[key] = fieldValue;
+        }
+      }
+    }
+    return readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
+  };
+
+  if (nestedInfo.isSingleResult) {
+    // Single item (firstOrDefault)
+    return transformItem(value);
+  } else if (Array.isArray(value)) {
+    // Array of items (toList)
+    return value.map(transformItem);
+  } else {
+    // Single object that should be treated as single result
+    return transformItem(value);
+  }
+}
+
+/**
+ * How one value of a mutation's RETURNING selection reads back — a column or an `sql` expression
+ * (through its own mapper), a literal, a collection, a nested object — keyed by its result key, in
+ * selection order. It is built while the RETURNING renders, and the rows are read through it: they
+ * used to be mapped by their result KEYS, so an aliased column (`when: ln.dueAt`) lost its mapper
+ * and a value under a column's name (a fragment, another column) got that column's. @internal
+ */
+export type ReturningRead =
+  | { kind: 'value'; column: string; mapper?: { fromDriver(value: any): any } }
+  | { kind: 'constant'; value: unknown }
+  | { kind: 'collection'; column: string; collection: any }
+  | { kind: 'nested'; shape: ReturningShape };
+
+/** The fields of a RETURNING row (or of a nested object in it), in selection order. @internal */
+export type ReturningShape = Array<{ key: string; read: ReturningRead }>;
+
+/**
+ * The read plan of a mutation's RETURNING: the shape of its rows, and whether its selector returned
+ * ONE value (`ln => ln.note`) — each row then reads as that value, as `.returning()`'s type says.
+ * @internal
+ */
+export interface ReturningReadPlan {
+  shape: ReturningShape;
+  scalar: boolean;
+}
+
+/**
+ * The column a RETURNING returns when its selection has no SQL value at all (only literals), so the
+ * statement still yields one row per mutated row. @internal
+ */
+export const RETURNING_PLACEHOLDER_COLUMN = '__returning__';
+
+/** A nested projection — a plain object literal of fields, not a column, an expression, a collection or a value. */
+const isNestedProjection = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || '__dbColumnName' in value || '__collectionResult' in value) {
+    return false;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+
+  return proto === Object.prototype || proto === null;
+};
+
+/**
+ * A value of a mutation's RETURNING selection, prepared for the walkers: a navigation row projected
+ * whole (`printed: ln.edition.book`) becomes an object of its columns — the walkers read with
+ * `Object.entries`, which sees nothing of a mock row (its columns are inherited getters), so such a
+ * field vanished from the result; a SELECT returns the same object — and a condition or a subquery
+ * becomes the `sql` expression it renders, a fragment interpolating it (which parenthesizes it and
+ * reports its refs). A condition used to be walked as a nested object and came back as its own
+ * internals (`{ field: 7 }`).
+ */
+const prepareReturningValue = (value: any): any => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || '__dbColumnName' in value
+    || value instanceof CollectionQueryBuilder || value instanceof SqlFragment) {
+    return value;
+  }
+
+  if (value instanceof WhereConditionBase || value instanceof Subquery) {
+    return new SqlFragment(['', ''], [value]);
+  }
+
+  const row = materializeMockSelection(value);
+
+  if (row !== value) {
+    return row;
+  }
+
+  if (!isNestedProjection(value)) {
+    // A value (a Date, any class instance) stays as it is
+    return value;
+  }
+
+  let changed = false;
+  const out: Record<string, any> = {};
+
+  for (const [key, field] of Object.entries(value)) {
+    out[key] = prepareReturningValue(field);
+    changed = changed || out[key] !== field;
+  }
+
+  return changed ? out : value;
+};
+
+/**
+ * What a mutation's RETURNING selector returned, ready to render (see prepareReturningValue). A
+ * selector returning ONE value — a column, a navigation's column, an `sql` expression, a condition,
+ * a collection — renders as `{ __value: <value> }`, each row reading as that value (`scalar`): its
+ * RETURNING list used to render empty, the value's own ref keys read as the projection's fields.
+ * @internal
+ */
+export function returningSelection(result: unknown): { selection: Record<string, unknown>; scalar: boolean } {
+  const prepared = prepareReturningValue(result);
+
+  return isNestedProjection(prepared)
+    ? { selection: prepared, scalar: false }
+    : { selection: { [SCALAR_SELECTION_ALIAS]: prepared }, scalar: true };
+}
+
+/**
+ * One value of a (prepared, see returningSelection) mutation RETURNING selection. An `undefined`
+ * field is left out, as a SELECT leaves it out; a literal — a string, a number, a Date, `null`, an
+ * array of values — reads back as it is. @internal
+ */
+export type ReturningValue =
+  | { kind: 'column'; ref: FieldRef }
+  | { kind: 'expression'; fragment: SqlFragment }
+  | { kind: 'collection'; collection: any }
+  | { kind: 'nested'; value: Record<string, unknown> }
+  | { kind: 'constant'; value: unknown }
+  | { kind: 'skip' };
+
+/** Classifies one value of a mutation's RETURNING selection; `path` names it in errors. @internal */
+export function classifyReturningValue(value: unknown, path: string): ReturningValue {
+  if (value === undefined) {
+    return { kind: 'skip' };
+  }
+
+  if (value === null || typeof value !== 'object') {
+    return { kind: 'constant', value };
+  }
+
+  if (value instanceof CollectionQueryBuilder || '__collectionResult' in value) {
+    return { kind: 'collection', collection: value };
+  }
+
+  if ('__dbColumnName' in value) {
+    return { kind: 'column', ref: value as FieldRef };
+  }
+
+  if (value instanceof SqlFragment) {
+    return { kind: 'expression', fragment: value };
+  }
+
+  if (value instanceof WhereConditionBase || value instanceof Subquery) {
+    return { kind: 'expression', fragment: new SqlFragment(['', ''], [value]) };
+  }
+
+  if (isNestedProjection(value)) {
+    return { kind: 'nested', value };
+  }
+
+  if (Array.isArray(value) && value.some((item, i) => item !== null && typeof item === 'object' && classifyReturningValue(item, `${path}[${i}]`).kind !== 'constant')) {
+    throw new Error(
+      `RETURNING field "${path}" is an array of columns or expressions, which has no single SQL value to return — `
+      + 'select them as an object, or build the array in SQL (sql`ARRAY[...]`)'
+    );
+  }
+
+  return { kind: 'constant', value };
+}
+
+/** The `mapWith` mapper of an `sql` expression, resolved the way a SELECT resolves it. @internal */
+export function fragmentReadMapper(fragment: SqlFragment): { fromDriver(value: any): any } | undefined {
+  let mapper: any = fragment.getMapper();
+
+  if (mapper && typeof mapper.getType === 'function') {
+    mapper = mapper.getType();
+  }
+
+  return mapper && typeof mapper.fromDriver === 'function' ? mapper : undefined;
+}
+
+/**
+ * Renders an `sql` expression of a mutation's RETURNING. The columns of the mutated row it reads
+ * render as `columnSql` gives them — a column qualified by the table's alias (MERGE, bulkUpdate), a
+ * column of the navigation RETURNING's CTE: their plain `"table"."col"` is not in scope there. Only
+ * the expression's own refs render so (a subquery's inner columns keep their table). Its parameters
+ * append to `context`. @internal
+ */
+export function renderReturningExpression(
+  fragment: SqlFragment,
+  context: SqlBuildContext,
+  isOwnColumn: (ref: FieldRef) => boolean,
+  columnSql: (ref: FieldRef) => string
+): string {
+  const ownRefs = new Set<object>(fragment.getFieldRefs().filter(isOwnColumn));
+  const previous = context.substitute;
+  context.substitute = (value, ctx) => (ownRefs.has(value) ? columnSql(value as FieldRef) : previous?.(value, ctx));
+
+  try {
+    return fragment.buildSql(context);
+  } finally {
+    context.substitute = previous;
+  }
+}
+
+/**
+ * What differs between the mutations in a plain (single-statement) RETURNING: how a column of the
+ * mutated row renders — bare, qualified by the table, or by its alias — and reads back. @internal
+ */
+export interface PlainReturningHooks {
+  isOwnColumn(ref: FieldRef): boolean;
+  columnSql(ref: FieldRef): string;
+  columnMapper(ref: FieldRef): { fromDriver(value: any): any } | undefined;
+  /** The statement's parameters: an expression's append here (RETURNING ends the statement). */
+  context: SqlBuildContext;
+  /**
+   * Bind the selection's literals as parameters instead of reading them from the plan: a compiled
+   * statement (`toStatement()`) is read by SQL, which sees only what the statement returns.
+   */
+  constantsAsParams?: boolean;
+}
+
+/**
+ * Renders a mutation's plain RETURNING list — the mutated row's own columns, `sql` expressions over
+ * them, literals — and its read plan. A selection reading anything else (a navigation, a collection,
+ * a nested object) takes the navigation RETURNING. @internal
+ */
+export function renderPlainReturning(
+  selection: Record<string, unknown>,
+  hooks: PlainReturningHooks
+): { sql: string; columns: string[]; shape: ReturningShape } {
+  const parts: string[] = [];
+  const columns: string[] = [];
+  const shape: ReturningShape = [];
+
+  for (const [key, value] of Object.entries(selection)) {
+    const classified = classifyReturningValue(value, key);
+
+    switch (classified.kind) {
+      case 'skip':
+        break;
+      case 'column':
+        if (!hooks.isOwnColumn(classified.ref)) {
+          throw new Error(`RETURNING field "${key}" reads a column of another table, which this RETURNING cannot join`);
+        }
+
+        parts.push(`${hooks.columnSql(classified.ref)} AS "${key}"`);
+        columns.push(key);
+        shape.push({ key, read: { kind: 'value', column: key, mapper: hooks.columnMapper(classified.ref) } });
+        break;
+      case 'expression':
+        parts.push(`${renderReturningExpression(classified.fragment, hooks.context, hooks.isOwnColumn, hooks.columnSql)} AS "${key}"`);
+        columns.push(key);
+        shape.push({ key, read: { kind: 'value', column: key, mapper: fragmentReadMapper(classified.fragment) } });
+        break;
+      case 'constant':
+        if (hooks.constantsAsParams) {
+          parts.push(`$${hooks.context.paramCounter++} AS "${key}"`);
+          hooks.context.params.push(classified.value);
+          columns.push(key);
+        }
+
+        shape.push({ key, read: { kind: 'constant', value: classified.value } });
+        break;
+      default:
+        throw new Error(`RETURNING field "${key}" reads a ${classified.kind === 'nested' ? 'nested object' : 'collection'}, which this RETURNING cannot render`);
+    }
+  }
+
+  if (parts.length === 0) {
+    parts.push(`NULL AS "${RETURNING_PLACEHOLDER_COLUMN}"`);
+  }
+
+  return { sql: parts.join(', '), columns, shape };
+}
+
+/**
+ * A collection a mutation's RETURNING projects, read the way a SELECT reads it: an aggregate as its
+ * number, a list's items (and a `firstOrDefault()`'s item) through their columns' mappers, and a
+ * collection selecting ONE value as its values. @internal
+ */
+export function readCollectionResult(collection: any, raw: any, registry: Map<string, TableSchema> | undefined): any {
+  if (!(collection instanceof CollectionQueryBuilder)) {
+    return raw;
+  }
+
+  if (collection.isScalarAggregation()) {
+    return scalarCollectionValue(collection.getAggregationType(), raw);
+  }
+
+  if (typeof (collection as any).isArrayAggregation === 'function' && (collection as any).isArrayAggregation()) {
+    return raw ?? [];
+  }
+
+  const scalarAlias = collection.getScalarSelectionAlias();
+
+  if (collection.isSingleResult()) {
+    if (raw === null || raw === undefined) {
+      return null;
+    }
+
+    const items = transformCollectionItemsOf([raw], collection, registry);
+
+    return (scalarAlias !== undefined ? unwrapScalarItems(items, scalarAlias) : items)[0] ?? null;
+  }
+
+  const items = transformCollectionItemsOf(raw ?? [], collection, registry);
+
+  return scalarAlias !== undefined ? unwrapScalarItems(items, scalarAlias) : items;
+}
+
+/** A mutation's RETURNING rows, read through the plan its rendering built (see ReturningRead). @internal */
+export function readReturningRows(rows: any[], plan: ReturningReadPlan, registry: Map<string, TableSchema> | undefined): any[] {
+  const readShape = (row: any, shape: ReturningShape): any => {
+    const out: any = {};
+
+    for (const { key, read } of shape) {
+      switch (read.kind) {
+        case 'value': {
+          const raw = row[read.column];
+          out[key] = read.mapper ? read.mapper.fromDriver(raw) : raw;
+          break;
+        }
+        case 'constant':
+          out[key] = read.value;
+          break;
+        case 'collection':
+          out[key] = readCollectionResult(read.collection, row[read.column], registry);
+          break;
+        case 'nested':
+          out[key] = readShape(row, read.shape);
+          break;
+      }
+    }
+
+    return out;
+  };
+
+  return rows.map(row => {
+    const out = readShape(row, plan.shape);
+
+    return plan.scalar ? out[SCALAR_SELECTION_ALIAS] : out;
+  });
+}
 
 /**
  * Type helper to resolve collection results to arrays
@@ -7617,7 +8994,7 @@ export class ReferenceQueryBuilder<TItem = any> {
         isMandatory: this.explicitAlias !== undefined ? false : this.isMandatory,
         sourceAlias: this.sourceAlias,
       };
-      if (this.explicitAlias !== undefined && this.targetTableSchema?.schema) {
+      if (this.targetTableSchema?.schema) {
         currentNavStep.targetSchema = this.targetTableSchema.schema;
       }
       extendedNavPath = [...this.navigationPath, currentNavStep];
@@ -7783,13 +9160,18 @@ export class CollectionQueryBuilder<TItem = any> {
   private limitValue?: number;
   private offsetValue?: number;
   // `table` is the alias the ordered column rendered under: the collection marker for an own
-  // column, a relation name for a navigation column.
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC'; table?: string }> = [];
+  // column, a relation name for a navigation column; `ref` is the column's own ref, which the
+  // build renders qualified (under its planned alias) and joins like a projected navigation.
+  // `fragment` is a key that is an SQL expression (a `sql` fragment, a condition, a nested
+  // collection's count / exists), rendered in the collection's parameter sequence; `field` is empty.
+  private orderByFields: Array<{ field: string; direction: OrderDirection; table?: string; ref?: FieldRef; fragment?: Condition }> = [];
   private asName?: string;
   private isMarkedAsList: boolean = false;
   private isDistinct: boolean = false;
   private aggregationType?: 'MIN' | 'MAX' | 'SUM' | 'COUNT' | 'EXISTS';
   private flattenResultType?: 'number' | 'string';
+  /** Set by a build whose selector returned ONE value (see isScalarSelection): the field its items are unwrapped from. */
+  private scalarSelectionAlias?: string;
   private schemaRegistry?: Map<string, TableSchema>;
   // Navigation path leading to this collection (for intermediate joins in lateral subqueries)
   private navigationPath: NavigationJoin[];
@@ -7800,6 +9182,8 @@ export class CollectionQueryBuilder<TItem = any> {
 
   // Performance: Cache the mock item to avoid recreating it
   private _cachedMockItem?: any;
+  // The selector's result on the mock item (see evaluateSelector); never copied to derived builders
+  private evaluatedSelection?: { result: any };
   // Cache selected field configs for mapper lookup during transformation
   private _selectedFieldConfigs?: SelectedField[];
 
@@ -7824,6 +9208,12 @@ export class CollectionQueryBuilder<TItem = any> {
    * (see {@link captureSnapshot}).
    */
   private writtenInPlace: boolean = false;
+
+  /**
+   * @internal The navigation plan of the build in progress (see {@link withNavigationPlan});
+   * `undefined` between builds and for builds it cannot change. Never copied to derived builders.
+   */
+  private navigationPlan?: NavigationAliasPlan;
 
   constructor(
     relationName: string,
@@ -7878,7 +9268,7 @@ export class CollectionQueryBuilder<TItem = any> {
       this.foreignKeys,      // Propagate composite/literal FK metadata
       this.matches
     );
-    newBuilder.selector = selector as any;
+    newBuilder.selector = selectorProjectingConditions(selector as any);
     newBuilder.whereCond = this.whereCond;
     newBuilder.limitValue = this.limitValue;
     newBuilder.offsetValue = this.offsetValue;
@@ -8164,8 +9554,47 @@ export class CollectionQueryBuilder<TItem = any> {
     this.writtenInPlace = true;
     const mockItem = this.createMockItem();
     const result = selector(mockItem);
-    parseOrderBy(result, this.orderByFields, undefined, getTableAlias);
+    forEachOrderByKey(result, (key, direction) => {
+      this.orderByFields.push({ field: key.__dbColumnName || key.__fieldName, direction, table: getTableAlias(key), ref: key });
+    }, (fragment, direction) => {
+      // Used to be dropped from the ORDER BY silently
+      this.orderByFields.push({ field: '', direction, fragment });
+    });
     return this;
+  }
+
+  /** The refs of this collection's ORDER BY keys (the columns an expression key reads included). */
+  private orderByRefs(): FieldRef[] {
+    const refs: FieldRef[] = [];
+
+    for (const entry of this.orderByFields) {
+      if (entry.ref !== undefined) {
+        refs.push(entry.ref);
+      }
+
+      if (entry.fragment !== undefined) {
+        refs.push(...entry.fragment.getFieldRefs());
+      }
+    }
+
+    return refs;
+  }
+
+  /**
+   * One ORDER BY key as a qualified expression over the collection's FROM: an own column under the
+   * collection marker (every strategy rewrites the marker to its alias for the target table), any
+   * other column under the alias its ref renders under — a navigation of ours under its planned
+   * alias (joined like a projected one), an enclosing row's column under that row's alias.
+   */
+  private orderByKeyExpression(entry: { field: string; table?: string; ref?: FieldRef }): string {
+    const alias = ((entry.ref as any)?.__tableAlias as string | undefined) ?? entry.table;
+    const marker = `__collection_${this.targetTable}__`;
+
+    if (!alias || alias === this.targetTable || alias === marker) {
+      return `"${marker}"."${entry.field}"`;
+    }
+
+    return `"${alias}"."${entry.field}"`;
   }
 
   /**
@@ -8254,17 +9683,21 @@ export class CollectionQueryBuilder<TItem = any> {
     const innerAny = innerCollection as any;
 
     // Build a navigation join from inner target table → this (intermediate) table
-    // e.g., product_price_capacity_groups.product_price_id → product_prices.id
+    // e.g., product_price_capacity_groups.product_price_id → product_prices.id — on the INNER
+    // relation's own keys: its foreign key(s) on the inner table, the intermediate's principal key(s)
     const navJoin: NavigationJoin = {
       alias: this.targetTable,
       targetTable: this.targetTable,
-      foreignKeys: [innerAny.foreignKey],  // FK on inner table pointing to intermediate
-      matches: ['id'],                     // PK on intermediate table
+      targetSchema: this.targetTableSchema?.schema,
+      foreignKeys: innerAny.foreignKeys,   // FK on inner table pointing to intermediate
+      matches: innerAny.matches,           // Principal key on intermediate table (`id` by default)
       isMandatory: true,                   // INNER JOIN for flattening
       sourceAlias: innerAny.targetTable,   // Source is the inner (target) table
     };
 
-    // Create new builder targeting the inner table but with outer's FK for parent correlation
+    // Create new builder targeting the inner table but with outer's FK for parent correlation — and
+    // the outer relation's principal key: a relation keyed on another column than `id`
+    // (`withPrincipalKey(c => c.code)`) used to correlate `fk = parent.id`
     const newBuilder = new CollectionQueryBuilder<TInner>(
       this.relationName,            // Keep outer relation name for CTE naming
       innerAny.targetTable,         // Target is the inner collection's table
@@ -8272,7 +9705,9 @@ export class CollectionQueryBuilder<TItem = any> {
       this.sourceTable,             // Source is the outer collection's source (e.g., products)
       innerAny.targetTableSchema,
       this.schemaRegistry,
-      this.navigationPath
+      this.navigationPath,
+      this.foreignKeys,
+      this.matches
     );
 
     // The FK column lives on the intermediate table, not the target table
@@ -8394,6 +9829,61 @@ export class CollectionQueryBuilder<TItem = any> {
     return this.sourceTable;
   }
 
+  /**
+   * The parent's key column this collection's foreign key refers to — the relation's principal key
+   * (`withPrincipalKey`), `id` by default. The CTE and temp-table strategies group the collection by
+   * its foreign-key value, so their aggregate joins back on THIS column of the parent, not on `id`.
+   */
+  getParentKeyColumn(): string {
+    for (let i = 0; i < this.foreignKeys.length; i++) {
+      const match = this.matches[i];
+
+      if (match !== undefined && !isLiteralKeyPart(this.foreignKeys[i]) && !isLiteralKeyPart(match)) {
+        return match;
+      }
+    }
+
+    return 'id';
+  }
+
+  /**
+   * The SQL type of {@link getParentKeyColumn} in the parent's table: the last hop of the navigation
+   * path the collection hangs off, else its source table. `undefined` when the schema is not known.
+   */
+  getParentKeyType(): string | undefined {
+    const parentTable = this.navigationPath.length > 0 ? this.navigationPath[this.navigationPath.length - 1].targetTable : this.sourceTable;
+    const parentSchema = this.schemaRegistry?.get(parentTable);
+
+    if (parentSchema === undefined) {
+      return undefined;
+    }
+
+    const column = getSchemaColumnMeta(parentSchema).get(this.getParentKeyColumn())
+      ?? [...getSchemaColumnMeta(parentSchema).values()].find(meta => meta.name === this.getParentKeyColumn());
+
+    return column?.type;
+  }
+
+  /**
+   * Whether the SQL this collection renders under `strategy` reads the last hop of its navigation
+   * path from the ENCLOSING scope, which then has to join the path: the CTE and temp-table strategies
+   * correlate their aggregate to it, and so does the correlated-subquery form of LATERAL (a count,
+   * min / max / sum, exists or flat list without LIMIT / OFFSET). A LATERAL join joins the path itself.
+   */
+  correlatesThroughEnclosingPath(strategy: CollectionStrategyType): boolean {
+    if (this.navigationPath.length === 0) {
+      return false;
+    }
+
+    if (strategy !== 'lateral') {
+      return true;
+    }
+
+    const scalarOrFlat = this.aggregationType !== undefined || this.flattenResultType !== undefined;
+
+    return scalarOrFlat && this.limitValue === undefined && this.offsetValue === undefined;
+  }
+
   /** The relation this collection navigates. */
   getRelationName(): string {
     return this.relationName;
@@ -8414,10 +9904,12 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
-   * Check if this is a single item result (firstOrDefault)
+   * Check if this is a single item result (firstOrDefault). A count / min / max / sum / exists or a
+   * flat list over `.limit(1)` is not: it keeps its own shape and default (0, false, null, []) —
+   * read as a single item, a parent without rows got `null` for its `.limit(1).count()`.
    */
   isSingleResult(): boolean {
-    return !this.isMarkedAsList && this.limitValue === 1;
+    return !this.isMarkedAsList && this.limitValue === 1 && this.aggregationType === undefined && this.flattenResultType === undefined;
   }
 
   /**
@@ -8432,6 +9924,15 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   getFlattenResultType(): 'number' | 'string' | undefined {
     return this.flattenResultType;
+  }
+
+  /**
+   * The field the items of a collection selecting ONE value are unwrapped from (`e => e.label`
+   * yields its labels, not `{ label }` objects), once it was built; `undefined` otherwise.
+   * @internal
+   */
+  getScalarSelectionAlias(): string | undefined {
+    return this.scalarSelectionAlias;
   }
 
   /**
@@ -8456,6 +9957,145 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * Every ref this collection reads from an ENCLOSING query: in its WHERE (see {@link getFieldRefs}),
+   * its projection — columns, `sql` fragments, nested objects, subqueries — its ORDER BY, and the
+   * ones its own nested collections read from beyond it. The enclosing scope has to have their
+   * tables in scope (it joins the navigations they read through), and a collection reading its
+   * parent row this way cannot be aggregated apart from that row: under the CTE and temp-table
+   * strategies it renders as LATERAL (see buildCTEBody).
+   */
+  getOuterFieldRefs(): FieldRef[] {
+    const refs: FieldRef[] = [];
+    const add = (ref: any): void => {
+      if (ref && typeof ref === 'object' && '__dbColumnName' in ref && isForeignChainRef(ref, this.chainId)) {
+        refs.push(ref);
+      }
+    };
+
+    if (this.whereCond) {
+      for (const ref of this.whereCond.getFieldRefs()) {
+        add(ref);
+      }
+    }
+
+    for (const entry of this.orderByFields) {
+      add(entry.ref);
+
+      if (entry.fragment !== undefined) {
+        for (const ref of entry.fragment.getFieldRefs()) {
+          add(ref);
+        }
+      }
+    }
+
+    if (this.selector) {
+      this.collectOuterRefs(this.evaluateSelector(), add, 0);
+    }
+
+    return refs;
+  }
+
+  /**
+   * Runs `build` with the refs this collection reads from an ENCLOSING collection's row renamed from
+   * that collection's marker (`"__collection_<table>__"`) to the alias the row renders under: an
+   * enclosing lateral's inner alias (its entry in `aliasMap`), else the table's own name — the CTE and
+   * temp-table aggregations select from the table unaliased. The marker names a TABLE, not a query,
+   * so only the collection that owns it can resolve it, and a nested build never reached it: a list
+   * nested in a collection kept the foreign marker (`missing FROM-clause entry for table
+   * "__collection_…__"`), and a collection over the table its enclosing collection reads
+   * (`m.loans` → `ln.member.loans.where(x => gt(x.id, ln.id))`) rewrote the enclosing row's refs to
+   * its own alias with its own marker — `x.id > x.id`, false for every row.
+   */
+  private withEnclosingRowAliases<T>(aliasMap: Map<string, string> | undefined, build: () => T): T {
+    const renamed: Array<[any, string]> = [];
+
+    for (const ref of this.getOuterFieldRefs()) {
+      const alias = (ref as any).__tableAlias;
+
+      if (typeof alias === 'string' && alias.length > 15 && alias.startsWith('__collection_') && alias.endsWith('__')) {
+        const table = alias.slice('__collection_'.length, -2);
+        (ref as any).__tableAlias = aliasMap?.get(table) ?? table;
+        renamed.push([ref, alias]);
+      }
+    }
+
+    if (renamed.length === 0) {
+      return build();
+    }
+
+    try {
+      return build();
+    } finally {
+      for (const [ref, alias] of renamed) {
+        ref.__tableAlias = alias;
+      }
+    }
+  }
+
+  /** Walks a selector result for {@link getOuterFieldRefs}. */
+  private collectOuterRefs(value: any, add: (ref: any) => void, depth: number): void {
+    if (value === null || typeof value !== 'object' || depth > 16) {
+      return;
+    }
+
+    if ('__dbColumnName' in value) {
+      add(value);
+      return;
+    }
+
+    if (value instanceof SqlFragment) {
+      for (const ref of value.getFieldRefs()) {
+        add(ref);
+      }
+      return;
+    }
+
+    // A nested collection or a subquery: what it reads from beyond itself
+    if (typeof value.getOuterFieldRefs === 'function') {
+      for (const ref of value.getOuterFieldRefs()) {
+        add(ref);
+      }
+      return;
+    }
+
+    if (Array.isArray(value) || value instanceof ReferenceQueryBuilder) {
+      return;
+    }
+
+    // A navigation row projected whole: its first column's ref names its row
+    if (isReferenceMockRow(value)) {
+      const firstKey = findFirstGetterKey(value);
+
+      if (firstKey !== undefined) {
+        add(value[firstKey]);
+      }
+      return;
+    }
+
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        this.collectOuterRefs(value[key], add, depth + 1);
+      }
+    }
+  }
+
+  /**
+   * The selector's result on this collection's item, evaluated once per builder: the enclosing
+   * scope reads it for {@link getOuterFieldRefs}, and every build of this collection renders it.
+   */
+  private evaluateSelector(): any {
+    if (!this.selector) {
+      return undefined;
+    }
+
+    if (this.evaluatedSelection === undefined) {
+      this.evaluatedSelection = { result: materializeMockSelection(this.selector(this.createMockItem())) };
+    }
+
+    return this.evaluatedSelection.result;
+  }
+
+  /**
    * Build SQL for this collection as a correlated subquery — the form it takes inside a condition
    * or a `sql` fragment.
    * EXISTS produces: EXISTS (SELECT 1 FROM "table" [JOINs] WHERE correlation AND conditions)
@@ -8468,22 +10108,15 @@ export class CollectionQueryBuilder<TItem = any> {
       throw new Error('buildSql() on CollectionQueryBuilder is only supported for EXISTS and COUNT aggregations');
     }
 
+    return this.withEnclosingRowAliases(context.lateralTableAliasMap, () =>
+      this.withNavigationPlan(undefined, () => this.buildSqlBody(context)));
+  }
+
+  /** The body of {@link buildSql}, run under the navigation plan of this collection's WHERE. */
+  private buildSqlBody(context: SqlBuildContext): string {
     const targetTable = this.targetTable;
     const foreignKey = this.foreignKey;
     const sourceTable = this.sourceTable;
-
-    // COUNT names its own table: a count reached through a navigation back to the SAME table
-    // (`post.user.posts`) would otherwise shadow the outer row that navigation hangs off — the
-    // bridge join and the correlation would both bind to the inner row, and every row would count
-    // everything. EXISTS keeps its historical unaliased form; a selectMany bridge addresses the raw
-    // table name, so it keeps it too.
-    const ownAlias = this.aggregationType === 'COUNT' && this.selectManyJoins.length === 0
-      ? `${this.relationName}__count`
-      : targetTable;
-    const ownRef = (alias: string): string => (alias === targetTable ? ownAlias : alias);
-
-    // Build JOINs needed inside the EXISTS subquery
-    const allJoins: string[] = [];
 
     // Inside a lateral, the collection's λ-root table is visible only under the
     // lateral's generated alias (e.g. `FROM "cart_discount_code" "lateral_3_cartDiscountCodes"`).
@@ -8495,13 +10128,34 @@ export class CollectionQueryBuilder<TItem = any> {
     const aliasMap = (context as { lateralTableAliasMap?: Map<string, string> }).lateralTableAliasMap;
     const rootAnchor = (alias: string): string => aliasMap?.get(alias) || alias;
 
+    // COUNT names its own table: a count reached through a navigation back to the SAME table
+    // (`post.user.posts`) would otherwise shadow the outer row that navigation hangs off — the
+    // bridge join and the correlation would both bind to the inner row, and every row would count
+    // everything. EXISTS keeps its historical unaliased form unless that bare name is one the
+    // subquery reads from the enclosing scope — the row it correlates to (a relation of a table to
+    // itself), the row the first hop of its navigation path starts from (`ed.book.editions` from an
+    // edition), or an enclosing row its WHERE reads — the same shadowing made those EXISTS true for
+    // every row. A selectMany bridge addresses the raw table name, so it keeps it.
+    const readsOuterNamed = (name: string): boolean =>
+      rootAnchor(this.navigationPath.length === 0 ? sourceTable : this.navigationPath[0].sourceAlias) === name
+      || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
+    const ownAlias = this.selectManyJoins.length > 0
+      ? targetTable
+      : this.aggregationType === 'COUNT'
+        ? `${this.relationName}__count`
+        : readsOuterNamed(targetTable) ? `${this.relationName}__exists` : targetTable;
+    const ownRef = (alias: string): string => (alias === targetTable ? ownAlias : alias);
+
+    // Build JOINs needed inside the EXISTS subquery
+    const allJoins: string[] = [];
+
     // Navigation path joins (for reference navigation like pc.order → orders)
     for (const [index, nav] of this.navigationPath.entries()) {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
       const src = index === 0 ? rootAnchor(nav.sourceAlias) : nav.sourceAlias;
-      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${src}"."${fk}" = "${nav.alias}"."${pk}"`);
+      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${src}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     // SelectMany joins (for selectMany navigation through intermediate tables)
@@ -8509,7 +10163,7 @@ export class CollectionQueryBuilder<TItem = any> {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     // Joins required by REFERENCE navigations inside the collection's own
@@ -8523,7 +10177,7 @@ export class CollectionQueryBuilder<TItem = any> {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} "${nav.targetTable}" "${nav.alias}" ON "${ownRef(nav.sourceAlias)}"."${fk}" = "${nav.alias}"."${pk}"`);
+      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${ownRef(nav.sourceAlias)}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
     const navJoinsSQL = allJoins.join('\n');
@@ -8560,19 +10214,156 @@ export class CollectionQueryBuilder<TItem = any> {
       whereSQL += ` AND ${rewrittenCondSql}`;
     }
 
+    const fromTable = quoteTableReference(targetTable, this.targetTableSchema?.schema);
+
     if (this.aggregationType === 'COUNT') {
-      const countParts = [ownAlias === targetTable ? `SELECT COUNT(*) FROM "${targetTable}"` : `SELECT COUNT(*) FROM "${targetTable}" "${ownAlias}"`];
+      const countParts = [ownAlias === targetTable ? `SELECT COUNT(*) FROM ${fromTable}` : `SELECT COUNT(*) FROM ${fromTable} "${ownAlias}"`];
       if (navJoinsSQL) countParts.push(navJoinsSQL);
       countParts.push(`WHERE ${whereSQL}`);
 
       return countParts.join('\n');
     }
 
-    const parts = [`EXISTS (SELECT 1 FROM "${targetTable}"`];
+    const parts = [ownAlias === targetTable ? `EXISTS (SELECT 1 FROM ${fromTable}` : `EXISTS (SELECT 1 FROM ${fromTable} "${ownAlias}"`];
     if (navJoinsSQL) parts.push(navJoinsSQL);
     parts.push(`WHERE ${whereSQL})`);
 
     return parts.join('\n');
+  }
+
+  /**
+   * Runs one build under the navigation plan of this collection's item: every reference-navigation
+   * path its selector result and its WHERE traverse is joined on its own parent, and the refs of a
+   * path that lost its plain alias to another path ending in the same relation name render under a
+   * path alias until `build` returns. See NavigationAliasPlan.
+   */
+  private withNavigationPlan<T>(selectorResult: unknown, build: (plan: NavigationAliasPlan | undefined) => T): T {
+    const anchorSchema = this.targetTableSchema ?? this.schemaRegistry?.get(this.targetTable);
+
+    if (anchorSchema === undefined) {
+      return build(undefined);
+    }
+
+    // Aliases that already mean something in our scope: the hops of the path this collection hangs
+    // off (and of a selectMany bridge), which render in — or correlate from — the same scope, and
+    // every alias an ENCLOSING row's ref we read renders under (`m.favoriteBook.category` next to
+    // our `ln.edition.book.category`: one alias `category`, and the inner join would shadow the
+    // outer row — the comparison became the inner row with itself). A navigation of ours by one of
+    // those names gets a path alias. The parent's own alias is left to the correlation rules of
+    // resolveRefNavigationJoins (the inverse of our own key IS the parent row).
+    const reserved = new Set([...this.navigationPath, ...this.selectManyJoins].map(step => step.alias));
+    for (const ref of this.getOuterFieldRefs()) {
+      const alias = (ref as any).__tableAlias;
+
+      if (typeof alias === 'string' && alias !== '' && alias !== this.sourceTable && !alias.startsWith('__collection_')) {
+        reserved.add(alias);
+      }
+    }
+    const plan = new NavigationAliasPlan(anchorSchema, this.targetTable, this.schemaRegistry, this.chainId, reserved.size > 0 ? reserved : undefined);
+    const nestedPaths: string[][] = [];
+    this.addSelectionToNavigationPlan(selectorResult, plan, nestedPaths);
+
+    if (this.whereCond) {
+      for (const ref of this.whereCond.getFieldRefs()) {
+        plan.addRef(ref);
+      }
+    }
+
+    // ORDER BY keys read through our navigations are joined (and aliased) like projected ones
+    for (const ref of this.orderByRefs()) {
+      plan.addRef(ref);
+    }
+
+    // After every ref: at equal depth, a path a field reads keeps the plain alias
+    for (const path of nestedPaths) {
+      plan.addPath(path);
+    }
+
+    const sealed = plan.seal();
+    const previous = this.navigationPlan;
+    this.navigationPlan = sealed;
+    const restore = sealed?.apply();
+
+    try {
+      return build(sealed);
+    } finally {
+      restore?.();
+      this.navigationPlan = previous;
+    }
+  }
+
+  /**
+   * Records the navigation paths a selector result traverses — the same values detectNavigationJoins
+   * walks: field refs, the refs inside `sql` fragments and nested objects, and, for a collection
+   * nested in the selector, the refs by which it correlates to our item. The path such a collection
+   * hangs off (when it starts at our item) goes to `nestedPaths`.
+   */
+  private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan, nestedPaths: string[][]): void {
+    if (value === null || typeof value !== 'object') {
+      return;
+    }
+
+    if ('__dbColumnName' in value) {
+      plan.addRef(value);
+      return;
+    }
+
+    if (value instanceof SqlFragment) {
+      for (const ref of value.getFieldRefs()) {
+        plan.addRef(ref);
+      }
+      return;
+    }
+
+    if (value instanceof CollectionQueryBuilder) {
+      for (const ref of value.getOuterFieldRefs()) {
+        plan.addRef(ref);
+      }
+
+      const nestedPath = value.getNavigationPath();
+
+      if (nestedPath.length > 0 && nestedPath[0].sourceAlias === this.targetTable) {
+        nestedPaths.push(nestedPath.map(step => step.alias));
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      return;
+    }
+
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        this.addSelectionToNavigationPlan((value as any)[key], plan, nestedPaths);
+      }
+    }
+  }
+
+  /**
+   * The planned hops of the navigation path a nested collection hangs off, or `undefined` when the
+   * plan does not cover that path (no plan, or a path that does not start at our item).
+   */
+  private plannedNestedPath(nestedPath: NavigationJoin[]): NavigationPathNode[] | undefined {
+    const plan = this.navigationPlan;
+
+    if (plan === undefined || nestedPath.length === 0 || nestedPath[0].sourceAlias !== this.targetTable) {
+      return undefined;
+    }
+
+    let node = plan.nodeForPath(nestedPath.map(step => step.alias));
+
+    if (node === undefined) {
+      return undefined;
+    }
+
+    const nodes: NavigationPathNode[] = [];
+
+    while (node !== undefined) {
+      nodes.unshift(node);
+      node = node.parent;
+    }
+
+    return nodes;
   }
 
   /**
@@ -8611,6 +10402,16 @@ export class CollectionQueryBuilder<TItem = any> {
         return;
       }
 
+      // An `sql` expression on its own — an aggregate's argument (`max(l => sql\`…${l.book.name}…\`)`)
+      // or a scalar selection: the navigations it reads are joined like a projected field's. Its
+      // own properties were walked as if they were fields, and the navigation left unjoined
+      if (sel instanceof SqlFragment) {
+        for (const fieldRef of sel.getFieldRefs()) {
+          this.addNavigationJoinForFieldRef(fieldRef, joins, currentSourceAlias, currentSchema, allTableAliases, joinedAliases);
+        }
+        return;
+      }
+
       // Handle object with multiple fields
       // Own enumerable keys only (the set Object.entries walks), without allocating the pairs:
       // a wide collection projection runs this for every field on every build.
@@ -8635,18 +10436,25 @@ export class CollectionQueryBuilder<TItem = any> {
           // PK (e.g. `discount.id`), so the outer collection must emit those joins
           // in its own FROM for the correlation to resolve.
           const nestedPath = value.getNavigationPath();
-          for (const step of nestedPath) {
+          // Under a navigation plan each hop joins under its planned alias, on its own parent: a
+          // hop named like another path's hop must not reuse that path's join
+          const plannedPath = this.plannedNestedPath(nestedPath);
+          for (let i = 0; i < nestedPath.length; i++) {
+            const planned = plannedPath?.[i];
+            const step = planned === undefined || (planned.alias === nestedPath[i].alias && this.navigationPlan!.parentAliasOf(planned) === nestedPath[i].sourceAlias)
+              ? nestedPath[i]
+              : { ...nestedPath[i], alias: planned.alias, sourceAlias: this.navigationPlan!.parentAliasOf(planned) };
             if (!joinedAliases.has(step.alias)) {
               joins.push(step);
               joinedAliases.add(step.alias);
             }
           }
-          // Its WHERE may also correlate to OUR item through one of our navigations
-          // (`line.reader.passes.where(p => eq(line.book.genre.lendable, true))`): that subquery
-          // renders `"genre"."lendable"`, leaves the ref to us as foreign, and relies on this FROM
-          // to bind it. getFieldRefs() reports exactly its foreign refs; the caller resolves the
-          // ones that are ours under the same rules as our own WHERE.
-          nestedCorrelationRefs?.push(...value.getFieldRefs());
+          // Its WHERE, projection or ORDER BY may also correlate to OUR item through one of our
+          // navigations (`line.reader.passes.where(p => eq(line.book.genre.lendable, true))`):
+          // that subquery renders `"genre"."lendable"`, leaves the ref to us as foreign, and relies
+          // on this FROM to bind it. getOuterFieldRefs() reports exactly its foreign refs; the
+          // caller resolves the ones that are ours under the same rules as our own WHERE.
+          nestedCorrelationRefs?.push(...value.getOuterFieldRefs());
         } else if (value && typeof value === 'object' && !Array.isArray(value)) {
           // Recursively check nested objects
           collectFromSelection(value);
@@ -8796,6 +10604,22 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // If this references the target table directly, no join needed
     if (!tableAlias || tableAlias === this.targetTable) {
+      return;
+    }
+
+    // A path of the build's navigation plan: its ancestors' aliases, then its own — the order the
+    // branch below records `__navigationAliases` and `__tableAlias` in. Only a hop of the collection's
+    // own table is joined right away; a deeper one waits for its parent (resolveNavigationJoins).
+    const planned = this.navigationPlan?.nodeOf(fieldRef);
+    if (planned !== undefined) {
+      for (let i = 1; i < planned.collectOrder.length; i++) {
+        allTableAliases.add(planned.collectOrder[i]);
+      }
+      allTableAliases.add(planned.alias);
+
+      if (planned.parent === undefined && !(joinedAliases !== undefined ? joinedAliases.has(planned.alias) : joins.some(j => j.alias === planned.alias))) {
+        this.addNavigationJoin(planned.alias, planned.relation, joins, sourceAlias, joinedAliases);
+      }
       return;
     }
 
@@ -8960,6 +10784,24 @@ export class CollectionQueryBuilder<TItem = any> {
             continue;
           }
 
+          // A path of the build's navigation plan hangs off its OWN parent, once that is joined —
+          // never off whichever joined table happens to have a relation of the same name
+          const planned = this.navigationPlan?.nodeForAlias(alias);
+          if (planned !== undefined) {
+            const parentAlias = this.navigationPlan!.parentAliasOf(planned);
+
+            if (planned.parent === undefined || joinedSchemas.has(parentAlias)) {
+              const targetSchema = this.addNavigationJoin(alias, planned.relation, joins, parentAlias, joinedAliases);
+              if (targetSchema) {
+                joinedSchemas.set(alias, targetSchema);
+              }
+
+              resolved.add(alias);
+              progressed = true;
+            }
+            continue;
+          }
+
           // Look for this alias in any of the already joined schemas (direct lookup)
           for (const [schemaAlias, schema] of joinedSchemas) {
             const relation = schema.relations?.[alias];
@@ -8985,7 +10827,8 @@ export class CollectionQueryBuilder<TItem = any> {
       // schema-graph BFS, which searches by relation NAME and therefore cannot tell which of
       // several relations pointing at the same table the projection actually meant
       for (const alias of allTableAliases) {
-        if (resolved.has(alias) || !this.schemaRegistry) {
+        // A planned path is anchored on its own parent or not at all — never by name
+        if (resolved.has(alias) || !this.schemaRegistry || this.navigationPlan?.nodeForAlias(alias) !== undefined) {
           continue;
         }
 
@@ -9105,9 +10948,61 @@ export class CollectionQueryBuilder<TItem = any> {
    * Now delegates to collection strategy pattern
    * Returns full CollectionAggregationResult for strategies that need special handling (like LATERAL)
    */
-  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[]): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string; memoId?: number } {
-    // Determine strategy type - default to 'lateral' if not specified
-    const strategyType: CollectionStrategyType = context.collectionStrategy || 'lateral';
+  /**
+   * @param joinOwnPath Set by the enclosing builder when it renders the last hop of the navigation
+   *   path this collection hangs off under another alias than that hop's relation name (another path
+   *   of the enclosing scope owns the name). The LATERAL correlated-subquery form then joins the path
+   *   inside its own subquery, as the LATERAL-join form always does, instead of binding to the
+   *   enclosing scope's join of that name — which would be the other path's row.
+   */
+  buildCTE(context: QueryContext, client?: DatabaseClient, parentIds?: any[], joinOwnPath?: boolean): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string; memoId?: number } {
+    // The user's selector is evaluated once per builder (see evaluateSelector). Downstream steps
+    // (field collection, aggregate-expression discovery, navigation-join detection) all
+    // need to walk the same selection, and re-invoking the selector is expensive
+    // (rebuilds proxy mocks and any nested CollectionQueryBuilder instances).
+    const selectorResult = this.evaluateSelector();
+
+    return this.withEnclosingRowAliases(context.lateralTableAliasMap, () =>
+      this.withNavigationPlan(selectorResult, () => this.buildCTEBody(context, client, parentIds, selectorResult, joinOwnPath === true)));
+  }
+
+  /**
+   * Whether the enclosing scope of a collection renders the last hop of the navigation path the
+   * collection hangs off under another alias than its relation name (see buildCTE's `joinOwnPath`).
+   * `plan` is the enclosing build's navigation plan and `anchorAlias` the alias its paths start from.
+   */
+  static pathRenamedIn(collection: CollectionQueryBuilder<any>, plan: NavigationAliasPlan | undefined, anchorAlias: string): boolean {
+    const path = collection.navigationPath;
+
+    if (plan === undefined || path.length === 0 || path[0].sourceAlias !== anchorAlias) {
+      return false;
+    }
+
+    const node = plan.nodeForPath(path.map(step => step.alias));
+
+    return node !== undefined && node.alias !== path[path.length - 1].alias;
+  }
+
+  /** The body of {@link buildCTE}, run under the navigation plan of the collection's item. */
+  private buildCTEBody(
+    context: QueryContext,
+    client: DatabaseClient | undefined,
+    parentIds: any[] | undefined,
+    selectorResult: any,
+    joinOwnPath: boolean
+  ): { sql: string; params: any[]; isCTE?: boolean; joinClause?: string; selectExpression?: string; tableName?: string; memoId?: number } {
+    // Determine strategy type - default to 'lateral' if not specified. A temp-table collection needs
+    // its parents' ids fetched first (executeWithTempTables); rendered inside one statement —
+    // countOver(), prepare(), a UNION leg, a future — it takes the CTE form, which is the very
+    // aggregation the temp-table strategy runs, over every parent (the temp-table strategy's
+    // promise used to land in the SQL as a join to a CTE nobody declared). A collection that reads
+    // its enclosing row beyond the relation key (see getOuterFieldRefs) cannot be aggregated apart
+    // from that row, which is what the CTE and temp-table strategies do: it renders as LATERAL.
+    const configuredStrategy: CollectionStrategyType = context.collectionStrategy || 'lateral';
+    const requestedStrategy: CollectionStrategyType = configuredStrategy === 'temptable' && parentIds === undefined ? 'cte' : configuredStrategy;
+    const strategyType: CollectionStrategyType = requestedStrategy !== 'lateral' && this.getOuterFieldRefs().length > 0
+      ? 'lateral'
+      : requestedStrategy;
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);
 
     // For LATERAL strategy, reserve the counter early and register the table alias
@@ -9136,6 +11031,20 @@ export class CollectionQueryBuilder<TItem = any> {
     const selectedFieldConfigs: SelectedField[] = [];
     const localParams: any[] = [];
 
+    // A literal of the item's projection. Typed from its JS type when the items are read as columns
+    // (a CTE body) or aggregated into a native array (toNumberList / toStringList): untyped, the
+    // array of a literal `7` aggregated as text[], and the JSON of a CTE body's items held '7'
+    const typedLiterals = context.typedLiterals === true || this.flattenResultType !== undefined;
+    const literalExpression = (value: unknown): string => {
+      const start = context.allParams.length;
+      const literalContext = { paramCounter: context.paramCounter, allParams: context.allParams, typedLiterals };
+      const expression = projectionLiteralSql(value, literalContext);
+      context.paramCounter = literalContext.paramCounter;
+      localParams.push(...context.allParams.slice(start));
+
+      return expression;
+    };
+
     // Helper function to check if a value is a plain object (not FieldRef, SqlFragment, etc.)
     const isPlainObject = (val: any): boolean => {
       return typeof val === 'object' &&
@@ -9162,23 +11071,20 @@ export class CollectionQueryBuilder<TItem = any> {
         };
         const fragmentSql = field.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
-        return { alias, expression: fragmentSql };
+        // Its `mapWith` reads the item's value back, as it does in a root projection
+        return { alias, expression: fragmentSql, mapper: fragmentReadMapper(field) };
       } else if (field instanceof CollectionQueryBuilder) {
-        // Nested collection query builder
-        // For temptable strategy, nested collections are not supported - need lateral/CTE
-        if (strategyType === 'temptable') {
-          throw new Error(
-            `Nested collections in temptable strategy are not supported. ` +
-            `The field "${alias}" contains a nested collection query. ` +
-            `Use collectionStrategy: 'lateral' or 'cte' for queries with nested collections.`
-          );
-        }
-        // For lateral/CTE strategies, build the nested collection as a subquery
+        // Nested collection query builder, built as a subquery of this one. Inside a temp-table
+        // aggregation — a statement of its own, with no WITH list of its enclosing query — it
+        // renders as LATERAL, which needs nothing outside the aggregation's own FROM.
+        // Inside a LATERAL collection it is LATERAL too: its aggregate joins back on this
+        // collection's table, which is visible there only under the lateral's alias.
         const nestedCtx: QueryContext = {
           ...context,
           cteCounter: context.cteCounter,
+          collectionStrategy: strategyType === 'cte' ? 'cte' : 'lateral',
         };
-        const nestedResult = field.buildCTE(nestedCtx, client);
+        const nestedResult = field.buildCTE(nestedCtx, client, undefined, CollectionQueryBuilder.pathRenamedIn(field, this.navigationPlan, this.targetTable));
         // Sync both counters back - cteCounter for CTE naming, paramCounter for parameter numbering
         context.cteCounter = nestedCtx.cteCounter;
         context.paramCounter = nestedCtx.paramCounter;
@@ -9198,20 +11104,25 @@ export class CollectionQueryBuilder<TItem = any> {
             // have an `id` column (junction tables like `cart_discount_codes`). The
             // intermediate joins are emitted into the outer's FROM via detectNavigationJoins
             // picking up the nested path.
+            // The CTE groups by the nested collection's foreign key, i.e. by its PARENT's principal
+            // key column (`withPrincipalKey`, `id` by default)
             const nestedPath = field.getNavigationPath();
+            const parentKey = field.getParentKeyColumn();
             if (nestedPath.length > 0) {
               const lastStep = nestedPath[nestedPath.length - 1];
-              const pk = lastStep.matches?.[0] || 'id';
-              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${lastStep.alias}"."${pk}" = "${nestedResult.tableName}".parent_id`;
+              // The alias detectNavigationJoins joined the path's last hop under
+              const plannedPath = this.plannedNestedPath(nestedPath);
+              const lastAlias = plannedPath !== undefined ? plannedPath[plannedPath.length - 1].alias : lastStep.alias;
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${lastAlias}"."${parentKey}" = "${nestedResult.tableName}".parent_id`;
             } else {
-              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."id" = "${nestedResult.tableName}".parent_id`;
+              nestedJoinClause = `LEFT JOIN "${nestedResult.tableName}" ON "${this.targetTable}"."${parentKey}" = "${nestedResult.tableName}".parent_id`;
             }
           } else {
             // LATERAL strategy: use the provided join clause (contains full LATERAL subquery)
             nestedJoinClause = nestedResult.joinClause!;
           }
 
-          return {
+          const joined: SelectedField = {
             alias,
             expression: nestedResult.selectExpression || nestedResult.sql,
             nestedCteJoin: {
@@ -9219,14 +11130,23 @@ export class CollectionQueryBuilder<TItem = any> {
               joinClause: nestedJoinClause,
               memoId: nestedResult.memoId,
             },
+          };
+
+          // A scalar aggregate (count / min / max / sum / exists) is a plain value: the collection
+          // mapping of `nestedCollectionInfo` turned a CTE count into `{}` and a string min / max
+          // into an object of its characters
+          if (!field.isScalarAggregation()) {
             // Store nested collection info for recursive mapper transformation
-            nestedCollectionInfo: {
+            joined.nestedCollectionInfo = {
               targetTable: field.getTargetTable(),
               selectedFieldConfigs: field.getSelectedFieldConfigs(),
               isSingleResult: field.isSingleResult(),
               flattenResultType: field.getFlattenResultType(),
-            },
-          };
+              scalarAlias: field.getScalarSelectionAlias(),
+            };
+          }
+
+          return joined;
         }
 
         // The nested collection becomes a correlated subquery in SELECT
@@ -9252,6 +11172,7 @@ export class CollectionQueryBuilder<TItem = any> {
             selectedFieldConfigs: field.getSelectedFieldConfigs(),
             isSingleResult: field.isSingleResult(),
             flattenResultType: field.getFlattenResultType(),
+            scalarAlias: field.getScalarSelectionAlias(),
           },
         };
       } else if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
@@ -9267,8 +11188,9 @@ export class CollectionQueryBuilder<TItem = any> {
         }
         return { alias, expression: `"${dbColumnName}"`, propertyName: fieldName, isColumn: true };
       } else if (typeof field === 'string') {
-        // Simple string reference (for backward compatibility)
-        return { alias, expression: `"${field}"` };
+        // A string is a value, as its type says — a parameter, read back as itself (`literal`). It
+        // used to render as a column of that NAME of the item's table
+        return { alias, expression: literalExpression(field), literal: { value: field } };
       } else if (isPlainObject(field)) {
         // Nested object - recursively process its fields
         const nestedFields: SelectedField[] = [];
@@ -9279,36 +11201,41 @@ export class CollectionQueryBuilder<TItem = any> {
         }
         return { alias, nested: nestedFields };
       } else {
-        // Literal value or expression
-        const expression = `$${context.paramCounter++}`;
-        context.allParams.push(field);
-        localParams.push(field);
-        return { alias, expression };
+        // Literal value or expression: a parameter, which the item reads back as the value itself
+        // (the database hands a parameter of unknown type back as text — `42` came back "42",
+        // `true` as "true"). A list of columns has no one SQL value
+        assertProjectionArrayOfValues(field, alias, `${this.relationName}.select()`);
+
+        return { alias, expression: literalExpression(field), literal: { value: field } };
       }
     };
-
-    // Evaluate the user's selector exactly once per buildCTE call. Downstream steps
-    // (field collection, aggregate-expression discovery, navigation-join detection) all
-    // need to walk the same selection, and re-invoking the selector is expensive
-    // (rebuilds proxy mocks and any nested CollectionQueryBuilder instances).
-    const selectorResult = this.selector ? materializeMockSelection(this.selector(this.createMockItem())) : undefined;
 
     // Step 1: Build field selection configuration
     if (this.selector) {
       const selectedFields = selectorResult;
 
+      // A list / single item of ONE value (`e => e.label`, `e => sql\`upper(${e.label})\``) reads as
+      // that value: its items are unwrapped from the one field they are built with (see isScalarSelection)
+      const readsScalar = this.aggregationType === undefined && this.flattenResultType === undefined;
+      this.scalarSelectionAlias = undefined;
+
       // Check if the selector returns a FieldRef directly (single field selection like p => p.title)
       if (typeof selectedFields === 'object' && selectedFields !== null && '__dbColumnName' in selectedFields) {
-        // Single field selection - use the field name as both alias and expression
-        const field = selectedFields as any;
-        const dbColumnName = field.__dbColumnName;
-        const fieldName = field.__fieldName;  // Property name for mapper lookup
-        selectedFieldConfigs.push({
-          alias: dbColumnName,
-          expression: `"${dbColumnName}"`,
-          propertyName: fieldName,
-          isColumn: true,
-        });
+        // Single field selection - the column name is the alias; a column read through a
+        // navigation (`ln => ln.edition.book.name`) renders qualified by that navigation's alias
+        const config = processField(selectedFields.__dbColumnName, selectedFields);
+        selectedFieldConfigs.push(config);
+        if (readsScalar) {
+          this.scalarSelectionAlias = config.alias;
+        }
+      } else if ((selectedFields instanceof SqlFragment || isScalarLiteralSelection(selectedFields)) && this.aggregationType === undefined) {
+        // An expression of the item — or ONE literal (`() => 'x'`) — projected as a field of its
+        // own (a list of it, a flattened list of it); it used to project no field at all — items
+        // came back as `{}` — and a string was walked as an object of its characters
+        selectedFieldConfigs.push(processField(SCALAR_SELECTION_ALIAS, selectedFields));
+        if (readsScalar) {
+          this.scalarSelectionAlias = SCALAR_SELECTION_ALIAS;
+        }
       } else if (selectedFields instanceof CollectionQueryBuilder || selectedFields instanceof SqlFragment) {
         // Selector returns a scalar subquery (e.g. .sum(row => other.count())) or a raw fragment.
         // No per-column fields to collect — the aggregate argument lives on aggregateExpression.
@@ -9346,12 +11273,19 @@ export class CollectionQueryBuilder<TItem = any> {
     // Cache selected field configs for mapper lookup during transformation
     this._selectedFieldConfigs = selectedFieldConfigs;
 
-    // Step 2: Build WHERE clause SQL (without WHERE keyword)
+    // Step 2: Build WHERE clause SQL (without WHERE keyword). Under LATERAL our table renders under
+    // the lateral's alias: an exists() / count() over a collection of our item correlates to it
     let whereClause: string | undefined;
     let whereParams: any[] | undefined;
     if (this.whereCond) {
       const condBuilder = new ConditionBuilder();
-      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
+      const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(
+        this.whereCond,
+        context.paramCounter,
+        context.placeholders,
+        context.hoistedCteNames,
+        strategyType === 'lateral' ? context.lateralTableAliasMap : undefined
+      );
       whereClause = sql;
       whereParams = params;
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
@@ -9362,28 +11296,25 @@ export class CollectionQueryBuilder<TItem = any> {
       }
     }
 
-    // Step 3: Build ORDER BY clauses SQL (without ORDER BY keyword)
-    // We need two versions:
-    // - orderByClause: uses database column names (for subquery ORDER BY on raw table)
-    // - orderByClauseAlias: uses property names/aliases (for json_agg ORDER BY on aliased subquery output)
-    // Note: orderByFields[].field already contains the database column name (from parseOrderBy using __dbColumnName)
+    // Step 3: ORDER BY keys as qualified expressions over the collection's FROM (see
+    // orderByKeyExpression). They used to render as bare column NAMES: under LATERAL a name the
+    // inner table lacks bound to the ENCLOSING row (the list came back unordered) and a name the
+    // projection reuses as an alias bound to that alias; the CTE / temp-table aggregates ordered
+    // by names their subquery output does not carry. Each strategy now orders by the expression
+    // itself, or by a column of its inner SELECT carrying it.
     let orderByClause: string | undefined;
-    let orderByClauseAlias: string | undefined;
+    let orderByFields: CollectionAggregationConfig['orderByFields'];
     if (this.orderByFields.length > 0) {
-      // Build reverse lookup: db column name -> property name
-      const dbToPropertyMap = this.targetTableSchema ? getDbToPropertyMapForSchema(this.targetTableSchema) : null;
-
-      const orderPartsDb = this.orderByFields.map(({ field, direction }) => {
-        // field is already the database column name
-        return `"${field}" ${direction}`;
-      });
-      const orderPartsAlias = this.orderByFields.map(({ field, direction }) => {
-        // Look up the property name from the db column name
-        const propertyName = dbToPropertyMap?.get(field) ?? field;
-        return `"${propertyName}" ${direction}`;
-      });
-      orderByClause = orderPartsDb.join(', ');
-      orderByClauseAlias = orderPartsAlias.join(', ');
+      orderByFields = this.orderByFields.map(({ field, direction, table, fragment }, index) => ({
+        field,
+        direction,
+        table,
+        // An expression key renders in our parameter sequence, its own columns under our marker
+        expression: fragment !== undefined
+          ? buildOrderByExpressionSql(fragment, context, strategyType === 'lateral' ? context.lateralTableAliasMap : undefined, localParams)
+          : this.orderByKeyExpression(this.orderByFields[index]),
+      }));
+      orderByClause = orderByFields.map(({ expression, direction }) => `${expression} ${direction}`).join(', ');
     }
 
     // Step 4: Determine aggregation type and field
@@ -9401,7 +11332,15 @@ export class CollectionQueryBuilder<TItem = any> {
       if (this.aggregationType !== 'COUNT' && this.aggregationType !== 'EXISTS' && this.selector) {
         const selectedField = selectorResult;
         if (typeof selectedField === 'object' && selectedField !== null && '__dbColumnName' in selectedField) {
-          aggregateField = (selectedField as any).__dbColumnName;
+          const tableAlias = (selectedField as any).__tableAlias;
+
+          if (tableAlias && tableAlias !== this.targetTable && tableAlias !== collectionMarkerAlias && !isForeignChainRef(selectedField, this.chainId)) {
+            // A column read through a navigation (`max(ed => ed.category.name)`): aggregated
+            // qualified by the navigation's alias — joined with the selector's navigations
+            aggregateExpression = `"${tableAlias}"."${(selectedField as any).__dbColumnName}"`;
+          } else {
+            aggregateField = (selectedField as any).__dbColumnName;
+          }
         } else if (selectedField instanceof CollectionQueryBuilder) {
           // Selector returns a nested collection (e.g., sum(row => other.where(...).count())).
           // We need a *scalar* SQL expression to feed into the aggregate — so force the nested
@@ -9410,10 +11349,23 @@ export class CollectionQueryBuilder<TItem = any> {
           // lateral) then wrap this expression with the aggregate function via
           // config.aggregateExpression.
           const nestedCtx: QueryContext = { ...context, collectionStrategy: 'lateral' };
-          const nestedResult = selectedField.buildCTE(nestedCtx, client);
+          const nestedResult = selectedField.buildCTE(nestedCtx, client, undefined, CollectionQueryBuilder.pathRenamedIn(selectedField, this.navigationPlan, this.targetTable));
           context.cteCounter = nestedCtx.cteCounter;
           context.paramCounter = nestedCtx.paramCounter;
           aggregateExpression = nestedResult.selectExpression || nestedResult.sql;
+        } else if (selectedField instanceof SqlFragment) {
+          // An expression of the item (`max(p => sql\`length(${p.title})\`)`): aggregated as it
+          // renders in the item's projection, its columns under our marker (each strategy rewrites
+          // it to the alias the item's table renders under). It used to throw "MAX requires an
+          // aggregate field".
+          const sqlBuildContext: SqlBuildContext = {
+            paramCounter: context.paramCounter,
+            params: context.allParams,
+            placeholders: context.placeholders,
+            lateralTableAliasMap: context.lateralTableAliasMap,
+          };
+          aggregateExpression = selectedField.buildSql(sqlBuildContext);
+          context.paramCounter = sqlBuildContext.paramCounter;
         }
       }
 
@@ -9467,6 +11419,8 @@ export class CollectionQueryBuilder<TItem = any> {
     const refNavigationJoins = [
       ...this.resolveWhereNavigationJoins(this.sourceTable),
       ...this.resolveRefNavigationJoins(nestedCorrelationRefs, this.sourceTable),
+      // An ORDER BY key read through one of our navigations
+      ...this.resolveRefNavigationJoins(this.orderByRefs(), this.sourceTable),
     ];
     for (const nav of refNavigationJoins) {
       if (!navigationJoins.some(existing => existing.alias === nav.alias)) {
@@ -9486,14 +11440,19 @@ export class CollectionQueryBuilder<TItem = any> {
     const allNavigationJoins: NavigationJoin[] = this.navigationPath.length === 0 && this.selectManyJoins.length === 0
       ? navigationJoins
       : [...this.navigationPath, ...this.selectManyJoins, ...navigationJoins];
-    const allSelectorJoins: NavigationJoin[] = this.selectManyJoins.length === 0
-      ? navigationJoins
-      : [...this.selectManyJoins, ...navigationJoins];
+    // The correlated form joins the path this collection hangs off as well when the enclosing scope
+    // renders the path's last hop under another alias (see buildCTE's `joinOwnPath`)
+    const allSelectorJoins: NavigationJoin[] = joinOwnPath && strategyType === 'lateral' && this.navigationPath.length > 0
+      ? allNavigationJoins
+      : this.selectManyJoins.length === 0
+        ? navigationJoins
+        : [...this.selectManyJoins, ...navigationJoins];
 
     // Step 6: Build CollectionAggregationConfig object
     const config: CollectionAggregationConfig = {
       relationName: this.relationName,
       targetTable: this.targetTable,
+      targetSchema: this.targetTableSchema?.schema,
       foreignKey: this.foreignKey,
       // Composite FK metadata: enables strategies to emit constant FK predicates
       // (e.g. SCD2 `is_current = TRUE` from `withForeignKey: [col, isCurrent] /
@@ -9503,12 +11462,12 @@ export class CollectionQueryBuilder<TItem = any> {
       foreignKeyTableAlias: this.foreignKeyTableAlias,
       sourceTable: this.sourceTable,
       parentIds,  // Pass parent IDs for temp table strategy
+      parentKeyType: strategyType === 'temptable' ? this.getParentKeyType() : undefined,
       selectedFields: selectedFieldConfigs,
       whereClause,
       whereParams,  // Pass WHERE clause parameters
       orderByClause,
-      orderByClauseAlias,  // For json_agg ORDER BY which uses aliases
-      orderByFields: this.orderByFields.length > 0 ? this.orderByFields : undefined,  // For including ORDER BY columns in inner SELECT
+      orderByFields,
       limitValue: this.limitValue,
       offsetValue: this.offsetValue,
       isDistinct: this.isDistinct,
@@ -9523,13 +11482,15 @@ export class CollectionQueryBuilder<TItem = any> {
       counter: reservedCounter !== undefined ? reservedCounter : context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
       selectorNavigationJoins: allSelectorJoins.length > 0 ? allSelectorJoins : undefined,
+      navigationPath: this.navigationPath.length > 0 ? this.navigationPath : undefined,
     };
 
-    // Step 6: Call the strategy
-    const result = strategy.buildAggregation(config, context, client!);
-
-    // Step 7: Restore the lateralTableAliasMap to prevent sibling collections from seeing this alias
-    // This is important because sibling collections at the same level should not affect each other
+    // Step 6: Restore the lateralTableAliasMap to prevent sibling collections from seeing this alias
+    // This is important because sibling collections at the same level should not affect each other.
+    // Restored BEFORE the strategy renders this collection: our own entry exists for what we nest
+    // (built above), while the names our correlation and the first hop of our navigation path read
+    // are the ENCLOSING scope's — a relation of a table to itself (`c.children`, `ed.book.editions`)
+    // used to correlate to its own inner row through that entry.
     if (strategyType === 'lateral' && context.lateralTableAliasMap) {
       if (hadPreviousEntry) {
         // Restore the previous value
@@ -9539,6 +11500,9 @@ export class CollectionQueryBuilder<TItem = any> {
         context.lateralTableAliasMap.delete(this.targetTable);
       }
     }
+
+    // Step 7: Call the strategy
+    const result = strategy.buildAggregation(config, context, client!);
 
     // Step 8: Return the result
     // For synchronous strategies (like JSONB), result is returned directly

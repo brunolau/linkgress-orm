@@ -294,6 +294,11 @@ db.libraries.where(l => exists(db.shelves
 For the second, traverse the navigation in the outer query, correlate on a plain key column, or
 rename the navigation property.
 
+For the first, a navigation collection is the way out when the model has the relation: a collection
+over the same table as the outer row — `exists(p.user!.posts!.where(p2 => gt(p2.views, p.views)))`,
+a tree's `n.children` — names its own table apart from the outer row and is not refused (see
+[Collections Reached Through Navigations](./querying.md#collections-reached-through-navigations)).
+
 ## Type Safety
 
 ### Full Type Inference

@@ -13,10 +13,10 @@ import { expectToReject } from '../utils/expect-rejects';
 // parent variant already relies on: the parent leg inserts ORDER BY an input
 // ordinal, so generated serial ids ascend in input-row order, and a
 // row_number-over-pk CTE recovers each parent's input index for the child
-// join. v1 restrictions (documented on the method): flat returning selectors
-// on BOTH sides, single-column serial PKs, no unlessExists guard, and EVERY
-// parent must carry at least one child (parents are returned through the
-// child join).
+// join. Restrictions (documented on the method): single-column serial PKs, no
+// unlessExists guard, and EVERY parent must carry at least one child (parents
+// are returned through the child join). Navigation RETURNING selectors on
+// either side are covered in tests/mutations/insert-returning-navigation.test.ts.
 
 class BulkParent extends DbEntity {
   id!: DbColumn<number>;

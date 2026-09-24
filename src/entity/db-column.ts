@@ -1,3 +1,9 @@
+// The branded entity class (type-only: no runtime import cycle). An empty marker interface stood in
+// for it here, which EVERY object — and every function — satisfies: UnwrapDbColumns recursed into
+// any value object no type test recognizes (a Temporal type declared only through augmentations)
+// and turned each of its methods into `{}`
+import type { DbEntity } from './entity-base';
+
 /**
  * Database column wrapper that provides type-safe query operations
  * while automatically unwrapping to the underlying type in results
@@ -89,6 +95,10 @@ export type UnwrapDbColumns<T> = T extends DbColumn<infer V>
     : {
         [K in keyof T]: T[K] extends DbColumn<infer V>
           ? V
+          : [T[K]] extends [undefined]
+          ? T[K]
+          : T[K] extends DbColumn<any> | undefined
+          ? UnwrapDbColumns<NonNullable<T[K]>>  // an optional column: its `?` keeps it optional
           : T[K] extends (infer U)[] | undefined
           ? U extends DbEntity
             ? UnwrapDbColumns<U>[]
@@ -182,12 +192,6 @@ export type UpdateData<TEntity> = {
  */
 export type UpsertData<TEntity> = UpdateData<TEntity>;
 
-/**
- * Marker to indicate DbEntity type (imported to avoid circular dependency)
- */
-interface DbEntity {
-  // This is just a marker for the type system
-}
 
 /**
  * Check if a value is a DbColumn

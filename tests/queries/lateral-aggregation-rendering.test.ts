@@ -58,7 +58,7 @@ describe('lateral aggregation rendering', () => {
     expect(statement).toContain('SELECT "lateral_0_posts"."title" as "postTitle", "lateral_0_posts"."views" as "views"');
     expect(statement).toContain("json_build_object('postTitle', \"postTitle\", 'views', \"views\")");
     expect(statement).toContain('FROM "posts" "lateral_0_posts"');
-    expect(statement).toContain('ORDER BY "views" DESC');
+    expect(statement).toContain('ORDER BY "lateral_0_posts"."views" DESC');
     expect(statement).toContain('LEFT JOIN LATERAL (');
     expect(rows.map(r => r.posts.map(p => p.views))).toEqual([[150, 100], [200], []]);
   });
@@ -102,7 +102,7 @@ describe('lateral aggregation rendering', () => {
     const statement = lastSql();
 
     expect(statement).toMatch(/AND "lateral_0_posts"\."views" > \$\d+/);
-    expect(statement).toContain('ORDER BY "views" DESC');
+    expect(statement).toContain('ORDER BY "lateral_0_posts"."views" DESC');
     expect(statement).toContain('LIMIT 1');
     expect(statement).not.toContain('__collection_posts__');
     expect(rows.map(r => r.top)).toEqual([[{ title: 'Alice Post 2', views: 150 }], [{ title: 'Bob Post', views: 200 }], []]);

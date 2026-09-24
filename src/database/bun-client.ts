@@ -41,13 +41,6 @@ function isBunSqlInstance(value: any): boolean {
 }
 
 /**
- * In text-results mode (`prepare: false`), Bun serializes object/array params
- * with toString() — a jsonb param would reach the server as "[object Object]".
- * Pre-stringify them: in the text protocol PostgreSQL parses the JSON string
- * into the json/jsonb target correctly (matching binary-mode behavior).
- * Dates pass through — Bun formats those itself.
- */
-/**
  * Convert Date values in result rows to PostgreSQL-text strings, in place.
  * 'YYYY-MM-DD HH:MM:SS.mmm' (UTC, no zone suffix); exactly-UTC-midnight
  * values become plain 'YYYY-MM-DD' (DATE columns arrive as midnight Dates).
@@ -65,28 +58,115 @@ function convertDatesToPgText(rows: any[]): void {
   }
 }
 
-function normalizeTextModeParams(params: any[] | undefined, textMode: boolean): any[] {
-  const list = params || [];
+/** A typed array of numbers — what Bun's binary protocol decodes an int4[] / float4[] column into. */
+function isNumericTypedArray(value: unknown): value is ArrayLike<number | bigint> {
+  return ArrayBuffer.isView(value) && !(value instanceof DataView) && !(value instanceof Uint8Array);
+}
 
-  if (!textMode) {
-    return list;
+/**
+ * Decode typed-array result values into plain arrays, in place. Through the binary protocol Bun
+ * returns an int4[] column as an Int32Array and a float4[] one as a Float32Array (every other array
+ * type — and every array in text mode — as a plain array, as pg and postgres.js do); `toEqual`,
+ * `JSON.stringify` and `Array.isArray` all tell them apart. Bytes (Uint8Array / Buffer) are bytea
+ * and stay as they are. The columns holding typed arrays are found from their first non-null value,
+ * so a result without any costs one look at one row.
+ */
+function convertTypedArrays(rows: any[]): void {
+  if (rows.length === 0) {
+    return;
   }
 
-  let needsCopy = false;
-  for (const param of list) {
-    if (param !== null && typeof param === 'object' && !(param instanceof Date)) {
-      needsCopy = true;
+  const pending = new Set(Object.keys(rows[0]));
+  const typedColumns: string[] = [];
+
+  for (const row of rows) {
+    for (const key of pending) {
+      const value = row[key];
+
+      if (value === null || value === undefined) {
+        continue;
+      }
+
+      pending.delete(key);
+      if (isNumericTypedArray(value)) {
+        typedColumns.push(key);
+      }
+    }
+
+    if (pending.size === 0) {
       break;
     }
   }
 
-  if (!needsCopy) {
-    return list;
+  if (typedColumns.length === 0) {
+    return;
   }
 
-  return list.map(param =>
-    param !== null && typeof param === 'object' && !(param instanceof Date) ? JSON.stringify(param) : param
-  );
+  for (const row of rows) {
+    for (const key of typedColumns) {
+      const value = row[key];
+
+      if (isNumericTypedArray(value)) {
+        // int8 elements read as strings, as pg / postgres.js (and Bun, for an int8 column) read them
+        row[key] = Array.from(value as ArrayLike<number | bigint>, element => (typeof element === 'bigint' ? element.toString() : element));
+      }
+    }
+  }
+}
+
+/**
+ * One parameter as Bun has to receive it.
+ *
+ * - A `Date` becomes its ISO instant, in both modes. Bun serializes a Date with
+ *   `Date.prototype.toString()` ("Sun Mar 10 2024 01:00:00 GMT+0100 (…)") wherever the server
+ *   did not describe the parameter as a timestamp — a `date` column, a text or untyped
+ *   parameter — and in text mode everywhere, which PostgreSQL rejects or stores as that text.
+ *   The ISO form is what postgres.js sends: a `timestamptz` gets the instant, a `timestamp` its
+ *   UTC wall time (what Bun's own timestamp encoding stores), a `date` the UTC date.
+ * - In text mode (`prepare: false`) Bun serializes object params with `toString()`, so a jsonb
+ *   param would reach the server as "[object Object]": plain objects and arrays are sent as
+ *   their JSON text, which PostgreSQL parses into the json / jsonb target (the prepared-mode
+ *   behavior). Bytes (`Uint8Array`, `Buffer`, `ArrayBuffer`) are left to Bun, which encodes
+ *   them as bytea itself — JSON-stringifying them used to store `{"0":1,"1":2}`. So is any
+ *   other class instance with a `toString()` of its own (Temporal values, decimals): its
+ *   string form is what the column parses, where its JSON form is a quoted string.
+ */
+function normalizeParam(param: unknown, textMode: boolean): unknown {
+  if (param instanceof Date) {
+    return Number.isNaN(param.getTime()) ? param : param.toISOString();
+  }
+
+  if (!textMode || param === null || typeof param !== 'object') {
+    return param;
+  }
+
+  if (ArrayBuffer.isView(param) || param instanceof ArrayBuffer) {
+    return param;
+  }
+
+  if (Array.isArray(param) || (param as object).toString === Object.prototype.toString) {
+    return JSON.stringify(param);
+  }
+
+  return param;
+}
+
+/** The parameter list as Bun has to receive it (see normalizeParam); the same array when nothing changes. */
+function normalizeParams(params: any[] | undefined, textMode: boolean): any[] {
+  const list = params || [];
+  let normalized: any[] | undefined;
+
+  for (let i = 0; i < list.length; i++) {
+    const param = list[i];
+    const value = normalizeParam(param, textMode);
+
+    if (value !== param) {
+      normalized ??= list.slice();
+      normalized[i] = value;
+    }
+  }
+
+  return normalized ?? list;
 }
 
 /**
@@ -97,7 +177,11 @@ class BunPooledConnection implements PooledConnection {
 
   async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // Bun result sets are real arrays — pass through without copying.
-    const result = await this.reserved.unsafe(sql, normalizeTextModeParams(params, this.textMode));
+    const result = await this.reserved.unsafe(sql, normalizeParams(params, this.textMode));
+
+    if (!this.textMode) {
+      convertTypedArrays(result);
+    }
 
     if (this.datesAsStrings) {
       convertDatesToPgText(result);
@@ -193,7 +277,11 @@ export class BunClient extends DatabaseClient {
   async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     // Use unsafe() for parameterized queries (similar to postgres library).
     // Bun result sets are real arrays — pass through without copying.
-    const result = await this.sql.unsafe(sql, normalizeTextModeParams(params, this.usesTextResults));
+    const result = await this.sql.unsafe(sql, normalizeParams(params, this.usesTextResults));
+
+    if (!this.usesTextResults) {
+      convertTypedArrays(result);
+    }
 
     if (this.datesAsStrings) {
       convertDatesToPgText(result);
@@ -229,7 +317,11 @@ export class BunClient extends DatabaseClient {
   async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     return await this.sql.begin(async (tx: BunSql) => {
       const queryFn = async (sqlStr: string, params?: any[]): Promise<QueryResult> => {
-        const result = await tx.unsafe(sqlStr, normalizeTextModeParams(params, this.usesTextResults));
+        const result = await tx.unsafe(sqlStr, normalizeParams(params, this.usesTextResults));
+
+        if (!this.usesTextResults) {
+          convertTypedArrays(result);
+        }
 
         if (this.datesAsStrings) {
           convertDatesToPgText(result);
@@ -345,6 +437,15 @@ export class BunClient extends DatabaseClient {
    */
   supportsBinaryArrayResults(): boolean {
     return this.usesTextResults;
+  }
+
+  /**
+   * Bun's binary numeric decoder returns `"0"` for a zero with a scale (`0.0000`); text mode keeps
+   * it. Conservatively true where the mode is unknown (a pre-built instance) — restoring a declared
+   * scale is a no-op on a value that kept it.
+   */
+  losesNumericZeroScale(): boolean {
+    return !this.usesTextResults;
   }
 
   /**

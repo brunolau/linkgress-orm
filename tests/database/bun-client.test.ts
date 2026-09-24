@@ -56,6 +56,7 @@ mock.module('bun:sql', () => {
 
 // Import after mocking
 import { BunClient } from '../../src/database/bun-client';
+import { TransactionalClient } from '../../src/database/database-client.interface';
 
 describe('BunClient', () => {
   describe('constructor', () => {
@@ -334,5 +335,138 @@ describe('BunSqlOptions type', () => {
     expect(postgresConfig.hostname).toBe('localhost');
     expect(mysqlConfig.adapter).toBe('mysql');
     expect(sqliteConfig.filename).toBe(':memory:');
+  });
+});
+
+/**
+ * The parameters BunClient hands Bun (see normalizeParam in bun-client.ts): a Date as its ISO
+ * instant in both modes (Bun sends Date.prototype.toString() wherever the server does not describe
+ * a timestamp, and everywhere in text mode); in text mode, plain objects and arrays as JSON text,
+ * bytes and value classes (a toString() of their own) left to Bun.
+ */
+describe('BunClient parameter normalization', () => {
+  /** A client in the given mode whose statements a mock captures. */
+  const clientCapturing = (textMode: boolean): { client: BunClient; sent: () => any[] } => {
+    const { mockSql } = createMockSql();
+    // prepare: false is only known from an options object; Bun's SQL connects lazily, so none opens here
+    const client = textMode ? new BunClient({ hostname: '127.0.0.1', port: 1, prepare: false }) : new BunClient(mockSql);
+    (client as any).sql = mockSql;
+
+    return { client, sent: () => mockSql.unsafe.mock.calls[0][1] };
+  };
+
+  class Money {
+    constructor(private readonly cents: number) {}
+
+    toString(): string {
+      return (this.cents / 100).toFixed(2);
+    }
+  }
+
+  test.each([false, true])('a Date is sent as its ISO instant (text mode: %p)', async (textMode) => {
+    const { client, sent } = clientCapturing(textMode);
+    await client.query('SELECT $1', [new Date('2024-03-10T23:30:00.000Z')]);
+
+    expect(sent()).toEqual(['2024-03-10T23:30:00.000Z']);
+  });
+
+  test.each([false, true])('an invalid Date is left to fail in the driver (text mode: %p)', async (textMode) => {
+    const { client, sent } = clientCapturing(textMode);
+    const invalid = new Date('not a date');
+    await client.query('SELECT $1', [invalid]);
+
+    expect(sent()[0]).toBe(invalid);
+  });
+
+  test('text mode: a plain object and an array are sent as JSON text', async () => {
+    const { client, sent } = clientCapturing(true);
+    await client.query('SELECT $1, $2', [{ a: 1 }, [1, 'x']]);
+
+    expect(sent()).toEqual(['{"a":1}', '[1,"x"]']);
+  });
+
+  test('text mode: bytes are left to Bun', async () => {
+    const { client, sent } = clientCapturing(true);
+    const bytes = new Uint8Array([1, 2, 255]);
+    const buffer = Buffer.from([3]);
+    const arrayBuffer = new Uint8Array([4]).buffer;
+    await client.query('SELECT $1, $2, $3', [bytes, buffer, arrayBuffer]);
+
+    expect(sent()[0]).toBe(bytes);
+    expect(sent()[1]).toBe(buffer);
+    expect(sent()[2]).toBe(arrayBuffer);
+  });
+
+  test('text mode: a value class with a toString() of its own is left to Bun', async () => {
+    const { client, sent } = clientCapturing(true);
+    const money = new Money(1999);
+    await client.query('SELECT $1', [money]);
+
+    expect(sent()[0]).toBe(money);
+  });
+
+  test('prepared mode: objects and arrays are left to Bun (it serializes jsonb itself)', async () => {
+    const { client, sent } = clientCapturing(false);
+    const payload = { a: 1 };
+    const list = [1, 2];
+    await client.query('SELECT $1, $2', [payload, list]);
+
+    expect(sent()[0]).toBe(payload);
+    expect(sent()[1]).toBe(list);
+  });
+
+  test.each([false, true])('a parameter list with nothing to change is passed as it is (text mode: %p)', async (textMode) => {
+    const { client, sent } = clientCapturing(textMode);
+    const params = [1, 'a', null, true, 9007199254740993n];
+    await client.query('SELECT $1, $2, $3, $4, $5', params);
+
+    expect(sent()).toBe(params);
+  });
+
+  test('prepared mode: typed-array result values read as plain arrays; bytes stay bytes', async () => {
+    const { mockSql } = createMockSql();
+    const bytes = new Uint8Array([1, 2]);
+    mockSql.unsafe = jest.fn<any>().mockResolvedValue(makeResultSet([
+      { i4: null, f4: new Float32Array([1.5]), i8: new BigInt64Array([9007199254740993n]), bytes, text: ['a'] },
+      { i4: new Int32Array([1, 2]), f4: null, i8: null, bytes: null, text: null },
+    ], 'SELECT') as any);
+    const client = new BunClient(mockSql);
+
+    const { rows } = await client.query('SELECT 1');
+
+    // a column NULL in the first row is still found from a later one
+    expect(rows[1].i4).toEqual([1, 2]);
+    expect(Array.isArray(rows[1].i4)).toBe(true);
+    expect(rows[0].f4).toEqual([1.5]);
+    expect(rows[0].i8).toEqual(['9007199254740993']);
+    expect(rows[0].bytes).toBe(bytes);
+    expect(rows[0].text).toEqual(['a']);
+    expect(rows[0].i4).toBeNull();
+  });
+
+  test('a changed list is a copy: the caller\'s array is not modified', async () => {
+    const { client, sent } = clientCapturing(true);
+    const date = new Date('2024-01-01T00:00:00.000Z');
+    const params: unknown[] = [date, { a: 1 }];
+    await client.query('SELECT $1, $2', params);
+
+    expect(sent()).not.toBe(params);
+    expect(params[0]).toBe(date);
+  });
+
+  test('a numeric zero loses its scale only in prepared (binary) mode — and the client says so', () => {
+    // Bun's binary numeric decoder reads numeric(20, 4) 0.0000 as "0"; text results keep "0.0000".
+    // The ORM restores the scale of a declared numeric(p, s) zero from this flag.
+    expect(clientCapturing(false).client.losesNumericZeroScale()).toBe(true);
+    expect(clientCapturing(true).client.losesNumericZeroScale()).toBe(false);
+  });
+
+  test('a transaction\'s client answers like the client it runs on', () => {
+    // db.transaction() runs its queries through a TransactionalClient over the parent client
+    const prepared = new TransactionalClient(async () => ({ rows: [], rowCount: 0 }), clientCapturing(false).client);
+    const text = new TransactionalClient(async () => ({ rows: [], rowCount: 0 }), clientCapturing(true).client);
+
+    expect(prepared.losesNumericZeroScale()).toBe(true);
+    expect(text.losesNumericZeroScale()).toBe(false);
   });
 });

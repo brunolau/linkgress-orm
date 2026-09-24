@@ -138,6 +138,8 @@ export type UnwrapSelection<T> = T extends SqlFragment<infer V>
   ? V
   : T extends SqlFragmentLike<infer V>
     ? V
+    : T extends WhereConditionBase
+      ? boolean  // a condition projects as a boolean column
     : T extends DbColumn<infer V>
       ? V  // Unwrap DbColumn<T> to T
       : T extends Subquery<infer R, any>
@@ -174,6 +176,27 @@ export interface SqlBuildContext {
    * so it must not depend on which driver happens to render it.
    */
   useJsonArrayAggregation?: boolean;
+  /**
+   * Table names that the LATERAL collection being built renders under a generated alias
+   * (`lib_editions` → `lateral_0_editions`). An `exists()` / `count()` over a collection of its
+   * item, nested in its WHERE or projection, correlates to that alias: the table is not visible
+   * under its own name inside the lateral.
+   */
+  lateralTableAliasMap?: Map<string, string>;
+  /**
+   * Renders a column or an expression operand some other way than its own SQL — `undefined` for a
+   * value it leaves alone. A grouped query's HAVING sets it: an aggregate ref (`g.count()`,
+   * `g.sum(r => r.x)`) renders as the aggregate, and, over a grouped subquery, a grouping key as that
+   * subquery's column. Consulted for comparison operands and for the values interpolated into `sql`.
+   */
+  substitute?: (value: object, context: SqlBuildContext) => string | undefined;
+  /**
+   * Render a projection's literals typed from their JS type (`CAST($1 AS boolean)`), for a
+   * projection another query reads as COLUMNS — a CTE body, a table subquery. Untyped, a literal
+   * reaches such a reader as text: `true` as 'true', and `gt(x.n, 5)` over a literal `42` compared
+   * strings.
+   */
+  typedLiterals?: boolean;
 }
 
 /**
@@ -191,7 +214,8 @@ export class Placeholder<TName extends string = string> {
   constructor(public readonly name: TName) {}
 }
 
-function getValueMapper(value: any): any | undefined {
+/** The type mapper a FieldRef or fragment carries, if any. @internal */
+export function getValueMapper(value: any): any | undefined {
   if (value && typeof value === 'object') {
     if ('__mapper' in value && value.__mapper) {
       return value.__mapper;
@@ -203,7 +227,8 @@ function getValueMapper(value: any): any | undefined {
   return undefined;
 }
 
-function applyToDriverMapper(value: any, mapper: any): any {
+/** `mapper.toDriver(value)` when the mapper has one, else the value unchanged. @internal */
+export function applyToDriverMapper(value: any, mapper: any): any {
   return mapper && typeof mapper.toDriver === 'function'
     ? mapper.toDriver(value)
     : value;
@@ -248,6 +273,12 @@ export abstract class WhereConditionBase {
    * Returns the fully qualified column name (with table alias if present)
    */
   protected getDbColumnName<T extends string, V = any>(field: FieldRef<T, V> | T, context?: SqlBuildContext): string {
+    if (context?.substitute && typeof field === 'object' && field !== null) {
+      const substituted = context.substitute(field, context);
+      if (substituted !== undefined) {
+        return substituted;
+      }
+    }
     // SqlFragment — build it to get raw SQL (e.g. sql`${field}::varchar(255)`)
     if (field instanceof SqlFragment) {
       return field.buildSql(context!);
@@ -298,6 +329,13 @@ export abstract class WhereConditionBase {
       // First occurrence - assign new parameter index
       context.placeholders.set(value.name, context.paramCounter);
       return `$${context.paramCounter++}`;
+    }
+
+    if (context.substitute && typeof value === 'object' && value !== null) {
+      const substituted = context.substitute(value, context);
+      if (substituted !== undefined) {
+        return substituted;
+      }
     }
 
     // SqlFragment — build it to inline its SQL (mirrors getDbColumnName's field-side
@@ -1365,7 +1403,7 @@ export function coalesce(
   }
   parts.push(')');
 
-  const mapper = all.map(getValueMapper).find(Boolean);
+  const mapper = pickResultMapper(all);
   const values = mapper
     ? all.map(value => isSqlFragmentLiteral(value) ? applyToDriverMapper(value, mapper) : value)
     : all;
@@ -1424,7 +1462,7 @@ function arithmetic(operator: string, operands: any[]): SqlFragment<number> {
   }
   parts.push(')');
 
-  const mapper = operands.map(getValueMapper).find(Boolean);
+  const mapper = pickResultMapper(operands);
   const values = mapper
     ? operands.map(value => isSqlFragmentLiteral(value) ? applyToDriverMapper(value, mapper) : value)
     : operands;
@@ -1739,9 +1777,11 @@ export function jsonbSelect<TJsonb, TKey extends keyof TJsonb & string = keyof T
   key: TKey
 ): SqlFragment<TJsonb[TKey]> {
   // Build the JSONB extraction SQL: (column #>> '{}')::jsonb->'propertyName'
-  // This converts JSONB to text, then back to JSONB, then extracts the property
+  // This converts JSONB to text, then back to JSONB, then extracts the property.
+  // The key is inlined as a properly quoted literal (a quote in the key used to break out
+  // of it). For a plain `->` path without the text round trip, use jsonbPath().
   return new SqlFragment<TJsonb[TKey]>(
-    ['(', ` #>> '{}')::jsonb->'${key}'`],
+    ['(', ` #>> '{}')::jsonb->${quoteSqlLiteral(key)}`],
     [jsonbField]
   ).as(key);
 }
@@ -1764,9 +1804,9 @@ export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb & string = key
   jsonbField: FieldLike<any> | DbColumn<any> | undefined,
   key: TKey
 ): SqlFragment<string> {
-  // Build the JSONB text extraction SQL: column->>'propertyName'
+  // Build the JSONB text extraction SQL: column->>'propertyName' (the key quoted as a literal)
   return new SqlFragment<string>(
-    ['', `->>'${key}'`],
+    ['', `->>${quoteSqlLiteral(key)}`],
     [jsonbField]
   ).as(key);
 }
@@ -1803,9 +1843,9 @@ function createJsonbElementProxy<T>(alias: string, path: string[] = []): JsonbEl
     if (path.length === 0) return alias;
     let expr = alias;
     for (let i = 0; i < path.length - 1; i++) {
-      expr += `->'${path[i]}'`;
+      expr += `->${quoteSqlLiteral(path[i])}`;
     }
-    expr += `->>'${path[path.length - 1]}'`;
+    expr += `->>${quoteSqlLiteral(path[path.length - 1])}`;
     return expr;
   };
 
@@ -1939,6 +1979,233 @@ export function jsonbConditionUnwrap<T>(value: T): T {
 }
 
 // ============================================================================
+// Literal quoting and type casts
+// ============================================================================
+
+/**
+ * Quote a JS string as a PostgreSQL string literal: `'it''s'`.
+ *
+ * Correct whatever `standard_conforming_strings` is set to: a string containing a backslash
+ * is emitted in the escape-string form with the backslashes doubled (`E'a\\b'`), exactly
+ * like PostgreSQL's own `quote_literal()`. NUL cannot be represented in a PostgreSQL text
+ * value at all and is refused.
+ */
+export function quoteSqlLiteral(value: string): string {
+  if (typeof value !== 'string') {
+    throw new TypeError(`quoteSqlLiteral expects a string, got ${typeof value}`);
+  }
+
+  if (value.includes('\u0000')) {
+    throw new Error('A PostgreSQL string literal cannot contain the NUL character (\\u0000)');
+  }
+
+  const quoted = value.replace(/'/g, "''");
+
+  return value.includes('\\')
+    ? `E'${quoted.replace(/\\/g, '\\\\')}'`
+    : `'${quoted}'`;
+}
+
+/**
+ * PostgreSQL type names the cast helpers are commonly given — listed for editor completion;
+ * any other valid type name (an enum, a domain, `numeric(12, 2)`, `varchar(64)[]`) is accepted.
+ */
+export type PgCastType =
+  | 'integer' | 'int' | 'int4' | 'smallint' | 'int2' | 'bigint' | 'int8'
+  | 'numeric' | 'decimal' | 'real' | 'float4' | 'double precision' | 'float8'
+  | 'text' | 'varchar' | 'char' | 'bpchar' | 'citext'
+  | 'boolean' | 'bool'
+  | 'date' | 'time' | 'timetz' | 'timestamp' | 'timestamptz' | 'interval'
+  | 'json' | 'jsonb' | 'jsonpath' | 'uuid' | 'bytea' | 'inet' | 'cidr'
+  | 'integer[]' | 'bigint[]' | 'smallint[]' | 'text[]' | 'varchar[]' | 'uuid[]' | 'numeric[]' | 'boolean[]' | 'jsonb[]'
+  | (string & {});
+
+/** An identifier: plain (`int4`, `my_enum`) or double-quoted (`"Status"`). */
+const PG_TYPE_IDENT = '(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"\\u0000]+")';
+
+/**
+ * A type name as it may follow `CAST(x AS …)`: optionally schema-qualified, possibly several
+ * words (`double precision`, `character varying`, `timestamp with time zone`), an optional
+ * `(n)` / `(p, s)` modifier and any number of `[]` / `[n]` array suffixes.
+ *
+ * The type name is inlined into the SQL text (a type cannot be a bind parameter), so it is
+ * validated against this shape instead of being trusted.
+ */
+const PG_TYPE_NAME_PATTERN = new RegExp(
+  `^(?:${PG_TYPE_IDENT}\\.)?${PG_TYPE_IDENT}(?: [A-Za-z_][A-Za-z0-9_$]*)*`
+  + '(?:\\s*\\(\\s*\\d+\\s*(?:,\\s*-?\\d+\\s*)?\\))?'
+  + '(?:\\s*\\[\\d*\\])*$'
+);
+
+/**
+ * Validate a PostgreSQL type name for inlining into a cast; returns it trimmed.
+ * Throws on anything that is not shaped like a type name.
+ */
+export function assertPgTypeName(pgType: string): string {
+  const trimmed = typeof pgType === 'string' ? pgType.trim() : '';
+
+  if (!trimmed || !PG_TYPE_NAME_PATTERN.test(trimmed)) {
+    throw new Error(`Invalid PostgreSQL type name for a cast: ${JSON.stringify(pgType)}`);
+  }
+
+  return trimmed;
+}
+
+/** Base type of a (possibly array, possibly parameterised) type name, lower-cased: `varchar(64)[]` → `varchar`. */
+function baseTypeName(pgType: string): string {
+  return pgType.replace(/(?:\s*\[\d*\])+$/, '').replace(/\s*\(.*\)$/, '').trim().toLowerCase();
+}
+
+function isJsonTypeName(pgType: string): boolean {
+  if (/\[\d*\]\s*$/.test(pgType)) {
+    return false;
+  }
+
+  const base = baseTypeName(pgType);
+  return base === 'json' || base === 'jsonb';
+}
+
+/**
+ * True for a plain JS value — anything that would bind as a parameter — as opposed to a
+ * column ref, a fragment, a condition, a placeholder, raw SQL or a subquery.
+ */
+export function isPlainSqlValue(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return true;
+  }
+
+  if (typeof value !== 'object') {
+    return typeof value !== 'function';
+  }
+
+  return !(
+    '__dbColumnName' in (value as object)
+    || value instanceof WhereConditionBase
+    || value instanceof Placeholder
+    || value instanceof RawSql
+    || typeof (value as any).buildSql === 'function'
+    || '__collectionResult' in (value as object)
+  );
+}
+
+function assertTypeModifier(name: string, value: number, min: number): void {
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new Error(`${name} must be an integer >= ${min}, got ${value}`);
+  }
+}
+
+/** `numeric`, `numeric(p)` or `numeric(p, s)`. @internal */
+export function numericTypeName(precision?: number, scale?: number): string {
+  if (precision === undefined) {
+    if (scale !== undefined) {
+      throw new Error('numeric scale needs a precision');
+    }
+    return 'numeric';
+  }
+
+  assertTypeModifier('numeric precision', precision, 1);
+
+  if (scale === undefined) {
+    return `numeric(${precision})`;
+  }
+
+  assertTypeModifier('numeric scale', scale, 0);
+  return `numeric(${precision}, ${scale})`;
+}
+
+/** `varchar` or `varchar(n)`. @internal */
+export function varcharTypeName(length?: number): string {
+  if (length === undefined) {
+    return 'varchar';
+  }
+
+  assertTypeModifier('varchar length', length, 1);
+  return `varchar(${length})`;
+}
+
+/**
+ * Result mapper that keeps the driver's value exactly as it arrives (NULL stays null).
+ *
+ * A fragment WITHOUT a mapper goes through the generic result conversion, which turns every
+ * numeric-looking string into a number (built for untyped aggregates) — a text value such as
+ * '01234' would come back as 1234. Helpers whose result type is explicit (casts, string
+ * functions, JSON paths, literals) carry this mapper instead, so the value is the one the
+ * statement produced.
+ * @internal
+ */
+export const DRIVER_VALUE_MAPPER = Object.freeze({
+  fromDriver: (value: unknown) => value,
+});
+
+/**
+ * The result mapper of an expression over several operands (COALESCE, arithmetic, CASE, …):
+ * the first REAL mapper an operand carries (a column's custom type) wins; failing that, the
+ * driver-value mapper if an operand carries it; else none.
+ * @internal
+ */
+export function pickResultMapper(values: readonly unknown[]): any | undefined {
+  let fallback: any;
+
+  for (const value of values) {
+    const mapper = getValueMapper(value);
+    if (!mapper) {
+      continue;
+    }
+    if (mapper !== DRIVER_VALUE_MAPPER) {
+      return mapper;
+    }
+    fallback = mapper;
+  }
+
+  return fallback;
+}
+
+/**
+ * `CAST(value AS pgType)` — the one cast renderer behind `cast()`, every `castAs*()` helper
+ * and the fluent `SqlFragment.cast*()` methods.
+ *
+ * - A column or fragment is cast as an expression.
+ * - A plain JS value binds as ONE parameter and the cast types it — a typed parameter
+ *   (`CAST($1 AS bigint)`); JS objects and arrays cast to `json`/`jsonb` are serialized with
+ *   `JSON.stringify` first, because the drivers would otherwise send a JS array as a
+ *   PostgreSQL array literal; a JS array cast to an array type (`int[]`) binds as that array
+ *   literal, which every driver accepts.
+ * - `null` / `undefined` render a typed NULL: `CAST(NULL AS text)`.
+ *
+ * The CAST(...) spelling needs no parentheses around a compound expression and is the same
+ * expression tree PostgreSQL builds for `x::type`, so it matches expression indexes written
+ * either way.
+ *
+ * The result is read back exactly as the driver returns the target type (NULL stays null):
+ * numbers for integer / double types, strings for text, numeric and int8, parsed JSON for
+ * json / jsonb.
+ */
+export function castTo<T = unknown>(value: unknown, pgType: PgCastType): SqlFragment<T> {
+  const type = assertPgTypeName(pgType);
+
+  if (value === null || value === undefined) {
+    return new SqlFragment<T>([`CAST(NULL AS ${type})`], [], DRIVER_VALUE_MAPPER);
+  }
+
+  const bound = isJsonTypeName(type) && isPlainSqlValue(value) && typeof value === 'object' && !(value instanceof Date)
+    ? JSON.stringify(value)
+    // A JS array cast to an array type binds as its array LITERAL — the form every driver accepts
+    // (Bun's SQL client cannot bind a JS array to an array parameter at all)
+    : Array.isArray(value) && type.endsWith('[]')
+      ? toPgArrayLiteral(value)
+      : value;
+
+  if (typeof bound === 'string' && isJsonTypeName(type)) {
+    // JSON text binds as TEXT and is parsed by the cast. A parameter PostgreSQL types as json /
+    // jsonb is serialized by its type on drivers that do so (postgres.js JSON-encodes it once more),
+    // which stored the document as a JSON string: `->>` read null, `@>` never matched
+    return new SqlFragment<T>(['CAST(CAST(', ` AS text) AS ${type})`], [bound], DRIVER_VALUE_MAPPER);
+  }
+
+  return new SqlFragment<T>(['CAST(', ` AS ${type})`], [bound], DRIVER_VALUE_MAPPER);
+}
+
+// ============================================================================
 // SQL Fragment - for use in SELECT projections and WHERE conditions
 // ============================================================================
 
@@ -1964,9 +2231,13 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   /**
    * Set custom type mapper for bidirectional transformation
    * Can accept either:
-   * - A function (value: TDriver) => TData for inline transformations
+   * - A function (value: TDriver) => TData for inline transformations — the fragment's value type
+   *   is what the function returns (an unannotated parameter is `any`; it used to be an implicit
+   *   `any` error, and the return type was ignored)
    * - A CustomTypeBuilder with full toDriver/fromDriver methods
    */
+  mapWith<TData, TDriver = any>(mapper: (value: TDriver) => TData): SqlFragment<TData>;
+  mapWith<TData = TValueType>(mapper: object): SqlFragment<TData>;
   mapWith<TData = TValueType, TDriver = any>(
     mapper: ((value: TDriver) => TData) | any
   ): SqlFragment<TData> {
@@ -1986,6 +2257,95 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   }
 
   /**
+   * Cast this expression: `CAST(<this> AS pgType)`. The alias is kept; the mapper is dropped,
+   * because it described the value BEFORE the cast.
+   *
+   * @example
+   * jsonbSelectText(p.payload, 'qty').cast<number>('integer')
+   * sql`${p.a} || ${p.b}`.cast<string>('varchar(64)')
+   */
+  cast<T = unknown>(pgType: PgCastType): SqlFragment<T> {
+    return castTo<T>(this, pgType).as(this.alias as string);
+  }
+
+  /** `CAST(<this> AS integer)` — int4, read back as a JS number. */
+  castAsInt(): SqlFragment<number> {
+    return this.cast<number>('integer');
+  }
+
+  /** `CAST(<this> AS smallint)` — read back as a JS number. */
+  castAsSmallInt(): SqlFragment<number> {
+    return this.cast<number>('smallint');
+  }
+
+  /**
+   * `CAST(<this> AS bigint)`. The pg / postgres.js drivers return int8 as a STRING (a JS
+   * number cannot hold every int8) — chain `.mapWith(Number)` or `.mapWith(BigInt)` to convert.
+   */
+  castAsBigInt(): SqlFragment<string> {
+    return this.cast<string>('bigint');
+  }
+
+  /**
+   * `CAST(<this> AS numeric)` / `numeric(p)` / `numeric(p, s)`, read back as a JS number.
+   * For the exact decimal text, use `.cast<string>('numeric')` (the drivers return numeric
+   * as a string).
+   */
+  castAsNumeric(precision?: number, scale?: number): SqlFragment<number> {
+    return this.cast<string>(numericTypeName(precision, scale)).mapWith<number>(Number);
+  }
+
+  /** `CAST(<this> AS double precision)` — float8, read back as a JS number. */
+  castAsDouble(): SqlFragment<number> {
+    return this.cast<number>('double precision');
+  }
+
+  /** `CAST(<this> AS text)`. */
+  castAsString(): SqlFragment<string> {
+    return this.cast<string>('text');
+  }
+
+  /** `CAST(<this> AS varchar)` / `varchar(n)` — an over-long value is truncated to n, as in PostgreSQL. */
+  castAsVarchar(length?: number): SqlFragment<string> {
+    return this.cast<string>(varcharTypeName(length));
+  }
+
+  /** `CAST(<this> AS boolean)`. */
+  castAsBoolean(): SqlFragment<boolean> {
+    return this.cast<boolean>('boolean');
+  }
+
+  /** `CAST(<this> AS date)`. */
+  castAsDate(): SqlFragment<Date> {
+    return this.cast<Date>('date');
+  }
+
+  /** `CAST(<this> AS timestamp)` — without time zone. */
+  castAsTimestamp(): SqlFragment<Date> {
+    return this.cast<Date>('timestamp');
+  }
+
+  /** `CAST(<this> AS timestamptz)`. */
+  castAsTimestamptz(): SqlFragment<Date> {
+    return this.cast<Date>('timestamptz');
+  }
+
+  /** `CAST(<this> AS jsonb)` — read back as the parsed JSON value. */
+  castAsJsonb<T = unknown>(): SqlFragment<T> {
+    return this.cast<T>('jsonb');
+  }
+
+  /** `CAST(<this> AS json)` — read back as the parsed JSON value. */
+  castAsJson<T = unknown>(): SqlFragment<T> {
+    return this.cast<T>('json');
+  }
+
+  /** `CAST(<this> AS uuid)`. */
+  castAsUuid(): SqlFragment<string> {
+    return this.cast<string>('uuid');
+  }
+
+  /**
    * Get the type mapper (internal use)
    */
   getMapper(): any | undefined {
@@ -2000,15 +2360,24 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   }
 
   /**
-   * Get all field references from the fragment values
+   * Get all field references from the fragment values.
+   *
+   * A Condition interpolated into a fragment (sql`${eq(p.user.name, x)}`, a caseWhen branch,
+   * asBoolean) reports its refs too, and a Subquery its OUTER refs — JOIN detection reads the
+   * refs of the whole tree, and a navigation hidden inside a nested condition would otherwise
+   * render against an alias that was never joined.
    */
   override getFieldRefs(): FieldRef[] {
     const refs: FieldRef[] = [];
     for (const value of this.values) {
       if (this.isFieldRef(value)) {
         refs.push(value);
-      } else if (value instanceof SqlFragment) {
+      } else if (value instanceof WhereConditionBase) {
+        // SqlFragment (and its subclasses) included — each reports its own tree
         refs.push(...value.getFieldRefs());
+      } else if (value && typeof value === 'object' && typeof (value as any).getOuterFieldRefs === 'function') {
+        // Subquery: only its correlation refs belong to the enclosing query
+        refs.push(...(value as any).getOuterFieldRefs());
       }
     }
     return refs;
@@ -2040,9 +2409,15 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
 
       if (i < this.values.length) {
         const value = this.values[i];
+        const substituted = context.substitute && (this.isFieldRef(value) || value instanceof SqlFragment)
+          ? context.substitute(value, context)
+          : undefined;
 
+        if (substituted !== undefined) {
+          sql += substituted;
+        }
         // Check if value is a RawSql - insert directly without parameterization
-        if (this.isRawSql(value)) {
+        else if (this.isRawSql(value)) {
           sql += value.value;
         }
         // Check if value is a named placeholder for prepared statements
@@ -2245,7 +2620,8 @@ export class ConditionBuilder {
     condition: Condition,
     startParam: number = 1,
     placeholders?: Map<string, number>,
-    hoistedCteNames?: Set<string>
+    hoistedCteNames?: Set<string>,
+    lateralTableAliasMap?: Map<string, string>
   ): { sql: string; params: any[]; placeholders?: Map<string, number>; paramCounter: number } {
     const context: SqlBuildContext = {
       paramCounter: startParam,
@@ -2253,6 +2629,9 @@ export class ConditionBuilder {
       placeholders,
       hoistedCteNames,
     };
+    if (lateralTableAliasMap !== undefined) {
+      context.lateralTableAliasMap = lateralTableAliasMap;
+    }
 
     const sql = condition.buildSql(context);
     return { sql, params: context.params, placeholders: context.placeholders, paramCounter: context.paramCounter };

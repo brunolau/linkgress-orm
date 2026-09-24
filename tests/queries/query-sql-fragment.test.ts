@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { withDatabase } from '../utils/test-database';
 import { expectToReject } from '../utils/expect-rejects';
-import { sql } from '../../src';
+import { cast, sql } from '../../src';
 
 /**
  * `db.query(sql`…`)`: raw statements as fragments. Every interpolated value is a bound parameter,
@@ -44,13 +44,34 @@ describe('db.query(SqlFragment)', () => {
     });
   });
 
-  test('passes arrays and JSON text as ordinary parameters', async () => {
+  test('passes arrays and JSON text as ordinary parameters (the pg driver\'s serialization)', async () => {
+    // A raw JS array and raw JSON text are bound as the DRIVER serializes them: pg sends an array
+    // literal and the text as is; postgres.js and Bun (prepared) serialize by the described type,
+    // storing JSON text as a JSON string, and Bun cannot bind a JS array to an array parameter
+    // (see bun-sql-contract.test.ts). The cast helpers below bind both the same way on every driver.
+    if ((process.env.LINKGRESS_TEST_DRIVER || 'pg').toLowerCase() !== 'pg') {
+      return;
+    }
+
     await withDatabase(async (db) => {
       const rows = await db.query<{ size: number; featured: boolean }>(
         sql`SELECT cardinality(${[1, 2, 3]}::int[])::int AS size, (${JSON.stringify({ featured: true })}::jsonb ->> 'featured')::boolean AS featured`
       );
 
       expect(rows).toEqual([{ size: 3, featured: true }]);
+    });
+  });
+
+  test('passes arrays and JSON through the cast helpers the same way on every driver', async () => {
+    await withDatabase(async (db) => {
+      const rows = await db.query<{ size: number; third: string; featured: boolean; fromObject: boolean }>(
+        sql`SELECT cardinality(${cast([1, 2, 3], 'int[]')})::int AS size,
+          (${cast(['a', 'b,c', 'd"e'], 'text[]')})[3] AS third,
+          (${cast(JSON.stringify({ featured: true }), 'jsonb')} ->> 'featured')::boolean AS featured,
+          (${cast({ featured: true }, 'jsonb')} ->> 'featured')::boolean AS "fromObject"`
+      );
+
+      expect(rows).toEqual([{ size: 3, third: 'd"e', featured: true, fromObject: true }]);
     });
   });
 

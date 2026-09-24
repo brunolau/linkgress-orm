@@ -206,8 +206,10 @@ describe('BunClient query contract', () => {
     // (covered below) but the server rejects it for native array columns
     // ("insufficient data left in message", 08P01). postgres.js handles this
     // via Describe-informed per-OID serialization, which Bun.SQL lacks.
-    // Consequence: linkgress `array()` columns are unsupported on BunClient
-    // until the array() mapper serializes to a PG array literal itself.
+    // The client cannot tell the two targets apart, so a raw array stays as it is
+    // here; linkgress binds a native array COLUMN (`integer('ids').array()`) as a
+    // PG array literal instead, which every driver accepts (see
+    // array-column-binding.test.ts).
     await client.query(`CREATE TABLE IF NOT EXISTS ${PROBE_TABLE}_arr (nums int[])`);
 
     try {
@@ -266,6 +268,120 @@ describe('BunClient query contract', () => {
     const result = await client.query(`SELECT 1 AS a`);
     expect(Array.isArray(result.rows)).toBe(true);
     expect(JSON.parse(JSON.stringify(result.rows))).toEqual([{ a: 1 }]);
+  });
+});
+
+/**
+ * What BunClient sends for the parameters Bun's SQL client cannot bind itself, in both modes. Bun
+ * serializes a Date with Date.prototype.toString() wherever the server does not describe the
+ * parameter as a timestamp (a `date` column, a text or untyped parameter) and everywhere in text
+ * mode — "Sun Mar 10 2024 01:00:00 GMT+0100 (…)" — and BunClient's text-mode JSON pass used to
+ * stringify bytes as `{"0":1,"1":2}`. BunClient sends a Date as its ISO instant (what postgres.js
+ * sends) and leaves bytes to Bun.
+ */
+describe.each([
+  ['prepared', true],
+  ['text mode', false],
+] as const)('BunClient parameters (%s)', (_mode, prepare) => {
+  let client: BunClient;
+
+  beforeAll(() => {
+    client = new BunClient({ ...DB_CONFIG, prepare });
+  });
+
+  afterAll(async () => {
+    await client.end();
+  });
+
+  const one = async (sql: string, params: unknown[]): Promise<any> => (await client.query(sql, params)).rows[0].v;
+  const instant = new Date('2024-03-10T23:30:00.000Z');
+
+  test('a Date into timestamptz is its instant', async () => {
+    expect(await one('SELECT CAST($1 AS timestamptz) = TIMESTAMPTZ \'2024-03-10T23:30:00Z\' AS v', [instant])).toBe(true);
+  });
+
+  test('a Date into timestamp is its UTC wall time', async () => {
+    expect(await one('SELECT CAST(CAST($1 AS timestamp) AS text) AS v', [instant])).toBe('2024-03-10 23:30:00');
+  });
+
+  test('a Date into date is its UTC date', async () => {
+    expect(await one('SELECT CAST(CAST($1 AS date) AS text) AS v', [new Date('2024-03-10T00:00:00.000Z')])).toBe('2024-03-10');
+  });
+
+  test('a Date into text is its ISO instant', async () => {
+    expect(await one('SELECT CAST($1 AS text) AS v', [instant])).toBe('2024-03-10T23:30:00.000Z');
+  });
+
+  test('bytes into bytea are the bytes', async () => {
+    expect(await one('SELECT encode(CAST($1 AS bytea), \'hex\') AS v', [new Uint8Array([0, 1, 255])])).toBe('0001ff');
+    expect(await one('SELECT encode(CAST($1 AS bytea), \'hex\') AS v', [Buffer.from([7, 8])])).toBe('0708');
+  });
+
+  test('a plain object and an array into jsonb', async () => {
+    expect(await one('SELECT CAST($1 AS jsonb) AS v', [{ a: [1, 'x'], b: null }])).toEqual({ a: [1, 'x'], b: null });
+    expect(await one('SELECT jsonb_typeof(CAST($1 AS jsonb)) AS v', [[1, 2]])).toBe('array');
+  });
+
+  test('a PG array literal into a native array', async () => {
+    expect(await one('SELECT CAST(CAST($1 AS int[]) AS text) AS v', ['{1,2,3}'])).toBe('{1,2,3}');
+    expect(await one('SELECT array_length(CAST($1 AS text[]), 1) AS v', ['{"a","b,c","d\\"e"}'])).toBe(3);
+  });
+
+  test('scalars pass through', async () => {
+    expect(await one('SELECT CAST(CAST($1 AS bigint) AS text) AS v', [9007199254740993n])).toBe('9007199254740993');
+    expect(await one('SELECT CAST($1 AS boolean) AS v', [true])).toBe(true);
+    expect(await one('SELECT CAST($1 AS text) AS v', ['plain'])).toBe('plain');
+  });
+
+  test('array result columns read as plain arrays (the binary protocol decodes int4[] / float4[] as typed arrays)', async () => {
+    const row = (await client.query(`SELECT
+        CAST('{1,2}' AS int4[]) AS i4,
+        CAST('{1.5,2}' AS float4[]) AS f4,
+        CAST('{9007199254740993,2}' AS int8[]) AS i8,
+        CAST('{}' AS int4[]) AS empty,
+        CAST(NULL AS int4[]) AS nothing,
+        CAST('\\x0102' AS bytea) AS bytes
+      WHERE CAST($1 AS integer) = 1`, [1])).rows[0];
+
+    expect(row.i4).toEqual([1, 2]);
+    expect(Array.isArray(row.i4)).toBe(true);
+    expect(row.f4).toEqual([1.5, 2]);
+    expect(row.i8).toEqual(['9007199254740993', '2']);
+    expect(row.empty).toEqual([]);
+    expect(row.nothing).toBeNull();
+    // bytea stays bytes
+    expect(Array.from(row.bytes as Uint8Array)).toEqual([1, 2]);
+    expect(Array.isArray(row.bytes)).toBe(false);
+  });
+
+  test('KNOWN DIVERGENCE: a multidimensional array result cannot be decoded through the binary protocol', async () => {
+    // Bun fails the read ("ERR_POSTGRES_MULTIDIMENSIONAL_ARRAY_NOT_SUPPORTED_YET"); text mode decodes it.
+    // Writing one works in both (a PG array literal); read it back as text, or use prepare: false.
+    let result: unknown;
+    let failed = false;
+
+    try {
+      result = (await client.query('SELECT CAST(\'{{1,2},{3,4}}\' AS int4[]) AS v WHERE CAST($1 AS integer) = 1', [1])).rows[0].v;
+    } catch {
+      failed = true;
+    }
+
+    if (prepare) {
+      expect(failed).toBe(true);
+    } else {
+      expect(result).toEqual([[1, 2], [3, 4]]);
+    }
+  });
+
+  test('KNOWN DIVERGENCE: a numeric zero read back through the binary protocol loses its scale', async () => {
+    // Bun's binary numeric decoder returns "0" for any zero with a scale ("0.0000", "0.00"); its
+    // text decoding, pg and postgres.js keep the digits. Non-zero values keep their scale too.
+    // Pinned so a Bun that fixes it shows up here.
+    const zero = await one('SELECT CAST(\'0.0000\' AS numeric(20, 4)) AS v WHERE CAST($1 AS integer) = 1', [1]);
+    const half = await one('SELECT CAST(\'0.5000\' AS numeric(20, 4)) AS v WHERE CAST($1 AS integer) = 1', [1]);
+
+    expect(zero).toBe(prepare ? '0' : '0.0000');
+    expect(half).toBe('0.5000');
   });
 });
 

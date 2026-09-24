@@ -12,15 +12,16 @@ Linkgress ORM provides type-safe methods for modifying data in your database. Al
 Insert a single record into a table:
 
 ```typescript
-// Insert a new user
-const newUser = await db.users.insert({
+// Insert a new user (resolves to nothing)
+await db.users.insert({
   username: 'alice',
   email: 'alice@example.com',
   isActive: true
 });
 
-console.log(newUser); // Returns the inserted record with generated ID
-// { id: 1, username: 'alice', email: 'alice@example.com', isActive: true }
+// ...or read the inserted row back
+const newUser = await db.users.insert({ username: 'alice', email: 'alice@example.com' }).returning();
+console.log(newUser); // { id: 1, username: 'alice', email: 'alice@example.com', isActive: true, ... }
 ```
 
 **Type Safety:**
@@ -30,16 +31,127 @@ console.log(newUser); // Returns the inserted record with generated ID
 
 ### Insert with Returning Specific Columns
 
-You can specify which columns to return after insert:
+`.returning(selector)` returns what the selector selects from the inserted row:
 
 ```typescript
-const user = await db.users.insert({
-  username: 'bob',
-  email: 'bob@example.com'
-}, ['id', 'username']); // Only return id and username
+const user = await db.users
+  .insert({ username: 'bob', email: 'bob@example.com' })
+  .returning(u => ({ id: u.id, username: u.username }));
 
 console.log(user); // { id: 2, username: 'bob' }
+
+// One value on its own
+const id = await db.users.insert({ username: 'cy', email: 'cy@example.com' }).returning(u => u.id); // 3
 ```
+
+### What `.returning(selector)` can select
+
+Every mutation's `.returning(selector)` — `insert`, `insertBulk`, `upsert` / `upsertBulk`, `mergeBulk`,
+`bulkUpdate`, `.where(...).update()` / `.delete()`, `update()` / `delete()` over every row, and both
+sides of `insertWithChildren` / `insertBulkWithChildren` — reads the written rows the way a `select()`
+reads rows:
+
+```typescript
+const rows = await db.loans
+  .where(ln => eq(ln.memberId, memberId))
+  .update({ note: 'renewed' })
+  .returning(ln => ({
+    id: ln.id,
+    due: ln.dueAt,                                    // a column, under any key, through its mapper
+    label: sql<string>`upper(${ln.note})`,            // an sql expression over the row
+    book: sql<string>`lower(${ln.book!.name})`,       // ... or over a navigation (joined for it)
+    overdue: lt(ln.dueAt, today),                     // a condition: a boolean
+    source: 'renewal',                                // a literal: returned as it is
+    meta: { by: 'batch', member: ln.member!.name },   // nested objects, any mix of the above
+    loans: ln.member!.loans!.count(),                 // collections, as in a select()
+  }));
+```
+
+- **A column** reads back through its own mapper whatever key it is returned under — and a value
+  returned under a mapped column's NAME (an expression, another column, a literal) keeps its own value.
+- **An `sql` expression** reading only the row's own columns renders in the mutation's own `RETURNING`
+  list; one reading a navigation — or anything reading a navigation or a collection — makes the
+  mutation run as a data-modifying CTE (`"__mutation__"`) the navigations are joined onto, as below.
+  Its parameters are bound like any other; its `mapWith` applies.
+- **A condition** (`eq`, `and`, …) reads back as a boolean; a subquery as its value.
+- **A literal** (`'renewal'`, `42`, `true`, `null`, a `Date`, a list of values) is returned as it is —
+  it is not read from the database. An `undefined` field is left out, as a `select()` leaves it out.
+- **One value** instead of an object (`ln => ln.id`, `ln => sql\`…\``, `ln => ln.book!.name`,
+  `m => m.loans!.count()`): a single-row `insert` returns that value, every other mutation the list of
+  them.
+- **Collections** read their items through their columns' mappers, as a `select()` reads them.
+- An array of columns or expressions (`[ln.id, ln.note]`) has no single SQL value to return and is
+  refused — select an object, or build the array in SQL.
+- `mergeBulk` and `bulkUpdate` qualify the row's columns by their target alias (`t."note"`): a bare
+  name is ambiguous or out of scope there.
+- `.toStatement(selector)` (the compiled `UPDATE` / `DELETE` for `DbCteBuilder.withMutation`) takes an
+  object of columns, expressions and literals — a literal binds as a parameter there, since SQL reads
+  the statement's columns. A selector returning one value, or reading a navigation, is refused.
+
+### Navigations in `.returning()`
+
+The selector of `.returning()` on `insert`, `insertBulk`, `upsert`, `upsertBulk`, `mergeBulk` and on
+both sides of `insertWithChildren` / `insertBulkWithChildren` can read navigations, as a `select()`
+does. The statement is then wrapped in a `"__mutation__"` CTE and the navigations are joined onto the
+rows it wrote — for an upsert or a merge, the rows as they are after the insert or the update, so a
+navigation follows the keys the update set.
+
+```typescript
+const loan = await db.loans
+  .insert({ memberId, editionId, bookId, note: 'reserved' })
+  .returning(ln => ({
+    id: ln.id,
+    ownBook: ln.book!.name,                              // "book"."name"
+    printedBook: ln.edition!.book!.name,                 // "edition__book"."name"
+    printedCategory: ln.edition!.book!.category!.name,   // "category"."name", joined on "edition__book"
+    edition: ln.edition!,                                // the edition's row, as an object of its columns
+  }));
+```
+
+- Every hop is joined on its own parent, so a path can be any number of hops deep and its middle
+  hops need not be projected. Two paths that end in the same relation name get a join each, under
+  the aliases a query gives them: the shallowest path keeps the plain name, every other one renders
+  as `<parentAlias>__<relation>` (see
+  [Navigation Joins and Their Aliases](./querying.md#navigation-joins-and-their-aliases)). When every
+  path is one hop deep, the statement is the one earlier versions rendered.
+- Nested object literals work as in a `select()`, and so does a navigation row projected whole: it
+  comes back as an object of its columns (all `null` when the navigation is `NULL`).
+- A column read through a navigation goes through its own column mapper, however deep the path.
+- A collection hanging off a navigation (`toList()`, `firstOrDefault()`, `count()`, `min()`, `max()`,
+  `sum()`, `exists()`, `toNumberList()`, `toStringList()`) is rendered with the `lateral` strategy and
+  follows the path it hangs off from the written row, also when another path owns the relation name —
+  with `limit()` / `offset()` too, and with a nested collection in its `where` (`ed.loans.exists()`).
+- A collection selecting one value (`b.editions!.select(e => e.label).toList()`) returns the values
+  (`string[]`), as it does in a `select()`.
+- A collection reads the tables as of the statement's start: it does not see rows the statement
+  itself inserts (PostgreSQL gives every part of one statement the same snapshot).
+- `mergeBulk` runs the MERGE … RETURNING itself in the CTE (PostgreSQL 17+, as any MERGE RETURNING).
+- In `insertWithChildren` / `insertBulkWithChildren`, a child's navigation to the parent TABLE reads
+  the parents inserted by the same statement together with the table's other rows — a child can
+  point at a new parent through one key and at an existing row of the same table through another.
+- Their parent selector: one of the parent's own columns rides the same statement; one reading a
+  navigation, a collection, a nested object or an expression is read back by the parents' keys with
+  a SELECT once the statement ran — so a parent's collection of children includes the new ones. The
+  parents keep their input order.
+
+  ```typescript
+  const { parents, children } = await db.categories.insertBulkWithChildren({
+    rows: [{ name: 'Drama' }, { name: 'Essays' }],
+    children: {
+      table: db.books,
+      foreignKey: 'categoryId',
+      rows: [{ parentIndex: 0, row: { name: 'Hamlet' } }, { parentIndex: 1, row: { name: 'Essais' } }],
+    },
+    returning: {
+      parents: c => ({ id: c.id, titles: c.books!.select(b => b.name).toList() }),  // read back
+      children: b => ({ id: b.id, category: b.category!.name }),                    // same statement
+    },
+  });
+  ```
+
+Refused before anything is written, with an error naming the paths involved: a path alias longer
+than PostgreSQL's 63-byte identifier limit — a truncated alias could collide with another one. Read
+one of the paths in a separate query, or shorten a relation name.
 
 ### Bulk Insert
 
@@ -119,7 +231,22 @@ const results = await db.users
 
 console.log(results);
 // [{ id: 1, age: 30 }]
+
+// Navigations, collections, expressions and conditions, as in an insert's RETURNING
+const renamed = await db.users
+  .where(u => eq(u.company!.name, 'Acme'))   // a WHERE through a navigation...
+  .update({ isActive: true })
+  .returning(u => ({
+    id: u.id,
+    company: u.company!.name,                  // ...next to a RETURNING through one
+    posts: u.posts!.count(),
+    shouted: sql<string>`upper(${u.username})`,
+  }));
 ```
+
+The selector gets the updated row's columns, navigations and collections — typed like an insert's
+(`EntityQuery`), so conditions and collection aggregates type-check. See
+[What `.returning(selector)` can select](#what-returningselector-can-select).
 
 ### Update with Affected Count
 
@@ -155,16 +282,12 @@ Upsert (INSERT ... ON CONFLICT) inserts a record or updates it if it already exi
 ### Simple Upsert
 
 ```typescript
-// Upsert based on unique constraint (e.g., username)
-const user = await db.users.upsert(
+// Upsert on a unique key (e.g., username)
+await db.users.upsert(
+  [{ username: 'alice', email: 'alice@example.com', isActive: true }],
   {
-    username: 'alice',
-    email: 'alice@example.com',
-    isActive: true
-  },
-  {
-    conflictTarget: ['username'], // Columns that define uniqueness
-    update: ['email', 'isActive']  // Columns to update on conflict
+    primaryKey: 'username',                // The conflict target (the table's primary key by default)
+    updateColumns: ['email', 'isActive'],  // Columns to update on conflict (every other one by default)
   }
 );
 
@@ -175,39 +298,57 @@ const user = await db.users.upsert(
 ### Upsert with Custom Update Logic
 
 ```typescript
-// Upsert with conditional update
-const user = await db.users.upsert(
+// Increment on conflict: the SET expression reads the existing row and the proposed one
+await db.users.upsertBulk(
+  [{ username: 'bob', email: 'bob@example.com', loginCount: 1 }],
   {
-    username: 'bob',
-    email: 'bob@example.com',
-    loginCount: 1
-  },
-  {
-    conflictTarget: ['username'],
-    update: {
-      email: 'bob@example.com',
-      loginCount: sql`${db.users.loginCount} + 1` // Increment on conflict
-    }
+    primaryKey: 'username',
+    updateSet: (existing, excluded) => ({ loginCount: add(existing.loginCount, excluded.loginCount) }),
   }
 );
 ```
+
+See [Upsert with SET Expressions](#upsert-with-set-expressions-updateset--updatewhere) for the full form.
+
+### The `values()` Builder: `onConflict()` / `doUpdate()` / `doNothing()`
+
+```typescript
+const rows = await db.users
+  .values([{ username: 'alice', email: 'alice@example.com', age: 30 }])
+  .onConflict(['username'])                 // or { constraint: 'users_username_key' }
+  .doUpdate({
+    set: {
+      email: 'renamed@example.com',         // a value — through the column's mapper
+      age: sql<number>`"users"."age" + EXCLUDED."age"`,   // an sql expression: EXCLUDED is the proposed row
+    },
+    where: '"users"."is_active"',           // the DO UPDATE's condition, as SQL
+  })
+  .execute();                               // the written rows, read as entities
+```
+
+- `doUpdate()` with no options updates every inserted non-key column to the proposed row's value.
+- `doUpdate({ updateColumns: ['email'] })` updates exactly those columns to the proposed row's values.
+- `doUpdate({ set })` updates exactly its columns to its values (a column the insert does not carry
+  too). A key that is no column is refused. (`set` used to name the columns only — they took the
+  INSERTED values and the given ones were dropped.)
+- `doNothing()` leaves a conflicting row alone (it is not returned).
 
 ### Bulk Upsert
 
 Insert or update multiple records:
 
 ```typescript
-const users = await db.users.upsertMany(
+const users = await db.users.upsertBulk(
   [
     { username: 'alice', email: 'alice@example.com' },
     { username: 'bob', email: 'bob@example.com' },
     { username: 'charlie', email: 'charlie@example.com' }
   ],
   {
-    conflictTarget: ['username'],
-    update: ['email']
+    primaryKey: 'username',
+    updateColumns: ['email']
   }
-);
+).returning();
 
 console.log(`Upserted ${users.length} users`);
 // Efficiently handles all records in a single operation
@@ -259,6 +400,68 @@ Rules of the road:
 - Fragment values bypass the column's type mapper — the fragment IS the SQL.
 - An aggregate-only scalar subquery always yields exactly one row, so the INSERT arm
   still materializes when the source has zero rows (`SUM → NULL → COALESCE(…, 0)`).
+- The same holds for every write that takes row values: `insert`, `insertBulk`, `upsert`,
+  `mergeBulk`, `values(…).execute()`, the rows of `insertWithChildren` / `insertBulkWithChildren`
+  and the cells of `bulkUpdate` (where the fragment is cast to its column's type, as the plain
+  cells are). A fragment used to be bound AS a parameter on several of these paths.
+- PostgreSQL types each parameter from its context: `sql\`${a} + ${b}\`` with two plain values is
+  `unknown + unknown` ("operator is not unique") — cast one of them (`sql\`${a}::int + ${b}\``).
+
+### Upsert with SET Expressions (`updateSet` / `updateWhere`)
+
+The conflict arm can compute each column from the row that is already there (`existing`) and
+the row proposed for insertion (`excluded`) — accumulate, keep the first non-null value, only
+accept a newer version — in the same single statement:
+
+```typescript
+import { add, coalesce, lt } from 'linkgress-orm';
+
+await db.counters.upsertBulk(rows, {
+  primaryKey: 'key',
+  updateSet: (existing, excluded) => ({
+    hits: add(existing.hits, excluded.hits),                  // accumulate
+    firstSeen: coalesce(existing.firstSeen, excluded.firstSeen), // keep the first non-null
+    note: 'merged',                                           // plain values bind through the column mapper
+  }),
+  updateWhere: (existing, excluded) => lt(existing.version, excluded.version),
+});
+// INSERT … ON CONFLICT ("key") DO UPDATE
+//   SET "hits" = ("counters"."hits" + "excluded"."hits"), …
+//   WHERE "counters"."version" < "excluded"."version"
+```
+
+- With `updateSet` alone, ONLY the columns it names are updated. Combined with
+  `updateColumns` / `updateColumnFilter`, the listed columns keep `= EXCLUDED."col"` and the
+  named ones take their expression (an expression wins over a list entry for the same column).
+- `updateWhere` is ANDed with a raw `setWhere` when both are given.
+- Values may be any [SQL expression helper](./sql-expressions.md), a `sql` fragment, a column of
+  either row, a condition (as a boolean) or a plain value. Navigations are not in scope in an
+  INSERT and throw.
+- `MutationBatch.addUpsertBulk` accepts the same `updateSet` / `updateWhere`.
+
+## Bulk Update with SET Expressions (`set` / `where`)
+
+`bulkUpdate` matches rows by key and, by default, assigns each provided column
+(`CASE WHEN v."col__provided" THEN v."col" ELSE t."col" END`). `set` replaces that assignment
+with an expression over the row being updated (`target`, alias `t`) and the incoming values row
+(`values`, alias `v`); `where` adds a guard to the key match:
+
+```typescript
+await db.tasks.bulkUpdate(changes, {
+  set: (target, values) => ({
+    label: coalesce(target.label, values.label),   // fill only where empty
+    revision: add(target.revision, 1),              // a column no row provides
+  }),
+  where: (target) => eq(target.status, TaskStatus.Planned),
+});
+// UPDATE "tasks" AS t SET …, "label" = COALESCE("t"."label", "v"."label"), "revision" = ("t"."revision" + $n)
+// FROM (VALUES …) AS v(…) WHERE t."id" = v."id" AND ("t"."status" = $m)
+```
+
+- Rows may carry only the key when `set` assigns everything.
+- Reading `values.col` that no row provides, or assigning a match-key column, throws before
+  anything is sent.
+- `MutationBatch.addBulkUpdate` accepts the same `set` / `where`.
 
 ## Delete Operations
 
@@ -350,6 +553,13 @@ console.log(`Deleted ${totalDeleted} users from table`);
 await db.users.delete();
 ```
 
+`db.table.update(data)` and `db.table.delete()` without a `where()` are the query update / delete over
+a condition every row meets (`WHERE TRUE`): the same column mappers and `sql` values in `SET`, the same
+`.returning(selector)` (navigations, collections, expressions — see
+[What `.returning(selector)` can select](#what-returningselector-can-select)), `.affectedCount()` and
+`.toStatement()`. The update-all used to bind its values without their column mappers and to read a
+navigation in its RETURNING as the root table's column of the same name.
+
 ## Type Safety
 
 All CRUD operations maintain full TypeScript type inference:
@@ -399,6 +609,34 @@ await db.transaction(async (tx) => {
   // If any operation fails, all changes are rolled back
 });
 ```
+
+### Advisory Locks
+
+Transaction-scoped advisory locks serialize concurrent units of work on a key that is not a
+row — an order being settled, an import per partner — without a lock table. They are released
+automatically at COMMIT / ROLLBACK:
+
+```typescript
+await db.transaction(async (tx) => {
+  await tx.advisoryXactLock(LockClass.Invoice, invoiceId);   // wait for the lock
+  // … check-then-write safely against every other holder of this lock
+});
+
+const got = await db.transaction(tx => tx.tryAdvisoryXactLock('import:partner-7')); // no waiting
+
+await db.transaction(async (tx) => {
+  await tx.advisoryXactLockAll(LockClass.Order, orderIds);   // many keys, one statement, fixed order
+});
+```
+
+- Keys: one integer (int8 range), a `(classId, key)` pair (int4 each), or a string hashed with
+  `hashtext()`. The pair form keeps unrelated lock families apart.
+- `tryAdvisoryXactLock` returns `true` when this transaction holds the lock (advisory locks are
+  re-entrant) and `false` when another session holds it.
+- `advisoryXactLockAll` deduplicates and sorts the keys (all integers or all strings), so two
+  transactions locking overlapping sets cannot deadlock on each other.
+- All three must be called on the context `db.transaction()` hands you: outside a transaction
+  the lock would end with the statement, so they throw instead.
 
 ## Performance Tips
 

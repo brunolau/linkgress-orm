@@ -229,6 +229,13 @@ entity.property(e => e.permissions)
   .hasType(integer('permissions').array().hasTypescriptType<Permission[]>());
 ```
 
+A JS array written to such a column — by an insert, update, upsert, merge, bulk operation, or compared
+in a condition — binds as a PostgreSQL array LITERAL (`{"a","b,c"}`), the one form every driver
+accepts (Bun's SQL client cannot bind a JS array to an array parameter). Elements are escaped as the
+literal needs: strings quoted, `null` as NULL, a `Date` as its ISO instant, bytes in the bytea hex form,
+a plain object as its JSON text (for `jsonb[]`), nested arrays as a multidimensional literal. A mapper
+of the column's own (`hasCustomMapper`, `mapWith`) replaces this and then binds the whole array itself.
+
 The entity property should be typed as an array:
 
 ```typescript

@@ -355,7 +355,8 @@ export function createTable(session: Session, stmt: A.CreateTableStmt): string {
   }
 
   if (stmt.onCommit === 'DROP') {
-    session.txn!.onCommit.push(() => {
+    // Dropped inside the committing transaction (see TxnState.preCommit)
+    session.txn!.preCommit.push(() => {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { dropRelationNow } = require('./drop');
       dropRelationNow(session, rel.oid);

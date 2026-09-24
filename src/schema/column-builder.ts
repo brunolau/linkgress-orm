@@ -1,6 +1,20 @@
 import { ColumnType } from '../types/column-types';
 import { TypeMapper } from '../types/type-mapper';
 import { CollationDefinition } from '../types/collation-builder';
+import { toPgArrayLiteral } from '../types/custom-types';
+
+/**
+ * The mapper a native array column (`integer('ids').array()`) gets when it has none of its own: a
+ * JS array binds as a PostgreSQL array LITERAL (`{1,2,3}`), the one form every driver accepts. pg
+ * and postgres.js parse it into the same array they would have built from the JS array; Bun's SQL
+ * client cannot bind a JS array to an array parameter at all (prepared: "insufficient data left in
+ * message"; text mode: `1,2,3` without braces). Any other value — null, an `sql` fragment, a
+ * literal the caller wrote — binds unchanged, and reads are unchanged.
+ */
+const NATIVE_ARRAY_MAPPER: TypeMapper<any, any> = {
+  toDriver: (value: unknown) => (Array.isArray(value) ? toPgArrayLiteral(value) : value),
+  fromDriver: (value: unknown) => value,
+};
 
 /**
  * Identity column options
@@ -157,6 +171,10 @@ export class ColumnBuilder<TType = any> {
   /**
    * Convert this column to a PostgreSQL array type
    *
+   * Values bind as a PostgreSQL array literal (`{1,2,3}`), which every driver accepts — Bun's SQL
+   * client included, which cannot bind a JS array to an array parameter. A mapper of the column's
+   * own (`mapWith`, `hasCustomMapper`) replaces that and then binds the whole array itself.
+   *
    * @example
    * // integer[] column
    * entity.property(e => e.permissions).hasType(integer('permissions').array<ADMIN_PERMISSION[]>());
@@ -166,6 +184,7 @@ export class ColumnBuilder<TType = any> {
    */
   array<TArray extends TType[] = TType[]>(): ColumnBuilder<TArray> {
     this.config.type = `${this.config.type}[]` as ColumnType;
+    this.config.mapper ??= NATIVE_ARRAY_MAPPER;
     return this as unknown as ColumnBuilder<TArray>;
   }
 

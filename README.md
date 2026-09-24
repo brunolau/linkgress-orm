@@ -19,6 +19,8 @@ A type-safe ORM for PostgreSQL and TypeScript with automatic type inference and 
 - **Nested Collection Queries** - Query one-to-many relationships with CTE, LATERAL, or temp table strategies
 - **Type-Safe Aggregations** - `count()`, `sum()`, `max()`, `min()` return proper types
 - **Powerful Filtering** - Type-checked query conditions, including list membership that keeps the statement text stable (`inArrayOpt`, `eqAny`)
+- **SQL Expression Helpers** - Casts (`castAsInt()`, `.cast('numeric(12, 2)')`), `caseWhen` / `caseOf`, `greatest` / `least` / `nullIf`, string / math / date-time functions, JSONB paths and mutations, array-column operators — no raw `sql` templates needed
+- **Expression Upserts & Bulk Updates** - `updateSet` / `updateWhere` over the existing and proposed row, `bulkUpdate` `set` / `where`; transaction-scoped advisory locks
 - **Prepared Queries** - Build queries once, execute many times with named placeholders (`sql.placeholder()` + `.prepare()`)
 - **Server-Side Prepared Statements** - Opt-in named statements on the `postgres` driver, overridable per query with `.withPreparedStatements()`
 - **Fluent Update/Delete** - Chain `.where().update()` and `.where().delete()` with RETURNING support
@@ -182,6 +184,7 @@ Array<{
 ### Guides
 - **[Schema Configuration](./docs/guides/schema-configuration.md)** - Entity configuration, relationships, and indexes
 - **[Querying](./docs/guides/querying.md)** - Query data with type-safe filters, joins, aggregations, and more
+- **[SQL Expression Helpers](./docs/guides/sql-expressions.md)** - Casts, CASE, scalar / string / math / date-time functions, JSONB and array operators
 - **[Insert/Update/Upsert/BULK](./docs/guides/insert-update-guide.md)** - Insert, update, delete, and bulk operations
 - **[Configuration & Options](./docs/guides/configuration.md)** - Every option with its default: logging, prepared statements (`preparedStatements`, `.withPreparedStatements()`), timeouts, slow-query detection, `LinkgressConfig`
 - **[Migrations](./docs/guides/migrations.md)** - Automatic and manual migrations with journal tracking

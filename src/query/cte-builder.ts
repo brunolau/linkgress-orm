@@ -1,6 +1,7 @@
 import { DatabaseClient } from '../database/database-client.interface';
 import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materializeMockSelection } from './query-builder';
-import { SqlBuildContext, FieldRef, UnwrapSelection, SqlFragment } from './conditions';
+import { SqlBuildContext, FieldRef, UnwrapSelection } from './conditions';
+import { pgTypeOfValue } from './sql-functions';
 import { renumberPlaceholders } from './query-batch';
 
 /**
@@ -97,6 +98,110 @@ export type CteTableRef<TColumns> = {
 };
 
 /**
+ * A ref to a column of a projection another query reads as a table — a CTE body, a table subquery
+ * — qualified by `alias`, carrying what reading the column needs. `metaValue` is what the body
+ * projected under `key`:
+ * - an expression's (or a mapped column's) `mapWith` / mapper, as `getMapper`;
+ * - a json_agg column's aggregation marker and inner metadata;
+ * - `__cteKind` — `'column'` (with the column's own `__mapper` and `__sqlType`), `'literal'` or
+ *   `'expression'` — so the reader applies the column's OWN mapper. The refs used to carry only
+ *   `getMapper`: a mapped column read through a CTE came back as its storage value, and one named
+ *   like a mapped column of the reading query's table went through THAT column's mapper.
+ * @internal
+ */
+export function projectedColumnRef(key: string, alias: string, metaValue: unknown): Record<string, any> {
+  const fieldRef: Record<string, any> = {
+    __fieldName: key,
+    __dbColumnName: key,
+    __tableAlias: alias,
+  };
+
+  if (metaValue === null || metaValue instanceof Date || Array.isArray(metaValue)
+    || (metaValue !== undefined && typeof metaValue !== 'object' && typeof metaValue !== 'function')) {
+    // A literal (or null, or a list of values) the body projected — rendered typed from its JS
+    // type (see projectionLiteralSql), which is the column's type
+    fieldRef.__cteKind = 'literal';
+    fieldRef.__sqlType = pgTypeOfValue(metaValue);
+
+    if (typeof metaValue === 'bigint') {
+      // An int8 the driver may hand back as text: read back as the bigint it was
+      fieldRef.__bigintLiteral = true;
+    }
+  } else if (metaValue !== null && typeof metaValue === 'object') {
+    const meta = metaValue as any;
+
+    if (typeof meta.getMapper === 'function') {
+      fieldRef.getMapper = () => meta.getMapper();
+    }
+
+    if (meta.__isAggregationArray) {
+      fieldRef.__isAggregationArray = true;
+      fieldRef.__innerSelectionMetadata = meta.__innerSelectionMetadata;
+    }
+
+    if ('__dbColumnName' in meta && !meta.__isAggregate) {
+      fieldRef.__cteKind = 'column';
+      fieldRef.__mapper = meta.__mapper;
+      fieldRef.__sqlType = meta.__sqlType;
+    } else {
+      // An expression — an `sql` fragment, a condition, a grouped query's aggregate, a collection
+      fieldRef.__cteKind = 'expression';
+    }
+  } else {
+    // A column the ref cannot tell anything about (a data-modifying CTE's RETURNING column, a
+    // subquery without metadata): read like an expression — never through the mapper of a column
+    // of the reading table that happens to share its name
+    fieldRef.__cteKind = 'expression';
+  }
+
+  return fieldRef;
+}
+
+/**
+ * The values of a nested object a projection holds — a plain object, or a navigation row projected
+ * whole (the columns it renders as) — or `undefined` for any other value.
+ */
+function nestedProjectionMeta(metaValue: unknown): Record<string, unknown> | undefined {
+  if (metaValue === null || typeof metaValue !== 'object' || Array.isArray(metaValue) || metaValue instanceof Date) {
+    return undefined;
+  }
+
+  const value = materializeMockSelection(metaValue);
+  const proto = Object.getPrototypeOf(value);
+
+  if (!(proto === Object.prototype || proto === null || value.constructor === Object)
+    || '__dbColumnName' in value || '__isAggregationArray' in value || '__collectionResult' in value) {
+    return undefined;
+  }
+
+  return value;
+}
+
+/**
+ * What a query reading a projection as a table (a CTE body, a table subquery) reads for its `key`: a
+ * column ref (see projectedColumnRef), or — for a nested object or a navigation row the body
+ * projected, which it renders as the flattened columns `__nested__<key>__<leaf>` — an object of refs
+ * to those columns. Selecting such a key used to name a column the body does not have.
+ * @internal
+ */
+export function projectedValueRef(key: string, alias: string, metaValue: unknown, columnName: string = key): any {
+  const nested = nestedProjectionMeta(metaValue);
+
+  if (nested === undefined) {
+    return projectedColumnRef(columnName, alias, metaValue);
+  }
+
+  const prefix = columnName.startsWith('__nested__') ? columnName : `__nested__${columnName}`;
+  const refs: Record<string, any> = {};
+
+  for (const leaf of Object.keys(nested)) {
+    refs[leaf] = projectedValueRef(leaf, alias, nested[leaf], `${prefix}__${leaf}`);
+  }
+
+  return refs;
+}
+
+/**
  * Represents a Common Table Expression (CTE) with strong typing
  */
 export class DbCte<TColumns> {
@@ -163,30 +268,22 @@ export class DbCte<TColumns> {
     };
 
     for (const key of Object.keys(this.columnDefs || {})) {
-      const fieldRef: Record<string, any> = {
-        __fieldName: key,
-        __dbColumnName: key,
-        __tableAlias: effectiveAlias,
-      };
-
-      // Preserve mapper / aggregation-array metadata, mirroring the internal
-      // CTE mock row (createMockRowForCte) so refs behave identically wherever
-      // FieldRefs are accepted.
-      const metaValue = this.selectionMetadata ? this.selectionMetadata[key] : undefined;
-      if (metaValue && typeof metaValue === 'object') {
-        if (typeof (metaValue as any).getMapper === 'function') {
-          fieldRef.getMapper = () => (metaValue as any).getMapper();
-        }
-        if ((metaValue as any).__isAggregationArray) {
-          fieldRef.__isAggregationArray = true;
-          fieldRef.__innerSelectionMetadata = (metaValue as any).__innerSelectionMetadata;
-        }
-      }
-
-      ref[key] = fieldRef;
+      // The same ref the internal CTE mock rows mint, so refs behave identically wherever FieldRefs
+      // are accepted
+      ref[key] = this.columnRef(key, effectiveAlias);
     }
 
     return ref as CteTableRef<TColumns>;
+  }
+
+  /**
+   * A ref to one of this CTE's columns, qualified by `alias` (the CTE's own name by default). It
+   * carries what reading the column needs — see {@link projectedColumnRef}; a nested object the
+   * body projected is an object of refs to its flattened columns (see {@link projectedValueRef}).
+   * @internal
+   */
+  columnRef(key: string, alias: string = this.name): any {
+    return projectedValueRef(key, alias, this.selectionMetadata ? this.selectionMetadata[key] : undefined);
   }
 
   /**
@@ -253,6 +350,8 @@ export class DbCteBuilder {
       useJsonArrayAggregation: this.client ? !this.client.supportsBinaryArrayResults() : undefined,
       paramCounter: context.paramCounter,
       allParams: context.params,
+      // The body's columns are read by other queries: its literals render typed
+      typedLiterals: true,
     };
 
     let sql: string;
@@ -405,15 +504,33 @@ export class DbCteBuilder {
     // This is more efficient than to_jsonb(t.*) which includes all columns
     const groupByColumnSet = new Set(groupByEntries.map(([, innerColumn]) => String(innerColumn)));
 
-    // Get all column names from inner selection metadata, excluding groupBy columns
+    // Get all column names from inner selection metadata, excluding groupBy columns (and values the
+    // inner query renders no column for: an undefined one)
     const aggregatedColumns: string[] = [];
     if (innerSelectionMetadata) {
       for (const key of Object.keys(innerSelectionMetadata)) {
-        if (!groupByColumnSet.has(key)) {
+        if (!groupByColumnSet.has(key) && innerSelectionMetadata[key] !== undefined) {
           aggregatedColumns.push(key);
         }
       }
     }
+
+    // One key of an aggregated item: a column of the inner query, or — for a nested object (a
+    // navigation row) it rendered as flattened `__nested__<path>` columns — the object rebuilt from
+    // them. It used to name a column `"<key>"` the inner query does not have
+    const jsonPart = (key: string, metaValue: unknown, column: string): string => {
+      const nested = nestedProjectionMeta(metaValue);
+
+      if (nested === undefined) {
+        return `'${key}', "${column}"`;
+      }
+
+      // A nested value is always rendered (an undefined one as NULL, see renderFlatNestedLeaf)
+      const prefix = column.startsWith('__nested__') ? column : `__nested__${column}`;
+      const parts = Object.keys(nested).map(leaf => jsonPart(leaf, nested[leaf], `${prefix}__${leaf}`));
+
+      return `'${key}', json_build_object(${parts.join(', ')})`;
+    };
 
     // Build the aggregation expression
     // Use JSON instead of JSONB for better aggregation performance
@@ -422,7 +539,7 @@ export class DbCteBuilder {
     let aggregationExpression: string;
     if (aggregatedColumns.length > 0) {
       // Use json_build_object for better performance - only include non-groupBy columns
-      const jsonParts = aggregatedColumns.map(col => `'${col}', "${col}"`).join(', ');
+      const jsonParts = aggregatedColumns.map(col => jsonPart(col, innerSelectionMetadata![col], col)).join(', ');
       aggregationExpression = `json_agg(json_build_object(${jsonParts}))`;
     } else {
       // Fallback to to_json(t.*) if we can't determine columns
@@ -447,37 +564,15 @@ export class DbCteBuilder {
     columnDefs[finalAggregationAlias] = finalAggregationAlias;
 
     // Store inner selection metadata for mapper preservation during result transformation
-    // The aggregation column contains items that need mappers applied
+    // The aggregation column contains items that need mappers applied. A grouping key is the inner
+    // projection's value itself — a column (with its mapper and SQL type), an expression, a literal —
+    // so a ref to it reads the way the inner column does (see projectedColumnRef)
     const selectionMetadata: Record<string, any> = {};
     groupByEntries.forEach(([outputAlias, innerColumn]) => {
       const innerCol = String(innerColumn);
-      // Check if inner selection metadata has mapper info for this column
+
       if (innerSelectionMetadata && innerCol in innerSelectionMetadata) {
-        const innerValue = innerSelectionMetadata[innerCol];
-        // If inner value has getMapper, preserve it
-        if (typeof innerValue === 'object' && innerValue !== null && typeof innerValue.getMapper === 'function') {
-          selectionMetadata[outputAlias] = {
-            __fieldName: outputAlias,
-            __dbColumnName: outputAlias,
-            getMapper: innerValue.getMapper,
-          };
-        } else if (innerValue instanceof SqlFragment) {
-          // SqlFragment with mapper
-          const mapper = innerValue.getMapper();
-          if (mapper) {
-            selectionMetadata[outputAlias] = {
-              __fieldName: outputAlias,
-              __dbColumnName: outputAlias,
-              getMapper: () => mapper,
-            };
-          } else {
-            selectionMetadata[outputAlias] = outputAlias;
-          }
-        } else {
-          selectionMetadata[outputAlias] = outputAlias;
-        }
-      } else {
-        selectionMetadata[outputAlias] = outputAlias;
+        selectionMetadata[outputAlias] = innerSelectionMetadata[innerCol];
       }
     });
     // Store inner selection metadata under the aggregation alias so mappers can be applied to items
@@ -504,6 +599,8 @@ export class DbCteBuilder {
       useJsonArrayAggregation: this.client ? !this.client.supportsBinaryArrayResults() : undefined,
       paramCounter: context.paramCounter,
       allParams: context.params,
+      // The aggregated rows' literals are typed like any CTE body's (they land in JSON typed)
+      typedLiterals: true,
     };
 
     // Extract referenced CTEs from the query and add them to this builder

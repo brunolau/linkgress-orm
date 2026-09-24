@@ -11,9 +11,21 @@ import {
   sql,
 } from './conditions';
 import { DbCte } from './cte-builder';
+import {
+  BIGINT_LITERAL_READ,
+  aggregatedItemReads,
+  assertProjectionArrayOfValues,
+  coercesNumericText,
+  fromDriverMapper,
+  holdsSqlValue,
+  isScalarLiteralSelection,
+  mapAggregatedItems,
+  projectionLiteralSql,
+} from './query-builder';
 import { parseOrderBy } from './query-utils';
 import { renumberPlaceholders } from './sql-utils';
 import { Subquery } from './subquery';
+import { selectorProjectingConditions } from './sql-functions';
 
 /**
  * Join types supported when a CTE is the FROM root.
@@ -65,9 +77,10 @@ export function onTrue(): Condition {
 
 /**
  * Build a mock row that yields {@link FieldRef}s for a CTE's columns, qualified
- * with the CTE's own name as the table alias. Mirrors
- * `SelectQueryBuilder.createMockRowForCte` so column mappers / aggregation-array
- * markers carried on the CTE's `selectionMetadata` survive into the projection.
+ * with the CTE's own name as the table alias. The same refs
+ * `SelectQueryBuilder.createMockRowForCte` mints (`DbCte.columnRef`), so each
+ * carries how its column reads: the body column's own mapper, a json_agg
+ * column's item metadata, a literal's type (see projectedColumnRef).
  */
 function createCteFieldRefProxy<TColumns extends Record<string, any>>(cte: DbCte<TColumns>): TColumns {
   return new Proxy({} as any, {
@@ -76,38 +89,7 @@ function createCteFieldRefProxy<TColumns extends Record<string, any>>(cte: DbCte
         return undefined;
       }
 
-      if (cte.selectionMetadata && prop in cte.selectionMetadata) {
-        const value = cte.selectionMetadata[prop];
-
-        // SqlFragment / column with a fromDriver mapper — preserve it so the
-        // projection re-applies the mapper to the joined column.
-        if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-          return {
-            __fieldName: prop,
-            __dbColumnName: prop,
-            __tableAlias: cte.name,
-            getMapper: () => (value as any).getMapper(),
-          };
-        }
-
-        // CTE aggregation-array marker (json_agg column) — preserve the inner
-        // metadata so nested items can be mapped.
-        if (typeof value === 'object' && value !== null && '__isAggregationArray' in value && (value as any).__isAggregationArray) {
-          return {
-            __fieldName: prop,
-            __dbColumnName: prop,
-            __tableAlias: cte.name,
-            __isAggregationArray: true,
-            __innerSelectionMetadata: (value as any).__innerSelectionMetadata,
-          };
-        }
-      }
-
-      return {
-        __fieldName: prop,
-        __dbColumnName: prop,
-        __tableAlias: cte.name,
-      } as FieldRef;
+      return cte.columnRef(prop);
     },
     has() {
       return true;
@@ -122,6 +104,30 @@ function createCteFieldRefProxy<TColumns extends Record<string, any>>(cte: DbCte
 }
 
 const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
+
+/** The column a selector returning ONE value (`r => r.id`, `() => 'x'`) is projected under. */
+const SCALAR_COLUMN = 'value';
+
+/**
+ * Whether a selector returned ONE value — a column, an expression, a subquery, a literal — rather
+ * than an object of fields. It reads as that value: its keys (`__fieldName`, …) used to be
+ * projected as the fields of an object, a string as its characters.
+ */
+function isSingleValueSelection(selection: unknown): boolean {
+  return isScalarLiteralSelection(selection)
+    || selection instanceof SqlFragment
+    || selection instanceof Subquery
+    || (typeof selection === 'object' && selection !== null && '__dbColumnName' in selection);
+}
+
+/** A plain nested projection object — flattened under path aliases, rebuilt by {@link transformRows}. */
+function isNestedProjection(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === 'object'
+    && Object.getPrototypeOf(value) === Object.prototype
+    && !('__dbColumnName' in value)
+    && !('__isAggregationArray' in value);
+}
 
 /**
  * A single joined CTE step (the right-hand relation + how it is attached).
@@ -155,7 +161,7 @@ interface CteJoinStep {
 export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSelection = TRootColumns> {
   private joinSteps: CteJoinStep[] = [];
   private selector?: (...sources: any[]) => any;
-  private orderByFields: Array<{ table: string; field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ table: string; field: string; direction: OrderDirection }> = [];
   private limitValue?: number;
   private offsetValue?: number;
   private lockClause?: string;
@@ -247,7 +253,7 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
       this.executor
     );
     next.joinSteps = this.joinSteps;
-    next.selector = selector as any;
+    next.selector = selectorProjectingConditions(selector as any);
     next.orderByFields = this.orderByFields;
     next.limitValue = this.limitValue;
     next.offsetValue = this.offsetValue;
@@ -263,15 +269,18 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   orderBy<T>(selector: (row: TSelection) => T[]): this;
   orderBy<T>(selector: (row: TSelection) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (row: TSelection) => T | T[] | Array<[T, OrderDirection]>): this {
-    const mockRow = new Proxy({} as any, {
-      get: (_t, prop: string | symbol) => {
-        if (typeof prop === 'symbol') {
-          return undefined;
-        }
-        return { __fieldName: prop, __dbColumnName: prop } as FieldRef;
-      },
-      has: () => true,
-    });
+    // A selection of one value orders by that value (`select(x => x.id).orderBy(id => id)`)
+    const mockRow = this.selector !== undefined && this.selectsSingleValue()
+      ? { __fieldName: SCALAR_COLUMN, __dbColumnName: SCALAR_COLUMN } as FieldRef
+      : new Proxy({} as any, {
+        get: (_t, prop: string | symbol) => {
+          if (typeof prop === 'symbol') {
+            return undefined;
+          }
+          return { __fieldName: prop, __dbColumnName: prop } as FieldRef;
+        },
+        has: () => true,
+      });
     const result = selector(mockRow as TSelection);
     this.orderByFields = [];
     parseOrderBy(result, this.orderByFields, undefined, () => '');
@@ -338,12 +347,12 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   _setState(
     joinSteps: CteJoinStep[],
     selector: ((...sources: any[]) => any) | undefined,
-    orderByFields: Array<{ table: string; field: string; direction: 'ASC' | 'DESC' }>,
+    orderByFields: Array<{ table: string; field: string; direction: OrderDirection }>,
     limitValue: number | undefined,
     offsetValue: number | undefined
   ): void {
     this.joinSteps = joinSteps;
-    this.selector = selector;
+    this.selector = selector && selectorProjectingConditions(selector);
     this.orderByFields = orderByFields;
     this.limitValue = limitValue;
     this.offsetValue = offsetValue;
@@ -382,7 +391,7 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
 
     // Build SELECT from the projection (root + joined CTE FieldRefs).
     const selection = this.evaluateSelection();
-    const selectParts = buildSelectParts(selection, ctx, this.rootCte.name);
+    const selectParts = buildSelectParts(selection, ctx, this.rootCte.name, false);
 
     let orderByClause = '';
     if (this.orderByFields.length > 0) {
@@ -420,8 +429,10 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
       ? await this.executor.query(sqlText, params)
       : await this.client.query(sqlText, params);
 
-    const selection = this.evaluateSelection();
-    return transformRows(result.rows, selection) as TSelection[];
+    const rows = transformRows(result.rows, this.evaluateSelection());
+
+    // A selector returning one value reads as that value
+    return (this.selectsSingleValue() ? rows.map(row => row[SCALAR_COLUMN]) : rows) as TSelection[];
   }
 
   /** Execute and return the first row, or null. */
@@ -504,7 +515,8 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     }
 
     const fromClause = this.buildFromClause(outerContext);
-    const selectParts = buildSelectParts(this.evaluateSelection(), outerContext, this.rootCte.name);
+    // The enclosing query reads these columns: literals render typed (untyped, `true` reached it as 'true')
+    const selectParts = buildSelectParts(this.evaluateSelection(), outerContext, this.rootCte.name, true);
 
     let tail = '';
     if (this.orderByFields.length > 0) {
@@ -584,8 +596,22 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     return new Subquery(sqlBuilder, mode, selectionMetadata) as any;
   }
 
-  /** Evaluate the user selector against fresh CTE FieldRef proxies. */
+  /**
+   * Evaluate the user selector against fresh CTE FieldRef proxies. A selector returning ONE value
+   * is projected as the one field {@link SCALAR_COLUMN}.
+   */
   protected evaluateSelection(): Record<string, any> {
+    const selection = this.evaluateSelector();
+
+    return isSingleValueSelection(selection) ? { [SCALAR_COLUMN]: selection } : selection;
+  }
+
+  /** Whether the selector returns one value (see isSingleValueSelection). */
+  private selectsSingleValue(): boolean {
+    return isSingleValueSelection(this.evaluateSelector());
+  }
+
+  private evaluateSelector(): any {
     const rootMock = createCteFieldRefProxy(this.rootCte);
     const joinMocks = this.joinSteps.map(step => createCteFieldRefProxy(step.cte));
     return this.selector!(rootMock, ...joinMocks);
@@ -659,72 +685,156 @@ function declareCte(cte: DbCte<any>, body: string): string {
 }
 
 /**
- * Build SELECT list fragments from a projection object whose leaves are
- * FieldRefs (qualified with their CTE/table alias), SqlFragments, or literals.
+ * Build SELECT list fragments from a projection object whose leaves are FieldRefs (qualified with
+ * their CTE/table alias), SqlFragments, subqueries, nested objects (flattened under
+ * `__nested__<path>` aliases) or literals.
+ *
+ * - A string is a value, as its type says — a parameter. It used to render as a column of that
+ *   NAME of the root CTE: an error, or another column's data.
+ * - A nested object used to be bound as ONE parameter, its column refs serialized into it.
+ * - A list of values is read back from the projection itself (see transformRows) and has no column,
+ *   unless the enclosing query reads the columns (`typedLiterals`) — then it is a jsonb value. A list
+ *   of columns has no one SQL value and is refused.
+ * - With `typedLiterals` (a subquery) a literal renders typed from its JS type.
  */
 function buildSelectParts(
   selection: Record<string, any>,
   ctx: SqlBuildContext,
-  defaultAlias: string
+  defaultAlias: string,
+  typedLiterals: boolean,
+  pathPrefix?: string,
+  parts: string[] = []
 ): string[] {
-  const parts: string[] = [];
-
   for (const [key, value] of Object.entries(selection)) {
+    const alias = pathPrefix === undefined ? key : `${pathPrefix}__${key}`;
+
     if (value instanceof SqlFragment) {
       const fragmentSql = value.buildSql(ctx);
-      parts.push(`${fragmentSql} as "${key}"`);
+      parts.push(`${fragmentSql} as "${alias}"`);
+    } else if (value instanceof Subquery) {
+      parts.push(`(${value.buildSql(ctx)}) as "${alias}"`);
     } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
-      const alias = (value as any).__tableAlias || defaultAlias;
-      parts.push(`"${alias}"."${(value as any).__dbColumnName}" as "${key}"`);
-    } else if (typeof value === 'string') {
-      // Bare column name string — qualify with the root alias.
-      parts.push(`"${defaultAlias}"."${value}" as "${key}"`);
+      const tableAlias = (value as any).__tableAlias || defaultAlias;
+      parts.push(`"${tableAlias}"."${(value as any).__dbColumnName}" as "${alias}"`);
+    } else if (isNestedProjection(value)) {
+      buildSelectParts(value, ctx, defaultAlias, typedLiterals, pathPrefix === undefined ? `__nested__${key}` : alias, parts);
+    } else if (value === undefined) {
+      continue;
     } else {
-      // Literal value
-      ctx.params.push(value);
-      parts.push(`$${ctx.paramCounter++} as "${key}"`);
+      const path = pathPrefix === undefined ? key : alias.substring('__nested__'.length).split('__').join('.');
+      assertProjectionArrayOfValues(value, path, 'selectFromCte().select()');
+
+      if (Array.isArray(value) && !typedLiterals) {
+        continue;
+      }
+
+      const literalContext = { paramCounter: ctx.paramCounter, allParams: ctx.params, typedLiterals };
+      const literalSql = projectionLiteralSql(value, literalContext);
+      ctx.paramCounter = literalContext.paramCounter;
+      parts.push(`${literalSql} as "${alias}"`);
     }
   }
 
   return parts;
 }
 
+/** How one projected value reads back (compiled once per query by {@link compileRead}). */
+interface CteFieldRead {
+  key: string;
+  /** The row key the value is delivered under (a nested value's path alias) */
+  rowKey: string;
+  kind: 'literal' | 'mapper' | 'value' | 'nested' | 'items';
+  value?: unknown;
+  mapper?: { fromDriver: (v: any) => any };
+  /** 'value': a numeric string becomes a number (not for a text column, see coercesNumericText) */
+  coerce?: boolean;
+  children?: CteFieldRead[];
+  itemReads?: Record<string, any>;
+}
+
+function compileRead(key: string, rowKey: string, value: any): CteFieldRead {
+  if (value === undefined || isScalarLiteralSelection(value) || (Array.isArray(value) && !holdsSqlValue(value))) {
+    // A literal reads back as itself (a parameter of unknown type comes back as text)
+    return { key, rowKey, kind: 'literal', value };
+  }
+
+  if (isNestedProjection(value)) {
+    const prefix = rowKey.startsWith('__nested__') ? rowKey : `__nested__${key}`;
+
+    return {
+      key,
+      rowKey,
+      kind: 'nested',
+      children: Object.keys(value).map(childKey => compileRead(childKey, `${prefix}__${childKey}`, value[childKey])),
+    };
+  }
+
+  if (value.__isAggregationArray) {
+    // A withAggregation CTE's items, through the aggregated query's own mappers
+    return { key, rowKey, kind: 'items', itemReads: aggregatedItemReads(value.__innerSelectionMetadata) };
+  }
+
+  const literalColumn = value.__cteKind === 'literal';
+  const mapper = literalColumn
+    ? (value.__bigintLiteral ? BIGINT_LITERAL_READ : undefined)
+    : fromDriverMapper(value.__mapper) ?? (typeof value.getMapper === 'function' ? fromDriverMapper(value.getMapper()) : undefined);
+
+  if (mapper) {
+    return { key, rowKey, kind: 'mapper', mapper };
+  }
+
+  // A column of the CTE body keeps its text ('01234' used to read back as 1234); an expression's
+  // numeric string (a SUM, a NUMERIC) becomes a number
+  return { key, rowKey, kind: 'value', coerce: coercesNumericText(value.__sqlType) };
+}
+
+function readValue(read: CteFieldRead, row: any): any {
+  switch (read.kind) {
+    case 'literal':
+      return read.value;
+    case 'nested': {
+      const out: any = {};
+
+      for (const child of read.children!) {
+        out[child.key] = readValue(child, row);
+      }
+
+      return out;
+    }
+    case 'items': {
+      const items = row[read.rowKey];
+
+      return read.itemReads && Array.isArray(items) ? mapAggregatedItems(items, read.itemReads) : items;
+    }
+    case 'mapper':
+      return read.mapper!.fromDriver(row[read.rowKey]);
+    default: {
+      const raw = row[read.rowKey];
+
+      return read.coerce && typeof raw === 'string' && NUMERIC_REGEX.test(raw) ? +raw : raw;
+    }
+  }
+}
+
 /**
- * Transform driver rows into the projected shape, re-applying any column /
- * SqlFragment fromDriver mappers and coercing Postgres numeric strings to
- * numbers. NULLs are preserved as `null` (faithful to the SQL — a CTE-rooted
- * projection mirrors raw column output, unlike the entity path which maps
- * absent columns to `undefined`).
+ * Transform driver rows into the projected shape: each value read the way its projection says —
+ * a column through its OWN mapper (the CTE body's column's, carried on the ref), a literal as
+ * itself, a nested object rebuilt from its path aliases, a json_agg column's items through the
+ * aggregated query's mappers. NULLs are preserved as `null` (faithful to the SQL — a CTE-rooted
+ * projection mirrors raw column output, unlike the entity path which maps absent columns to
+ * `undefined`).
  */
 function transformRows(rows: any[], selection: Record<string, any>): any[] {
   // Pre-analyze each selected field once.
-  const fields: Array<{ key: string; mapper?: { fromDriver: (v: any) => any } }> = [];
-  for (const [key, value] of Object.entries(selection)) {
-    let mapper: { fromDriver: (v: any) => any } | undefined;
-    if (value && typeof value === 'object' && typeof (value as any).getMapper === 'function') {
-      let m = (value as any).getMapper();
-      if (m && typeof m.getType === 'function') {
-        m = m.getType();
-      }
-      if (m && typeof m.fromDriver === 'function') {
-        mapper = m;
-      }
-    }
-    fields.push({ key, mapper });
-  }
+  const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key]));
 
   return rows.map(row => {
     const out: any = {};
-    for (const { key, mapper } of fields) {
-      const raw = row[key];
-      if (mapper) {
-        out[key] = mapper.fromDriver(raw);
-      } else if (typeof raw === 'string' && NUMERIC_REGEX.test(raw)) {
-        out[key] = +raw;
-      } else {
-        out[key] = raw;
-      }
+
+    for (const read of reads) {
+      out[read.key] = readValue(read, row);
     }
+
     return out;
   });
 }

@@ -72,6 +72,34 @@ describe('in-memory database API', () => {
     await forked.end();
   });
 
+  test('ON COMMIT DROP drops the temp table as its transaction commits', async () => {
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+
+    // One multi-statement query is one implicit transaction: the table lives until its end. The drop
+    // used to run after the transaction had ended and failed with "DDL outside a transaction".
+    const results = await client.query('create temp table tmp_ocd(id int primary key) on commit drop; insert into tmp_ocd values (1), (2); select count(*)::int as n from tmp_ocd');
+    expect(results[2].rows).toEqual([{ n: 2 }]);
+    expect(await expectToReject(client.query('select * from tmp_ocd'))).toMatchObject({ code: '42P01' });
+
+    // Through an explicit transaction block: kept until COMMIT, gone after it
+    await client.query('begin');
+    await client.query('create temp table tmp_ocd_block(id int) on commit drop');
+    await client.query('insert into tmp_ocd_block values (1)');
+    expect((await client.query('select count(*)::int as n from tmp_ocd_block')).rows).toEqual([{ n: 1 }]);
+    await client.query('commit');
+    expect(await expectToReject(client.query('select * from tmp_ocd_block'))).toMatchObject({ code: '42P01' });
+
+    // A rolled-back block leaves nothing behind either, and the name is free again
+    await client.query('begin');
+    await client.query('create temp table tmp_ocd_block(id int) on commit drop');
+    await client.query('rollback');
+    await client.query('create temp table tmp_ocd_block(id int) on commit drop');
+    expect(await expectToReject(client.query('select * from tmp_ocd_block'))).toMatchObject({ code: '42P01' });
+    await client.end();
+  });
+
   test('listen() serves the database over TCP, procedures COMMIT inside CALL', async () => {
     const db = createInMemoryDatabase();
     const listener = await db.listen();

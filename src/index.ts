@@ -97,7 +97,7 @@ export type {
 export { QueryBatch } from './query/query-batch';
 // MutationBatch — independent insertBulk/bulkUpdate legs in ONE round trip (data-modifying CTEs)
 export { MutationBatch } from './query/mutation-batch';
-export type { MutationBatchKey } from './query/mutation-batch';
+export type { MutationBatchKey, UpsertLegConfig, BulkUpdateLegConfig } from './query/mutation-batch';
 
 export type {
   BatchListKey,
@@ -187,6 +187,7 @@ export {
   flagHasNone,
   flagSet,
   flagUnset,
+  quoteSqlLiteral,
 } from './query/conditions';
 
 export type {
@@ -194,7 +195,100 @@ export type {
   ConditionOperator,
   FieldRef,
   JsonbElement,
+  PgCastType,
 } from './query/conditions';
+
+// SQL expression helpers (casts, literals, CASE, scalar/string/math/date functions, JSONB, arrays)
+export {
+  cast,
+  castAsInt,
+  castAsSmallInt,
+  castAsBigInt,
+  castAsNumeric,
+  castAsDouble,
+  castAsString,
+  castAsVarchar,
+  castAsBoolean,
+  castAsDate,
+  castAsTimestamp,
+  castAsTimestamptz,
+  castAsJsonb,
+  castAsJson,
+  castAsUuid,
+  literal,
+  typedNull,
+  asBoolean,
+  caseWhen,
+  caseOf,
+  CaseWhenExpression,
+  CaseOfExpression,
+  CaseOfBuilder,
+  greatest,
+  least,
+  nullIf,
+  isDistinctFrom,
+  isNotDistinctFrom,
+  lower,
+  upper,
+  trim,
+  trimStart,
+  trimEnd,
+  length,
+  concat,
+  concatWs,
+  substring,
+  replace,
+  regexpReplace,
+  round,
+  floor,
+  ceil,
+  abs,
+  mod,
+  currentTimestamp,
+  localTimestamp,
+  currentDate,
+  utcTimestamp,
+  atTimeZone,
+  dateTrunc,
+  datePart,
+  toChar,
+  toInterval,
+  addInterval,
+  subInterval,
+  jsonbPath,
+  jsonbPathText,
+  jsonbSet,
+  jsonbRemoveKey,
+  jsonbRemovePath,
+  jsonbContains,
+  jsonbContainedBy,
+  jsonbHasKey,
+  jsonbHasAnyKey,
+  jsonbHasAllKeys,
+  jsonbArrayLength,
+  jsonbTypeOf,
+  jsonbBuildObject,
+  jsonbBuildArray,
+  toJsonb,
+  jsonbPathExists,
+  arrayContains,
+  arrayContainsAll,
+  arrayOverlaps,
+  arrayContainedBy,
+  arrayLength,
+  arrayIsEmpty,
+  arrayIsNotEmpty,
+  pgTypeOfValue,
+} from './query/sql-functions';
+
+export type {
+  SqlOperand,
+  OperandValue,
+  DateTruncUnit,
+  DatePartField,
+  IntervalSpec,
+  JsonbPathKey,
+} from './query/sql-functions';
 
 // Subquery support
 export {
@@ -258,6 +352,7 @@ export type {
   CollectionStrategyType,
   TimeTraceEntry,
   QueryTimeTrace,
+  AdvisoryLockKey,
 } from './entity/db-context';
 
 // Collection strategy pattern
@@ -348,6 +443,7 @@ export type {
   EntityQuery,
   EntityUpsertConfig,
   EntityMergeConfig,
+  BulkUpdateExpressionConfig,
   FluentMerge,
   EntityCollectionQuery,
   IEntityQueryable,

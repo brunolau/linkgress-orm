@@ -66,7 +66,7 @@ describe('query-build shape caches — regression guards', () => {
     expect(Object.getPrototypeOf(captured[0])).toBe(Object.getPrototypeOf(captured[1]));
   });
 
-  test('a collection ordered by a column whose property name differs from its db name keeps both ORDER BY forms (CTE strategy)', async () => {
+  test('a collection ordered by a column whose property name differs from its db name orders json_agg by the projected alias of that column (CTE strategy)', async () => {
     const { client, db } = makeLscDb('cte');
 
     await db.lscUsers.select(u => ({

@@ -9,7 +9,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { formatJoinValue, buildCollectionCorrelationWhere } from '../join-utils';
+import { formatJoinValue, buildCollectionCorrelationWhere, quoteTableReference } from '../join-utils';
 import { LateralSqlCache } from '../lateral-sql-cache';
 
 /** Key-part separator: a control character no alias, column name or SQL text contains. */
@@ -62,10 +62,10 @@ const appendFieldsKey = (key: string, fields: SelectedField[]): string => {
  */
 export const lateralShapeKey = (config: CollectionAggregationConfig, context: QueryContext): string => {
   const aliasMap = context.lateralTableAliasMap;
-  let key = config.counter + KEY_SEP + config.relationName + KEY_SEP + config.targetTable + KEY_SEP + config.foreignKey + KEY_SEP
+  let key = config.counter + KEY_SEP + config.relationName + KEY_SEP + config.targetTable + KEY_SEP + (config.targetSchema ?? '') + KEY_SEP + config.foreignKey + KEY_SEP
     + listKey(config.foreignKeys) + KEY_SEP + listKey(config.matches) + KEY_SEP + (config.foreignKeyTableAlias ?? '') + KEY_SEP
     + config.sourceTable + KEY_SEP + (aliasMap?.get(config.sourceTable) ?? '') + KEY_SEP
-    + (config.whereClause ?? '') + KEY_SEP + (config.orderByClause ?? '') + KEY_SEP + (config.orderByClauseAlias ?? '') + KEY_SEP
+    + (config.whereClause ?? '') + KEY_SEP + (config.orderByClause ?? '') + KEY_SEP
     + (config.orderByFields?.map(field => field.table ?? '').join(',') ?? '') + KEY_SEP
     + (config.limitValue ?? '') + KEY_SEP + (config.offsetValue ?? '') + KEY_SEP
     + (config.isDistinct === true ? 'D' : '') + (config.isSingleResult === true ? 'S' : '') + (config.useJsonArrayAggregation === true ? 'J' : '') + KEY_SEP
@@ -73,6 +73,9 @@ export const lateralShapeKey = (config: CollectionAggregationConfig, context: Qu
     + (config.arrayField ?? '') + KEY_SEP + config.defaultValue + KEY_SEP;
   key = appendNavigationJoinsKey(key, config.navigationJoins, aliasMap);
   key = appendNavigationJoinsKey(key, config.selectorNavigationJoins, aliasMap);
+  // How many of those joins are path hops (they start at the head of both lists): a hop renders
+  // from its own source where a selector join of the same shape renders from the inner alias
+  key += (config.navigationPath?.length ?? 0) + KEY_SEP;
 
   return appendFieldsKey(key, config.selectedFields);
 };
@@ -320,7 +323,7 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
     };
 
     // Build navigation JOINs for multi-level navigation (selector joins only)
-    const navJoinsSQL = this.buildNavigationJoinsWithAlias(selectorNavigationJoins, innerTableAlias, targetTable, context);
+    const navJoinsSQL = this.buildNavigationJoinsWithAlias(selectorNavigationJoins, innerTableAlias, targetTable, context, undefined, config.navigationPath);
 
     // Check if the source table has been aliased by a parent LATERAL (for nested collections)
     // If so, use that alias instead of the raw table name
@@ -356,22 +359,23 @@ export class LateralCollectionStrategy implements ICollectionStrategy {
       // Pattern: (SELECT array_agg(x) FROM (SELECT DISTINCT x FROM ...) sub)
       // This is more efficient than array_agg(DISTINCT x) which forces a sort
       if (isDistinct) {
-        subquerySQL = `(SELECT COALESCE(${arrayAggFn}("${arrayField}"), ${defaultValue})
+        const orderBySQL = this.buildDistinctListOrderBy(config, fieldExpression, arrayField, innerTableAlias);
+        subquerySQL = `(SELECT COALESCE(${arrayAggFn}("${arrayField}"${orderBySQL}), ${defaultValue})
 FROM (SELECT DISTINCT ${fieldExpression} as "${arrayField}"
-FROM "${targetTable}" "${innerTableAlias}"
+FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL}) "sq")`;
       } else {
-        const orderBySQL = this.buildOwnColumnsAggregateOrderBy(config, innerTableAlias);
+        const orderBySQL = this.buildAggregateOrderBy(config, innerTableAlias);
         subquerySQL = `(SELECT COALESCE(${arrayAggFn}(${fieldExpression}${orderBySQL}), ${defaultValue})
-FROM "${targetTable}" "${innerTableAlias}"
+FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
       }
     } else if (aggregationType === 'exists') {
       // EXISTS as correlated subquery: (SELECT EXISTS(SELECT 1 FROM ... WHERE ...))
       subquerySQL = `(SELECT EXISTS(SELECT 1
-FROM "${targetTable}" "${innerTableAlias}"
+FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL}))`;
     } else {
@@ -385,8 +389,9 @@ WHERE ${whereSQL}))`;
         case 'max':
         case 'sum':
           if (aggregateExpression) {
-            // Nested scalar-subquery summand (e.g. sum(row => other.count()))
-            aggregateSql = `${aggregationType.toUpperCase()}(${aggregateExpression})`;
+            // Nested scalar-subquery summand (e.g. sum(row => other.count())), a navigation column,
+            // or an expression of the item (its columns under our marker)
+            aggregateSql = `${aggregationType.toUpperCase()}(${rewriteTableReference(aggregateExpression)})`;
           } else if (aggregateField) {
             aggregateSql = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
           } else {
@@ -399,7 +404,7 @@ WHERE ${whereSQL}))`;
 
       // Build correlated subquery for scalar aggregation
       subquerySQL = `(SELECT COALESCE(${aggregateSql}, ${defaultValue})
-FROM "${targetTable}" "${innerTableAlias}"
+FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
 ${navJoinsSQL}
 WHERE ${whereSQL})`;
     }
@@ -420,24 +425,46 @@ WHERE ${whereSQL})`;
    * The ` ORDER BY …` inside the aggregate of an unlimited `toNumberList()` / `toStringList()`,
    * or '' when the collection is not ordered. That shape renders as a correlated subquery with no
    * inner sorted subquery, so an ordering that is not written into the aggregate itself is simply
-   * lost — the array came back in heap order. The columns are qualified with the inner alias: a
-   * navigation joined for the selector can carry a column of the same name. Only an ordering by
-   * the collection's OWN columns is rendered; any other keeps the previous (unordered) rendering.
+   * lost — the array came back in heap order. Every key is its qualified expression: an own column
+   * under the inner alias, a navigation's column under the alias it is joined under.
    */
-  private buildOwnColumnsAggregateOrderBy(config: CollectionAggregationConfig, innerTableAlias: string): string {
+  private buildAggregateOrderBy(config: CollectionAggregationConfig, innerTableAlias: string): string {
     const fields = config.orderByFields;
 
     if (!fields || fields.length === 0) {
       return '';
     }
 
-    const ownMarker = `__collection_${config.targetTable}__`;
+    return ' ORDER BY ' + fields
+      .map(field => `${this.rewriteMarker(field.expression, config.targetTable, innerTableAlias)} ${field.direction}`)
+      .join(', ');
+  }
 
-    if (!fields.every(field => field.table === undefined || field.table === ownMarker)) {
+  /**
+   * The ` ORDER BY …` inside the aggregate of a DISTINCT list. The aggregate reads only the
+   * de-duplicated values, so it can order by nothing else: an ordering by any other value has no
+   * single answer (one listed value may stand for several rows), which PostgreSQL refuses for a
+   * DISTINCT select too.
+   */
+  private buildDistinctListOrderBy(config: CollectionAggregationConfig, fieldExpression: string, arrayField: string, innerTableAlias: string): string {
+    const fields = config.orderByFields;
+
+    if (!fields || fields.length === 0) {
       return '';
     }
 
-    return ' ORDER BY ' + fields.map(field => `"${innerTableAlias}"."${field.field}" ${field.direction}`).join(', ');
+    const parts = fields.map(field => {
+      if (this.rewriteMarker(field.expression, config.targetTable, innerTableAlias) !== fieldExpression) {
+        throw new Error(
+          `The distinct list "${config.relationName}" is ordered by ${field.expression.replace(`"__collection_${config.targetTable}__".`, '')}, `
+          + 'which it does not select: a distinct list can only be ordered by the value it lists.'
+        );
+      }
+
+      return `"${arrayField}" ${field.direction}`;
+    });
+
+    return ' ORDER BY ' + parts.join(', ');
   }
 
   /**
@@ -510,9 +537,7 @@ WHERE ${whereSQL})`;
 
     for (const join of navigationJoins) {
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
-      const qualifiedTable = join.targetSchema
-        ? `"${join.targetSchema}"."${join.targetTable}"`
-        : `"${join.targetTable}"`;
+      const qualifiedTable = quoteTableReference(join.targetTable, join.targetSchema);
 
       // Build the ON clause
       // foreignKeys are the columns in the source table
@@ -537,13 +562,19 @@ WHERE ${whereSQL})`;
    * @param innerTableAlias - The alias used for the collection's target table (e.g., "lateral_0_posts")
    * @param targetTable - Optional: the original target table name (e.g., "posts") to map to innerTableAlias
    * @param context - Optional: QueryContext containing lateralTableAliasMap for nested lateral references
+   * @param pathHops - The hops of the navigation path the collection hangs off (`config.navigationPath`).
+   *   Such a hop starts from the ENCLOSING row (the first hop) or from the previous hop — never from
+   *   the collection's own row, so the own-table rewrites below must not touch it. They used to:
+   *   `ed.book.editions` — a collection over the very table `ed` is read from — joined `book` from
+   *   the INNER edition, and the correlation `inner.book_id = book.id` held for every edition.
    */
   private buildNavigationJoinsWithAlias(
     navigationJoins: NavigationJoin[] | undefined,
     innerTableAlias: string,
     targetTable?: string,
     context?: QueryContext,
-    relationName?: string
+    relationName?: string,
+    pathHops?: readonly NavigationJoin[]
   ): string {
     if (!navigationJoins || navigationJoins.length === 0) {
       return '';
@@ -563,9 +594,7 @@ WHERE ${whereSQL})`;
 
     for (const join of navigationJoins) {
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
-      const qualifiedTable = join.targetSchema
-        ? `"${join.targetSchema}"."${join.targetTable}"`
-        : `"${join.targetTable}"`;
+      const qualifiedTable = quoteTableReference(join.targetTable, join.targetSchema);
 
       // Build the ON clause
       // foreignKeys are the columns in the source table
@@ -577,7 +606,12 @@ WHERE ${whereSQL})`;
         // Use innerTableAlias if the source alias matches the collection's target table or relation name
         // This handles the case where we've aliased the main FROM table
         let sourceAlias = join.sourceAlias;
-        if (targetTable && sourceAlias === targetTable) {
+        if (pathHops !== undefined && pathHops.includes(join)) {
+          // The first hop reads the enclosing row: a parent lateral exposes it under its own alias
+          if (join === pathHops[0] && lateralAliasMap && lateralAliasMap.has(sourceAlias)) {
+            sourceAlias = lateralAliasMap.get(sourceAlias)!;
+          }
+        } else if (targetTable && sourceAlias === targetTable) {
           // This join's source is the current collection's table - use inner alias
           sourceAlias = innerTableAlias;
         } else if (sourceAlias === relationName) {
@@ -612,7 +646,7 @@ WHERE ${whereSQL})`;
     const rendered = { select: '', joins: '' };
     const jsonbObjectExpr = this.renderFields(selectedFields, '', targetTable, innerTableAlias, rendered);
 
-    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, relationName);
+    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, relationName, config.navigationPath);
 
     // Check if the source table has been aliased by a parent LATERAL (for nested collections)
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
@@ -648,7 +682,7 @@ SELECT json_agg(
 ) as data
 FROM (
   SELECT ${distinctClause}${rendered.select}
-  FROM "${targetTable}" "${innerTableAlias}"
+  FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
   ${navJoinsSQL}
   ${rendered.joins}
   ${whereSQL}
@@ -676,7 +710,7 @@ FROM (
     const rendered = { select: '', joins: '' };
     const jsonbObjectExpr = this.renderFields(selectedFields, '', targetTable, innerTableAlias, rendered);
 
-    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, relationName);
+    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, relationName, config.navigationPath);
 
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
 
@@ -699,7 +733,7 @@ FROM (
 SELECT ${jsonbObjectExpr} as data
 FROM (
   SELECT ${distinctClause}${rendered.select}
-  FROM "${targetTable}" "${innerTableAlias}"
+  FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
   ${navJoinsSQL}
   ${rendered.joins}
   ${whereSQL}
@@ -750,7 +784,7 @@ FROM (
     }
 
     // Build navigation JOINs for multi-level navigation
-    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context);
+    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, undefined, config.navigationPath);
 
     // For nested collections, the source table may be aliased in a parent LATERAL
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
@@ -791,7 +825,7 @@ SELECT ${config.useJsonArrayAggregation ? 'json_agg' : 'array_agg'}(
 ) as data
 FROM (
   SELECT ${distinctClause}${fieldExpression} as "${arrayField}"
-  FROM "${targetTable}" "${innerTableAlias}"
+  FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
   ${navJoinsSQL}
   ${whereSQL}
   ${orderBySQL}
@@ -803,27 +837,21 @@ FROM (
   }
 
   /**
-   * Build scalar aggregation using LATERAL (COUNT, MIN, MAX, SUM)
+   * Build scalar aggregation using LATERAL (COUNT, MIN, MAX, SUM, EXISTS). Reached only for a
+   * collection with a LIMIT and/or OFFSET (every other scalar takes the correlated-subquery form),
+   * so the aggregate runs over exactly the rows the ordered, limited collection yields:
+   * `.orderBy(...).limit(2).count()` counts at most two rows. The collection's navigation joins are
+   * part of that inner query — a WHERE, ORDER BY or aggregated value may read through them.
    */
   private buildScalarAggregation(
     config: CollectionAggregationConfig,
     lateralAlias: string,
     context: QueryContext
   ): string {
-    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, sourceTable, whereClause, relationName } = config;
+    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, sourceTable, whereClause, orderByClause, limitValue, offsetValue, relationName, navigationJoins } = config;
 
     // Use a unique table alias to avoid conflicts with outer query tables
     const innerTableAlias = `${lateralAlias}_${relationName}`;
-
-    // Helper to rewrite expressions that reference the collection's table to use inner alias
-    const rewriteTableReference = (expression: string): string => {
-      // Replace the special marker alias `"__collection_tableName__".` with `"innerTableAlias".`
-      if (!expression.includes('"__collection_')) {
-        return expression;  // nothing to rewrite — skip the regex pass entirely
-      }
-      const markerPattern = collectionMarkerPattern(targetTable, true);
-      return expression.replace(markerPattern, `"${innerTableAlias}".`);
-    };
 
     // For nested collections, the source table may be aliased in a parent LATERAL
     const effectiveSourceTable = context.lateralTableAliasMap?.get(sourceTable) || sourceTable;
@@ -833,47 +861,44 @@ FROM (
     const fkTableAlias = config.foreignKeyTableAlias || innerTableAlias;
     let whereSQL = `WHERE ${this.buildParentCorrelation(config, fkTableAlias, effectiveSourceTable, foreignKey)}`;
     if (whereClause) {
-      const rewrittenWhereClause = rewriteTableReference(whereClause);
-      whereSQL += ` AND ${rewrittenWhereClause}`;
+      whereSQL += ` AND ${this.rewriteMarker(whereClause, targetTable, innerTableAlias)}`;
     }
 
-    // Build aggregation expression
-    let aggregateExpression: string;
+    // Like the list form this LATERAL join renders, the path a collection hangs off is joined inside
+    const navJoinsSQL = this.buildNavigationJoinsWithAlias(navigationJoins, innerTableAlias, targetTable, context, relationName, config.navigationPath);
+    const orderBySQL = orderByClause ? `\nORDER BY ${this.rewriteMarker(orderByClause, targetTable, innerTableAlias)}` : '';
+    const limitOffsetSQL = (limitValue !== undefined ? `\nLIMIT ${limitValue}` : '') + (offsetValue !== undefined ? `\nOFFSET ${offsetValue}` : '');
+    const innerRows = (selectList: string): string => `SELECT ${selectList}
+FROM ${quoteTableReference(targetTable, config.targetSchema)} "${innerTableAlias}"
+${navJoinsSQL}
+${whereSQL}${orderBySQL}${limitOffsetSQL}`;
+
     switch (aggregationType) {
       case 'count':
-        aggregateExpression = 'COUNT(*)';
-        break;
+        return `SELECT COUNT(*) as data\nFROM (${innerRows('1')}) sub`;
+
       case 'min':
       case 'max':
-      case 'sum':
+      case 'sum': {
+        let valueExpression: string;
         if (aggregateExprFromConfig) {
-          // Nested scalar-subquery summand (e.g. sum(row => other.count()))
-          aggregateExpression = `${aggregationType.toUpperCase()}(${aggregateExprFromConfig})`;
+          // Nested scalar-subquery summand (e.g. sum(row => other.count())), a navigation column,
+          // or an expression of the item (its columns under our marker)
+          valueExpression = this.rewriteMarker(aggregateExprFromConfig, targetTable, innerTableAlias);
         } else if (aggregateField) {
-          aggregateExpression = `${aggregationType.toUpperCase()}("${innerTableAlias}"."${aggregateField}")`;
+          valueExpression = `"${innerTableAlias}"."${aggregateField}"`;
         } else {
           throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
         }
-        break;
-      case 'exists': {
-        // EXISTS as LATERAL: SELECT EXISTS(SELECT 1 FROM ... WHERE ...)
-        const lateralSQL = `
-SELECT EXISTS(SELECT 1
-FROM "${targetTable}" "${innerTableAlias}"
-${whereSQL}) as data
-        `.trim();
-        return lateralSQL;
+
+        return `SELECT ${aggregationType.toUpperCase()}("__value") as data\nFROM (${innerRows(`${valueExpression} as "__value"`)}) sub`;
       }
+
+      case 'exists':
+        return `SELECT EXISTS(${innerRows('1')}) as data`;
+
       default:
         throw new Error(`Unknown aggregation type: ${aggregationType}`);
     }
-
-    const lateralSQL = `
-SELECT ${aggregateExpression} as data
-FROM "${targetTable}" "${innerTableAlias}"
-${whereSQL}
-    `.trim();
-
-    return lateralSQL;
   }
 }

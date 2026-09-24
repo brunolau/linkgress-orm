@@ -57,11 +57,19 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Built-in operators: coalesce, JSONB extraction, flag/bitmask operations
   - Advanced patterns and type safety
 
+- **[SQL Expression Helpers](./guides/sql-expressions.md)** - Built-in spellings of common SQL expressions
+  - Casts (`cast`, `castAsInt`, `castAsString`, … and `.cast*()` on every fragment)
+  - Literals, typed NULLs, conditions as values
+  - CASE (`caseWhen`, `caseOf`), GREATEST / LEAST / NULLIF, IS DISTINCT FROM
+  - String, math and date/time functions, intervals
+  - JSONB paths, mutations and predicates; array-column operators
+
 - **[Insert/Update/Upsert/BULK](./guides/insert-update-guide.md)** - Insert, update, and delete operations
   - Fluent API for update and delete (`.where().update()`, `.where().delete()`)
   - RETURNING clause support with selectors
-  - Bulk insert and update
-  - Upsert (INSERT ... ON CONFLICT)
+  - Bulk insert and update, with SET expressions (`bulkUpdate` `set` / `where`)
+  - Upsert (INSERT ... ON CONFLICT), with SET expressions (`updateSet` / `updateWhere`)
+  - Advisory transaction locks
   - Type safety and performance tips
 
 - **[Configuration & Options](./guides/configuration.md)** - Every option, and when to turn it on

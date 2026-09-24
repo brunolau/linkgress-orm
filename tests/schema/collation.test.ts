@@ -125,7 +125,8 @@ describe('Collation Support', () => {
     }
   });
 
-  test('collation should enable case-insensitive and accent-insensitive matching', async () => {
+  // PGlite ships no ICU data: the collation is created, but compares like the default one
+  test.skipIf(process.env.LINKGRESS_TEST_DRIVER === 'pglite')('collation should enable case-insensitive and accent-insensitive matching', async () => {
     pgCollation({
       name: 'nd_ci_ai',
       provider: 'icu',

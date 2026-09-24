@@ -135,6 +135,12 @@ export interface TxnState {
   localSettings: Map<string, string | null>;
   createdStorage: number[];
   droppedStorage: number[];
+  /**
+   * Actions that run AS PART of the commit, inside the committing transaction (PostgreSQL's
+   * PreCommit_on_commit_actions): `ON COMMIT DROP` drops its temp table here, so the drop is in the
+   * catalog the commit publishes. Run as an after-commit hook, the drop had no transaction left.
+   */
+  preCommit: (() => void)[];
   onCommit: (() => void)[];
   onAbort: (() => void)[];
   /** checks of DEFERRABLE constraints currently deferred */
@@ -1085,6 +1091,7 @@ export class Session implements ExecSession, AnalyzerEnv {
       localSettings: new Map(),
       createdStorage: [],
       droppedStorage: [],
+      preCommit: [],
       onCommit: [],
       onAbort: [],
       deferredChecks: [],
@@ -1278,6 +1285,17 @@ export class Session implements ExecSession, AnalyzerEnv {
     const txn = this.txn;
     if (!txn) {
       return;
+    }
+    if (txn.preCommit.length > 0) {
+      // ON COMMIT actions run inside the committing transaction; a failing one aborts it instead
+      try {
+        for (const fn of txn.preCommit.splice(0)) {
+          fn();
+        }
+      } catch (e) {
+        this.abortTxn();
+        throw e;
+      }
     }
     if (txn.deferredChecks.length > 0) {
       // deferred constraint checks fire before the commit; a violation aborts the transaction instead

@@ -170,6 +170,58 @@ const db = new DbContext(client, schema);
   strategy, `FutureQuery` batches) apply.
 - **Under jest**, node needs `--experimental-vm-modules`: PGlite loads its WASM through dynamic `import()`.
 
+### 4. BunClient (Bun.SQL)
+
+The `BunClient` runs linkgress on Bun's built-in SQL client — no driver package to install. It only
+works under the Bun runtime.
+
+**Usage:**
+```typescript
+import { BunClient, DbContext } from 'linkgress-orm';
+
+// Option 1: Configuration object (Bun.SQL options)
+const client = new BunClient({ hostname: 'localhost', port: 5432, database: 'mydb', username: 'postgres', password: 'password' });
+
+// Option 2: Text-format results (see below)
+const client = new BunClient({ hostname: 'localhost', database: 'mydb', prepare: false });
+
+// Option 3: Connection string, or an SQL instance you created (it stays yours to close)
+const client = new BunClient('postgres://postgres:password@localhost:5432/mydb');
+const client = new BunClient(new Bun.SQL('postgres://…'));
+
+const db = new DbContext(client, schema);
+```
+
+**Parameters.** BunClient sends what Bun cannot bind itself the way `postgres` does:
+- A `Date` goes as its ISO instant, in both modes: a `timestamptz` gets the instant, a `timestamp` its
+  UTC wall time, a `date` the UTC date. (Bun sends `Date.prototype.toString()` — "Sun Mar 10 2024
+  01:00:00 GMT+0100 (…)" — wherever the server does not describe a timestamp parameter, and
+  everywhere with `prepare: false`, which PostgreSQL rejects or stores as that text.)
+- With `prepare: false`, a plain object or array goes as its JSON text (Bun would send
+  "[object Object]"); bytes (`Uint8Array`, `Buffer`) and value classes with a `toString()` of their own
+  are left to Bun.
+- A JS array cannot be bound to a native ARRAY parameter by Bun in either mode. linkgress binds a
+  native array column (`integer('ids').array()`) and `cast(values, 'int[]')` as a PostgreSQL array
+  literal, which works; a raw JS array you pass to raw SQL for an array parameter still fails —
+  pass `cast(values, 'int[]')` (or a literal) instead. A JS array bound to `jsonb` is JSON, as with
+  the other drivers.
+
+**Results.**
+- Through the binary protocol (the default), Bun decodes an `int4[]` column as an `Int32Array` and a
+  `float4[]` as a `Float32Array`; BunClient hands them over as plain arrays, as every other driver
+  does (`int8[]` elements as strings). A multidimensional array result cannot be decoded at all
+  (`ERR_POSTGRES_MULTIDIMENSIONAL_ARRAY_NOT_SUPPORTED_YET`) — read it as text, or use `prepare: false`.
+- A numeric ZERO read through the binary protocol loses its scale (`numeric(20,4)` `0.0000` reads as
+  `"0"`); non-zero values keep it, and text mode keeps both. A Bun decoder bug, pinned by the test
+  suite so a fixed Bun shows up. BunClient reports it (`losesNumericZeroScale()` is `true` in the
+  binary mode), and linkgress gives the zero of a column declared with a scale
+  (`decimal('amount', 10, 2)`) its scale back — in entity rows, projections, one-value selections and
+  every mutation's `.returning()`. A column without a declared scale (`numeric('n')`) and raw SQL
+  (`db.query(...)`) read as Bun delivers them.
+- `prepare: false` uses unnamed statements with text-format results: native arrays decode correctly
+  everywhere (collections then keep `array_agg`), at a small re-parse cost per query.
+- `datesAsStrings: true` turns `Date` results into PostgreSQL text (`YYYY-MM-DD HH:MM:SS.mmm`).
+
 ## Creating a Custom Client
 
 You can implement your own database client by extending `DatabaseClient`:
@@ -195,6 +247,12 @@ class MyCustomClient extends DatabaseClient {
   }
 }
 ```
+
+A few capability hooks have defaults a client overrides when its driver differs:
+`supportsMultiStatementQueries()`, `supportsBinaryProtocol()`, `supportsBinaryArrayResults()` (false:
+collections aggregate with `json_agg` so no native array reaches the driver) and
+`losesNumericZeroScale()` (true: the driver reads a scaled numeric zero as `"0"`, and the query
+builders restore the scale of columns declared with one).
 
 ## Usage with DbContext
 

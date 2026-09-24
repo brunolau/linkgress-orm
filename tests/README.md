@@ -47,6 +47,10 @@ another on `DB_NAME` itself. The server user needs `CREATEDB`. A memory run buil
 from, and runs files in parallel. A PGlite run (`--driver pglite`) does the same with a PGlite
 data-directory dump (every file boots its own PGlite); the server is then only needed by the files that
 construct `PgClient` / `PostgresClient` themselves, and the run only warns when it is unreachable.
+`@electric-sql/pglite` (like `postgres`) is a devDependency, so `npm install` is all a PGlite run needs.
+A few files skip, under PGlite only, what one in-process session cannot do: hold a lock against a second
+session (advisory locks, a live `FOR UPDATE NOWAIT`), cancel a running statement (the end-to-end timeout
+tests), ICU collations, and the blocks that run on `PostgresClient` by construction.
 
 ### Runner options (`bun tests/run.ts [paths] [options]`)
 

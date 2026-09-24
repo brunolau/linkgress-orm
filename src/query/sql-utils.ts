@@ -249,6 +249,14 @@ export function extractUniqueColumnKeys(
 /**
  * Build VALUES clause with parameter placeholders
  */
+/** An `sql` fragment or condition (anything rendering itself with `buildSql` and reporting its refs). */
+function isSqlExpression(value: unknown): value is { buildSql(context: { paramCounter: number; params: any[] }): string } {
+  return value !== null
+    && typeof value === 'object'
+    && typeof (value as any).buildSql === 'function'
+    && typeof (value as any).getFieldRefs === 'function';
+}
+
 export function buildValuesClause(
   dataArray: Record<string, any>[],
   columnConfigs: ColumnConfig[],
@@ -263,6 +271,16 @@ export function buildValuesClause(
 
     for (const config of columnConfigs) {
       const value = data[config.propName];
+
+      // An `sql` fragment renders inline, its parameters continuing the statement's — it used to be
+      // bound AS a parameter (duck-typed: this module stays free of the conditions module)
+      if (isSqlExpression(value)) {
+        const context = { paramCounter: paramIndex, params };
+        rowPlaceholders.push(`(${value.buildSql(context)})`);
+        paramIndex = context.paramCounter;
+        continue;
+      }
+
       const mappedValue = applyToDriverMapper(value, config);
       params.push(mappedValue);
       rowPlaceholders.push(`$${paramIndex++}`);

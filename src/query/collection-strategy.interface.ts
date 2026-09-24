@@ -1,5 +1,6 @@
 import { DatabaseClient } from '../database/database-client.interface';
 import { QueryContext } from './query-builder';
+import type { OrderDirection } from '../entity/db-context';
 
 /**
  * Represents a field in a collection selection that can be either a simple expression
@@ -28,6 +29,14 @@ export interface SelectedField {
    */
   sourceTable?: string;
   /**
+   * Set when the field is a literal of the projection (`kind: 'loan'`, `n: 42`, `at: someDate`):
+   * `expression` binds it as a parameter, and the item reads back `value` itself — the database
+   * hands an untyped parameter back as text.
+   */
+  literal?: { value: unknown };
+  /** The read mapper of an `sql` expression field (its `mapWith`). */
+  mapper?: { fromDriver(value: any): any };
+  /**
    * When this field is a nested CTE (collection within collection),
    * this specifies how to join that CTE.
    */
@@ -47,6 +56,7 @@ export interface SelectedField {
     selectedFieldConfigs?: SelectedField[];
     isSingleResult?: boolean;  // true for firstOrDefault()
     flattenResultType?: 'number' | 'string';  // set for toNumberList()/toStringList() — array elements are primitives, not objects
+    scalarAlias?: string;  // set when the collection selects ONE value: its items are unwrapped from this field
   };
 }
 
@@ -178,6 +188,12 @@ export interface CollectionAggregationConfig {
   targetTable: string;
 
   /**
+   * Schema of the target table when it is not in the default schema: the collection reads
+   * `"<targetSchema>"."<targetTable>"`.
+   */
+  targetSchema?: string;
+
+  /**
    * Foreign key column in target table.
    * @deprecated Use `foreignKeys` for full composite-/literal-predicate support.
    *             Retained for backward compatibility; equals `foreignKeys[0]`.
@@ -214,9 +230,16 @@ export interface CollectionAggregationConfig {
   sourceTable: string;
 
   /**
-   * Parent IDs to filter by (for temp table strategy)
+   * Parent IDs to filter by (for temp table strategy): the values of the parents' principal key
+   * the collection's foreign key refers to.
    */
   parentIds?: any[];
+
+  /**
+   * The SQL type of that principal key column (temp table strategy: its parent-id column's type).
+   * Undefined when unknown — the strategy then keeps its `integer` default.
+   */
+  parentKeyType?: string;
 
   /**
    * Fields to select (supports nested object structures)
@@ -234,26 +257,29 @@ export interface CollectionAggregationConfig {
   whereParams?: any[];
 
   /**
-   * ORDER BY clause SQL (without ORDER BY keyword) - uses database column names
-   * Used for ordering in subqueries that access raw table columns
+   * ORDER BY clause SQL (without the ORDER BY keyword): every key's `expression` with its
+   * direction, over the collection's FROM (own columns still under the collection marker).
    */
   orderByClause?: string;
 
   /**
-   * ORDER BY clause SQL using property names (aliases)
-   * Used for ordering in json_agg which operates on aliased subquery output
-   */
-  orderByClauseAlias?: string;
-
-  /**
-   * ORDER BY fields as individual entries (database column names and directions)
-   * Used to include ORDER BY columns in inner SELECT for window functions
+   * The ORDER BY keys, in order. A strategy that orders the rows of its FROM directly uses the
+   * `expression`; one that aggregates over an inner SELECT's output orders by the projected field
+   * selecting the same expression, or by a hidden column it adds for the key.
    */
   orderByFields?: Array<{
+    /** The ordered column's database name. */
     field: string;
-    direction: 'ASC' | 'DESC';
+    direction: OrderDirection;
     /** Alias the column rendered under: `__collection_<targetTable>__` for an own column. */
     table?: string;
+    /**
+     * The key as a qualified expression over the collection's FROM: `"__collection_<targetTable>__"."<column>"`
+     * for an own column (rewrite the marker to the strategy's alias for the target table), or
+     * `"<alias>"."<column>"` for a column of a navigation (under its planned alias, joined with the
+     * collection's navigation joins).
+     */
+    expression: string;
   }>;
 
   /**
@@ -330,6 +356,14 @@ export interface CollectionAggregationConfig {
    * Use selectorNavigationJoins for just the selector joins (needed for CTE strategy).
    */
   navigationJoins?: NavigationJoin[];
+
+  /**
+   * The hops of the navigation path this collection hangs off (`ln.edition.book.editions`: the
+   * `edition` and `book` joins), the same objects `navigationJoins` starts with. A hop is joined
+   * from the ENCLOSING row (the first one) or from the previous hop — never from the collection's
+   * own row, even when the enclosing row's table is the collection's table.
+   */
+  navigationPath?: NavigationJoin[];
 
   /**
    * Navigation joins detected from the collection's selector only.

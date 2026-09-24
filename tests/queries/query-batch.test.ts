@@ -373,7 +373,8 @@ describe('QueryBatch', () => {
       });
     });
 
-    test('timestamp column with a custom fromDriver mapper receives the driver text form, never a Date', async () => {
+    // A postgres.js client of its own, on the server's database — which a PGlite run does not build
+    test.skipIf(process.env.LINKGRESS_TEST_DRIVER === 'pglite')('timestamp column with a custom fromDriver mapper receives the driver text form, never a Date', async () => {
       // Consumer regression: the app configures postgres.js with timestamp
       // parser PASSTHROUGH — the driver delivers 'YYYY-MM-DD HH:MM:SS' strings —
       // and a custom mapper turns that string into the app's date abstraction.

@@ -83,7 +83,7 @@ interface UnionComponent {
  */
 export class UnionQueryBuilder<TSelection> {
   private components: UnionComponent[] = [];
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ field: string; direction: OrderDirection }> = [];
   private limitValue?: number;
   private offsetValue?: number;
   private client: DatabaseClient;

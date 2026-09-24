@@ -1,4 +1,5 @@
 import type { DatabaseClient } from '../database/database-client.interface';
+import type { Condition } from './conditions';
 import { renumberPlaceholders } from './query-batch';
 import { hasBarePlaceholder } from './sql-utils';
 
@@ -7,6 +8,28 @@ const POSTGRES_MAX_PARAMS = 65535;
 /** Typed handle returned by MutationBatch.addInsertBulk / addBulkUpdate. */
 export interface MutationBatchKey {
   readonly id: string;
+}
+
+/**
+ * Upsert leg configuration: the conflict key, the columns taking `= EXCLUDED."col"`, and the
+ * same typed conflict-arm expressions `upsertBulk` accepts (`updateSet` over
+ * `(existing, excluded)`, `updateWhere`).
+ */
+export interface UpsertLegConfig {
+  primaryKey: string | string[];
+  updateColumns?: string[];
+  updateSet?: (existing: any, excluded: any) => Record<string, unknown>;
+  updateWhere?: (existing: any, excluded: any) => Condition;
+}
+
+/**
+ * Bulk-update leg configuration: the match key and the same typed `set` / `where` over
+ * `(target, values)` that `bulkUpdate` accepts.
+ */
+export interface BulkUpdateLegConfig {
+  primaryKey?: string | string[];
+  set?: (target: any, values: any) => Record<string, unknown>;
+  where?: (target: any, values: any) => Condition;
 }
 
 /**
@@ -26,7 +49,11 @@ interface MutationCapableTable {
     data: Record<string, any>[],
     guardPredicate: string
   ): { sql: string; params: any[] } | null;
-  _buildBulkUpdateStatement(data: Record<string, any>[], primaryKeys: string[]): { sql: string; params: any[] };
+  _buildBulkUpdateStatement(
+    data: Record<string, any>[],
+    primaryKeys: string[],
+    expressions?: { set?: (target: any, values: any) => Record<string, unknown>; where?: (target: any, values: any) => Condition }
+  ): { sql: string; params: any[] };
   _buildDeleteWhereInStatement(field: string, values: any[]): { sql: string; params: any[] } | null;
   _buildUpdateWhereInStatement(
     field: string,
@@ -35,7 +62,7 @@ interface MutationCapableTable {
   ): { sql: string; params: any[] } | null;
   _buildUpsertBulkStatement(
     values: Record<string, any>[],
-    config: { primaryKey: string | string[]; updateColumns?: string[] }
+    config: UpsertLegConfig
   ): { sql: string; params: any[] } | null;
   _buildDependentInsertSelectStatement(
     row: Record<string, any>,
@@ -276,7 +303,7 @@ export class MutationBatch {
   addUpsertBulk(
     table: MutationCapableTable,
     rows: Record<string, any>[],
-    config: { primaryKey: string | string[]; updateColumns?: string[] },
+    config: UpsertLegConfig,
     id: string,
     options?: { returning?: string[] }
   ): MutationBatchKey | null {
@@ -407,7 +434,7 @@ export class MutationBatch {
     table: MutationCapableTable,
     rows: Record<string, any>[],
     id: string,
-    config?: { primaryKey?: string | string[] }
+    config?: BulkUpdateLegConfig
   ): MutationBatchKey | null {
     if (rows.length === 0) {
       return null;
@@ -417,7 +444,11 @@ export class MutationBatch {
     MutationBatch.assertSingleStatementBudget(rows, id);
 
     const primaryKeys = table._resolveBulkUpdatePrimaryKeys(rows, config);
-    const built = table._buildBulkUpdateStatement(rows, primaryKeys);
+    const built = table._buildBulkUpdateStatement(
+      rows,
+      primaryKeys,
+      config?.set || config?.where ? { set: config.set, where: config.where } : undefined
+    );
 
     this.legs.push({ id, sql: built.sql, params: built.params, client: table._getClient(), executor: table._getExecutor() });
 

@@ -1,6 +1,6 @@
 // Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
 
-exports[`query-build shape caches — regression guards a collection ordered by a column whose property name differs from its db name keeps both ORDER BY forms (CTE strategy) 1`] = `
+exports[`query-build shape caches — regression guards a collection ordered by a column whose property name differs from its db name orders json_agg by the projected alias of that column (CTE strategy) 1`] = `
 "WITH "cte_0" AS (SELECT
   "__fk_user_id" as parent_id,
   json_agg(
@@ -12,7 +12,7 @@ FROM (
   
   
   
-  ORDER BY "user_id" DESC
+  
 ) sub
 GROUP BY "__fk_user_id")
 SELECT "lsc_users"."id" as "id", COALESCE("cte_0".data, '[]'::json) as "posts"
@@ -32,7 +32,7 @@ FROM (
   
   
   WHERE "lateral_0_posts"."user_id" = "lsc_users"."id"
-  ORDER BY "user_id" DESC
+  ORDER BY "lateral_0_posts"."user_id" DESC
   
 ) sub) "lateral_0" ON true"
 `;

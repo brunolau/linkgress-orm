@@ -73,7 +73,8 @@ describe('forUpdate()', () => {
 		expect(q.toSql()).toMatch(/FOR UPDATE\s*$/);
 	});
 
-	test('live: a held FOR UPDATE lock makes a second NOWAIT read fail (lock is real)', async () => {
+	// Needs a second session while the first holds the lock — PGlite runs one
+	test.skipIf(process.env.LINKGRESS_TEST_DRIVER === 'pglite')('live: a held FOR UPDATE lock makes a second NOWAIT read fail (lock is real)', async () => {
 		const user = await db.users.insert({
 			username: `for-update-${Date.now()}`,
 			email: `for-update-${Date.now()}@test.local`,

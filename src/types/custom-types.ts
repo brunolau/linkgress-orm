@@ -78,17 +78,36 @@ export const json = <T = any>() =>
     fromDriver: (value: T) => value,       // Driver returns parsed objects
   });
 
+/** The text form of one array element, before array-literal quoting. */
+const arrayElementText = (value: object): string => {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  // bytea: the hex input form
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    const bytes = value instanceof ArrayBuffer
+      ? new Uint8Array(value)
+      : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    let hex = '\\x';
+
+    for (const byte of bytes) {
+      hex += byte.toString(16).padStart(2, '0');
+    }
+
+    return hex;
+  }
+
+  // A plain object (a json / jsonb element): its JSON text. A value class with a toString() of its
+  // own (Temporal values, decimals) reads as that.
+  return value.toString === Object.prototype.toString ? JSON.stringify(value) : String(value);
+};
+
 /**
- * Array type
- * Note: PostgreSQL drivers return arrays as already-parsed
- */
-/**
- * Serialize a JS array into a PostgreSQL array literal ('{1,2,3}',
- * '{"a","b"}', nested arrays recursively). Strings are quoted with
- * backslash/quote escaping; null/undefined elements become NULL.
- */
-/**
- * Serialize a JS array into a PostgreSQL array LITERAL string (`{1,2,3}`).
+ * Serialize a JS array into a PostgreSQL array LITERAL string (`{1,2,3}`, `{"a","b"}`, nested
+ * arrays as a multidimensional literal). Strings are quoted with backslash / quote escaping,
+ * null / undefined elements become NULL, Dates their ISO instant, bytes the bytea hex form
+ * (`\x0102ff`), plain objects their JSON text, other objects their `toString()`.
  *
  * Exported because it is the one array encoding every supported driver accepts:
  * pg and postgres.js serialize raw JS arrays themselves, but Bun's SQL client
@@ -110,11 +129,32 @@ export const toPgArrayLiteral = (values: readonly any[]): string => {
     if (typeof value === 'boolean') {
       return value ? 't' : 'f';
     }
-    const text = value instanceof Date ? value.toISOString() : String(value);
+    const text = typeof value === 'object' ? arrayElementText(value) : String(value);
     return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   });
   return `{${parts.join(',')}}`;
 };
+
+/**
+ * A mapper that gives a `numeric(p, s)` / `decimal(p, s)` ZERO back its scale (`"0"` → `"0.0000"`),
+ * for a client that loses it (see `DatabaseClient.losesNumericZeroScale`); `undefined` for a column
+ * of any other type or without a scale. PostgreSQL renders such a column with exactly `s`
+ * decimals, and the client keeps the scale of every other value, so the restored text is exact.
+ */
+export const numericZeroScaleMapper = (config: { type?: string; scale?: number }): { fromDriver(value: unknown): unknown } | undefined => {
+  if ((config.type !== 'decimal' && config.type !== 'numeric') || !config.scale || config.scale <= 0) {
+    return undefined;
+  }
+
+  const zero = `0.${'0'.repeat(config.scale)}`;
+
+  return { fromDriver: (value: unknown) => (value === '0' ? zero : value) };
+};
+
+/**
+ * Array type
+ * Note: PostgreSQL drivers return arrays as already-parsed
+ */
 
 export const array = <T = any>(itemType: string) =>
   customType<T[], T[]>({

@@ -173,7 +173,9 @@ describe('Query timeouts (PostgresClient)', () => {
     });
   });
 
-  describe('query-builder / context level (end-to-end)', () => {
+  // Its PostgresClient reads the server's database, which a PGlite run seeds nothing into (the
+  // suite's shared client is the in-process PGlite there)
+  describe.skipIf(process.env.LINKGRESS_TEST_DRIVER === 'pglite')('query-builder / context level (end-to-end)', () => {
     beforeAll(async () => {
       // Seed at least one row so the per-row pg_sleep in the projection executes.
       await withDatabase(async (sharedDb) => {

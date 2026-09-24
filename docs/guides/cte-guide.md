@@ -62,6 +62,58 @@ const result = await db.users
   .toList();
 ```
 
+`innerJoin` takes a CTE the same way, after a `select()` or straight off the table
+(`db.users.innerJoin(cte, …)`, `db.users.leftJoin(cte, …)`). A joined CTE the query does not carry yet is
+attached to its WITH list, as `.with(cte)` would — and one attached already is declared once. (An
+`innerJoin` of a CTE, and any join of one straight off the table, used to throw
+"rightTable._getSchema is not a function".)
+
+## How a CTE's Columns Read Back
+
+A column of a CTE body reads back — through a join, at a CTE root, in a comparison — the way the body's
+own projection reads it:
+
+```typescript
+const times = cteBuilder.with('post_times', db.posts.select(p => ({
+  postId: p.id,
+  time: p.publishTime,                 // a mapped column
+  meta: { title: p.title, views: p.views },
+  author: p.user,                      // a navigation row
+  kind: 'post',                        // a literal
+  featured: true,
+})));
+
+const rows = await db.posts
+  .innerJoin(times.cte,
+    (p, t) => and(eq(p.id, t.postId), eq(t.time, { hour: 9, minute: 30 }), eq(t.featured, true)),
+    (p, t) => ({ title: p.title, time: t.time, meta: t.meta, author: t.author!.username, kind: t.kind }))
+  .toList();
+```
+
+- **Mapped columns** read — and compare — through the body column's OWN mapper: `t.time` is
+  `{ hour, minute }`, and `eq(t.time, { hour: 9, minute: 30 })` converts the value like a comparison
+  with `p.publishTime` would. (A CTE's columns used to carry an expression's `mapWith` and nothing
+  else: a mapped column read through a CTE came back as its storage value; one named like a mapped
+  column of the READING table went through THAT column's mapper.)
+- **Text** stays text (`'01234'` used to read back as `1234`); a numeric column or an aggregate reads as
+  a number.
+- **Literals** render typed in the body — `CAST($1 AS boolean)`, an `integer` (a `bigint` beyond int4, a
+  `double precision` for a fraction), `text`, a `timestamptz` for a `Date`, `jsonb` for a list of
+  values — so the reading query compares them as their type (`gt(t.n, 5)` over a literal `42` used to
+  compare TEXT and match nothing) and reads them back as their values, a `bigint` as a `bigint`. A
+  grouped body's constants and a table subquery's literals render typed too.
+- **A nested object or a navigation row** of the body is the object of its flattened columns:
+  `t.meta` reads back as `{ title, views }`, `t.meta.views` and `t.author.username` are columns of their
+  own, in a selection or a condition. At the type level such a value is one `FieldRef` — it cannot be
+  told from a column whose mapped value is an object — so reach into it in a condition with a cast
+  (`eq((t.meta as any).title, 'x')`).
+
+A **table subquery** (`query.asSubquery('table')`, joined with an alias) reads its columns the same way.
+
+`withAggregation()` items read through the aggregated query's own mappers (they used to be looked up by
+NAME among the reading table's columns), nested objects and navigation rows key by key, literals as
+themselves; a grouping key reads through its column's mapper.
+
 ## CTEs with Aggregations
 
 Create CTEs that include collection aggregations:
@@ -292,6 +344,26 @@ FieldRef proxy per source, in FROM order (root first, then each joined CTE). You
 also `.select(root => ({ … }))` with no join to project the root CTE directly.
 `.orderBy(...)`, `.limit(n)`, `.offset(n)`, `.toList()` and `.first()` round out the
 query (`orderBy` matches the column **output aliases**, e.g. `r => [[r.status, 'DESC']]`).
+
+The projection takes what a table's `select()` takes, and each value reads back as
+[a CTE's columns read back](#how-a-ctes-columns-read-back):
+
+```typescript
+db.selectFromCte(times.cte).select(t => ({
+  postId: t.postId,
+  kind: 'post',                                   // a string is a value, not a column name
+  meta: { time: t.time, loud: sql<string>`upper(${t.meta.title})` },   // flattened, rebuilt
+  comments: db.postComments.where(c => eq(c.postId, t.postId)).select(() => ({ n: sql<number>`count(*)` })).asSubquery('scalar'),
+}));
+
+db.selectFromCte(times.cte).select(t => t.postId).orderBy(id => id).toList();   // number[]
+```
+
+A selector returning one value (a column, an expression, a literal) reads as the list of that value, and
+`orderBy` orders by it. As a `table` subquery (`.asSubquery('table')`) the projection's literals render
+typed for the enclosing query. An array of columns is refused. (A string used to render as a column of
+that NAME, a nested object and a subquery were bound as parameters, and a one-value selector projected
+the ref's own keys.)
 
 ### The `onTrue()` helper and `ON TRUE`
 

@@ -4,7 +4,24 @@ import type { DatabaseClient } from '../database/database-client.interface';
 import type { OrderDirection } from '../entity/db-context';
 import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy, getTableAlias } from './query-utils';
-import { createNestedFieldRefProxy, getColumnNameMapForSchema } from './query-builder';
+import { createNestedFieldRefProxy, getColumnNameMapForSchema, holdsSqlValue, projectionLiteralSql } from './query-builder';
+import { selectorProjectingConditions } from './sql-functions';
+
+/**
+ * Whether a projected value of a join is a value rather than a column or an expression: a literal,
+ * a Date, or a list / plain object of values — each reads back as itself.
+ */
+function isJoinProjectionValue(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || value instanceof Date) {
+    return true;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+
+  return (Array.isArray(value) || proto === Object.prototype || proto === null)
+    && !('__dbColumnName' in value)
+    && !holdsSqlValue(value);
+}
 
 /**
  * Join type
@@ -39,7 +56,7 @@ export class JoinQueryBuilder<TLeft, TRight> {
   private whereCond?: Condition;
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ table: string; field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ table: string; field: string; direction: OrderDirection }> = [];
   private executor?: QueryExecutor;
 
   constructor(
@@ -201,7 +218,54 @@ export class JoinQueryBuilder<TLeft, TRight> {
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
-    return result.rows;
+    return this.readRows(result.rows);
+  }
+
+  /**
+   * The rows read back field by field: a column of either table through its column's mapper, a
+   * literal as itself (it rides the statement as a parameter the database hands back as text). The
+   * rows used to be returned as the driver delivered them.
+   */
+  private readRows(rows: any[]): any[] {
+    const selection = this.selection!(
+      this.createMockRow(this.leftSchema, this.leftAlias),
+      this.createMockRow(this.rightSchema, this.rightAlias)
+    );
+    const readers: Array<[string, (row: any) => any]> = [];
+
+    for (const [key, value] of Object.entries(selection)) {
+      if (value === undefined) {
+        continue;
+      }
+
+      if (isJoinProjectionValue(value)) {
+        readers.push([key, () => value]);
+        continue;
+      }
+
+      const ref = value as any;
+      const schema = ref.__tableAlias === this.rightAlias ? this.rightSchema : ref.__tableAlias === this.leftAlias ? this.leftSchema : undefined;
+      const column = schema && typeof ref.__fieldName === 'string' ? schema.columns[ref.__fieldName] : undefined;
+      let mapper = column ? (column as any).build().mapper : undefined;
+
+      if (!mapper && typeof ref.getMapper === 'function') {
+        mapper = ref.getMapper();
+      }
+
+      readers.push([key, mapper && typeof mapper.fromDriver === 'function'
+        ? row => mapper.fromDriver(row[key])
+        : row => row[key]]);
+    }
+
+    return rows.map(row => {
+      const out: any = {};
+
+      for (const [key, read] of readers) {
+        out[key] = read(row);
+      }
+
+      return out;
+    });
   }
 
   /**
@@ -227,7 +291,7 @@ export class JoinQueryBuilder<TLeft, TRight> {
    * Set the selection (called internally)
    */
   _setSelection(selector: (left: TLeft, right: TRight) => any): void {
-    this.selection = selector;
+    this.selection = selectorProjectingConditions(selector);
   }
 
   /**
@@ -308,13 +372,31 @@ export class JoinQueryBuilder<TLeft, TRight> {
         // FieldRef object
         const tableAlias = (value as any).__tableAlias || this.leftAlias;
         selectParts.push(`"${tableAlias}"."${value.__dbColumnName}" as "${key}"`);
-      } else if (typeof value === 'string') {
-        // Simple column reference
-        selectParts.push(`"${this.leftAlias}"."${value}" as "${key}"`);
+      } else if (value === undefined) {
+        // Left out, as a SELECT leaves it out
+        continue;
+      } else if (value !== null && typeof value === 'object' && typeof (value as any).buildSql === 'function') {
+        // An `sql` expression (a condition arrives as one, see selectorProjectingConditions)
+        const buildContext = { paramCounter: context.paramCounter, params: context.allParams };
+        const expressionSql = (value as any).buildSql(buildContext);
+        context.paramCounter = buildContext.paramCounter;
+        selectParts.push(`${expressionSql} as "${key}"`);
+      } else if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+        // A list or an object of values reads back as itself (see readRows) and needs no column; one
+        // holding columns has no one SQL value — it used to be bound as ONE parameter, the column
+        // refs serialized into it, and read back as that text
+        if (holdsSqlValue(value)) {
+          throw new Error(
+            `JoinQueryBuilder select(): "${key}" is ${Array.isArray(value) ? 'an array' : 'an object'} of columns or expressions, `
+            + 'which a join cannot project — select each column as a field of its own'
+          );
+        }
       } else {
         // Literal value
-        selectParts.push(`$${context.paramCounter++} as "${key}"`);
-        context.allParams.push(value);
+        const literalContext = { paramCounter: context.paramCounter, allParams: context.allParams };
+        const literalSql = projectionLiteralSql(value, literalContext);
+        context.paramCounter = literalContext.paramCounter;
+        selectParts.push(`${literalSql} as "${key}"`);
       }
     }
 

@@ -1,20 +1,18 @@
 import { DatabaseClient } from '../../database/database-client.interface';
-import { collectionMarkerPattern } from '../query-utils';
 import {
   ICollectionStrategy,
   CollectionStrategyType,
   CollectionAggregationConfig,
   CollectionAggregationResult,
-  SelectedField,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { buildLiteralOnlyPredicates } from '../join-utils';
+import { CteCollectionStrategy } from './cte-collection-strategy';
 
 /**
  * Temp table-based collection strategy
  *
  * This strategy uses PostgreSQL temporary tables to store parent IDs,
- * then JOINs against them to aggregate related records.
+ * then aggregates the related records of exactly those parents.
  *
  * Benefits:
  * - Better performance for large datasets
@@ -26,6 +24,12 @@ import { buildLiteralOnlyPredicates } from '../join-utils';
  * - Needs temp table management
  * - Transaction-scoped temp tables
  *
+ * The aggregation itself is the CTE strategy's aggregation SELECT (see
+ * CteCollectionStrategy.buildAggregationSelect) restricted to the parents in the temp table, so
+ * both strategies render a collection's navigations, WHERE, ORDER BY, LIMIT / OFFSET, aggregates
+ * and nested collections the same way. The temp-table strategy used to aggregate
+ * `SELECT * FROM <target>` directly, which had no navigation joins at all.
+ *
  * SQL Pattern:
  * ```sql
  * CREATE TEMP TABLE tmp_parent_ids_0 (
@@ -35,53 +39,21 @@ import { buildLiteralOnlyPredicates } from '../join-utils';
  * INSERT INTO tmp_parent_ids_0 VALUES (1),(2),(3);
  *
  * SELECT
- *   t.id as parent_id,
- *   json_agg(
- *     json_build_object('id', p.id, 'title', p.title)
- *     ORDER BY p.views DESC
- *   ) as data
- * FROM tmp_parent_ids_0 t
- * LEFT JOIN posts p ON p.user_id = t.id AND p.views > $1
- * GROUP BY t.id;
+ *   "__fk_user_id" as parent_id,
+ *   json_agg(json_build_object('id', "id", 'title', "title") ORDER BY "__order_0" DESC) as data
+ * FROM (
+ *   SELECT "posts"."user_id" as "__fk_user_id", "id", "title", "posts"."views" as "__order_0"
+ *   FROM "posts"
+ *   WHERE "posts"."user_id" IN (SELECT id FROM tmp_parent_ids_0) AND "views" > $1
+ * ) sub
+ * GROUP BY "__fk_user_id";
  * ```
  */
 export class TempTableCollectionStrategy implements ICollectionStrategy {
+  private readonly aggregations = new CteCollectionStrategy();
+
   getType(): CollectionStrategyType {
     return 'temptable';
-  }
-
-  /**
-   * Helper to rewrite the collection marker alias to the actual table name
-   * For temp table strategy, we use the actual table name (no aliasing), so marker becomes table name
-   */
-  private rewriteCollectionMarker(expr: string | undefined, targetTable: string): string | undefined {
-    if (!expr) return expr;
-    const markerPattern = collectionMarkerPattern(targetTable, false);
-    return expr.replace(markerPattern, `"${targetTable}"`);
-  }
-
-  /**
-   * Compose the trailing AND-clauses appended after the temp-table IN filter.
-   * Combines the user's where clause (already rewritten for collection markers)
-   * with any literal FK predicates declared on the navigation (e.g. SCD2
-   * `is_current = TRUE`). Returns "" or " AND <preds...>". Without this, the
-   * temptable strategy leaks SCD2-closed target rows into the projection — the
-   * exact constant-FK projection symptom.
-   */
-  private buildAdditionalWhere(
-    config: CollectionAggregationConfig,
-    targetTable: string,
-    rewrittenWhereClause: string | undefined,
-  ): string {
-    const literalPreds = buildLiteralOnlyPredicates(targetTable, config.foreignKeys, config.matches);
-    const parts: string[] = [];
-    if (literalPreds.length > 0) {
-      parts.push(...literalPreds);
-    }
-    if (rewrittenWhereClause) {
-      parts.push(rewrittenWhereClause);
-    }
-    return parts.length > 0 ? ` AND ${parts.join(' AND ')}` : '';
   }
 
   requiresParentIds(): boolean {
@@ -94,53 +66,72 @@ export class TempTableCollectionStrategy implements ICollectionStrategy {
     context: QueryContext,
     client: DatabaseClient
   ): Promise<CollectionAggregationResult> {
-    if (!config.parentIds || config.parentIds.length === 0) {
+    // Several rows can share one parent (a collection hanging off a navigation), and a row
+    // without that navigation has none: the temp table's primary key takes each parent once
+    const parentIds = [...new Set((config.parentIds ?? []).filter(id => id !== null && id !== undefined))];
+
+    if (parentIds.length === 0) {
       // No parent IDs means we'll return empty results
-      // We can still create an empty temp table for consistency
-      return this.buildEmptyAggregation(config, context);
+      return this.buildEmptyAggregation(config);
     }
 
+    const tempTableName = `tmp_parent_ids_${config.counter}`;
+    const fkTable = config.foreignKeyTableAlias || config.targetTable;
+    const multiStatement = client.supportsMultiStatementQueries();
+    const aggregationSQL = this.aggregations.buildAggregationSelect(
+      // The multi-statement path lists with json_agg: identical element values for the
+      // toNumberList/toStringList use-cases, and it keeps native Postgres arrays off the wire —
+      // Bun's SQL client cannot decode binary array results
+      multiStatement && config.aggregationType === 'array' ? { ...config, useJsonArrayAggregation: true } : config,
+      `"${fkTable}"."${config.foreignKey}" IN (SELECT id FROM ${tempTableName})`
+    );
+    // The statement's own parameters: the collection is built with its own numbering from $1
+    const aggregationParams = context.allParams;
+
     // Check if client supports multi-statement queries for optimization
-    if (client.supportsMultiStatementQueries()) {
-      return this.buildAggregationMultiStatement(config, context, client);
-    } else {
-      return this.buildAggregationLegacy(config, context, client);
+    if (multiStatement) {
+      return this.buildAggregationMultiStatement(config, context, client, tempTableName, parentIds, aggregationSQL, aggregationParams);
     }
+
+    return this.buildAggregationLegacy(config, context, client, tempTableName, parentIds, aggregationSQL, aggregationParams);
+  }
+
+  /** The SQL type of the temp table's parent id column: the parent key's own type. */
+  private parentIdType(config: CollectionAggregationConfig): string {
+    return config.parentKeyType ?? 'integer';
   }
 
   /**
    * Build aggregation using multi-statement query (single round trip)
-   * Supported by postgres.js using .simple() mode
-   *
-   * Uses the same server-side aggregation SQL as the legacy path (json_agg /
-   * scalar aggregates) so both execution modes return identical values; only
-   * the transport differs (one multi-statement round trip vs several queries).
+   * Supported by postgres.js using .simple() mode — which takes no parameters, so every
+   * parameter of the aggregation is written into the statement as a literal.
    */
   private async buildAggregationMultiStatement(
     config: CollectionAggregationConfig,
     context: QueryContext,
-    client: DatabaseClient
+    client: DatabaseClient,
+    tempTableName: string,
+    parentIds: any[],
+    aggregationSQL: string,
+    aggregationParams: any[]
   ): Promise<CollectionAggregationResult> {
-    const tempTableName = `tmp_parent_ids_${config.counter}`;
+    const interpolatedSQL = TempTableCollectionStrategy.interpolateParams(aggregationSQL, aggregationParams);
 
-    // Build aggregation SQL with WHERE parameters interpolated
-    const aggregationSQL = this.buildAggregationSQLWithInterpolatedParams(config, tempTableName);
-
-    // Build the value placeholders for INSERT (interpolate integer parent IDs - safe)
-    const valuePlaceholders = config.parentIds!.map(id => `(${id})`).join(',');
+    // The parent ids go in as literals too
+    const valuePlaceholders = parentIds.map(id => `(${TempTableCollectionStrategy.escapeValue(id)})`).join(',');
 
     // Combine everything into a single multi-statement query
     const multiStatementSQL = `
 -- Create temporary table for parent IDs
 CREATE TEMP TABLE ${tempTableName} (
-  id integer PRIMARY KEY
+  id ${this.parentIdType(config)} PRIMARY KEY
 ) ON COMMIT DROP;
 
 -- Insert parent IDs
 INSERT INTO ${tempTableName} VALUES ${valuePlaceholders};
 
 -- Query and return the data
-${aggregationSQL};
+${interpolatedSQL};
 
 -- Cleanup
 DROP TABLE IF EXISTS ${tempTableName};
@@ -164,7 +155,7 @@ DROP TABLE IF EXISTS ${tempTableName};
 
     // Group results by parent_id — every aggregation type returns
     // (parent_id, data) rows, aggregated server-side.
-    const dataMap = new Map<number, any>();
+    const dataMap = new Map<any, any>();
 
     for (const row of result.rows) {
       dataMap.set(row.parent_id, row.data);
@@ -172,7 +163,7 @@ DROP TABLE IF EXISTS ${tempTableName};
 
     // Return result with fetched data
     return {
-      sql: aggregationSQL,
+      sql: interpolatedSQL,
       params: [], // Params already used in execution
       tableName: `${tempTableName}_result`,
       joinClause: '', // Not needed - data already fetched
@@ -190,14 +181,16 @@ DROP TABLE IF EXISTS ${tempTableName};
   private async buildAggregationLegacy(
     config: CollectionAggregationConfig,
     context: QueryContext,
-    client: DatabaseClient
+    client: DatabaseClient,
+    tempTableName: string,
+    parentIds: any[],
+    aggregationSQL: string,
+    aggregationParams: any[]
   ): Promise<CollectionAggregationResult> {
-    const tempTableName = `tmp_parent_ids_${config.counter}`;
-
     // Create temp table (without ON COMMIT DROP to persist across queries in the same session)
     const createTableSQL = `
 CREATE TEMP TABLE IF NOT EXISTS ${tempTableName} (
-  id integer PRIMARY KEY
+  id ${this.parentIdType(config)} PRIMARY KEY
 )
     `.trim();
 
@@ -209,24 +202,16 @@ CREATE TEMP TABLE IF NOT EXISTS ${tempTableName} (
     }
 
     // Insert parent IDs
-    const valuePlaceholders = config.parentIds!.map((_, idx) => `($${idx + 1})`).join(',');
+    const valuePlaceholders = parentIds.map((_, idx) => `($${idx + 1})`).join(',');
     const insertSQL = `INSERT INTO ${tempTableName} VALUES ${valuePlaceholders}`;
 
     // Use executor from context if available for query logging
     if (context.executor) {
-      await context.executor.query(insertSQL, config.parentIds);
+      await context.executor.query(insertSQL, parentIds);
     } else {
-      await client.query(insertSQL, config.parentIds);
+      await client.query(insertSQL, parentIds);
     }
 
-    // Renumber parameters in whereClause to start from $1 for this standalone query
-    // The config.whereClause may have placeholders like $5, $6 from the global context,
-    // but since we're executing as a separate query, we need $1, $2, etc.
-    const renumberedConfig = this.renumberWhereParams(config);
-
-    // Build aggregation query based on type
-    const aggregationSQL = this.buildAggregationSQLByType(renumberedConfig, tempTableName);
-    const aggregationParams: any[] = renumberedConfig.whereParams || [];
     const selectExpression = `"${tempTableName}_agg".data`;
 
     // Execute aggregation query and store results in another temp table
@@ -258,145 +243,165 @@ ${aggregationSQL}
   }
 
   /**
-   * Renumber parameter placeholders in whereClause to start from $1
-   * This is needed because the whereClause is built with global param numbering,
-   * but the legacy strategy executes it as a standalone query.
+   * Writes every `$n` placeholder of `sql` as the literal of `params[n - 1]`, for a statement run
+   * without parameters (the simple protocol). What PostgreSQL itself would not read as a placeholder
+   * is copied verbatim: quoted literals and identifiers, dollar-quoted strings (`$$…$$`,
+   * `$tag$…$tag$`), `--` and `/* … *\/` comments, and a `$` inside an identifier (`col$1`). `$12` is
+   * one placeholder, not `$1` followed by `2`.
    */
-  private renumberWhereParams(config: CollectionAggregationConfig): CollectionAggregationConfig {
-    if (!config.whereClause || !config.whereParams || config.whereParams.length === 0) {
-      return config;
+  static interpolateParams(sql: string, params: readonly any[]): string {
+    if (params.length === 0) {
+      return sql;
     }
 
-    // Find all $N placeholders and renumber them starting from $1
-    let newWhereClause = config.whereClause;
-    const paramRegex = /\$(\d+)/g;
-    const matches = [...config.whereClause.matchAll(paramRegex)];
+    let out = '';
+    let i = 0;
 
-    if (matches.length === 0) {
-      return config;
-    }
+    while (i < sql.length) {
+      const char = sql[i];
 
-    // Get the original parameter numbers in order of appearance
-    const originalNumbers = matches.map(m => parseInt(m[1], 10));
-
-    // Create a mapping from original number to new number (1-based)
-    const numberMap = new Map<number, number>();
-    let newIndex = 1;
-    for (const origNum of originalNumbers) {
-      if (!numberMap.has(origNum)) {
-        numberMap.set(origNum, newIndex++);
+      if (char === '-' && sql[i + 1] === '-') {
+        // A line comment: up to the end of the line
+        const newline = sql.indexOf('\n', i);
+        const end = newline === -1 ? sql.length : newline;
+        out += sql.slice(i, end);
+        i = end;
+        continue;
       }
+
+      if (char === '/' && sql[i + 1] === '*') {
+        // A block comment — they nest in PostgreSQL
+        let depth = 1;
+        let end = i + 2;
+
+        while (end < sql.length && depth > 0) {
+          if (sql[end] === '/' && sql[end + 1] === '*') {
+            depth++;
+            end += 2;
+          } else if (sql[end] === '*' && sql[end + 1] === '/') {
+            depth--;
+            end += 2;
+          } else {
+            end++;
+          }
+        }
+
+        out += sql.slice(i, end);
+        i = end;
+        continue;
+      }
+
+      if (char === '$' && i > 0 && TempTableCollectionStrategy.isIdentifierChar(sql[i - 1])) {
+        // Part of an identifier (`col$1`), not a placeholder or a dollar quote
+        out += char;
+        i++;
+        continue;
+      }
+
+      if (char === '$' && !/[0-9]/.test(sql[i + 1] ?? '')) {
+        // A dollar-quoted string: `$tag$` up to the next `$tag$`
+        const opener = /^\$([A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*)?\$/.exec(sql.slice(i));
+
+        if (opener !== null) {
+          const close = sql.indexOf(opener[0], i + opener[0].length);
+          const end = close === -1 ? sql.length : close + opener[0].length;
+          out += sql.slice(i, end);
+          i = end;
+          continue;
+        }
+      }
+
+      if (char === "'" || char === '"') {
+        // A quoted literal / identifier: up to its closing quote ('' / "" escape the quote; an
+        // E'…' string also escapes it with a backslash)
+        const escapeString = char === "'" && i > 0 && (sql[i - 1] === 'E' || sql[i - 1] === 'e');
+        let end = i + 1;
+
+        while (end < sql.length) {
+          if (escapeString && sql[end] === '\\') {
+            end += 2;
+            continue;
+          }
+
+          if (sql[end] === char) {
+            if (sql[end + 1] === char) {
+              end += 2;
+              continue;
+            }
+
+            break;
+          }
+
+          end++;
+        }
+
+        out += sql.slice(i, end + 1);
+        i = end + 1;
+        continue;
+      }
+
+      if (char === '$' && /[0-9]/.test(sql[i + 1] ?? '')) {
+        let end = i + 1;
+
+        while (end < sql.length && /[0-9]/.test(sql[end])) {
+          end++;
+        }
+
+        const index = Number(sql.slice(i + 1, end)) - 1;
+
+        if (index < 0 || index >= params.length) {
+          throw new Error(`The temp-table aggregation refers to parameter $${index + 1}, but it has ${params.length}.`);
+        }
+
+        out += TempTableCollectionStrategy.escapeValue(params[index]);
+        i = end;
+        continue;
+      }
+
+      out += char;
+      i++;
     }
 
-    // Replace all placeholders with their new numbers
-    newWhereClause = config.whereClause.replace(paramRegex, (_, num) => {
-      const newNum = numberMap.get(parseInt(num, 10));
-      return `$${newNum}`;
-    });
+    return out;
+  }
 
-    return {
-      ...config,
-      whereClause: newWhereClause,
-    };
+  /** Whether `char` can continue an identifier (a `$` right after one is part of it). */
+  private static isIdentifierChar(char: string): boolean {
+    return /[A-Za-z0-9_$\u0080-￿]/.test(char);
   }
 
   /**
-   * Build aggregation SQL based on aggregation type
+   * A string literal of `text`. Quotes are doubled; a text with a backslash is written as an
+   * `E'…'` string with its backslashes doubled too — a plain `'…'` string reads a backslash as an
+   * escape when `standard_conforming_strings` is off, and `E'…'` reads it the same way under both.
    */
-  private buildAggregationSQLByType(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    switch (config.aggregationType) {
-      case 'jsonb':
-        return this.buildJsonbAggregationSQL(config, tempTableName);
+  private static quoteString(text: string): string {
+    const quoted = text.replace(/'/g, "''");
 
-      case 'array':
-        return this.buildArrayAggregationSQL(config, tempTableName);
-
-      case 'count':
-      case 'min':
-      case 'max':
-      case 'sum':
-        return this.buildScalarAggregationSQL(config, tempTableName);
-
-      case 'exists':
-        return this.buildExistsAggregationSQL(config, tempTableName);
-
-      default:
-        throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
-    }
-  }
-
-  /**
-   * Build aggregation SQL with WHERE parameters interpolated
-   * Used for multi-statement queries with .simple() mode
-   *
-   * For JSONB/array aggregations, this returns a simple SELECT without aggregation
-   * so we can group in JavaScript (much faster than json_agg)
-   */
-  private buildAggregationSQLWithInterpolatedParams(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    // Clone config and interpolate WHERE parameters
-    const configWithInterpolatedParams = { ...config };
-
-    if (config.whereClause && config.whereParams && config.whereParams.length > 0) {
-      // Replace $1, $2, etc. with actual values
-      let interpolatedWhere = config.whereClause;
-      config.whereParams.forEach((param, idx) => {
-        const placeholder = `$${idx + 1}`;
-        const value = this.escapeValue(param);
-        interpolatedWhere = interpolatedWhere.replace(placeholder, value);
-      });
-      configWithInterpolatedParams.whereClause = interpolatedWhere;
-      configWithInterpolatedParams.whereParams = []; // Clear params since they're now interpolated
-    }
-
-    // Use the SAME server-side aggregation SQL as the legacy path so both
-    // execution modes produce identical value semantics (json_agg turns
-    // numerics into JSON numbers and timestamps into ISO strings — client-side
-    // row grouping used to leak driver-native values like numeric strings and
-    // Date objects, diverging from the CTE/lateral/legacy strategies).
-    switch (config.aggregationType) {
-      case 'jsonb':
-        return this.buildJsonbAggregationSQL(configWithInterpolatedParams, tempTableName);
-
-      case 'array':
-        // json_agg instead of array_agg: identical element values for the
-        // list use-cases (toNumberList/toStringList), and it keeps native
-        // Postgres arrays off the wire — Bun's SQL client cannot decode
-        // binary array results (see debug/bun-sql-binary-array-repro.ts).
-        return this.buildArrayAggregationSQL(configWithInterpolatedParams, tempTableName, true);
-
-      case 'count':
-      case 'min':
-      case 'max':
-      case 'sum':
-        // Scalar aggregations still need database aggregation
-        return this.buildScalarAggregationSQL(configWithInterpolatedParams, tempTableName);
-
-      case 'exists':
-        // EXISTS aggregation needs database aggregation
-        return this.buildExistsAggregationSQL(configWithInterpolatedParams, tempTableName);
-
-      default:
-        throw new Error(`Unknown aggregation type: ${config.aggregationType}`);
-    }
+    return text.includes('\\') ? `E'${quoted.replace(/\\/g, '\\\\')}'` : `'${quoted}'`;
   }
 
   /**
    * Safely escape a value for SQL interpolation
    * Used only in multi-statement queries with .simple() mode
    */
-  private escapeValue(value: any): string {
+  static escapeValue(value: any): string {
     if (value === null || value === undefined) {
       return 'NULL';
     }
 
     if (typeof value === 'number') {
-      return String(value);
+      if (!Number.isFinite(value)) {
+        // NaN / ±Infinity have no numeric literal: the quoted forms convert by context
+        return `'${Number.isNaN(value) ? 'NaN' : value > 0 ? 'Infinity' : '-Infinity'}'`;
+      }
+
+      // Parenthesized when negative: `a-$1` must not become the comment `a--1`
+      return value < 0 ? `(${String(value)})` : String(value);
+    }
+
+    if (typeof value === 'bigint') {
+      return value < 0n ? `(${String(value)})` : String(value);
     }
 
     if (typeof value === 'boolean') {
@@ -404,25 +409,38 @@ ${aggregationSQL}
     }
 
     if (typeof value === 'string') {
-      // Escape single quotes by doubling them (PostgreSQL standard)
-      return `'${value.replace(/'/g, "''")}'`;
+      return TempTableCollectionStrategy.quoteString(value);
     }
 
     if (value instanceof Date) {
       return `'${value.toISOString()}'`;
     }
 
-    // For arrays, objects, etc., convert to JSON string
-    return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+    if (Array.isArray(value)) {
+      // A PostgreSQL array literal ('{1,2}' / '{"a","b"}'), cast by the statement's own `::type[]`
+      const elements = value.map(element => {
+        if (element === null || element === undefined) {
+          return 'NULL';
+        }
+
+        if (typeof element === 'number' || typeof element === 'bigint' || typeof element === 'boolean') {
+          return String(element);
+        }
+
+        return `"${String(element instanceof Date ? element.toISOString() : element).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+      });
+
+      return TempTableCollectionStrategy.quoteString(`{${elements.join(',')}}`);
+    }
+
+    // For objects etc., convert to JSON string
+    return TempTableCollectionStrategy.quoteString(JSON.stringify(value));
   }
 
   /**
    * Build aggregation for when there are no parent IDs
    */
-  private buildEmptyAggregation(
-    config: CollectionAggregationConfig,
-    context: QueryContext
-  ): CollectionAggregationResult {
+  private buildEmptyAggregation(config: CollectionAggregationConfig): CollectionAggregationResult {
     // Return a result that will always give empty/default values
     const dummyTableName = `empty_agg_${config.counter}`;
 
@@ -434,282 +452,5 @@ ${aggregationSQL}
       selectExpression: config.defaultValue, // Just use default value
       isCTE: false,
     };
-  }
-
-  /**
-   * Build JSONB aggregation using temp table
-   *
-   * When LIMIT/OFFSET is specified, uses ROW_NUMBER() window function to correctly
-   * apply pagination per parent row (not globally).
-   */
-  private buildJsonbAggregationSQL(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    const { selectedFields, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue, isDistinct } = config;
-
-    // Helper to build json_build_object expression (handles nested structures)
-    const buildJsonbObject = (fields: SelectedField[], prefix: string = '', tableAlias: string = 't'): string => {
-      const parts: string[] = [];
-      for (const field of fields) {
-        if (field.nested) {
-          // Nested object - recurse
-          const nestedJsonb = buildJsonbObject(field.nested, prefix ? `${prefix}__${field.alias}` : field.alias, tableAlias);
-          parts.push(`'${field.alias}', ${nestedJsonb}`);
-        } else if (field.expression) {
-          // Leaf field - reference the column via table alias
-          parts.push(`'${field.alias}', ${tableAlias}.${field.expression}`);
-        }
-      }
-      return `json_build_object(${parts.join(', ')})`;
-    };
-
-    // Build the JSONB fields for json_build_object (handles nested structures)
-    const jsonbObjectExpr = buildJsonbObject(selectedFields);
-
-    // Build WHERE clause (combine temp table join with additional filters, rewrite markers)
-    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
-
-    // Build ORDER BY clause (use primary key DESC as default for consistent ordering matching JSONB)
-    const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
-
-    // Build json_agg ORDER BY clause (uses aliases since it operates on subquery output)
-    const jsonbAggOrderBy = orderByClauseAlias ? ` ORDER BY ${orderByClauseAlias}` : '';
-
-    // If LIMIT or OFFSET is specified, use ROW_NUMBER() for per-parent pagination
-    if (limitValue !== undefined || offsetValue !== undefined) {
-      return this.buildJsonbAggregationSQLWithRowNumber(
-        config, tempTableName, jsonbObjectExpr, additionalWhere
-      );
-    }
-
-    // No LIMIT/OFFSET - use simple aggregation
-    const sql = `
-SELECT
-  t."${foreignKey}" as parent_id,
-  json_agg(
-    ${jsonbObjectExpr}${jsonbAggOrderBy}
-  ) as data
-FROM (
-  SELECT *
-  FROM "${targetTable}"
-  WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-  ${orderBySQL}
-) t
-GROUP BY t."${foreignKey}"
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build JSONB aggregation with ROW_NUMBER() for per-parent LIMIT/OFFSET
-   */
-  private buildJsonbAggregationSQLWithRowNumber(
-    config: CollectionAggregationConfig,
-    tempTableName: string,
-    jsonbObjectExpr: string,
-    additionalWhere: string
-  ): string {
-    const { targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
-
-    // Build ORDER BY for ROW_NUMBER() - use the order clause or default to id DESC
-    const rowNumberOrderBy = orderByClause || `"id" DESC`;
-
-    // Build the row number filter condition
-    const offset = offsetValue || 0;
-    let rowNumberFilter: string;
-    if (limitValue !== undefined) {
-      rowNumberFilter = `WHERE "__rn" > ${offset} AND "__rn" <= ${offset + limitValue}`;
-    } else {
-      rowNumberFilter = `WHERE "__rn" > ${offset}`;
-    }
-
-    const sql = `
-SELECT
-  t."${foreignKey}" as parent_id,
-  json_agg(
-    ${jsonbObjectExpr}
-  ) as data
-FROM (
-  SELECT *, ROW_NUMBER() OVER (PARTITION BY "${foreignKey}" ORDER BY ${rowNumberOrderBy}) as "__rn"
-  FROM "${targetTable}"
-  WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-) t
-${rowNumberFilter}
-GROUP BY t."${foreignKey}"
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build array aggregation using temp table
-   *
-   * When LIMIT/OFFSET is specified, uses ROW_NUMBER() window function to correctly
-   * apply pagination per parent row (not globally).
-   */
-  private buildArrayAggregationSQL(
-    config: CollectionAggregationConfig,
-    tempTableName: string,
-    useJsonAgg: boolean = false
-  ): string {
-    const { arrayField, targetTable, foreignKey, whereClause, orderByClause, orderByClauseAlias, limitValue, offsetValue } = config;
-
-    if (!arrayField) {
-      throw new Error('arrayField is required for array aggregation');
-    }
-
-    // Build WHERE clause (rewrite collection markers)
-    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
-
-    // Build ORDER BY clause (use primary key DESC as default for consistent ordering matching JSONB)
-    const orderBySQL = orderByClause ? `ORDER BY ${orderByClause}` : `ORDER BY "id" DESC`;
-
-    // Build array_agg ORDER BY clause (uses aliases since it operates on subquery output)
-    const arrayAggOrderBy = orderByClauseAlias ? ` ORDER BY ${orderByClauseAlias}` : '';
-
-    // If LIMIT or OFFSET is specified, use ROW_NUMBER() for per-parent pagination
-    if (limitValue !== undefined || offsetValue !== undefined) {
-      return this.buildArrayAggregationSQLWithRowNumber(
-        config, tempTableName, additionalWhere, useJsonAgg
-      );
-    }
-
-    const aggFn = useJsonAgg ? 'json_agg' : 'array_agg';
-
-    // No LIMIT/OFFSET - use simple aggregation
-    const sql = `
-SELECT
-  t."${foreignKey}" as parent_id,
-  ${aggFn}(t."${arrayField}"${arrayAggOrderBy}) as data
-FROM (
-  SELECT "${foreignKey}", "${arrayField}"
-  FROM "${targetTable}"
-  WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-  ${orderBySQL}
-) t
-GROUP BY t."${foreignKey}"
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build array aggregation with ROW_NUMBER() for per-parent LIMIT/OFFSET
-   */
-  private buildArrayAggregationSQLWithRowNumber(
-    config: CollectionAggregationConfig,
-    tempTableName: string,
-    additionalWhere: string,
-    useJsonAgg: boolean = false
-  ): string {
-    const { arrayField, targetTable, foreignKey, orderByClause, limitValue, offsetValue } = config;
-
-    // Build ORDER BY for ROW_NUMBER() - use the order clause or default to id DESC
-    const rowNumberOrderBy = orderByClause || `"id" DESC`;
-
-    // Build the row number filter condition
-    const offset = offsetValue || 0;
-    let rowNumberFilter: string;
-    if (limitValue !== undefined) {
-      rowNumberFilter = `WHERE "__rn" > ${offset} AND "__rn" <= ${offset + limitValue}`;
-    } else {
-      rowNumberFilter = `WHERE "__rn" > ${offset}`;
-    }
-
-    const aggFn = useJsonAgg ? 'json_agg' : 'array_agg';
-
-    const sql = `
-SELECT
-  t."${foreignKey}" as parent_id,
-  ${aggFn}(t."${arrayField}") as data
-FROM (
-  SELECT "${foreignKey}", "${arrayField}", ROW_NUMBER() OVER (PARTITION BY "${foreignKey}" ORDER BY ${rowNumberOrderBy}) as "__rn"
-  FROM "${targetTable}"
-  WHERE "${foreignKey}" IN (SELECT id FROM ${tempTableName})${additionalWhere}
-) t
-${rowNumberFilter}
-GROUP BY t."${foreignKey}"
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build scalar aggregation using temp table
-   */
-  private buildScalarAggregationSQL(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    const { aggregationType, aggregateField, aggregateExpression: aggregateExprFromConfig, targetTable, foreignKey, whereClause } = config;
-
-    // Build WHERE clause (rewrite collection markers)
-    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
-
-    // Build aggregation expression
-    // Use targetTable as alias to match field references in whereClause
-    let aggregateExpression: string;
-    switch (aggregationType) {
-      case 'count':
-        // Count only rows where there's an actual join match (not the temp table row)
-        aggregateExpression = `COUNT("${targetTable}"."${foreignKey}")`;
-        break;
-      case 'min':
-      case 'max':
-      case 'sum':
-        if (aggregateExprFromConfig) {
-          // Nested scalar-subquery summand (e.g. sum(row => other.count()))
-          aggregateExpression = `${aggregationType.toUpperCase()}(${aggregateExprFromConfig})`;
-        } else if (aggregateField) {
-          aggregateExpression = `${aggregationType.toUpperCase()}("${targetTable}"."${aggregateField}")`;
-        } else {
-          throw new Error(`${aggregationType.toUpperCase()} requires an aggregate field`);
-        }
-        break;
-      default:
-        throw new Error(`Unknown aggregation type: ${aggregationType}`);
-    }
-
-    const sql = `
-SELECT
-  tmp.id as parent_id,
-  COALESCE(${aggregateExpression}, ${config.defaultValue}) as data
-FROM ${tempTableName} tmp
-LEFT JOIN "${targetTable}" ON "${targetTable}"."${foreignKey}" = tmp.id${additionalWhere}
-GROUP BY tmp.id
-    `.trim();
-
-    return sql;
-  }
-
-  /**
-   * Build EXISTS aggregation using temp table
-   * Returns true for each parent that has at least one child row
-   */
-  private buildExistsAggregationSQL(
-    config: CollectionAggregationConfig,
-    tempTableName: string
-  ): string {
-    const { targetTable, foreignKey, whereClause } = config;
-
-    // Build WHERE clause (rewrite collection markers)
-    const rewrittenWhereClause = this.rewriteCollectionMarker(whereClause, targetTable);
-    const additionalWhere = this.buildAdditionalWhere(config, targetTable, rewrittenWhereClause);
-
-    const sql = `
-SELECT
-  tmp.id as parent_id,
-  COALESCE(bool_or(("${targetTable}"."${foreignKey}" IS NOT NULL)), false) as data
-FROM ${tempTableName} tmp
-LEFT JOIN "${targetTable}" ON "${targetTable}"."${foreignKey}" = tmp.id${additionalWhere}
-GROUP BY tmp.id
-    `.trim();
-
-    return sql;
   }
 }

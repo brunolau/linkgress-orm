@@ -156,6 +156,16 @@ export abstract class DatabaseClient {
   supportsBinaryArrayResults(): boolean {
     return true;
   }
+
+  /**
+   * Whether a numeric ZERO read through this client loses its scale — `0.0000` arriving as `"0"`
+   * (Bun's binary numeric decoder; every other value keeps its scale). The query builders then
+   * restore it for a column declared with one (`decimal('price', 10, 4)`).
+   * Default: false.
+   */
+  losesNumericZeroScale(): boolean {
+    return false;
+  }
 }
 
 /**
@@ -210,5 +220,9 @@ export class TransactionalClient extends DatabaseClient {
 
   supportsBinaryArrayResults(): boolean {
     return this.parentClient.supportsBinaryArrayResults();
+  }
+
+  losesNumericZeroScale(): boolean {
+    return this.parentClient.losesNumericZeroScale();
   }
 }

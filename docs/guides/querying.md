@@ -36,6 +36,111 @@ const users = await db.users
 // Array<{ id: number; username: string }>
 ```
 
+A selector that returns ONE column or expression — not an object — reads as the list of that value:
+
+```typescript
+const names = await db.users.orderBy(u => u.username).select(u => u.username).toList();
+// string[] — ['alice', 'bob']
+
+const cities = await db.users.select(u => u.address!.city).toList();        // a navigation's column, joined
+const loud = await db.users.select(u => sql<string>`upper(${u.username})`).toList();
+const first = await db.users.orderBy(u => u.id).select(u => u.email).firstOrDefault();  // string | null
+```
+
+The same holds in a collection (`u.posts!.select(p => p.title).toList()` is a `string[]`,
+`.firstOrDefault()` a `string | null`), in a union, a batch, `countOver()` and a mutation's RETURNING.
+The value reads through its column's mapper. Such a query's SQL still names its column by the column's
+name, so it can serve as a subquery or CTE body as before. (A root query used to return empty objects
+here, and a collection `{ column: value }` objects.)
+
+A selector returning ONE literal reads as that literal on every row — at the root, in a collection
+(`toList()`, `firstOrDefault()`, `toNumberList()`, `toStringList()`) and in UNION legs:
+
+```typescript
+await db.users.select(() => 'x').toList();                        // ['x', 'x', 'x']
+await db.users.select(u => ({ flags: u.posts!.select(() => 1).toNumberList() })).toList();
+```
+
+(A string used to be walked as an object of its characters — `[{ "0": "x" }]` — and a number projected no
+column at all.)
+
+A condition placed in a projection selects as a boolean column, at the top level or inside a nested
+object:
+
+```typescript
+const users = await db.users
+  .select(u => ({
+    username: u.username,
+    isAdult: gte(u.age, 18),                          // boolean
+    flags: { hasEmail: isNotNull(u.email) },          // { hasEmail: boolean }
+  }))
+  .toList();
+```
+
+A literal in a projection — `'member'`, `42`, `true`, `null`, a `Date`, a list of values — is a value,
+as its type says, and reads back as exactly that value: at the top level, inside a nested object, in a
+collection's items, in a grouped query and in a join of one.
+
+```typescript
+const rows = await db.users.select(u => ({
+  id: u.id,
+  kind: 'member',                       // 'member' — bound as a parameter
+  since: new Date('2020-01-01'),        // the Date itself
+  flags: { vip: false, tier: 2 },       // { vip: false, tier: 2 }
+  posts: u.posts!.select(p => ({ title: p.title, source: 'blog' })).toList(),
+})).toList();
+```
+
+- A **string** is a value too. It used to be taken for a COLUMN NAME: `kind: 'member'` failed
+  ("column users.member does not exist") and `kind: 'email'` silently returned the email column. Use
+  the column itself (`u.email`) to read one.
+- The statement still carries the literal as a parameter, so a query used as a subquery, a CTE body or
+  a UNION leg exposes it as a column. In a CTE body and a subquery it renders typed from its JS type
+  (`CAST($1 AS boolean)`, an integer, a double, text, a `timestamptz` for a `Date`, jsonb for a list of
+  values), so the query reading it sees a boolean, a number, a date (see the
+  [CTE guide](./cte-guide.md#how-a-ctes-columns-read-back)). A UNION leg binds it untyped: the database
+  hands such a parameter back as TEXT, so a UNION reads each leg's literal from its rows (`42` as `42`,
+  `true` as `"true"`) — every leg may project its own. For a discriminator the database should see typed
+  and inline, use [`literal('book')`](./sql-expressions.md#literals-typed-nulls-and-conditions-as-values).
+- A literal inside a nested object that also holds a `Date` or any other value object stays on the
+  flat path (the whole object used to be bound as one JSON parameter, mock column refs and all).
+- An array of COLUMNS (`{ pair: [u.id, u.username] }`, `[p.user]`) has no single SQL value and is
+  refused, naming the field — build the array in SQL (`sql\`ARRAY[...]\``, `jsonbBuildArray(...)`) or
+  select the columns as an object. (It used to vanish from the result, or — nested — be bound as a
+  parameter with the column refs serialized into it.) An array of values reads back as itself.
+
+### How Projected Values Read Back
+
+Every value of a projection reads back the way it would at the top level of its own table's query —
+through its column's mapper, typed as the driver types its column — wherever the projection puts it:
+
+```typescript
+const rows = await db.posts.select(p => ({
+  meta: {
+    time: p.publishTime,                                   // a mapped column: through its mapper
+    name: p.user!.username,                                // text stays text ('01234', not 1234)
+    loud: sql<string>`upper(${p.title})`.mapWith(v => `<${v}>`),
+    comments: p.postComments!.count(),                     // a count: a number
+  },
+  author: p.user,                                          // the navigation row, as its columns
+})).toList();
+```
+
+- **Nested objects** read each value its own way: a column through its mapper, an `sql` expression
+  through its `mapWith` (an expression's numeric string — a count, a SUM — as a number), NULL as null.
+  (Every numeric-looking string of a nested object used to become a number, and no mapper ran.)
+- **A navigation row projected whole** (`author: p.user`, `creator: t.level!.createdBy`, even the
+  root row, `me: u`) renders as its columns — flattened like a nested object — and reads back typed and
+  mapped: timestamps as `Date`s, mapped columns mapped. It works in `selectDistinct()`, UNION legs,
+  futures, prepared statements and next to collections under every strategy. A missing row (a LEFT
+  JOIN that found none) reads as an object of nulls. (It used to be ONE `json_build_object`: timestamps
+  came back as strings, mappers never ran, a DISTINCT over it failed and a UNION leg read back `"{}"`.)
+- **A column read through a navigation** keeps its type: a text or uuid column holding digits stays
+  text, a jsonb string stays a string. A numeric column read through a navigation (a decimal, an int8)
+  reads as a number, as it always has — at the top level of its own table the driver's string.
+- **A column of a CTE or a subquery** reads through the body column's own mapper — see the
+  [CTE guide](./cte-guide.md#how-a-ctes-columns-read-back).
+
 ### WHERE Filtering
 
 Filter records using type-safe condition functions:
@@ -249,6 +354,93 @@ const users = await db.users
   .toList();
 ```
 
+Every `orderBy()` — of a table, a projection, a collection, a grouped query, a union — takes the same
+forms:
+
+| Form | Example | Orders by |
+|---|---|---|
+| one key | `u => u.name` | `name ASC` |
+| keys | `u => [u.role, u.name]` | each ascending |
+| `[key, direction]` pairs | `u => [[u.role, 'DESC'], [u.name, 'ASC']]` | as given |
+| one flat pair | `u => [u.name, 'DESC']` | `name DESC` |
+| pairs and keys mixed | `u => [[u.role, 'DESC'], u.name]` | `role DESC, name ASC` |
+| a pair without direction | `u => [[u.name]]` | `name ASC` |
+
+A direction is `ASC` or `DESC`, optionally followed by `NULLS FIRST` / `NULLS LAST` (`'DESC NULLS LAST'`),
+in any case and spacing. PostgreSQL's defaults apply otherwise: NULLs sort last ascending and first
+descending.
+
+```typescript
+const members = await db.members
+  .orderBy(m => [[m.favoriteBookId, 'ASC NULLS FIRST'], m.name])
+  .toList();
+```
+
+A key that is `false`, `null` or `undefined` is left out, so a key can depend on a condition:
+
+```typescript
+const users = await db.users
+  .orderBy(u => [byRole && [u.role, 'DESC'], u.name])
+  .toList();
+```
+
+Anything else that is not a key is refused with the reason, where it used to be dropped from the
+ORDER BY without a word: a string (a column NAME — `'name'` — or a direction on its own), a number (an
+ORDER BY position), `true`, a function, a whole navigation row (`u => u.company` — order by one of its
+columns), a direction that is none, a pair of more than two values.
+
+A key can be a column of a navigation, before or after `select()`. Before it, the navigation is
+joined for the ORDER BY alone; after it, a key can be a projected column, a leaf of a nested object,
+a `sql` fragment, or a column of a navigation row projected whole:
+
+```typescript
+// Before select(): ordered by the book the loan's edition prints, then by the note
+const loans = await db.loans
+  .orderBy(ln => [[ln.edition!.book!.name, 'ASC'], [ln.note, 'DESC']])
+  .select(ln => ({ note: ln.note }))
+  .toList();
+
+// After select()
+const rows = await db.loans
+  .select(ln => ({ note: ln.note, printed: { book: ln.edition!.book!.name }, own: ln.book }))
+  .orderBy(r => [r.printed.book, r.own.name])
+  .toList();
+```
+
+A key keeps meaning the column it was written against: when a later `select()` renames or drops
+it, the query still orders by that column (and joins its navigation). A navigation keyed on a
+principal key other than `id` joins on that key; a missing (NULL) navigation sorts like NULL. Each
+`orderBy()` replaces the previous ordering — only the last one's navigations are joined.
+
+A key can also be an SQL expression — a `sql` fragment, a condition, or a collection's `count()` /
+`exists()`. It renders parenthesized, its parameters numbered with the query's, and the navigations it
+reads are joined:
+
+```typescript
+const loans = await db.loans
+  .orderBy(ln => [
+    [sql<number>`position(${'x'} in ${ln.note})`, 'DESC'],  // a bound parameter
+    [eq(ln.note, 'urgent'), 'DESC'],                         // a condition: TRUE first
+    [ln.id, 'ASC'],
+  ])
+  .toList();
+
+const busiest = await db.members
+  .orderBy(m => [[m.loans!.count(), 'DESC']])
+  .select(m => ({ name: m.name }))
+  .toList();
+
+// After select(), a fragment reads a projected COLUMN as that column — also under a path alias
+const rows = await db.loans
+  .select(ln => ({ id: ln.id, printed: ln.edition!.book!.name }))
+  .orderBy(r => [[sql<string>`lower(${r.printed})`, 'ASC']])
+  .toList();
+```
+
+A fragment written after `select()` cannot read a projected fragment or literal — there is no column
+behind it, and an output alias is visible to ORDER BY only standing alone. Order by that value itself
+(`orderBy(r => r.shout)`), or build the expression from its columns; `orderBy()` throws, naming the value.
+
 ### Pagination
 
 Limit and offset results:
@@ -379,6 +571,15 @@ const usersWithTopPosts = await db.users
   .toList();
 ```
 
+The keys are columns of the collection's item — whether the projection selects them or not, under
+the same name or another — or of its navigations (`p.category!.name`), or SQL expressions over them
+(`sql\`lower(${p.title})\``, a condition, a nested collection's `count()`). `limit()` / `offset()` apply
+per parent row, and a count, sum, min / max or flat list of a limited collection aggregates the rows
+the ordered, limited collection yields. Every collection strategy returns the same order. A
+`selectDistinct()` collection can only be ordered by values it selects; ordering it by anything else
+fails — linkgress refuses it naming the key, or, for a LATERAL list of objects, PostgreSQL refuses the
+statement.
+
 ### Collection Aggregations
 
 Aggregate data in nested collections:
@@ -398,32 +599,157 @@ const usersWithStats = await db.users
   .toList();
 ```
 
-## GROUP BY
-
-Group results and aggregate data:
+`min()`, `max()` and `sum()` also aggregate an `sql` expression of the item — with its parameters, the
+navigations it reads joined, the collection's `where()` / `orderBy()` / `limit()` applied, under every
+strategy, nested in another collection, and in a mutation's RETURNING:
 
 ```typescript
-// Group posts by user and count
-const postsByUser = await db.posts
-  .groupBy(p => p.userId)
-  .select(g => ({
-    userId: g.key,
-    postCount: g.count(),
-    totalViews: g.sum(p => p.views),
-    avgViews: g.avg(p => p.views)
+db.users.select(u => ({
+  longestTitle: u.posts!.max(p => sql<number>`length(${p.title})`),
+  weighted: u.posts!.where(p => gt(p.views, 0)).sum(p => sql<number>`${p.views} * ${2}`),
+}));
+```
+
+(Such a selector used to throw "MAX requires an aggregate field".) An `sql` expression in a collection's
+items reads through its `mapWith`, as it does at the top level.
+
+### Collections Reached Through Navigations
+
+A collection may hang off any chain of reference navigations — including one leading back to the
+table the query reads, and a relation of a table to itself:
+
+```typescript
+const loans = await db.loans
+  .select(ln => ({
+    note: ln.note,
+    printedBookEditions: ln.edition!.book!.editions!.count(),  // editions of the edition's book
+    memberLoans: ln.member!.loans!                             // every loan of the same member
+      .select(x => ({ note: x.note }))
+      .toList('memberLoans'),
   }))
   .toList();
 
-// Group with HAVING clause
-const activePosters = await db.posts
-  .groupBy(p => p.userId)
-  .having(g => gt(g.count(), 5))  // Only users with > 5 posts
-  .select(g => ({
-    userId: g.key,
-    postCount: g.count()
+const nodes = await db.nodes
+  .select(n => ({
+    name: n.name,
+    children: n.children!.select(c => ({ name: c.name })).toList('children'),
+    siblings: n.parent!.children!.select(c => ({ name: c.name })).toList('siblings'),
   }))
   .toList();
 ```
+
+A row whose navigation is missing gets the empty value (`[]`, `0`, `null`). A relation keyed on a
+principal key other than `id` joins on that key, and a table in another schema is read
+schema-qualified.
+
+### Comparing Items With the Enclosing Row
+
+A collection's `where()`, projection and ORDER BY may read the row it hangs off — the root row, or
+the item of an enclosing collection:
+
+```typescript
+const members = await db.members
+  .select(m => ({
+    name: m.name,
+    loans: m.loans!.select(ln => ({
+      note: ln.note,
+      // the member's loans made after this one
+      laterLoans: ln.member!.loans!.where(x => gt(x.id, ln.id)).count(),
+    })).toList('loans'),
+  }))
+  .toList();
+```
+
+Such a collection cannot be aggregated apart from that row, so under the `cte` and `temptable`
+strategies it renders as a LATERAL subquery, with the same results.
+
+## GROUP BY
+
+Project the rows, group the projection by a key object, then select the key and aggregates:
+
+```typescript
+const postsByUser = await db.posts
+  .select(p => ({ userId: p.userId, views: p.views, title: p.title, author: p.user!.username }))
+  .groupBy(r => ({ userId: r.userId }))
+  .select(g => ({
+    userId: g.key.userId,
+    postCount: g.count(),          // number
+    totalViews: g.sum(r => r.views),
+    avgViews: g.avg(r => r.views),
+    lastTitle: g.max(r => r.title), // string
+    author: g.max(r => r.author),
+  }))
+  .toList();
+```
+
+### Keys
+
+A key is a column of the projection — also one read through a navigation — or an SQL expression
+(`sql\`date_trunc('day', ${p.createdAt})\``). Grouping by an expression groups the rows of a subquery
+that computes it once; everything below works the same over it.
+
+### Aggregates
+
+`count()`, `sum()`, `avg()`, `min()` and `max()`. The argument is a column of the projection or an SQL
+expression over it — `g.max(r => sql\`length(${r.title})\`)`, `g.sum(r => sql\`${r.views} * 2\`)`.
+
+- COUNT reads as a number, SUM and AVG as numbers (cast to double precision).
+- MIN / MAX read as a value of their column: text as a string, a timestamp as a Date, a mapped column
+  through its mapper (a grouped CTE or subquery keeps that mapper), a numeric column as a number. Of
+  an SQL expression, a number-looking value reads as a number, anything else as it is. (They all
+  used to go through `Number()`: a text or timestamp extreme came back `NaN` / epoch milliseconds.)
+
+A projected value can also be an SQL expression over keys and aggregates, a constant, or `null`:
+
+```typescript
+.select(g => ({
+  userId: g.key.userId,
+  perPost: sql<number>`${g.sum(r => r.views)} / ${g.count()}`,
+  kind: 'author-stats',
+}))
+```
+
+A nested object, or any other value, is refused naming the field — it used to be left out of the
+result without a word.
+
+### HAVING
+
+`having()` filters the groups. Its callback receives the group as columns, so aggregates and keys go
+into conditions as they are — no cast:
+
+```typescript
+const prolific = await db.posts
+  .select(p => ({ userId: p.userId, views: p.views, title: p.title }))
+  .groupBy(r => ({ userId: r.userId }))
+  .having(g => and(
+    gt(g.count(), 5),
+    or(gt(g.sum(r => r.views), 1000), lt(g.min(r => r.title), 'B')),
+  ))
+  .select(g => ({ userId: g.key.userId, posts: g.count() }))
+  .toList();
+```
+
+Any condition works: `and` / `or` / `not`, `between`, `inArray`, `isNull`, an aggregate on either side
+of a comparison (`gt(g.max(r => r.views), g.min(r => r.views))`), a grouping key (`eq(g.key.userId, 7)`),
+an `sql` fragment (`sql\`${g.count()} > ${5}\``), an aggregate of a navigation column. `having()` can be
+called before or after `select()`, and repeatedly: the conditions are combined with AND. Its callback
+runs when the query is built, over the same group the projection reads.
+
+### ORDER BY, LIMIT
+
+A grouped query orders by what it projects — a key or an aggregate by its output alias:
+
+```typescript
+const top = await db.posts
+  .select(p => ({ userId: p.userId, views: p.views }))
+  .groupBy(r => ({ userId: r.userId }))
+  .select(g => ({ userId: g.key.userId, total: g.sum(r => r.views) }))
+  .orderBy(r => [[r.total, 'DESC NULLS LAST'], r.userId])
+  .limit(10)
+  .toList();
+```
+
+An `sql` expression written inside `orderBy()` is refused — project it and order by that field.
 
 ## JOINs
 
@@ -471,6 +797,32 @@ const data = await db.posts
   }))
   .toList();
 ```
+
+### Navigation Joins and Their Aliases
+
+A reference navigation (`ln.edition.book.name`) is joined for you: one `LEFT JOIN` per hop (an
+`INNER JOIN` for a required relation), each on its own parent table. A hop renders under its
+relation name (`"edition"`, `"book"`), which is also the alias to use in a raw `sql` fragment. When
+two navigation paths in one query end in the same relation name, such as `ln.book` (the loan's own
+book) and `ln.edition.book` (the book the edition prints), each still gets its own join. The
+shallowest path keeps the plain name (on a tie, the one that appears first, projection before
+`where`), and every other path renders as `<parentAlias>__<relation>`:
+
+```typescript
+const rows = await db.loans
+  .select(ln => ({
+    ownBook: ln.book!.name,                              // "book"."name"
+    printedBook: ln.edition!.book!.name,                 // "edition__book"."name"
+    printedCategory: ln.edition!.book!.category!.name,   // "category"."name", joined on "edition__book"
+  }))
+  .toList();
+```
+
+A raw fragment naming `"book"` therefore always means the shallowest `book` path. Inside a
+collection the same rule applies within the collection's own subquery, under every collection
+strategy. A name the collection reads from an enclosing row (the hops of the path it hangs off, or a
+navigation the enclosing row's own columns are read through) is never reused for one of the
+collection's own navigations: that navigation renders under a path alias instead.
 
 ## Subqueries
 
@@ -606,6 +958,24 @@ const users = await db.users
   .toList();
 ```
 
+### Reading a Fragment's Value: `mapWith`
+
+`.mapWith(fn)` reads the fragment's driver value through `fn` (null stays null) — at the top level,
+inside nested objects, in a collection's items, in a grouped query and in any mutation's
+`.returning()`. The fragment's value type is what `fn` returns; `.mapWith(customType)` takes a
+mapper object with `fromDriver` / `toDriver` instead:
+
+```typescript
+const rows = await db.orders.select(o => ({
+  total: sql<string>`sum(${o.amount})`.mapWith(Number),                 // SqlFragment<number>
+  tag: sql`upper(${o.code})`.mapWith(value => `#${value}`),              // SqlFragment<string>
+})).toList();
+```
+
+In a SELECT, a fragment WITHOUT a mapper reads through the generic conversion of untyped values: a
+numeric-looking string becomes a number and NULL `undefined` — `.mapWith(String)` keeps text as text.
+(A mutation's `.returning()` hands such a fragment's value over as the driver delivers it.)
+
 ### Type-Safe Parameters
 
 Magic SQL strings automatically handle parameter binding:
@@ -717,7 +1087,12 @@ one call cannot carry parameters.
 
 ## Built-in Operators
 
-Linkgress provides type-safe operators for common SQL operations.
+Linkgress provides type-safe operators for common SQL operations. The
+[SQL Expression Helpers](./sql-expressions.md) guide covers the rest of the built-in
+expression vocabulary: casts (`castAsInt()`, `.cast('numeric(12, 2)')`), `caseWhen` / `caseOf`,
+`greatest` / `least` / `nullIf`, `isDistinctFrom`, string / math / date-time functions, JSONB
+paths and mutations (`jsonbPathText`, `jsonbSet`, `jsonbContains`, …) and array-column operators
+(`arrayContains`, `arrayOverlaps`, …).
 
 ### Coalesce
 

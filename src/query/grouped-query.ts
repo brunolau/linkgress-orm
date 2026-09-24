@@ -1,14 +1,25 @@
-import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, WhereConditionBase } from './conditions';
+import { and, Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, WhereConditionBase } from './conditions';
 import { TableSchema } from '../schema/table-builder';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { OrderDirection } from '../entity/db-context';
 import { QueryExecutor } from '../entity/db-context';
-import { assertNoCorrelatedAliasShadowing, isForeignChainRef, parseOrderBy, getQualifiedFieldName } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, isForeignChainRef, parseOrderBy, getQualifiedFieldName, projectedAliasOf } from './query-utils';
 import { Subquery } from './subquery';
 import type { ManualJoinDefinition, JoinType } from './query-builder';
-import { CollectionQueryBuilder, ReferenceQueryBuilder, getColumnNameMapForSchema, getRelationEntriesForSchema, getTargetSchemaForRelation } from './query-builder';
-import { DbCte, isCte } from './cte-builder';
-import { formatJoinValue } from './join-utils';
+import {
+  CollectionQueryBuilder,
+  ReferenceQueryBuilder,
+  aggregatedItemReads,
+  assertProjectionArrayOfValues,
+  getColumnNameMapForSchema,
+  getRelationEntriesForSchema,
+  getTargetSchemaForRelation,
+  mapAggregatedItems,
+  projectionLiteralSql,
+} from './query-builder';
+import { DbCte, isCte, projectedValueRef } from './cte-builder';
+import { formatJoinValue, NavigationAliasPlan } from './join-utils';
+import { selectorProjectingConditions } from './sql-functions';
 
 /**
  * Query context for tracking CTEs and parameters
@@ -27,6 +38,11 @@ interface QueryContext {
    * statement-level relation instead of re-declaring it.
    */
   hoistedCteNames?: Set<string>;
+  /**
+   * Render the projection's constants typed from their JS type — set for a projection other queries
+   * read as columns (a CTE body, a table subquery). See {@link SqlBuildContext.typedLiterals}.
+   */
+  typedLiterals?: boolean;
 }
 
 /**
@@ -76,7 +92,11 @@ type IsValueType<T> = IsClassInstance<T> extends true
  * Type helper to resolve FieldRef types to their value types
  * Preserves class instances (Date, Map, Set, Temporal, etc.) as-is
  */
-type ResolveFieldRefs<T> = T extends FieldRef<any, infer V>
+type ResolveFieldRefs<T> = T extends SqlFragment<infer V>
+  ? V  // an expression (coalesce, caseWhen, casts, …) resolves to its value type
+  : T extends WhereConditionBase
+  ? boolean  // a condition projects as a boolean column
+  : T extends FieldRef<any, infer V>
   ? V
   : T extends Array<infer U>
   ? Array<ResolveFieldRefs<U>>
@@ -140,13 +160,11 @@ export interface GroupedItem<TGroupingKey, TOriginalRow> {
   avg(selector: (item: TOriginalRow) => FieldRef<any, number | undefined> | number | undefined): number;
 }
 
-/**
- * Marker for aggregate function calls in the selection
- */
-interface AggregateMarker {
-  __aggregateType: 'COUNT' | 'SUM' | 'MIN' | 'MAX' | 'AVG';
-  __selector?: (item: any) => any;
-}
+/** Column types whose values a MIN / MAX reads back as a JS number (as COUNT / SUM / AVG do). */
+const NUMERIC_COLUMN_TYPES: ReadonlySet<string> = new Set([
+  'smallint', 'integer', 'bigint', 'decimal', 'numeric', 'real', 'double precision',
+  'smallserial', 'serial', 'bigserial', 'int2', 'int4', 'int8', 'float4', 'float8',
+]);
 
 /**
  * Aggregate field reference - used in HAVING clauses
@@ -175,6 +193,92 @@ function createAggregateFieldRef<T>(
 }
 
 /**
+ * The group a `having()` callback reads: the key and aggregates of {@link GroupedItem}, typed as the
+ * columns they are in the HAVING clause, so they go into conditions as they are —
+ * `gt(g.count(), 2)`, `eq(g.key.status, 'open')`, `lt(g.max(r => r.label), 'M')` — without a cast.
+ */
+export interface HavingGroupedItem<TGroupingKey, TOriginalRow> {
+  /** The grouping key's fields. */
+  readonly key: { readonly [K in keyof ResolveFieldRefs<TGroupingKey>]: FieldRef<string, ResolveFieldRefs<TGroupingKey>[K]> };
+
+  /** `COUNT(*)` of the group. */
+  count(): FieldRef<string, number>;
+
+  /** `SUM(...)` of a column or expression of the grouped row. */
+  sum<TField>(selector: (item: TOriginalRow) => TField): FieldRef<string, number>;
+
+  /** `MIN(...)` of a column or expression of the grouped row — a value of its type. */
+  min<TField>(selector: (item: TOriginalRow) => TField): FieldRef<string, TField extends FieldRef<any, infer V> ? V : TField>;
+
+  /** `MAX(...)` of a column or expression of the grouped row — a value of its type. */
+  max<TField>(selector: (item: TOriginalRow) => TField): FieldRef<string, TField extends FieldRef<any, infer V> ? V : TField>;
+
+  /** `AVG(...)` of a column or expression of the grouped row. */
+  avg(selector: (item: TOriginalRow) => FieldRef<any, number | undefined> | number | undefined): FieldRef<string, number>;
+}
+
+/** A `having()` callback: the condition a group must meet, over its key and aggregates. */
+type HavingSelector<TGroupingKey, TOriginalRow> = (group: HavingGroupedItem<TGroupingKey, TOriginalRow>) => Condition;
+
+/** Whether `value` is an aggregate ref minted by a mock group (`g.count()`, `g.sum(...)`, …). */
+function isAggregateRef(value: unknown): value is AggregateFieldRef {
+  return typeof value === 'object' && value !== null && (value as any).__isAggregate === true;
+}
+
+/** Whether `value` is a column ref (a FieldRef of the grouped row, of a navigation or of a join). */
+function isFieldRefValue(value: unknown): value is FieldRef & { __tableAlias?: string } {
+  return typeof value === 'object' && value !== null && '__dbColumnName' in value && !(value instanceof WhereConditionBase);
+}
+
+/** What `value` is, for an error that refuses it in a grouped query. */
+function describeGroupedValue(value: unknown): string {
+  if (value === undefined) {
+    return 'undefined (a property the row does not have?)';
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'an array';
+  }
+  if (value instanceof CollectionQueryBuilder) {
+    return 'a collection (a navigation to many rows)';
+  }
+  if (typeof value === 'function') {
+    return 'a function';
+  }
+  if (typeof value === 'object') {
+    return 'a nested object (a whole navigation row, or an object of fields?)';
+  }
+  return `the constant ${JSON.stringify(value)}`;
+}
+
+/**
+ * What one build of a grouped select evaluates once and every clause reads: the grouped row, its key,
+ * the projection, the HAVING condition over the same group, and each aggregate's argument.
+ */
+interface GroupedBuildState {
+  /** The grouped row: the projection the grouping reads (its keys and the aggregates' arguments). */
+  mockOriginalSelection: any;
+  mockGroupingKey: any;
+  mockResult: any;
+  havingCond?: Condition;
+  /** Each aggregate's argument — a column or an expression of the grouped row. */
+  aggregateArguments: Map<AggregateFieldRef, unknown>;
+}
+
+/**
+ * How a grouped build reads the grouped row: straight off the joined tables, or — when it groups by an
+ * expression — as the columns of the subquery that computes it.
+ */
+interface GroupedRenderer {
+  /** The SQL of an aggregate's argument (or of a column the projection reads outside the key). */
+  argument(argument: unknown, aggregate: AggregateFieldRef | undefined): string;
+  /** The SQL of a grouping key, or `undefined` when `value` is none (or needs no substitution). */
+  key(value: object): string | undefined;
+}
+
+/**
  * Grouped query builder - result of calling groupBy()
  * Provides type-safe access to grouping keys and aggregate functions
  */
@@ -186,10 +290,10 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   private originalSelector: (row: any) => any;
   private groupingKeySelector: (row: TOriginalRow) => TGroupingKey;
   private whereCond?: Condition;
-  private havingCond?: Condition;
+  private havingSelectors: Array<HavingSelector<TGroupingKey, TOriginalRow>> = [];
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ field: string; direction: OrderDirection; aliased?: boolean }> = [];
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
@@ -257,7 +361,7 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       this.groupingKeySelector,
       selector,
       this.whereCond,
-      this.havingCond,
+      [...this.havingSelectors],
       this.limitValue,
       this.offsetValue,
       this.orderByFields,
@@ -270,164 +374,15 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   }
 
   /**
-   * Add HAVING condition (filter groups after aggregation)
+   * Add a HAVING condition (filters groups after aggregation). Chained calls are combined with AND.
+   * The callback runs when the query is built, over the same group the projection reads: its key
+   * and aggregates render exactly as they do in the SELECT.
    */
   having(
-    condition: (group: GroupedItem<TGroupingKey, TOriginalRow>) => Condition
+    condition: (group: HavingGroupedItem<TGroupingKey, TOriginalRow>) => Condition
   ): this {
-    const mockGroup = this.createMockGroupedItem();
-    this.havingCond = condition(mockGroup);
+    this.havingSelectors.push(condition);
     return this;
-  }
-
-  /**
-   * Create a mock GroupedItem for type inference and condition building
-   */
-  private createMockGroupedItem(): GroupedItem<TGroupingKey, TOriginalRow> {
-    // Create mock for the original row
-    const mockOriginalRow = this.createMockRow();
-
-    // Evaluate the grouping key selector to get the key structure
-    const mockKey = this.groupingKeySelector(mockOriginalRow as TOriginalRow);
-
-    return {
-      key: mockKey as any,
-      count: () => {
-        return createAggregateFieldRef<number>('COUNT') as any;
-      },
-      sum: (selector: any) => {
-        return createAggregateFieldRef<number>('SUM', selector) as any;
-      },
-      min: (selector: any) => {
-        return createAggregateFieldRef('MIN', selector) as any;
-      },
-      max: (selector: any) => {
-        return createAggregateFieldRef('MAX', selector) as any;
-      },
-      avg: (selector: any) => {
-        return createAggregateFieldRef<number>('AVG', selector) as any;
-      },
-    };
-  }
-
-  /**
-   * Create mock row for the original table
-   */
-  private createMockRow(): any {
-    const mock: any = {};
-    const tableAlias = this.schema.name;
-
-    // Add columns as FieldRef objects - use pre-computed column name map if available
-    const columnNameMap = getColumnNameMapForSchema(this.schema);
-
-    // Performance: Lazy-cache FieldRef objects
-    const fieldRefCache: Record<string, any> = {};
-
-    for (const [colName, dbColumnName] of columnNameMap) {
-      Object.defineProperty(mock, colName, {
-        get() {
-          let cached = fieldRefCache[colName];
-          if (!cached) {
-            cached = fieldRefCache[colName] = {
-              __fieldName: colName,
-              __dbColumnName: dbColumnName,
-              __tableAlias: tableAlias,
-            };
-          }
-          return cached;
-        },
-        enumerable: true,
-        configurable: true,
-      });
-    }
-
-    // Add navigation properties (collections and single references)
-    // Performance: Use pre-computed relation entries and cached schemas
-    const relationEntries = getRelationEntriesForSchema(this.schema);
-
-    for (const [relName, relConfig] of relationEntries) {
-      let targetSchema: TableSchema | undefined;
-      if (this.schemaRegistry) {
-        targetSchema = this.schemaRegistry.get(relConfig.targetTable);
-      }
-      if (!targetSchema) {
-        targetSchema = getTargetSchemaForRelation(this.schema, relName, relConfig);
-      }
-
-      if (relConfig.type === 'many') {
-        Object.defineProperty(mock, relName, {
-          get: () => {
-            return new CollectionQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKey || relConfig.foreignKeys?.[0] || '',
-              this.schema.name,
-              targetSchema,
-              this.schemaRegistry,
-              undefined,
-              relConfig.foreignKeys,  // Propagate composite FK / literal predicates
-              relConfig.matches
-            );
-          },
-          enumerable: true,
-          configurable: true,
-        });
-      } else {
-        Object.defineProperty(mock, relName, {
-          get: () => {
-            const refBuilder = new ReferenceQueryBuilder(
-              relName,
-              relConfig.targetTable,
-              relConfig.foreignKeys || [relConfig.foreignKey || ''],
-              relConfig.matches || [],
-              relConfig.isMandatory ?? false,
-              targetSchema,
-              this.schemaRegistry,
-              [],
-              this.schema.name
-            );
-            return refBuilder.createMockTargetRow();
-          },
-          enumerable: true,
-          configurable: true,
-        });
-      }
-    }
-
-    // Add columns from manually joined tables
-    for (const join of this.manualJoins) {
-      if ((join as any).isSubquery || !join.schema) {
-        continue;
-      }
-
-      const joinColumnNameMap = getColumnNameMapForSchema(join.schema);
-      if (!mock[join.alias]) {
-        mock[join.alias] = {};
-      }
-
-      // Lazy-cache for joined table
-      const joinFieldRefCache: Record<string, any> = {};
-      const joinAlias = join.alias;
-      for (const [colName, dbColumnName] of joinColumnNameMap) {
-        Object.defineProperty(mock[join.alias], colName, {
-          get() {
-            let cached = joinFieldRefCache[colName];
-            if (!cached) {
-              cached = joinFieldRefCache[colName] = {
-                __fieldName: colName,
-                __dbColumnName: dbColumnName,
-                __tableAlias: joinAlias,
-              };
-            }
-            return cached;
-          },
-          enumerable: true,
-          configurable: true,
-        });
-      }
-    }
-
-    return mock;
   }
 }
 
@@ -437,16 +392,21 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
 export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   /** @internal Chain identity inherited from the query this grouping came from. */
   public chainId?: number;
+  /**
+   * @internal The navigation plan of the build in progress (see {@link withNavigationPlan});
+   * `undefined` between builds and for builds it cannot change.
+   */
+  private navigationPlan?: NavigationAliasPlan;
   private schema: TableSchema;
   private client: DatabaseClient;
   private originalSelector: (row: any) => any;
   private groupingKeySelector: (row: TOriginalRow) => TGroupingKey;
   private resultSelector: (group: GroupedItem<TGroupingKey, TOriginalRow>) => TSelection;
   private whereCond?: Condition;
-  private havingCond?: Condition;
+  private havingSelectors: Array<HavingSelector<TGroupingKey, TOriginalRow>>;
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ field: string; direction: OrderDirection; aliased?: boolean }> = [];
   private executor?: QueryExecutor;
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
@@ -459,10 +419,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     groupingKeySelector: (row: TOriginalRow) => TGroupingKey,
     resultSelector: (group: GroupedItem<TGroupingKey, TOriginalRow>) => TSelection,
     whereCond?: Condition,
-    havingCond?: Condition,
+    havingSelectors?: Array<HavingSelector<TGroupingKey, TOriginalRow>>,
     limit?: number,
     offset?: number,
-    orderBy?: Array<{ field: string; direction: 'ASC' | 'DESC' }>,
+    orderBy?: Array<{ field: string; direction: OrderDirection; aliased?: boolean }>,
     executor?: QueryExecutor,
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
@@ -474,9 +434,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     this.client = client;
     this.originalSelector = originalSelector;
     this.groupingKeySelector = groupingKeySelector;
-    this.resultSelector = resultSelector;
+    this.resultSelector = selectorProjectingConditions(resultSelector);
     this.whereCond = whereCond;
-    this.havingCond = havingCond;
+    this.havingSelectors = havingSelectors ?? [];
     this.limitValue = limit;
     this.offsetValue = offset;
     this.orderByFields = orderBy || [];
@@ -511,13 +471,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   }
 
   /**
-   * Add HAVING condition (filter groups after aggregation)
+   * Add a HAVING condition (filters groups after aggregation). Chained calls — and one made before
+   * select() — are combined with AND. The callback runs when the query is built, over the same group
+   * the projection reads: its key and aggregates render exactly as they do in the SELECT.
    */
   having(
-    condition: (group: GroupedItem<TGroupingKey, TOriginalRow>) => Condition
+    condition: (group: HavingGroupedItem<TGroupingKey, TOriginalRow>) => Condition
   ): this {
-    const mockGroup = this.createMockGroupedItem();
-    this.havingCond = condition(mockGroup);
+    this.havingSelectors.push(condition);
     return this;
   }
 
@@ -551,7 +512,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const mockGroup = this.createMockGroupedItem();
     const mockResult = this.resultSelector(mockGroup);
     const result = selector(mockResult);
-    parseOrderBy(result, this.orderByFields);
+    // An aggregate or `sql` fragment of the projection orders by its output alias
+    parseOrderBy(result, this.orderByFields, undefined, undefined, projectedAliasOf(mockResult, { columns: true }));
     return this;
   }
 
@@ -582,6 +544,29 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * Transform database results - convert aggregate values and apply mappers
    */
   private transformResults(rows: any[]): any[] {
+    const readers = this.buildFieldReaders();
+
+    return rows.map(row => {
+      const transformed: any = {};
+
+      for (const [key, value] of Object.entries(row)) {
+        const read = readers.get(key);
+        transformed[key] = read ? read(value) : value;
+      }
+
+      return transformed;
+    });
+  }
+
+  /**
+   * How each field of this grouped projection reads back from its driver value, keyed by the
+   * projection's keys: an aggregate as a number (a MIN / MAX as a value of its type), a mapped
+   * column through its mapper; a field without a reader reads as the driver delivers it. Shared by
+   * toList() and by a join of this grouped query, whose rows carry the grouped fields as they are —
+   * they used to come back raw there (a count as the driver's string, a mapped MIN unmapped).
+   * @internal
+   */
+  buildFieldReaders(): Map<string, (value: any) => any> {
     // Get the mock result to identify which fields are aggregates and have mappers
     const mockGroup = this.createMockGroupedItem();
     const mockResult = this.resultSelector(mockGroup);
@@ -628,41 +613,109 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       }
     }
 
-    return rows.map(row => {
-      const transformed: any = {};
+    const readers = new Map<string, (value: any) => any>();
 
-      for (const [key, value] of Object.entries(row)) {
-        const mockValue = (mockResult as any)[key];
-
-        // Check if this field is an aggregate
-        if (mockValue && typeof mockValue === 'object' && '__isAggregate' in mockValue && mockValue.__isAggregate) {
-          const aggType = (mockValue as AggregateFieldRef).__aggregateType;
-
-          // Convert string to number for numeric aggregates
-          if (aggType === 'COUNT' || aggType === 'SUM' || aggType === 'AVG' || aggType === 'MIN' || aggType === 'MAX') {
-            transformed[key] = value === null ? null : Number(value);
-          } else {
-            transformed[key] = value;
-          }
-        }
-        // Check if this field has a mapper
-        else if (columnMetadataCache[key]?.hasMapper) {
-          const mapper = columnMetadataCache[key].mapper;
-          if (value === null || value === undefined) {
-            transformed[key] = null;
-          } else if (typeof mapper.fromDriver === 'function') {
-            transformed[key] = mapper.fromDriver(value);
-          } else {
-            transformed[key] = value;
-          }
-        } else {
-          // Non-aggregate field without mapper - keep as is
-          transformed[key] = value;
-        }
+    for (const [key, mockValue] of Object.entries(mockResult as object)) {
+      // A constant reads back as itself: its parameter comes back as text (`true` as "true", `42`
+      // as "42", a Date as a string)
+      if (mockValue === null || mockValue === undefined || typeof mockValue !== 'object' || mockValue instanceof Date) {
+        readers.set(key, () => mockValue);
+        continue;
       }
 
-      return transformed;
-    });
+      // Check if this field is an aggregate
+      if (mockValue && typeof mockValue === 'object' && '__isAggregate' in mockValue && mockValue.__isAggregate) {
+        const aggType = (mockValue as AggregateFieldRef).__aggregateType;
+
+        readers.set(key, aggType === 'MIN' || aggType === 'MAX'
+          // An extreme of a value is a value of its type
+          ? value => this.readExtremeValue(value, mockValue as AggregateFieldRef, mockOriginalSelection)
+          // COUNT, SUM and AVG are numbers (SUM / AVG are cast to double precision)
+          : value => (value === null ? null : Number(value)));
+      }
+      // Check if this field has a mapper
+      else if (columnMetadataCache[key]?.hasMapper) {
+        const mapper = columnMetadataCache[key].mapper;
+
+        readers.set(key, value => {
+          if (value === null || value === undefined) {
+            return null;
+          }
+
+          return typeof mapper.fromDriver === 'function' ? mapper.fromDriver(value) : value;
+        });
+      }
+      // Non-aggregate field without mapper - keep as is
+    }
+
+    return readers;
+  }
+
+  /**
+   * The MIN / MAX of a value, read the way the value itself reads: through its column's mapper, as a
+   * number for a numeric column, as the driver delivers it for any other column (text, dates,
+   * timestamps, uuid, …). Every MIN / MAX used to go through Number(): a text extreme came back NaN
+   * (null in JSON) and a timestamp one as epoch milliseconds, and mapped columns skipped their mapper.
+   */
+  private readExtremeValue(value: any, aggregate: AggregateFieldRef, originalSelection: any): any {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    const { mapper, sqlType } = this.extremeTypeOf(aggregate, originalSelection);
+
+    if (mapper && typeof mapper.fromDriver === 'function') {
+      return mapper.fromDriver(value);
+    }
+
+    if (sqlType !== undefined) {
+      return NUMERIC_COLUMN_TYPES.has(sqlType) ? Number(value) : value;
+    }
+
+    // An expression of unknown type: a numeric-looking string reads as a number, as for any fragment
+    return typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+  }
+
+  /**
+   * What the MIN / MAX `aggregate` is an extreme of: the mapper and SQL type of its column (or the
+   * mapper of its `sql` expression), as far as they are known.
+   */
+  private extremeTypeOf(aggregate: AggregateFieldRef, originalSelection: any): { mapper?: any; sqlType?: string } {
+    let source: any;
+    try {
+      source = aggregate.__aggregateSelector?.(originalSelection);
+    } catch {
+      source = undefined;
+    }
+
+    let mapper: any;
+    let sqlType: string | undefined;
+
+    if (source && typeof source === 'object') {
+      if (typeof source.getMapper === 'function') {
+        mapper = source.getMapper();
+      } else if ('__fieldName' in source) {
+        // A navigation's column carries its mapper and type; one of the grouped table or of a
+        // manual join is looked up in that table's schema
+        mapper = source.__mapper;
+        sqlType = source.__sqlType;
+
+        const alias: string | undefined = source.__tableAlias;
+        const tableSchema = (source.__sourceTable ? this.schemaRegistry?.get(source.__sourceTable) : undefined)
+          ?? (alias === undefined || alias === this.schema.name ? this.schema : undefined)
+          ?? this.manualJoins.find(join => join.alias === alias)?.schema
+          ?? this.schemaRegistry?.get(alias!);
+        const column = tableSchema?.columns[source.__fieldName];
+
+        if (column) {
+          const config = column.build();
+          mapper = mapper ?? config.mapper;
+          sqlType = sqlType ?? config.type;
+        }
+      }
+    }
+
+    return { mapper, sqlType };
   }
 
   /**
@@ -682,6 +735,16 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const enhancedMetadata: Record<string, any> = {};
 
     for (const [key, value] of Object.entries(mockResult as object)) {
+      // The MIN / MAX of a mapped column reads through the column's mapper
+      if (isAggregateRef(value)) {
+        const mapper = value.__aggregateType === 'MIN' || value.__aggregateType === 'MAX'
+          ? this.extremeTypeOf(value, mockOriginalSelection).mapper
+          : undefined;
+
+        enhancedMetadata[key] = mapper ? { ...value, getMapper: () => mapper } : value;
+        continue;
+      }
+
       // Check if it's a FieldRef
       if (typeof value === 'object' && value !== null && '__fieldName' in value) {
         const fieldName = (value as any).__fieldName as string;
@@ -769,6 +832,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         // See SelectQueryBuilder.asSubquery — the statement-level CTE set must
         // survive the subquery boundary or anything nested re-declares it.
         hoistedCteNames: outerContext.hoistedCteNames,
+        // The enclosing query reads the subquery's columns: its constants render typed
+        typedLiterals: true,
       };
 
       const { sql } = this.buildQuery(context);
@@ -889,7 +954,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       createLeftMock,
       createRightMock,
       this.executor,
-      isCteJoin ? cte as any : undefined
+      isCteJoin ? cte as any : undefined,
+      // The grouped fields read back as this grouped query reads them
+      this.buildFieldReaders()
     );
   }
 
@@ -926,27 +993,13 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   private createMockForSubquery<T>(alias: string, subquery: Subquery<T, 'table'>): T {
     const selectionMetadata = subquery.getSelectionMetadata();
 
+    // Each column's ref carries how it reads — its own mapper, a literal's type, a json_agg
+    // column's items (see projectedColumnRef); they used to carry a `mapWith` mapper only
     return new Proxy({} as any, {
-      get(target, prop: string | symbol) {
+      get(_target, prop: string | symbol) {
         if (typeof prop === 'symbol') return undefined;
 
-        if (selectionMetadata && prop in selectionMetadata) {
-          const value = selectionMetadata[prop];
-          if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-            return {
-              __fieldName: prop,
-              __dbColumnName: prop,
-              __tableAlias: alias,
-              getMapper: () => (value as any).getMapper(),
-            };
-          }
-        }
-
-        return {
-          __fieldName: prop,
-          __dbColumnName: prop,
-          __tableAlias: alias,
-        };
+        return projectedValueRef(prop, alias, selectionMetadata ? selectionMetadata[prop] : undefined);
       },
       has() { return true; },
       ownKeys() { return []; },
@@ -960,30 +1013,12 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * Create a mock for a CTE
    */
   private createMockForCte<T>(cte: DbCte<T>): T {
-    const alias = cte.name;
-    const selectionMetadata = cte.selectionMetadata;
-
+    // The refs every CTE mock row mints (see DbCte.columnRef)
     return new Proxy({} as any, {
-      get(target, prop: string | symbol) {
+      get(_target, prop: string | symbol) {
         if (typeof prop === 'symbol') return undefined;
 
-        if (selectionMetadata && prop in selectionMetadata) {
-          const value = selectionMetadata[prop];
-          if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
-            return {
-              __fieldName: prop,
-              __dbColumnName: prop,
-              __tableAlias: alias,
-              getMapper: () => (value as any).getMapper(),
-            };
-          }
-        }
-
-        return {
-          __fieldName: prop,
-          __dbColumnName: prop,
-          __tableAlias: alias,
-        };
+        return cte.columnRef(prop);
       },
       has() { return true; },
       ownKeys() { return []; },
@@ -1024,17 +1059,124 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     };
     const mockResult = this.resultSelector(mockGroup);
 
+    // HAVING over the SAME group: its key and aggregates are the objects the projection reads
+    // (at runtime the group's keys and aggregates ARE the column refs the HAVING group types them as)
+    const havingCond = this.buildHavingConditionOf(mockGroup as unknown as HavingGroupedItem<TGroupingKey, TOriginalRow>);
+
+    // Every aggregate's argument, evaluated once over the grouped row: the navigation plan, the
+    // joins and the rendering all see the same refs
+    const aggregateArguments = new Map<AggregateFieldRef, unknown>();
+    const collectAggregate = (value: unknown): void => {
+      if (isAggregateRef(value) && value.__aggregateSelector && !aggregateArguments.has(value)) {
+        aggregateArguments.set(value, value.__aggregateSelector(mockOriginalSelection));
+      }
+    };
+    for (const value of Object.values(mockResult as object)) {
+      collectAggregate(value);
+    }
+    for (const ref of havingCond?.getFieldRefs() ?? []) {
+      collectAggregate(ref);
+    }
+
     // Check if we have SqlFragment expressions in the grouping key
     // If so, we'll use the subquery wrapping optimization
     const hasSqlFragmentInGroupBy = Object.values(mockGroupingKey as object).some(
-      value => value instanceof SqlFragment
+      value => value instanceof WhereConditionBase
     );
 
+    const state: GroupedBuildState = { mockOriginalSelection, mockGroupingKey, mockResult, havingCond, aggregateArguments };
+
+    return this.withNavigationPlan(
+      [mockOriginalSelection, mockGroupingKey, ...aggregateArguments.values()],
+      havingCond,
+      () => this.buildQueryBody(context, state, hasSqlFragmentInGroupBy)
+    );
+  }
+
+  /** The HAVING condition of `group`: every having() callback's, combined with AND. */
+  private buildHavingConditionOf(group: HavingGroupedItem<TGroupingKey, TOriginalRow>): Condition | undefined {
+    const conditions = this.havingSelectors.map(selector => selector(group));
+
+    return conditions.length === 0 ? undefined : conditions.length === 1 ? conditions[0] : and(...conditions);
+  }
+
+  /**
+   * Runs one build under the navigation plan of the grouped selection, its grouping key, its WHERE
+   * and its HAVING: every reference-navigation path they traverse is joined on its own parent, and the
+   * refs of a path that lost its plain alias to another path ending in the same relation name render
+   * under a path alias until `build` returns. See NavigationAliasPlan.
+   */
+  private withNavigationPlan<T>(values: readonly unknown[], havingCond: Condition | undefined, build: () => T): T {
+    const plan = new NavigationAliasPlan(this.schema, this.schema.name, this.schemaRegistry, this.chainId);
+
+    for (const value of values) {
+      this.addSelectionToNavigationPlan(value, plan);
+    }
+
+    for (const condition of [this.whereCond, havingCond]) {
+      if (condition) {
+        for (const ref of condition.getFieldRefs()) {
+          // An aggregate ref is no column: its argument was added with the values
+          if (!isAggregateRef(ref)) {
+            plan.addRef(ref);
+          }
+        }
+      }
+    }
+
+    const sealed = plan.seal();
+    const previous = this.navigationPlan;
+    this.navigationPlan = sealed;
+    const restore = sealed?.apply();
+
+    try {
+      return build();
+    } finally {
+      restore?.();
+      this.navigationPlan = previous;
+    }
+  }
+
+  /** Records the navigation paths a selection traverses: its field refs and those inside `sql` fragments and nested objects. */
+  private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan): void {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || value instanceof CollectionQueryBuilder) {
+      return;
+    }
+
+    if ('__dbColumnName' in value) {
+      plan.addRef(value);
+      return;
+    }
+
+    if (value instanceof SqlFragment) {
+      for (const ref of value.getFieldRefs()) {
+        plan.addRef(ref);
+      }
+      return;
+    }
+
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        this.addSelectionToNavigationPlan((value as any)[key], plan);
+      }
+    }
+  }
+
+  /** The body of {@link buildQuery}, run under its navigation plan. */
+  private buildQueryBody(
+    context: QueryContext,
+    state: GroupedBuildState,
+    hasSqlFragmentInGroupBy: boolean
+  ): { sql: string; params: any[] } {
     // Detect navigation property references in WHERE and add JOINs
     const navigationJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
 
     // Detect joins from the original selection (navigation properties used in select)
-    this.detectAndAddJoinsFromSelection(mockOriginalSelection, navigationJoins);
+    this.detectAndAddJoinsFromSelection(state.mockOriginalSelection, navigationJoins);
+
+    // ... and from the aggregates' arguments, which can reach a navigation the grouped row does not
+    // project (an expression written inside g.sum(...), a column of an entity row)
+    this.detectAndAddJoinsFromSelection([...state.aggregateArguments.values()], navigationJoins);
 
     // Detect joins from WHERE condition
     this.detectAndAddJoinsFromCondition(this.whereCond, navigationJoins);
@@ -1096,12 +1238,22 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       context.allParams.push(...params);
     }
 
-    if (hasSqlFragmentInGroupBy) {
-      // Use subquery wrapping optimization for complex GROUP BY expressions
-      return this.buildQueryWithSubqueryWrapping(context, mockOriginalSelection, mockGroupingKey, mockResult, baseFromClause, whereClause);
-    } else {
-      // Use simple query for basic GROUP BY (column references only)
-      return this.buildSimpleGroupedQuery(context, mockOriginalSelection, mockGroupingKey, mockResult, baseFromClause, whereClause);
+    // One build context for the rest of the statement: every part shares its parameter counter
+    const buildContext: SqlBuildContext = {
+      paramCounter: context.paramCounter,
+      params: context.allParams,
+      hoistedCteNames: context.hoistedCteNames,
+      typedLiterals: context.typedLiterals,
+    };
+
+    try {
+      return hasSqlFragmentInGroupBy
+        // Grouping by an expression: group the rows of a subquery that computes it once
+        ? this.buildQueryWithSubqueryWrapping(buildContext, state, baseFromClause, whereClause)
+        // Grouping by columns only
+        : this.buildSimpleGroupedQuery(buildContext, state, baseFromClause, whereClause);
+    } finally {
+      context.paramCounter = buildContext.paramCounter;
     }
   }
 
@@ -1109,240 +1261,329 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * Build a simple grouped query when GROUP BY only contains column references
    */
   private buildSimpleGroupedQuery(
-    context: QueryContext,
-    mockOriginalSelection: any,
-    mockGroupingKey: any,
-    mockResult: any,
+    buildContext: SqlBuildContext,
+    state: GroupedBuildState,
     baseFromClause: string,
     whereClause: string
   ): { sql: string; params: any[] } {
     // Extract GROUP BY fields from the grouping key
     const groupByFields: string[] = [];
-    for (const [key, value] of Object.entries(mockGroupingKey as object)) {
-      if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
-        const field = value as any;
-        const tableAlias = field.__tableAlias || this.schema.name;
-        groupByFields.push(`"${tableAlias}"."${field.__dbColumnName}"`);
-      }
+    for (const [key, value] of Object.entries(state.mockGroupingKey as object)) {
+      groupByFields.push(this.directColumnSql(value, () => `groupBy(): the grouping key "${key}"`));
     }
+
+    // Columns and expressions read straight off the joined rows
+    const renderer: GroupedRenderer = {
+      argument: (argument, aggregate) => this.directArgumentSql(argument, aggregate, buildContext),
+      key: () => undefined,
+    };
 
     // Build SELECT clause from result selector
-    const selectParts: string[] = [];
-    for (const [alias, value] of Object.entries(mockResult as object)) {
-      const selectPart = this.buildSelectPart(alias, value, mockOriginalSelection, context, this.schema.name);
-      if (selectPart) {
-        selectParts.push(selectPart);
-      }
-    }
+    const selectParts = this.buildSelectParts(state, renderer, buildContext);
 
     // Build GROUP BY clause
-    const groupByClause = `GROUP BY ${groupByFields.join(', ')}`;
+    const groupByClause = groupByFields.length > 0 ? `GROUP BY ${groupByFields.join(', ')}` : '';
 
     // Build HAVING clause
-    let havingClause = '';
-    if (this.havingCond) {
-      const havingSql = this.buildHavingCondition(this.havingCond, context);
-      havingClause = `HAVING ${havingSql}`;
-    }
+    const havingClause = this.buildHavingClause(state, renderer, buildContext);
 
     // Build ORDER BY clause
-    let orderByClause = '';
-    if (this.orderByFields.length > 0) {
-      // Look up database column names from schema
-      const colNameMap = getColumnNameMapForSchema(this.schema);
-      const orderParts = this.orderByFields.map(
-        ({ field, direction }) => {
-          const dbColumnName = colNameMap.get(field) ?? field;
-          return `"${dbColumnName}" ${direction}`;
-        }
-      );
-      orderByClause = `ORDER BY ${orderParts.join(', ')}`;
-    }
+    const orderByClause = this.buildGroupedOrderByClause();
 
     // Build LIMIT/OFFSET
-    let limitClause = '';
-    if (this.limitValue !== undefined) {
-      limitClause = `LIMIT ${this.limitValue}`;
-    }
-    if (this.offsetValue !== undefined) {
-      limitClause += ` OFFSET ${this.offsetValue}`;
-    }
+    const limitClause = this.buildLimitClause();
 
     const finalQuery = `SELECT ${selectParts.join(', ')}\nFROM ${baseFromClause}\n${whereClause}\n${groupByClause}\n${havingClause}\n${orderByClause}\n${limitClause}`.trim();
 
     return {
       sql: finalQuery,
-      params: context.allParams,
+      params: buildContext.params,
     };
   }
 
   /**
    * Build a grouped query with subquery wrapping for complex GROUP BY expressions
    * This avoids repeating SqlFragment expressions in both SELECT and GROUP BY
+   *
+   * The subquery projects each grouping key under its own name and each aggregate's argument under
+   * a column of its own (`__arg<n>`); the outer query reads nothing else. Its HAVING and ORDER BY
+   * read the same columns: a key by its name, an aggregate over its argument's column.
    */
   private buildQueryWithSubqueryWrapping(
-    context: QueryContext,
-    mockOriginalSelection: any,
-    mockGroupingKey: any,
-    mockResult: any,
+    buildContext: SqlBuildContext,
+    state: GroupedBuildState,
     baseFromClause: string,
     whereClause: string
   ): { sql: string; params: any[] } {
-    // Step 1: Build the inner subquery that computes all expressions
-    // This includes: grouping key fields, fields needed for aggregates
+    // Step 1: the subquery's columns — grouping keys, then (as the outer query asks for them) the
+    // aggregates' arguments
     const innerSelectParts: string[] = [];
-    const groupByAliases: string[] = []; // Aliases to use in outer GROUP BY
-    const sqlFragmentAliasMap = new Map<SqlFragment, string>(); // Map SqlFragment to its alias
+    const groupByAliases: string[] = [];
+    const keyAliases = new Map<object, string>();
+    const argumentAliases = new Map<unknown, string>();
 
-    // Add grouping key fields to inner select
-    for (const [key, value] of Object.entries(mockGroupingKey as object)) {
-      if (value instanceof SqlFragment) {
-        // Build the SqlFragment expression
-        const sqlBuildContext = {
-          paramCounter: context.paramCounter,
-          params: context.allParams,
-        };
-        const fragmentSql = value.buildSql(sqlBuildContext);
-        context.paramCounter = sqlBuildContext.paramCounter;
-        innerSelectParts.push(`${fragmentSql} as "${key}"`);
-        groupByAliases.push(`"${key}"`);
-        sqlFragmentAliasMap.set(value, key);
-      } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
-        const field = value as any;
-        const tableAlias = field.__tableAlias || this.schema.name;
-        innerSelectParts.push(`"${tableAlias}"."${field.__dbColumnName}" as "${key}"`);
-        groupByAliases.push(`"${key}"`);
+    // Renders an expression of the joined rows, never through the outer query's substitutions
+    const renderInner = (expression: WhereConditionBase): string => {
+      const substitute = buildContext.substitute;
+      buildContext.substitute = undefined;
+
+      try {
+        return expression.buildSql(buildContext);
+      } finally {
+        buildContext.substitute = substitute;
       }
+    };
+
+    for (const [key, value] of Object.entries(state.mockGroupingKey as object)) {
+      if (value instanceof WhereConditionBase && !isFieldRefValue(value)) {
+        innerSelectParts.push(`${renderInner(value)} as "${key}"`);
+      } else {
+        innerSelectParts.push(`${this.directColumnSql(value, () => `groupBy(): the grouping key "${key}"`)} as "${key}"`);
+      }
+      groupByAliases.push(`"${key}"`);
+      keyAliases.set(value, key);
     }
 
-    // Add fields needed for aggregates to inner select
-    const aggregateFields = new Set<string>(); // Track fields we've already added
-    for (const [, value] of Object.entries(mockResult as object)) {
-      if (typeof value === 'object' && value !== null && '__isAggregate' in value && (value as any).__isAggregate) {
-        const aggField = value as AggregateFieldRef;
-        if (aggField.__aggregateSelector) {
-          const field = aggField.__aggregateSelector(mockOriginalSelection);
-          if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            const fieldRef = field as any;
-            const tableAlias = fieldRef.__tableAlias || this.schema.name;
-            const dbColName = fieldRef.__dbColumnName;
-            const fieldKey = `${tableAlias}.${dbColName}`;
-            if (!aggregateFields.has(fieldKey)) {
-              aggregateFields.add(fieldKey);
-              innerSelectParts.push(`"${tableAlias}"."${dbColName}" as "${dbColName}"`);
-            }
-          }
-        }
-      } else if (typeof value === 'object' && value !== null && '__aggregateType' in value) {
-        // Backward compatibility
-        const agg = value as AggregateMarker;
-        if (agg.__selector) {
-          const field = agg.__selector(mockOriginalSelection);
-          if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            const fieldRef = field as any;
-            const tableAlias = fieldRef.__tableAlias || this.schema.name;
-            const dbColName = fieldRef.__dbColumnName;
-            const fieldKey = `${tableAlias}.${dbColName}`;
-            if (!aggregateFields.has(fieldKey)) {
-              aggregateFields.add(fieldKey);
-              innerSelectParts.push(`"${tableAlias}"."${dbColName}" as "${dbColName}"`);
-            }
-          }
+    // A grouping key, also when the condition reads it through another ref to the same column
+    const keyAliasOf = (value: object): string | undefined => {
+      const alias = keyAliases.get(value);
+
+      if (alias !== undefined || !isFieldRefValue(value)) {
+        return alias;
+      }
+
+      for (const [key, alias] of keyAliases) {
+        if (isFieldRefValue(key)
+          && key.__dbColumnName === value.__dbColumnName
+          && ((key as any).__tableAlias || this.schema.name) === ((value as any).__tableAlias || this.schema.name)) {
+          return alias;
         }
       }
-    }
 
-    // Build the inner subquery
+      return undefined;
+    };
+
+    const renderer: GroupedRenderer = {
+      argument: (argument, aggregate) => {
+        const keyAlias = typeof argument === 'object' && argument !== null ? keyAliasOf(argument) : undefined;
+        if (keyAlias !== undefined) {
+          return `"${keyAlias}"`;
+        }
+
+        // The same column or expression is projected once
+        const identity = isFieldRefValue(argument)
+          ? `${(argument as any).__tableAlias || this.schema.name}.${argument.__dbColumnName}`
+          : argument;
+        let alias = argumentAliases.get(identity);
+
+        if (alias === undefined) {
+          alias = `__arg${argumentAliases.size}`;
+          const argumentSql = argument instanceof WhereConditionBase && !isFieldRefValue(argument)
+            ? renderInner(argument)
+            : this.directArgumentSql(argument, aggregate, buildContext);
+          innerSelectParts.push(`${argumentSql} as "${alias}"`);
+          argumentAliases.set(identity, alias);
+        }
+
+        return `"${alias}"`;
+      },
+      key: value => {
+        const alias = keyAliasOf(value);
+        return alias === undefined ? undefined : `"${alias}"`;
+      },
+    };
+
+    // Step 2: the outer query over the subquery's columns (its SELECT and HAVING add the aggregate
+    // arguments to the subquery as they go, so the subquery is assembled last)
+    const outerSelectParts = this.buildSelectParts(state, renderer, buildContext);
+    const havingClause = this.buildHavingClause(state, renderer, buildContext);
+    const orderByClause = this.buildGroupedOrderByClause();
+    const limitClause = this.buildLimitClause();
+
     const innerQuery = `SELECT ${innerSelectParts.join(', ')}\nFROM ${baseFromClause}\n${whereClause}`.trim();
-
-    // Step 2: Build the outer query that groups by aliases
-    const outerSelectParts: string[] = [];
-    for (const [alias, value] of Object.entries(mockResult as object)) {
-      if (typeof value === 'object' && value !== null && '__isAggregate' in value && (value as any).__isAggregate) {
-        // Aggregate function
-        const aggField = value as AggregateFieldRef;
-        const aggType = aggField.__aggregateType;
-
-        if (aggType === 'COUNT') {
-          outerSelectParts.push(`CAST(COUNT(*) AS INTEGER) as "${alias}"`);
-        } else if (aggField.__aggregateSelector) {
-          const field = aggField.__aggregateSelector(mockOriginalSelection);
-          if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            const fieldRef = field as any;
-            const dbColName = fieldRef.__dbColumnName;
-            // Reference the alias from inner query
-            if (aggType === 'SUM' || aggType === 'AVG') {
-              outerSelectParts.push(`CAST(${aggType}("${dbColName}") AS DOUBLE PRECISION) as "${alias}"`);
-            } else {
-              outerSelectParts.push(`${aggType}("${dbColName}") as "${alias}"`);
-            }
-          }
-        } else {
-          outerSelectParts.push(`${aggType}(*) as "${alias}"`);
-        }
-      } else if (typeof value === 'object' && value !== null && '__aggregateType' in value) {
-        // Backward compatibility
-        const agg = value as AggregateMarker;
-        if (agg.__aggregateType === 'COUNT') {
-          outerSelectParts.push(`CAST(COUNT(*) AS INTEGER) as "${alias}"`);
-        } else if (agg.__selector) {
-          const field = agg.__selector(mockOriginalSelection);
-          if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-            const fieldRef = field as any;
-            const dbColName = fieldRef.__dbColumnName;
-            if (agg.__aggregateType === 'SUM' || agg.__aggregateType === 'AVG') {
-              outerSelectParts.push(`CAST(${agg.__aggregateType}("${dbColName}") AS DOUBLE PRECISION) as "${alias}"`);
-            } else {
-              outerSelectParts.push(`${agg.__aggregateType}("${dbColName}") as "${alias}"`);
-            }
-          }
-        }
-      } else if (value instanceof SqlFragment) {
-        // SqlFragment - reference the alias from inner query
-        const innerAlias = sqlFragmentAliasMap.get(value);
-        if (innerAlias) {
-          outerSelectParts.push(`"${innerAlias}" as "${alias}"`);
-        }
-      } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
-        // Direct field reference - find the matching key in grouping key
-        const field = value as any;
-        // Look for matching alias in groupByAliases
-        for (const [key, gkValue] of Object.entries(mockGroupingKey as object)) {
-          if (gkValue === value ||
-              (typeof gkValue === 'object' && gkValue !== null && '__dbColumnName' in gkValue &&
-               (gkValue as any).__dbColumnName === field.__dbColumnName)) {
-            outerSelectParts.push(`"${key}" as "${alias}"`);
-            break;
-          }
-        }
-      }
-    }
-
-    // Build GROUP BY clause using aliases
     const groupByClause = `GROUP BY ${groupByAliases.join(', ')}`;
 
-    // Build HAVING clause
-    let havingClause = '';
-    if (this.havingCond) {
-      const havingSql = this.buildHavingCondition(this.havingCond, context);
-      havingClause = `HAVING ${havingSql}`;
+    const finalQuery = `SELECT ${outerSelectParts.join(', ')}\nFROM (${innerQuery}) "q1"\n${groupByClause}\n${havingClause}\n${orderByClause}\n${limitClause}`.trim();
+
+    return {
+      sql: finalQuery,
+      params: buildContext.params,
+    };
+  }
+
+  /**
+   * The SELECT list of a grouped query: each field of the projection under its name. An aggregate
+   * renders as the aggregate over its argument, a grouping key as the key, an `sql` expression with
+   * its aggregates and keys rendered the same way (`sql\`${g.sum(r => r.x)} / ${g.count()}\``), a
+   * constant as a parameter. A field that is none of these — a nested object, a collection — is
+   * refused; it used to be left out of the SELECT (and the result) without a word.
+   */
+  private buildSelectParts(state: GroupedBuildState, renderer: GroupedRenderer, buildContext: SqlBuildContext): string[] {
+    const selectParts: string[] = [];
+
+    this.withSubstitutions(state, renderer, buildContext, () => {
+      for (const [alias, value] of Object.entries(state.mockResult as object)) {
+        selectParts.push(`${this.projectionSql(alias, value, state, renderer, buildContext)} as "${alias}"`);
+      }
+    });
+
+    return selectParts;
+  }
+
+  /** The SQL of one field of a grouped projection (see {@link buildSelectParts}). */
+  private projectionSql(
+    alias: string,
+    value: unknown,
+    state: GroupedBuildState,
+    renderer: GroupedRenderer,
+    buildContext: SqlBuildContext
+  ): string {
+    if (isAggregateRef(value)) {
+      return this.aggregateSql(value, state, renderer, true);
     }
 
-    // Build ORDER BY clause
-    let orderByClause = '';
-    if (this.orderByFields.length > 0) {
-      // Look up database column names from schema
-      const colNameMap = getColumnNameMapForSchema(this.schema);
-      const orderParts = this.orderByFields.map(
-        ({ field, direction }) => {
-          const dbColumnName = colNameMap.get(field) ?? field;
-          return `"${dbColumnName}" ${direction}`;
-        }
-      );
-      orderByClause = `ORDER BY ${orderParts.join(', ')}`;
+    if (value === null || value === undefined) {
+      return 'NULL';
     }
 
-    // Build LIMIT/OFFSET
+    if (typeof value === 'object' && (isFieldRefValue(value) || value instanceof WhereConditionBase)) {
+      const keySql = renderer.key(value);
+      if (keySql !== undefined) {
+        return keySql;
+      }
+
+      if (isFieldRefValue(value)) {
+        return renderer.argument(value, undefined);
+      }
+
+      // An expression of keys and aggregates (rendered through the substitutions)
+      return (value as WhereConditionBase).buildSql(buildContext);
+    }
+
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint' || value instanceof Date) {
+      // Typed from its JS type when another query reads the columns (a CTE body, a subquery)
+      const literalContext = { paramCounter: buildContext.paramCounter, allParams: buildContext.params, typedLiterals: buildContext.typedLiterals };
+      const literalSql = projectionLiteralSql(value, literalContext);
+      buildContext.paramCounter = literalContext.paramCounter;
+
+      return literalSql;
+    }
+
+    throw new Error(
+      `Grouped select(): "${alias}" is ${describeGroupedValue(value)} — a grouped query projects its keys, `
+      + 'aggregates (g.count(), g.sum(...), …), sql expressions over them and constants, each as a top-level field.'
+    );
+  }
+
+  /**
+   * The SQL of an aggregate: `COUNT(*)`, or the function over its argument as `renderer` reads it.
+   * In the SELECT list, COUNT is an integer and SUM / AVG a double precision, as the result reads them.
+   */
+  private aggregateSql(aggregate: AggregateFieldRef, state: GroupedBuildState, renderer: GroupedRenderer, inSelectList: boolean): string {
+    const type = aggregate.__aggregateType;
+
+    if (type === 'COUNT') {
+      return inSelectList ? 'CAST(COUNT(*) AS INTEGER)' : 'COUNT(*)';
+    }
+
+    const call = `${type}(${renderer.argument(this.aggregateArgumentOf(aggregate, state), aggregate)})`;
+
+    return inSelectList && (type === 'SUM' || type === 'AVG') ? `CAST(${call} AS DOUBLE PRECISION)` : call;
+  }
+
+  /** The argument `aggregate`'s selector returns over the grouped row, evaluated once per build. */
+  private aggregateArgumentOf(aggregate: AggregateFieldRef, state: GroupedBuildState): unknown {
+    if (!state.aggregateArguments.has(aggregate)) {
+      state.aggregateArguments.set(aggregate, aggregate.__aggregateSelector?.(state.mockOriginalSelection));
+    }
+
+    return state.aggregateArguments.get(aggregate);
+  }
+
+  /**
+   * An aggregate's argument read straight off the joined rows: a column (under its navigation's
+   * planned alias), or an `sql` expression / condition over the row. Anything else is refused —
+   * it used to leave the aggregate out of the SELECT, or render `SUM(*)`.
+   */
+  private directArgumentSql(argument: unknown, aggregate: AggregateFieldRef | undefined, buildContext: SqlBuildContext): string {
+    if (isFieldRefValue(argument)) {
+      const tableAlias = this.navigationPlan?.nodeOf(argument)?.alias || (argument as any).__tableAlias || this.schema.name;
+      return `"${tableAlias}"."${argument.__dbColumnName}"`;
+    }
+
+    if (argument instanceof WhereConditionBase) {
+      return argument.buildSql(buildContext);
+    }
+
+    const name = aggregate ? `g.${aggregate.__aggregateType.toLowerCase()}()` : 'Grouped select()';
+    throw new Error(
+      `${name}: the selector returned ${describeGroupedValue(argument)} — it must return a column or an sql expression of the grouped row.`
+    );
+  }
+
+  /** A grouping key that is a column: `"<alias>"."<column>"`. */
+  private directColumnSql(value: unknown, subject: () => string): string {
+    if (isFieldRefValue(value)) {
+      const tableAlias = (value as any).__tableAlias || this.schema.name;
+      return `"${tableAlias}"."${value.__dbColumnName}"`;
+    }
+
+    throw new Error(`${subject()} is ${describeGroupedValue(value)} — a grouping key is a column or an sql expression of the row.`);
+  }
+
+  /**
+   * The HAVING clause: the having() conditions over the SAME group the projection reads, every
+   * aggregate in them — at any depth: inside and / or / not, between, in, an `sql` fragment, the
+   * right-hand side of a comparison — rendered as in the SELECT, every grouping key as in the GROUP BY.
+   * Only a top-level comparison with an aggregate on its left used to render; everything else
+   * named the aggregate's function as a column (`"count"`) or rendered `SUM(*)`.
+   */
+  private buildHavingClause(state: GroupedBuildState, renderer: GroupedRenderer, buildContext: SqlBuildContext): string {
+    if (!state.havingCond) {
+      return '';
+    }
+
+    const havingCond = state.havingCond;
+    let sql = '';
+
+    this.withSubstitutions(state, renderer, buildContext, () => {
+      sql = havingCond.buildSql(buildContext);
+    });
+
+    return `HAVING ${sql}`;
+  }
+
+  /** Runs `render` with the grouped substitutions on: aggregate refs render as aggregates, keys as keys. */
+  private withSubstitutions(state: GroupedBuildState, renderer: GroupedRenderer, buildContext: SqlBuildContext, render: () => void): void {
+    const previous = buildContext.substitute;
+    buildContext.substitute = value => isAggregateRef(value)
+      ? this.aggregateSql(value, state, renderer, false)
+      : renderer.key(value);
+
+    try {
+      render();
+    } finally {
+      buildContext.substitute = previous;
+    }
+  }
+
+  /** ORDER BY: an output alias as itself, a property of the grouped row as its column. */
+  private buildGroupedOrderByClause(): string {
+    if (this.orderByFields.length === 0) {
+      return '';
+    }
+
+    const colNameMap = getColumnNameMapForSchema(this.schema);
+    const orderParts = this.orderByFields.map(({ field, direction, aliased }) => {
+      const dbColumnName = aliased ? field : colNameMap.get(field) ?? field;
+      return `"${dbColumnName}" ${direction}`;
+    });
+
+    return `ORDER BY ${orderParts.join(', ')}`;
+  }
+
+  /** LIMIT / OFFSET. */
+  private buildLimitClause(): string {
     let limitClause = '';
     if (this.limitValue !== undefined) {
       limitClause = `LIMIT ${this.limitValue}`;
@@ -1350,79 +1591,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     if (this.offsetValue !== undefined) {
       limitClause += ` OFFSET ${this.offsetValue}`;
     }
-
-    const finalQuery = `SELECT ${outerSelectParts.join(', ')}\nFROM (${innerQuery}) "q1"\n${groupByClause}\n${havingClause}\n${orderByClause}\n${limitClause}`.trim();
-
-    return {
-      sql: finalQuery,
-      params: context.allParams,
-    };
-  }
-
-  /**
-   * Build a single SELECT part for a result field
-   */
-  private buildSelectPart(
-    alias: string,
-    value: any,
-    mockOriginalSelection: any,
-    context: QueryContext,
-    defaultTableAlias: string
-  ): string | null {
-    if (typeof value === 'object' && value !== null && '__isAggregate' in value && (value as any).__isAggregate) {
-      // This is an AggregateFieldRef (from our mock GroupedItem)
-      const aggField = value as AggregateFieldRef;
-      const aggType = aggField.__aggregateType;
-
-      if (aggType === 'COUNT') {
-        return `CAST(COUNT(*) AS INTEGER) as "${alias}"`;
-      } else if (aggField.__aggregateSelector) {
-        const field = aggField.__aggregateSelector(mockOriginalSelection);
-        if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-          const fieldRef = field as any;
-          const tableAlias = fieldRef.__tableAlias || defaultTableAlias;
-          if (aggType === 'SUM' || aggType === 'AVG') {
-            return `CAST(${aggType}("${tableAlias}"."${fieldRef.__dbColumnName}") AS DOUBLE PRECISION) as "${alias}"`;
-          } else {
-            return `${aggType}("${tableAlias}"."${fieldRef.__dbColumnName}") as "${alias}"`;
-          }
-        }
-      } else {
-        return `${aggType}(*) as "${alias}"`;
-      }
-    } else if (typeof value === 'object' && value !== null && '__aggregateType' in value) {
-      // Backward compatibility: Old AggregateMarker style
-      const agg = value as AggregateMarker;
-      if (agg.__aggregateType === 'COUNT') {
-        return `CAST(COUNT(*) AS INTEGER) as "${alias}"`;
-      } else if (agg.__selector) {
-        const field = agg.__selector(mockOriginalSelection);
-        if (typeof field === 'object' && field !== null && '__dbColumnName' in field) {
-          const fieldRef = field as any;
-          const tableAlias = fieldRef.__tableAlias || defaultTableAlias;
-          if (agg.__aggregateType === 'SUM' || agg.__aggregateType === 'AVG') {
-            return `CAST(${agg.__aggregateType}("${tableAlias}"."${fieldRef.__dbColumnName}") AS DOUBLE PRECISION) as "${alias}"`;
-          } else {
-            return `${agg.__aggregateType}("${tableAlias}"."${fieldRef.__dbColumnName}") as "${alias}"`;
-          }
-        }
-      }
-    } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
-      // Direct field reference from the grouping key
-      const field = value as any;
-      const tableAlias = field.__tableAlias || defaultTableAlias;
-      return `"${tableAlias}"."${field.__dbColumnName}" as "${alias}"`;
-    } else if (value instanceof SqlFragment) {
-      // SQL fragment - build the expression
-      const sqlBuildContext = {
-        paramCounter: context.paramCounter,
-        params: context.allParams,
-      };
-      const fragmentSql = value.buildSql(sqlBuildContext);
-      context.paramCounter = sqlBuildContext.paramCounter;
-      return `${fragmentSql} as "${alias}"`;
-    }
-    return null;
+    return limitClause;
   }
 
   /**
@@ -1601,6 +1770,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         continue;
       }
 
+      // A navigation of the build's plan collects the aliases of its whole path
+      if (this.collectPlannedAliases(fieldRef, allTableAliases)) {
+        continue;
+      }
+
       if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
         const tableAlias = fieldRef.__tableAlias as string;
         if (tableAlias && tableAlias !== this.schema.name) {
@@ -1650,6 +1824,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       }
 
       if (value && typeof value === 'object' && '__tableAlias' in value && '__dbColumnName' in value) {
+        // A navigation of the build's plan collects the aliases of its own path, in the same order
+        if (this.collectPlannedAliases(value, allTableAliases)) {
+          continue;
+        }
+
         const tableAlias = value.__tableAlias as string;
         if (tableAlias && tableAlias !== this.schema.name) {
           allTableAliases.add(tableAlias);
@@ -1673,6 +1852,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
             continue;
           }
 
+          if (this.collectPlannedAliases(fieldRef, allTableAliases)) {
+            continue;
+          }
+
           if ('__tableAlias' in fieldRef && fieldRef.__tableAlias) {
             const tableAlias = fieldRef.__tableAlias as string;
             if (tableAlias && tableAlias !== this.schema.name) {
@@ -1691,6 +1874,25 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         this.collectTableAliasesFromSelection(value, allTableAliases);
       }
     }
+  }
+
+  /**
+   * Adds the aliases of the path `ref` navigates — its own first, then its ancestors' from the root
+   * down, the order `__tableAlias` + `__navigationAliases` have always been collected in — when the
+   * build's navigation plan knows the path. False for any other ref.
+   */
+  private collectPlannedAliases(ref: unknown, allTableAliases: Set<string>): boolean {
+    const planned = this.navigationPlan?.nodeOf(ref);
+
+    if (planned === undefined) {
+      return false;
+    }
+
+    for (const alias of planned.collectOrder) {
+      allTableAliases.add(alias);
+    }
+
+    return true;
   }
 
   /**
@@ -1730,6 +1932,17 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           continue;
         }
 
+        // A path of the build's navigation plan hangs off its OWN parent, once that is joined —
+        // never off whichever joined table happens to have a relation of the same name
+        const planned = this.navigationPlan?.nodeForAlias(alias);
+        if (planned !== undefined) {
+          if (planned.parent === undefined || joinedSchemas.has(planned.parent.alias)) {
+            joins.push(this.navigationPlan!.joinOf(planned));
+            resolved.add(alias);
+          }
+          continue;
+        }
+
         // Look for this alias in any of the already joined schemas
         for (const [sourceAlias, schema] of joinedSchemas) {
           if (schema.relations && schema.relations[alias]) {
@@ -1764,101 +1977,61 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       }
     }
   }
-
-  /**
-   * Build HAVING condition SQL - handles aggregate field refs specially
-   */
-  private buildHavingCondition(condition: Condition, context: QueryContext): string {
-    // Replace aggregate field refs with SQL fragments in the condition
-    const transformedCondition = this.transformHavingCondition(condition);
-
-    // Now build the condition normally
-    const condBuilder = new ConditionBuilder();
-    const { sql, params } = condBuilder.build(transformedCondition, context.paramCounter);
-    context.paramCounter += params.length;
-    context.allParams.push(...params);
-    return sql;
-  }
-
-  /**
-   * Transform a HAVING condition by replacing aggregate field refs with SQL fragments
-   */
-  private transformHavingCondition(condition: Condition): Condition {
-    // If the condition has field references, check if they're aggregate refs
-    const cond = condition as any;
-
-    // Handle different condition types
-    if (cond.field && typeof cond.field === 'object' && '__isAggregate' in cond.field) {
-      // This is an aggregate comparison (e.g., COUNT(*) > 5)
-      const aggField = cond.field as AggregateFieldRef;
-      const aggSql = this.buildAggregateFieldSql(aggField);
-
-      // Create a new SQL fragment condition
-      // Since we can't easily replace the field, we'll create a SqlFragment
-      // that represents the whole expression
-      const operator = this.getOperatorForCondition(cond);
-      const value = cond.value;
-
-      // Build the full comparison SQL using SqlFragment's template literal style
-      // SqlFragment expects an array of strings (the template parts) and an array of values
-      return new SqlFragment([`${aggSql} ${operator} `, ''], [value]) as any;
-    }
-
-    return condition;
-  }
-
-  /**
-   * Build SQL for an aggregate field reference
-   */
-  private buildAggregateFieldSql(aggField: AggregateFieldRef): string {
-    const aggType = aggField.__aggregateType;
-
-    if (aggType === 'COUNT') {
-      return 'COUNT(*)';
-    } else if (aggField.__aggregateSelector) {
-      // Evaluate the selector to get the actual field
-      const mockRow = this.createMockRow();
-      const selectedField = aggField.__aggregateSelector(mockRow);
-
-      if (typeof selectedField === 'object' && selectedField !== null && '__dbColumnName' in selectedField) {
-        const field = selectedField as any;
-        const tableAlias = field.__tableAlias || this.schema.name;
-        return `${aggType}("${tableAlias}"."${field.__dbColumnName}")`;
-      } else {
-        return `${aggType}(*)`;
-      }
-    } else {
-      return `${aggType}(*)`;
-    }
-  }
-
-  /**
-   * Get the operator string from a condition object
-   */
-  private getOperatorForCondition(cond: any): string {
-    // Try to get the operator - this is a bit of a hack
-    // Different condition types have different ways to get the operator
-    if (cond.getOperator && typeof cond.getOperator === 'function') {
-      return cond.getOperator();
-    }
-
-    // Map common condition types to operators
-    const condName = cond.constructor?.name || '';
-    if (condName.includes('Eq')) return '=';
-    if (condName.includes('Ne')) return '!=';
-    if (condName.includes('Gt') && !condName.includes('Gte')) return '>';
-    if (condName.includes('Gte')) return '>=';
-    if (condName.includes('Lt') && !condName.includes('Lte')) return '<';
-    if (condName.includes('Lte')) return '<=';
-
-    return '='; // Default fallback
-  }
 }
 
 /**
  * Query builder for grouped queries that have been joined
  * This handles the case where a GroupedSelectQueryBuilder is joined with a CTE or subquery
  */
+/**
+ * What one field of a grouped join's projection is: a column (of the grouped query or of the joined
+ * side), an `sql` expression (a condition arrives as one, see selectorProjectingConditions; a
+ * subquery renders as one), a literal, or `undefined` — left out, as a SELECT leaves it out. A
+ * nested object or a collection has no column of the join to be read from.
+ */
+function joinedProjectionKind(value: unknown, key: string): 'column' | 'expression' | 'literal' | 'skip' {
+  if (value === undefined) {
+    return 'skip';
+  }
+
+  if (value === null || typeof value !== 'object') {
+    return 'literal';
+  }
+
+  if ('__dbColumnName' in value) {
+    return 'column';
+  }
+
+  if (value instanceof SqlFragment || value instanceof Subquery) {
+    return 'expression';
+  }
+
+  const isCollection = value instanceof CollectionQueryBuilder || '__collectionResult' in value;
+
+  if (isCollection || Object.getPrototypeOf(value) === Object.prototype) {
+    throw new Error(
+      `Grouped join projection field "${key}" is a ${isCollection ? 'collection' : 'nested object'}, which a grouped join `
+      + 'cannot project — select columns, sql expressions or literals'
+    );
+  }
+
+  // A value — a Date, an array of values, any class instance. A list of columns has no one value
+  assertProjectionArrayOfValues(value, key, 'Grouped join select()');
+
+  return 'literal';
+}
+
+/** The read mapper of a projected column or expression (its `mapWith` / column mapper), if any. */
+function readMapperOf(value: any): { fromDriver(value: any): any } | undefined {
+  let mapper = typeof value?.getMapper === 'function' ? value.getMapper() : value?.__mapper;
+
+  if (mapper && typeof mapper.getType === 'function') {
+    mapper = mapper.getType();
+  }
+
+  return mapper && typeof mapper.fromDriver === 'function' ? mapper : undefined;
+}
+
 export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
   private schema: TableSchema;
   private client: DatabaseClient;
@@ -1873,9 +2046,11 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
   private createRightMock: () => TRight;
   private executor?: QueryExecutor;
   private cte?: DbCte<TRight>;
+  /** How the grouped query's own fields read back (see GroupedSelectQueryBuilder.buildFieldReaders), by field name. */
+  private leftReaders: Map<string, (value: any) => any>;
   private limitValue?: number;
   private offsetValue?: number;
-  private orderByFields: Array<{ field: string; direction: 'ASC' | 'DESC' }> = [];
+  private orderByFields: Array<{ field: string; direction: OrderDirection; aliased?: boolean }> = [];
   private additionalJoins: Array<{
     type: JoinType;
     source: Subquery<any, 'table'> | DbCte<any>;
@@ -1898,7 +2073,8 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     createLeftMock: () => TLeft,
     createRightMock: () => TRight,
     executor?: QueryExecutor,
-    cte?: DbCte<TRight>
+    cte?: DbCte<TRight>,
+    leftReaders?: Map<string, (value: any) => any>
   ) {
     this.schema = schema;
     this.client = client;
@@ -1908,11 +2084,12 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     this.rightAlias = rightAlias;
     this.joinType = joinType;
     this.joinCondition = joinCondition;
-    this.resultSelector = resultSelector;
+    this.resultSelector = selectorProjectingConditions(resultSelector);
     this.createLeftMock = createLeftMock;
     this.createRightMock = createRightMock;
     this.executor = executor;
     this.cte = cte;
+    this.leftReaders = leftReaders ?? new Map();
   }
 
   /**
@@ -1966,7 +2143,8 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const mockRight = this.createRightMock();
     const mockResult = this.resultSelector(mockLeft, mockRight);
     const result = selector(mockResult);
-    parseOrderBy(result, this.orderByFields, getQualifiedFieldName);
+    // An aggregate or `sql` fragment of the projection orders by its output alias
+    parseOrderBy(result, this.orderByFields, getQualifiedFieldName, undefined, projectedAliasOf(mockResult));
     return this;
   }
 
@@ -1988,7 +2166,71 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
-    return result.rows;
+    return this.transformRows(result.rows);
+  }
+
+  /**
+   * The joined rows read back field by field: a grouped field as the grouped query reads it (an
+   * aggregate as a number, a MIN / MAX of a mapped column through the column's mapper), a joined
+   * column or an `sql` expression through its mapper, a literal as itself. The rows used to be
+   * returned as the driver delivered them — a count as a string, a mapped MIN as its storage value.
+   */
+  private transformRows(rows: any[]): any[] {
+    const mockResult = this.resultSelector(this.createLeftMock(), this.createRightMock()) as Record<string, unknown>;
+    const readers: Array<[string, (row: any) => any]> = [];
+
+    for (const [key, value] of Object.entries(mockResult)) {
+      const kind = joinedProjectionKind(value, key);
+
+      if (kind === 'skip') {
+        continue;
+      }
+
+      if (kind === 'literal') {
+        // Read back as itself — it rides the statement as a parameter only for SQL reading the query
+        readers.push([key, () => value]);
+        continue;
+      }
+
+      if (kind === 'expression') {
+        const mapper = readMapperOf(value);
+        readers.push([key, row => (mapper ? mapper.fromDriver(row[key]) : row[key])]);
+        continue;
+      }
+
+      // A column: one of the grouped query's fields, or of the joined side
+      const ref = value as any;
+
+      if (ref.__isAggregationArray) {
+        // A withAggregation CTE's items, through the aggregated query's own mappers
+        const itemReads = aggregatedItemReads(ref.__innerSelectionMetadata);
+        readers.push([key, row => (itemReads && Array.isArray(row[key]) ? mapAggregatedItems(row[key], itemReads) : row[key])]);
+        continue;
+      }
+
+      const readGrouped = ref.__tableAlias === this.leftAlias ? this.leftReaders.get(ref.__fieldName) : undefined;
+      const mapper = readGrouped === undefined ? readMapperOf(ref) : undefined;
+
+      readers.push([key, row => {
+        const raw = row[key];
+
+        if (readGrouped) {
+          return readGrouped(raw);
+        }
+
+        return mapper && raw !== null && raw !== undefined ? mapper.fromDriver(raw) : raw;
+      }]);
+    }
+
+    return rows.map(row => {
+      const out: any = {};
+
+      for (const [key, read] of readers) {
+        out[key] = read(row);
+      }
+
+      return out;
+    });
   }
 
   /**
@@ -2127,7 +2369,9 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
 
     const selectParts: string[] = [];
     for (const [alias, value] of Object.entries(mockResult as object)) {
-      if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
+      const kind = joinedProjectionKind(value, alias);
+
+      if (kind === 'column') {
         const field = value as any;
         const tableAlias = field.__tableAlias;
         if (tableAlias) {
@@ -2135,16 +2379,25 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
         } else {
           selectParts.push(`"${field.__dbColumnName}" as "${alias}"`);
         }
-      } else if (value instanceof SqlFragment) {
+      } else if (kind === 'expression') {
         const sqlBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
         };
-        const fragmentSql = value.buildSql(sqlBuildContext);
+        // A subquery renders parenthesized, as the fragment interpolating it renders it
+        const fragment = value instanceof SqlFragment ? value : new SqlFragment(['', ''], [value]);
+        const fragmentSql = fragment.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
         selectParts.push(`${fragmentSql} as "${alias}"`);
-      } else {
-        selectParts.push(`"${alias}"`);
+      } else if (kind === 'literal') {
+        // A literal is a parameter (NULL for null); it rendered as a column named like its key
+        // ("column "kind" does not exist")
+        if (value === null) {
+          selectParts.push(`NULL as "${alias}"`);
+        } else {
+          selectParts.push(`$${context.paramCounter++} as "${alias}"`);
+          context.allParams.push(value);
+        }
       }
     }
 
@@ -2183,7 +2436,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     let orderByClause = '';
     if (this.orderByFields.length > 0) {
       const orderParts = this.orderByFields.map(
-        ({ field, direction }) => `${field} ${direction}`
+        ({ field, direction, aliased }) => `${aliased ? `"${field}"` : field} ${direction}`
       );
       orderByClause = `ORDER BY ${orderParts.join(', ')}`;
     }

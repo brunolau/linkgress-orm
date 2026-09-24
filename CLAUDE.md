@@ -65,7 +65,8 @@ an option):
 - **Never use `expect(...).rejects` / `.resolves` matchers in this suite** — Bun only awaits real promises there; driver queries and some builders are lazy thenables that never start, so the test hangs or misreports. Use `expectToReject()` from `tests/utils/expect-rejects.ts` (same matching semantics), or plain `await` for "should not throw".
 - Under Bun, `require('postgres')` returns the package's ES module namespace — unwrap `.default` (or `import postgres from 'postgres'`).
 - **BunClient is suite-green in BOTH modes**: Bun.SQL (≤ 1.3.14) cannot decode native ARRAY result columns in binary/prepared mode — arrays either PANIC the runtime ("incorrect alignment", data-dependent on preceding column byte lengths) or decode as numeric-keyed objects. Default (prepared) mode: `supportsBinaryArrayResults()` = false → strategies emit `json_agg` instead of `array_agg`; raw SQL selecting native arrays can still crash (repro: `debug/bun-sql-binary-array-repro.ts`). **`prepare: false` (text-results) mode**: arrays decode correctly, the panic surface disappears entirely, capability auto-reports true (array_agg kept), and the client pre-stringifies object params (Bun's text mode would send "[object Object]"). ~0.05–0.08 ms/query re-parse cost; run the suite in this mode with `LINKGRESS_TEST_BUN_PREPARE=false`. BunClient result sets are passed through without copying — never re-introduce `Array.from` on them.
-- Bun.SQL serializes JS-array params as JSON: fine for `jsonb` targets, but binding a JS array to a native `int[]` column fails with a protocol error (08P01). The `array()` custom type therefore does not work with BunClient for writes.
+- Bun.SQL serializes JS-array params as JSON: fine for `jsonb` targets, but binding a JS array to a native `int[]` parameter fails with a protocol error (08P01). A native array column (`.array()`) and `cast(values, 'int[]')` therefore bind a PostgreSQL array LITERAL on every driver (`toPgArrayLiteral`); a raw JS array handed to raw SQL for an array parameter still fails on Bun.
+- Bun's binary numeric decoder reads a scaled zero as `"0"`: `BunClient.losesNumericZeroScale()` is `true` in that mode and the query builders restore the scale of columns declared with one (`numericZeroScaleMapper`) — entity rows, projections, one-value selections, every RETURNING.
 - Multi-statement `.simple()` result shapes differ by driver (postgres.js collapses row-less statements and mislabels commands; Bun emits one entry per statement; both return the bare result set for a single statement) — `querySimple`/`querySimpleMulti` normalize via `normalizeSimpleResultSets` + last-row-bearing-set selection. Keep mocks faithful to REAL shapes (result sets are true arrays with `command`/`count`).
 
 ### PGlite test runs
@@ -73,7 +74,7 @@ an option):
 - `pnpm test:pglite` (`bun tests/run.ts --driver pglite`) — the whole suite on PGlite, files in parallel on half the cores (`-j` to change; every file owns its PGlite). ~21 s on 8 files vs ~145 s serially on the server. Bun loads PGlite's WASM natively (under jest/node it needs `--experimental-vm-modules` — that is a note for library users, not this suite).
 - The runner builds the AppDatabase schema once (plus `pg_trgm`/`unaccent`, which a long-lived test server has from earlier runs) with `bun tests/global-schema.ts pglite-snapshot <file>` and `dumpDataDir()`s it (`LINKGRESS_TEST_PGLITE_SNAPSHOT`); every test file boots its OWN instance from it (`tests/utils/pglite-server.ts`, ~150 ms). Shared and fresh harness clients borrow that instance; `disposeSharedDatabase()` stops it. Without a snapshot (a file run with plain `bun test`) the server builds the schema itself behind a gate.
 - Files that construct `PgClient`/`PostgresClient` directly still hit the real server; on pglite the runner creates the server schema when it can and only warns when it is unreachable.
-- Expected on PGlite: 7 failures, all attributed — 5 specs that seed through the harness but query their own `PostgresClient` (`query-timeout` × 4, `query-batch` × 1), `for-update` (needs two sessions; the single-session guard fails it at once) and `collation` (no ICU data). The 4 `query-batch-fidelity` date-revival failures `bench/pglite/README.md` measured under jest do not occur under Bun. PGlite's database collation is `C` and its session `TimeZone` a fixed offset (`Etc/GMT-1`).
+- Expected on PGlite: 0 failures and 18 skips, all attributed (`LINKGRESS_TEST_DRIVER === 'pglite'` guards in the specs): advisory locks held against a second session, a live `FOR UPDATE NOWAIT`, the end-to-end `query-timeout` block (PGlite cannot cancel a statement), ICU collation, and the blocks that query their own `PostgresClient` (`query-batch` passthrough, the single round-trip temp-table form of `collection-schema-qualified`). The 4 `query-batch-fidelity` date-revival failures `bench/pglite/README.md` measured under jest do not occur under Bun. PGlite's database collation is `C` and its session `TimeZone` a fixed offset (`Etc/GMT-1`). `@electric-sql/pglite` and `postgres` are devDependencies.
 - `LINKGRESS_TEST_RECORD_DIR=<dir>` records every harness statement with a result digest (`tests/utils/query-recorder.ts`; under Bun the test is its position in the file, set by the preload); `node bench/pglite/compare-runs.mjs --a <pg.json> --b <pglite.json> --a-rec <dir> --b-rec <dir>` diffs two runs (the runner's `--json` output or jest reports): outcomes, per-file timings, statement results.
 - `MemorySocket` delivers server output with `process.nextTick` under Bun, `setImmediate` under Node: `bun test` does not wake for immediates queued as a test settles (each response then waited ~0.1–0.9 s for a timer tick — the memory suite took 44.6 s instead of 12.7 s).
 
@@ -155,12 +156,19 @@ entity.property(e => e.publishTime)
 - Also attached directly on FieldRefs as `__mapper` (set by `ReferenceQueryBuilder.createMockTargetRow()`)
 
 ### Result Mapping Pipeline (`transformResults()` in query-builder.ts)
-1. **Pre-analysis phase**: Categorizes each field into `FieldType` enum (FIELD_REF_MAPPER, FIELD_REF_NO_MAPPER, SQL_FRAGMENT_MAPPER, SIMPLE, etc.)
-2. **Per-row phase**: Applies `mapper.fromDriver()` based on pre-computed field type
+1. **Pre-analysis phase**: `compileFieldRead()` compiles each projected value into a `FieldRead` (FieldType FIELD_REF_MAPPER, FIELD_REF_NO_MAPPER, SQL_FRAGMENT_MAPPER, SIMPLE, LITERAL, NESTED, collections, CTE_AGGREGATION)
+2. **Per-row phase**: `readField()` applies it — `mapper.fromDriver()`, a literal as itself, a NESTED read value by value
 
-Mapper lookup order for FieldRefs:
+Every value reads the way its own column reads, wherever it sits:
+- A nested object and a navigation row projected whole (`{ author: p.user }`) are NESTED reads over their values; a navigation row renders as its columns (`__nested__author__<col>`, flattened like a nested object — never `json_build_object`). `reconstructNestedObjects()` folds the flat aliases and converts NOTHING.
+- SIMPLE converts a numeric string to a number only for a value of numeric or unknown SQL type (`coercesNumericText(__sqlType)`) — a text/uuid/json column keeps '01234'. At the top level SIMPLE reads NULL as `undefined`; in a nested object (`keepNull`) as `null`.
+- A CTE / table-subquery column ref is minted by `projectedColumnRef()` / `projectedValueRef()` (cte-builder.ts) and carries `__cteKind` ('column' with the body column's `__mapper` / `__sqlType`, 'literal', 'expression'): it never goes through the reading table's mapper found by name. A CTE body's and a subquery's literals render typed (`QueryContext.typedLiterals` → `projectionLiteralSql()` → `CAST($n AS …)`).
+
+Mapper lookup order for plain FieldRefs:
 1. Base table's `schemaColumnCache` (fast path for direct fields)
 2. `__mapper` on the FieldRef itself (fallback for navigation property fields from other tables)
+
+`buildQueryBody()` has a near-twin for UNION legs, `buildQueryCoreBody()`: a projection-rendering change belongs in both.
 
 ### Key Locations
 - `createCustomType()`: `src/types/custom-types.ts`

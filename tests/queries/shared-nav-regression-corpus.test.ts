@@ -469,11 +469,11 @@ describe('shared-nav regression corpus', () => {
       })
       .toList();
 
-    // The CTE strategy renders each ordered list's ORDER BY twice (inner subquery +
-    // json_agg), so ONE ordered list = exactly 2 DESC occurrences. Pre-fix, select()
-    // aliased the parent's orderByFields array, so the DESC entry pushed through
-    // list `a` leaked into list `b` as well — 4 occurrences.
-    expect((lastSql().match(/ DESC/g) ?? []).length).toBe(2);
+    // The CTE strategy renders each ordered list's ORDER BY once, in its json_agg, so ONE
+    // ordered list = exactly 1 DESC occurrence. Pre-fix, select() aliased the parent's
+    // orderByFields array, so the DESC entry pushed through list `a` leaked into list `b`
+    // as well — 2 occurrences.
+    expect((lastSql().match(/ DESC/g) ?? []).length).toBe(1);
   });
 
   test('F4 [guard]: statement-style offset() accumulation still applies', async () => {

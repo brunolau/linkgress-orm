@@ -1,5 +1,4 @@
 import { describe, test, expect } from 'bun:test';
-import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { DbCteBuilder, eq, gt, sql } from '../../src';
 import PgIntDateTimeUtils from '../../debug/types/pgIntDatetimeUtils';
@@ -288,8 +287,7 @@ describe('CTE with Aggregation and Join', () => {
         'orders',
       );
 
-      // Use temptable collection strategy - note: no nested collections (taskOrders removed)
-      // temptable strategy doesn't support nested collections within collection queries
+      // Use temptable collection strategy
       const searchProducts = await db.users
         .withQueryOptions({ collectionStrategy: 'temptable' })
         .where(p => gt(p.id, -1))
@@ -318,26 +316,40 @@ describe('CTE with Aggregation and Join', () => {
     });
   });
 
-  test('should reject nested collections with temptable collection strategy', async () => {
+  test('nested collections under the temptable collection strategy read what the lateral strategy reads', async () => {
     await withDatabase(async (db) => {
       await seedTestData(db);
 
-      // temptable strategy should throw an error when nested collections are used
-      await expectToReject(async () => {
-        await db.users
-          .withQueryOptions({ collectionStrategy: 'temptable' })
-          .where(p => gt(p.id, -1))
-          .select(user => ({
-            id: user.id,
-            taskOrders: user.orders!.select(o => ({
-              id: o.id,
-              tasks: o.orderTasks!.select(ot => ({
-                taskId: ot.task!.id,
-              })).toList('tasks')
-            })).toList('taskOrders')
-          }))
-          .toList();
-      }, 'Nested collections in temptable strategy are not supported');
+      // The temp-table aggregation renders a collection nested in it (with a navigation of its
+      // own) as a LATERAL subquery of the aggregation statement — it used to refuse the shape
+      const run = (collectionStrategy: 'temptable' | 'lateral') => db.users
+        .withQueryOptions({ collectionStrategy })
+        .where(p => gt(p.id, -1))
+        .select(user => ({
+          id: user.id,
+          taskOrders: user.orders!.select(o => ({
+            id: o.id,
+            tasks: o.orderTasks!.select(ot => ({
+              taskId: ot.task!.id,
+            })).toList('tasks')
+          })).toList('taskOrders')
+        }))
+        .toList();
+
+      const normalize = (rows: Awaited<ReturnType<typeof run>>) => [...rows]
+        .sort((a, b) => a.id - b.id)
+        .map(row => ({
+          id: row.id,
+          taskOrders: [...(row.taskOrders as any[])]
+            .sort((a, b) => a.id - b.id)
+            .map(order => ({ id: order.id, tasks: (order.tasks as any[]).map(task => task.taskId).sort() })),
+        }));
+
+      const viaTempTable = normalize(await run('temptable'));
+      const viaLateral = normalize(await run('lateral'));
+
+      expect(viaTempTable).toEqual(viaLateral);
+      expect(viaTempTable.some(row => row.taskOrders.some(order => order.tasks.length > 0))).toBe(true);
     });
   });
 
