@@ -586,6 +586,26 @@ const mergeCoverage = (): void => {
   console.log('\nCoverage written to coverage/lcov.info');
 };
 
+/**
+ * The message for an error that stopped the run. A refused connection arrives as an AggregateError with an
+ * EMPTY message (one refusal per resolved address — ::1 and 127.0.0.1 for "localhost"), so printing
+ * `message` printed a blank line and the run just exited 1.
+ */
+const describeRunError = (e: unknown): string => {
+  const causes: unknown[] = Array.isArray((e as { errors?: unknown[] })?.errors) ? (e as { errors: unknown[] }).errors : [e];
+  const refused = [e, ...causes].some((c) => (c as NodeJS.ErrnoException)?.code === 'ECONNREFUSED');
+
+  if (refused) {
+    return `Cannot reach PostgreSQL at ${baseEnv.DB_HOST || 'localhost'}:${baseEnv.DB_PORT || '5432'} (connection refused). `
+      + 'Start the server, or point DB_HOST / DB_PORT (.env or the environment) at one — or run the suite without '
+      + 'a server: npm run test:memory';
+  }
+
+  const text = causes.map((c) => (c instanceof Error ? c.message || c.name : String(c))).filter(Boolean).join('; ');
+
+  return text || String(e);
+};
+
 let exitCode = 0;
 try {
   const runs: RunResult[] = [];
@@ -621,7 +641,7 @@ try {
     mergeCoverage();
   }
 } catch (e) {
-  console.error(e instanceof Error ? e.message : e);
+  console.error(describeRunError(e));
   exitCode = 1;
 } finally {
   // normally already dropped by the run that created them; this covers a run that threw half-way
