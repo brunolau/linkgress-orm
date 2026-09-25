@@ -522,6 +522,30 @@ describe('Insert, Update, Delete Operations', () => {
       });
     });
 
+    test('jsonbMerge casts a compound patch as a whole', async () => {
+      await withDatabase(async (db) => {
+        const { users } = await seedTestData(db);
+
+        await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update({ metadata: { foo: 'bar' } });
+
+        // Two TEXT halves of one JSON document: only their concatenation is valid JSON, so the cast
+        // must cover the whole patch. Cast on the last half alone, `jsonb || text || jsonb` resolves
+        // to text concatenation and the UPDATE fails.
+        await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .update(p => ({ metadata: jsonbMerge(p.metadata, sql`${'{"baz":'}::text || ${'"qux"}'}::text`) }));
+
+        const row = await db.users
+          .where(u => eq(u.id, users.alice.id))
+          .select(u => ({ metadata: u.metadata }))
+          .firstOrDefault();
+
+        expect(row?.metadata).toEqual({ foo: 'bar', baz: 'qux' });
+      });
+    });
+
     test('coalesce helper should support 3+ args', async () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);

@@ -1412,11 +1412,14 @@ export function coalesce(
 }
 
 /**
- * JSONB merge helper - emits `COALESCE(target, '{}'::jsonb) || $patch::jsonb`.
+ * JSONB merge helper - emits `COALESCE(target, '{}'::jsonb) || (patch)::jsonb`.
  *
  * Convenience wrapper for the common pattern of merging a JSONB patch onto a
  * column that may be null. Safe under concurrent writes because the `||`
  * operator is evaluated atomically by PostgreSQL per row.
+ *
+ * The patch is parenthesised before its cast, so a compound patch (`sql\`${a} || ${b}\``)
+ * is cast as a whole — without the parentheses the cast bound to its last operand only.
  *
  * @param target - The JSONB column (or SqlFragment) to merge onto. May be null.
  *                 Accept the column proxy directly (e.g. `p.integrationInfo`) — at
@@ -1435,7 +1438,7 @@ export function jsonbMerge<T extends object = any>(
   patch: FieldLike<T> | SqlFragment<T> | T
 ): SqlFragment<T> {
   return new SqlFragment<T>(
-    ['COALESCE(', `, '{}'::jsonb) || `, '::jsonb'],
+    ['COALESCE(', `, '{}'::jsonb) || (`, ')::jsonb'],
     [target, patch]
   );
 }
