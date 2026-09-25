@@ -137,6 +137,15 @@ describe('Baseline Migrations (fresh-database path)', () => {
     return result.rows;
   };
 
+  const journalRowsWithAppliedBy = async (): Promise<
+    { filename: string; baselined: boolean; applied_by: string | null }[]
+  > => {
+    const result = await client.query(
+      `SELECT filename, baselined, applied_by FROM "public"."${JOURNAL_TABLE}" ORDER BY filename ASC`
+    );
+    return result.rows;
+  };
+
   // The downstream detection shape: "was this database ever baselined?"
   const dbWasBaselined = async (): Promise<boolean> => {
     const result = await client.query(
@@ -249,6 +258,36 @@ describe('Baseline Migrations (fresh-database path)', () => {
         { filename: '20250603-120000.ts', baselined: true },
         { filename: '20250604-120000.ts', baselined: false },
         { filename: '20250605-120000.ts', baselined: false },
+      ]);
+    });
+
+    it('should label both baselined and runOnBaseline-executed rows with the configured appliedBy', async () => {
+      createTestMigration('20250609-090000.ts', {
+        up: ['CREATE TABLE baseline_marker_one (id SERIAL PRIMARY KEY)'],
+        down: ['DROP TABLE baseline_marker_one'],
+      });
+      createTestMigration('20250609-100000.ts', {
+        up: [`INSERT INTO baseline_test_config (config_key, config_value) VALUES ('seed', 'v1')`],
+        down: [`DELETE FROM baseline_test_config WHERE config_key = 'seed'`],
+        runOnBaseline: true,
+      });
+
+      const labelledRunner = new MigrationRunner(db, {
+        migrationsDirectory: TEST_MIGRATIONS_DIR,
+        journalTable: JOURNAL_TABLE,
+        verbose: false,
+        appliedBy: '2026.09.25-88a9dc5',
+      });
+
+      const result = await labelledRunner.up();
+
+      expect(result.baselined).toEqual(['20250609-090000.ts']);
+      expect(result.applied).toEqual(['20250609-100000.ts']);
+      expect(result.failed).toBeUndefined();
+
+      expect(await journalRowsWithAppliedBy()).toEqual([
+        { filename: '20250609-090000.ts', baselined: true, applied_by: '2026.09.25-88a9dc5' },
+        { filename: '20250609-100000.ts', baselined: false, applied_by: '2026.09.25-88a9dc5' },
       ]);
     });
 
@@ -575,6 +614,86 @@ describe('Baseline Migrations (fresh-database path)', () => {
         )
       `);
     };
+
+    // Shape from the release that added `baselined` but predates `applied_by`
+    const createBaselinedOnlyShapeJournal = async () => {
+      await client.query(`
+        CREATE TABLE "public"."${JOURNAL_TABLE}" (
+          id SERIAL PRIMARY KEY,
+          filename VARCHAR(255) NOT NULL UNIQUE,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          baselined BOOLEAN NOT NULL DEFAULT FALSE
+        )
+      `);
+    };
+
+    it('should add the applied_by column idempotently and default old rows to NULL', async () => {
+      await createBaselinedOnlyShapeJournal();
+      await client.query(
+        `INSERT INTO "public"."${JOURNAL_TABLE}" (filename, baselined) VALUES ('20250501-120000.ts', true)`
+      );
+
+      const journal = new MigrationJournal(client, {
+        journalTable: JOURNAL_TABLE,
+        appliedBy: '2026.09.25-88a9dc5',
+      });
+
+      // Upgrade, then again — must be idempotent
+      await journal.ensureTable();
+      await journal.ensureTable();
+
+      const column = await client.query(
+        `SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'applied_by'`,
+        [JOURNAL_TABLE]
+      );
+      expect(column.rows).toHaveLength(1);
+      expect(column.rows[0].is_nullable).toBe('YES');
+
+      // Pre-existing row predates the column — NULL
+      const applied = await journal.getApplied();
+      expect(applied).toHaveLength(1);
+      expect(applied[0].filename).toBe('20250501-120000.ts');
+      expect(applied[0].applied_by).toBeNull();
+
+      // A row recorded after the upgrade, through a labelled journal, carries it
+      await journal.recordApplied('20250502-120000.ts');
+      const all = await journal.getApplied();
+      expect(all.map(a => ({ filename: a.filename, applied_by: a.applied_by }))).toEqual([
+        { filename: '20250501-120000.ts', applied_by: null },
+        { filename: '20250502-120000.ts', applied_by: '2026.09.25-88a9dc5' },
+      ]);
+    });
+
+    it('should upgrade a pre-applied_by journal through runner.up() with old rows NULL and new rows labelled', async () => {
+      await createBaselinedOnlyShapeJournal();
+      await client.query(
+        `INSERT INTO "public"."${JOURNAL_TABLE}" (filename, baselined) VALUES ('20250703-120000.ts', false)`
+      );
+
+      createTestMigration('20250703-120000.ts', { up: ['SELECT 1'] });
+      createTestMigration('20250704-120000.ts', {
+        up: ['CREATE TABLE baseline_marker_one (id SERIAL PRIMARY KEY)'],
+        down: ['DROP TABLE baseline_marker_one'],
+      });
+
+      const labelledRunner = new MigrationRunner(db, {
+        migrationsDirectory: TEST_MIGRATIONS_DIR,
+        journalTable: JOURNAL_TABLE,
+        verbose: false,
+        appliedBy: '2026.09.25-88a9dc5',
+      });
+
+      const result = await labelledRunner.up();
+
+      expect(result.applied).toEqual(['20250704-120000.ts']);
+      expect(result.skipped).toEqual(['20250703-120000.ts']);
+
+      expect(await journalRowsWithAppliedBy()).toEqual([
+        { filename: '20250703-120000.ts', baselined: false, applied_by: null },
+        { filename: '20250704-120000.ts', baselined: false, applied_by: '2026.09.25-88a9dc5' },
+      ]);
+    });
 
     it('should add the baselined column idempotently and default old rows to false', async () => {
       await createOldShapeJournal();

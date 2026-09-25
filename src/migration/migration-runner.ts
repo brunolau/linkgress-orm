@@ -195,6 +195,17 @@ export class MigrationRunner {
    *
    * Each migration's down() method is executed within a transaction.
    *
+   * If a migration's file cannot be found (e.g. reverting from a build that
+   * does not contain it), nothing is reverted and the journal row is KEPT —
+   * treated exactly like a failed down(): `result.failed` is set and
+   * execution stops, so later (older) migrations in this batch are never
+   * touched. Deleting the journal row without running down() would leave the
+   * migration's schema change in place while claiming it was reverted, and
+   * the next up() would then re-run it against a schema that already has it.
+   * Run down() from a build that contains the file, or — if you reverted its
+   * effects by hand — remove the row yourself with
+   * `MigrationJournal.recordReverted()`.
+   *
    * @param count - Number of migrations to revert (default: 1)
    * @returns Result containing reverted migrations
    */
@@ -218,10 +229,16 @@ export class MigrationRunner {
       const migration = allMigrations.find(m => m.filename === entry.filename);
 
       if (!migration) {
-        this.logger(`  WARNING: Migration file not found for ${entry.filename}, removing from journal`, 'warn');
-        await this.journal.recordReverted(entry.filename);
-        result.applied.push(entry.filename);
-        continue;
+        result.failed = {
+          filename: entry.filename,
+          error: new Error(
+            `Migration file not found for ${entry.filename}: nothing was reverted and the journal ` +
+            `row is kept. Run down() from a build that contains the file, or remove the row with ` +
+            `MigrationJournal.recordReverted() if you reverted it by hand.`
+          ),
+        };
+        this.logger(`  FAILED: Migration file not found for ${entry.filename}`, 'error');
+        break;
       }
 
       try {
@@ -285,9 +302,17 @@ export class MigrationRunner {
    *
    * @returns Array of migration status objects. `baselined` is true for
    *   migrations recorded by the fresh-database baseline shortcut without
-   *   being executed (undefined for migrations not yet applied).
+   *   being executed; `appliedBy` is the `MigrationConfig.appliedBy` label
+   *   the recording runner carried, null when it had none (both undefined
+   *   for migrations not yet applied).
    */
-  async status(): Promise<{ filename: string; applied: boolean; appliedAt?: Date; baselined?: boolean }[]> {
+  async status(): Promise<{
+    filename: string;
+    applied: boolean;
+    appliedAt?: Date;
+    baselined?: boolean;
+    appliedBy?: string | null;
+  }[]> {
     await this.journal.ensureTable();
 
     const allMigrations = await this.loader.loadAllMigrations();
@@ -299,6 +324,7 @@ export class MigrationRunner {
       applied: appliedMap.has(m.filename),
       appliedAt: appliedMap.get(m.filename)?.applied_at,
       baselined: appliedMap.get(m.filename)?.baselined,
+      appliedBy: appliedMap.get(m.filename)?.applied_by,
     }));
   }
 

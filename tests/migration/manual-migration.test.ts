@@ -145,6 +145,7 @@ describe('Manual Migration System', () => {
       expect(columns).toContain('id');
       expect(columns).toContain('filename');
       expect(columns).toContain('applied_at');
+      expect(columns).toContain('applied_by');
     });
 
     it('should record applied migration', async () => {
@@ -154,6 +155,26 @@ describe('Manual Migration System', () => {
       const applied = await journal.getApplied();
       expect(applied).toHaveLength(1);
       expect(applied[0].filename).toBe('20260101-120000.ts');
+      // No appliedBy configured on this journal — NULL, same as a
+      // pre-existing row from before the column existed
+      expect(applied[0].applied_by).toBeNull();
+    });
+
+    it('should record the configured appliedBy label on every recorded row', async () => {
+      const labelledJournal = new MigrationJournal(client, {
+        journalTable: '__test_migrations',
+        journalSchema: 'public',
+        appliedBy: '2026.09.25-88a9dc5',
+      });
+      await labelledJournal.ensureTable();
+      await labelledJournal.recordApplied('20260101-120000.ts');
+      await labelledJournal.recordApplied('20260102-120000.ts', true);
+
+      const applied = await labelledJournal.getApplied();
+      expect(applied.map(a => ({ filename: a.filename, applied_by: a.applied_by }))).toEqual([
+        { filename: '20260101-120000.ts', applied_by: '2026.09.25-88a9dc5' },
+        { filename: '20260102-120000.ts', applied_by: '2026.09.25-88a9dc5' },
+      ]);
     });
 
     it('should check if migration is applied', async () => {
@@ -424,6 +445,82 @@ describe('Manual Migration System', () => {
       expect(tableCheck.rows[0].exists).toBe(false);
     });
 
+    it('should fail down() when the migration file is missing, keeping the journal row and the schema change', async () => {
+      createTestMigration(
+        '20260501-120000.ts',
+        'CREATE TABLE "test_table_one" (id SERIAL PRIMARY KEY)',
+        'DROP TABLE "test_table_one"'
+      );
+
+      await runner.up();
+
+      // Simulate reverting from a build that no longer ships the file
+      fs.unlinkSync(path.join(TEST_MIGRATIONS_DIR, '20260501-120000.ts'));
+
+      const result = await runner.down(1);
+
+      expect(result.applied).toEqual([]);
+      expect(result.failed?.filename).toBe('20260501-120000.ts');
+      expect(result.failed?.error).toBeDefined();
+      expect(result.failed?.error.message).toContain('20260501-120000.ts');
+
+      // The journal row was NOT removed — down() never ran
+      const applied = await runner.getJournal().getApplied();
+      expect(applied.map(a => a.filename)).toContain('20260501-120000.ts');
+
+      // Nothing was reverted — the table the migration created still exists
+      const tableCheck = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'test_table_one'
+        ) as exists
+      `);
+      expect(tableCheck.rows[0].exists).toBe(true);
+    });
+
+    it('should revert the newest present migration, then stop and keep the journal row when an older file is missing', async () => {
+      createTestMigration(
+        '20260502-120000.ts',
+        'CREATE TABLE "test_table_one" (id SERIAL PRIMARY KEY)',
+        'DROP TABLE "test_table_one"'
+      );
+      createTestMigration(
+        '20260503-120000.ts',
+        'CREATE TABLE "test_table_two" (id SERIAL PRIMARY KEY)',
+        'DROP TABLE "test_table_two"'
+      );
+
+      await runner.up();
+
+      // Older migration's file goes missing; newer one is still present.
+      // down() reverts newest-first, so it reverts 20260503 successfully
+      // before hitting the missing 20260502 file and stopping.
+      fs.unlinkSync(path.join(TEST_MIGRATIONS_DIR, '20260502-120000.ts'));
+
+      const result = await runner.down(2);
+
+      expect(result.applied).toEqual(['20260503-120000.ts']);
+      expect(result.failed?.filename).toBe('20260502-120000.ts');
+
+      // The reverted (newer) migration's table is gone
+      const tableTwo = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'test_table_two'
+        ) as exists
+      `);
+      expect(tableTwo.rows[0].exists).toBe(false);
+
+      // The missing-file (older) migration's journal row and table both remain
+      const applied = await runner.getJournal().getApplied();
+      expect(applied.map(a => a.filename)).toEqual(['20260502-120000.ts']);
+
+      const tableOne = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'test_table_one'
+        ) as exists
+      `);
+      expect(tableOne.rows[0].exists).toBe(true);
+    });
+
     it('should stop on migration failure', async () => {
       // Use unique timestamps and table names for this test
       createTestMigration(
@@ -504,6 +601,45 @@ describe('Manual Migration System', () => {
       expect(status[0].appliedAt).toBeInstanceOf(Date);
       expect(status[1].filename).toBe('20260102-120000.ts');
       expect(status[1].applied).toBe(true);
+    });
+
+    it('should record the configured appliedBy label on normal-path migrations', async () => {
+      createTestMigration(
+        '20260201-120000.ts',
+        'CREATE TABLE test_table_one (id SERIAL PRIMARY KEY)',
+        'DROP TABLE test_table_one'
+      );
+
+      const labelledRunner = new MigrationRunner(db, {
+        migrationsDirectory: TEST_MIGRATIONS_DIR,
+        journalTable: '__runner_migrations',
+        verbose: false,
+        appliedBy: '2026.09.25-88a9dc5',
+      });
+
+      const result = await labelledRunner.up();
+      expect(result.applied).toEqual(['20260201-120000.ts']);
+
+      const applied = await labelledRunner.getJournal().getApplied();
+      expect(applied).toHaveLength(1);
+      expect(applied[0].applied_by).toBe('2026.09.25-88a9dc5');
+
+      const status = await labelledRunner.status();
+      expect(status[0].appliedBy).toBe('2026.09.25-88a9dc5');
+    });
+
+    it('should record NULL appliedBy when the runner has none configured', async () => {
+      createTestMigration(
+        '20260202-120000.ts',
+        'CREATE TABLE test_table_one (id SERIAL PRIMARY KEY)',
+        'DROP TABLE test_table_one'
+      );
+
+      const result = await runner.up();
+      expect(result.applied).toEqual(['20260202-120000.ts']);
+
+      const status = await runner.status();
+      expect(status[0].appliedBy).toBeNull();
     });
   });
 

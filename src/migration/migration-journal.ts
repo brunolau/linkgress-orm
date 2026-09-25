@@ -11,14 +11,16 @@ export class MigrationJournal {
   private tableName: string;
   private schemaName: string;
   private qualifiedName: string;
+  private appliedBy: string | null;
 
   constructor(
     private client: DatabaseClient,
-    config?: Pick<MigrationConfig, 'journalTable' | 'journalSchema'>
+    config?: Pick<MigrationConfig, 'journalTable' | 'journalSchema' | 'appliedBy'>
   ) {
     this.tableName = config?.journalTable || '__migrations';
     this.schemaName = config?.journalSchema || 'public';
     this.qualifiedName = `"${this.schemaName}"."${this.tableName}"`;
+    this.appliedBy = config?.appliedBy ?? null;
   }
 
   /**
@@ -39,8 +41,9 @@ export class MigrationJournal {
   /**
    * Ensure the journal table exists in the database.
    * Creates it if it doesn't exist, and upgrades journals created before the
-   * `baselined` column existed (idempotent ADD COLUMN IF NOT EXISTS — rows in
-   * pre-existing journals keep the default false).
+   * `baselined` / `applied_by` columns existed (idempotent ADD COLUMN IF NOT
+   * EXISTS — rows in pre-existing journals keep baselined = false and
+   * applied_by = NULL).
    */
   async ensureTable(): Promise<void> {
     // First ensure the schema exists
@@ -55,14 +58,18 @@ export class MigrationJournal {
         id SERIAL PRIMARY KEY,
         filename VARCHAR(255) NOT NULL UNIQUE,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        baselined BOOLEAN NOT NULL DEFAULT FALSE
+        baselined BOOLEAN NOT NULL DEFAULT FALSE,
+        applied_by TEXT
       )
     `;
     await this.client.query(sql);
 
-    // Upgrade journals created before the baselined column existed
+    // Upgrade journals created before the baselined / applied_by columns existed
     await this.client.query(
       `ALTER TABLE ${this.qualifiedName} ADD COLUMN IF NOT EXISTS baselined BOOLEAN NOT NULL DEFAULT FALSE`
+    );
+    await this.client.query(
+      `ALTER TABLE ${this.qualifiedName} ADD COLUMN IF NOT EXISTS applied_by TEXT`
     );
   }
 
@@ -71,7 +78,7 @@ export class MigrationJournal {
    */
   async getApplied(): Promise<MigrationJournalEntry[]> {
     const result = await this.client.query<MigrationJournalEntry>(
-      `SELECT id, filename, applied_at, baselined FROM ${this.qualifiedName} ORDER BY filename ASC`
+      `SELECT id, filename, applied_at, baselined, applied_by FROM ${this.qualifiedName} ORDER BY filename ASC`
     );
     return result.rows;
   }
@@ -93,11 +100,14 @@ export class MigrationJournal {
    * @param filename - The migration filename
    * @param baselined - True when the migration was recorded by the
    *   fresh-database baseline shortcut without being executed (default false)
+   *
+   * The row's `applied_by` is the journal's configured `appliedBy` label
+   * (NULL when none).
    */
   async recordApplied(filename: string, baselined: boolean = false): Promise<void> {
     await this.client.query(
-      `INSERT INTO ${this.qualifiedName} (filename, baselined) VALUES ($1, $2)`,
-      [filename, baselined]
+      `INSERT INTO ${this.qualifiedName} (filename, baselined, applied_by) VALUES ($1, $2, $3)`,
+      [filename, baselined, this.appliedBy]
     );
   }
 
