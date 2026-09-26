@@ -120,7 +120,7 @@ describe('inArrayOpt / notInArrayOpt', () => {
       const ctx = makeContext();
       const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-      expect(inArrayOpt(ref('integer'), nine).buildSql(ctx)).toBe('"p"."product_id" = ANY($1::integer[])');
+      expect(inArrayOpt(ref('integer'), nine).buildSql(ctx)).toBe('("p"."product_id" = ANY($1::integer[]))');
       expect(ctx.params).toEqual(['{1,2,3,4,5,6,7,8,9}']);
       expect(ctx.paramCounter).toBe(2);
     });
@@ -144,28 +144,28 @@ describe('inArrayOpt / notInArrayOpt', () => {
     test('notInArrayOpt mirrors the switch with NOT IN and <> ALL', () => {
       expect(notInArrayOpt(ref('integer'), [1, 2]).buildSql(makeContext())).toBe('"p"."product_id" NOT IN ($1, $2)');
       expect(notInArrayOpt(ref('integer'), Array.from({ length: 9 }, (_, i) => i)).buildSql(makeContext()))
-        .toBe('"p"."product_id" <> ALL($1::integer[])');
+        .toBe('("p"."product_id" <> ALL($1::integer[]))');
     });
 
     test('the array form carries the column cast, uncast refs stay bare', () => {
       const nine = Array.from({ length: 9 }, (_, i) => i);
 
       expect(inArrayOpt(ref('uuid'), nine.map(String)).buildSql(makeContext())).toContain('::uuid[]');
-      expect(inArrayOpt(ref(undefined), nine).buildSql(makeContext())).toBe('"p"."product_id" = ANY($1)');
+      expect(inArrayOpt(ref(undefined), nine).buildSql(makeContext())).toBe('("p"."product_id" = ANY($1))');
     });
 
     test('a configured threshold moves the switch point for both operators', () => {
       LinkgressConfig.inArrayOptThreshold = 2;
 
       expect(inArrayOpt(ref('integer'), [1, 2]).buildSql(makeContext())).toBe('"p"."product_id" IN ($1, $2)');
-      expect(inArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).toBe('"p"."product_id" = ANY($1::integer[])');
-      expect(notInArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).toBe('"p"."product_id" <> ALL($1::integer[])');
+      expect(inArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).toBe('("p"."product_id" = ANY($1::integer[]))');
+      expect(notInArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).toBe('("p"."product_id" <> ALL($1::integer[]))');
     });
 
     test('threshold 0 sends every non-empty list to the array form, the empty list stays constant', () => {
       LinkgressConfig.inArrayOptThreshold = 0;
 
-      expect(inArrayOpt(ref('integer'), [1]).buildSql(makeContext())).toBe('"p"."product_id" = ANY($1::integer[])');
+      expect(inArrayOpt(ref('integer'), [1]).buildSql(makeContext())).toBe('("p"."product_id" = ANY($1::integer[]))');
       expect(inArrayOpt(ref('integer'), []).buildSql(makeContext())).toBe('1=0');
     });
 
@@ -211,10 +211,10 @@ describe('inArrayOpt / notInArrayOpt', () => {
       LinkgressConfig.inArrayUsesOpt = true;
       const ctx = makeContext();
 
-      expect(inArray(ref('integer'), nine).buildSql(ctx)).toBe('"p"."product_id" = ANY($1::integer[])');
+      expect(inArray(ref('integer'), nine).buildSql(ctx)).toBe('("p"."product_id" = ANY($1::integer[]))');
       expect(ctx.params).toEqual(['{1,2,3,4,5,6,7,8,9}']);
       expect(notInArray(ref('integer'), nine).buildSql(makeContext()))
-        .toBe('"p"."product_id" <> ALL($1::integer[])');
+        .toBe('("p"."product_id" <> ALL($1::integer[]))');
     });
 
     test('the threshold and the pad ladder apply to the routed inArray as well', () => {
@@ -222,7 +222,7 @@ describe('inArrayOpt / notInArrayOpt', () => {
 
       expect(inArray(ref('integer'), [1]).buildSql(makeContext())).toBe('"p"."product_id" IN ($1)');
       expect(inArray(ref('integer'), [1, 2]).buildSql(makeContext())).toBe('"p"."product_id" IN ($1, $2, $3, $4)');
-      expect(inArray(ref('integer'), [1, 2, 3, 4, 5]).buildSql(makeContext())).toBe('"p"."product_id" = ANY($1::integer[])');
+      expect(inArray(ref('integer'), [1, 2, 3, 4, 5]).buildSql(makeContext())).toBe('("p"."product_id" = ANY($1::integer[]))');
     });
 
     test('padding repeats the last element, so the routed inArray still selects the same rows', () => {

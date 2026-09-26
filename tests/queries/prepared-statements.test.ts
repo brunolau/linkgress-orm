@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { expectToReject } from '../utils/expect-rejects';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt, lt, gte, lte, and, or, like, sql, PreparedQuery, inSubquery } from '../../src';
+import { eq, gt, lt, gte, lte, ne, and, or, like, param, sql, PreparedQuery, inSubquery } from '../../src';
 
 describe('Prepared Statements', () => {
   describe('Basic prepared queries', () => {
@@ -58,6 +58,26 @@ describe('Prepared Statements', () => {
           expect(u.age).toBeGreaterThan(30);
           expect(u.age).toBeLessThan(50);
         });
+      });
+    });
+
+    test('binds every other parameter too: a literal and param() beside a (reused) placeholder', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // $1 = true (a literal), $2 = the placeholder (twice), $3 = param('alice')
+        const query = db.users
+          .where(u => and(
+            eq(u.isActive, true),
+            or(gt(u.age, sql.placeholder('minAge')), eq(u.age, sql.placeholder('minAge'))),
+            ne(u.username, param('alice', 'text'))
+          ))
+          .select(u => ({ username: u.username }))
+          .prepare('activeFromAgeExceptAlice');
+
+        expect(query.getSql()).toContain('$3');
+        expect(await query.execute({ minAge: 25 })).toEqual([{ username: 'bob' }]);
+        expect(await query.execute({ minAge: 36 })).toEqual([]);
       });
     });
 

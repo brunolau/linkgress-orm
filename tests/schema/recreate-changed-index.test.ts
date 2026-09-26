@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn,
-  integer, varchar, boolean as boolColumn, timestamptz, ixNormalized,
+  integer, varchar, boolean as boolColumn, timestamptz, ixNormalized, literal, modulo,
 } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 import { MigrationOperation } from '../../src/migration/db-schema-manager';
@@ -126,6 +126,43 @@ class ParenPartialDb extends DbContext {
   }
 }
 
+// ---- Expression indexes where only a CAST differs: the fast comparison folds `CAST(x AS t)` to `x`, so
+// only the authoritative (mirror) comparison can tell `(age % 10)` from `(age % CAST(10 AS bigint))` ----
+class ModPlainV extends DbEntity { id!: DbColumn<number>; email!: DbColumn<string>; hash!: DbColumn<string>; username!: DbColumn<string>; active!: DbColumn<boolean>; }
+class ModCastV extends DbEntity { id!: DbColumn<number>; email!: DbColumn<string>; hash!: DbColumn<string>; username!: DbColumn<string>; active!: DbColumn<boolean>; }
+class PredPlainV extends DbEntity { id!: DbColumn<number>; email!: DbColumn<string>; hash!: DbColumn<string>; username!: DbColumn<string>; active!: DbColumn<boolean>; }
+class PredCastV extends DbEntity { id!: DbColumn<number>; email!: DbColumn<string>; hash!: DbColumn<string>; username!: DbColumn<string>; active!: DbColumn<boolean>; }
+
+// v1: the expression as an earlier model spelled it — no cast
+class ModPlainDb extends DbContext {
+  get users(): DbEntityTable<ModPlainV> { return this.table(ModPlainV); }
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(ModPlainV, e => { defineColumns(e); e.hasIndex('ix_age_mod').withExpression('(age % 10)'); });
+  }
+}
+// v2: SAME index name, re-declared with the builder, which ADDS a cast — a genuinely different expression
+// (a query spelled the new way cannot use the old index)
+class ModCastDb extends DbContext {
+  get users(): DbEntityTable<ModCastV> { return this.table(ModCastV); }
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(ModCastV, e => { defineColumns(e); e.hasIndex('ix_age_mod').withExpression((u: any) => modulo(u.age, literal(10, 'bigint'))); });
+  }
+}
+// partial index: WHERE age = 1 …
+class PredPlainDb extends DbContext {
+  get users(): DbEntityTable<PredPlainV> { return this.table(PredPlainV); }
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(PredPlainV, e => { defineColumns(e); e.hasIndex('ix_age_pred', (u: IdxUser) => [u.email]).where('age = 1'); });
+  }
+}
+// … then WHERE CAST(age AS bigint) = 1
+class PredCastDb extends DbContext {
+  get users(): DbEntityTable<PredCastV> { return this.table(PredCastV); }
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(PredCastV, e => { defineColumns(e); e.hasIndex('ix_age_pred', (u: IdxUser) => [u.email]).where('CAST(age AS bigint) = 1'); });
+  }
+}
+
 function indexOps(ops: MigrationOperation[]): MigrationOperation[] {
   return ops.filter(o => o.type === 'create_index' || o.type === 'recreate_index' || o.type === 'drop_index');
 }
@@ -209,6 +246,72 @@ describe('recreate changed indexes (auto-migration)', () => {
       const c = createFreshClient();
       await c.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
       await c.end();
+    }
+  });
+
+  test('detects an index expression that ADDS a cast (the fast comparison folds it away; the mirror decides), then converges', async () => {
+    const clientV1 = createFreshClient();
+    const v1 = new ModPlainDb(clientV1);
+    let v2: ModCastDb | null = null;
+    try {
+      await clientV1.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await v1.getSchemaManager().ensureCreated();
+      expect(await indexDef(clientV1, 'ix_age_mod')).not.toContain('bigint');
+      await v1.dispose();
+
+      (EntityMetadataStore as any).metadata.clear();
+      const clientV2 = createFreshClient();
+      v2 = new ModCastDb(clientV2);
+
+      const recreate = (await v2.getSchemaManager().analyze()).find(o => o.type === 'recreate_index');
+      expect(recreate).toBeDefined();
+      expect((recreate as any).indexName).toBe('ix_age_mod');
+
+      await v2.getSchemaManager().migrate();
+      expect(await indexDef(clientV2, 'ix_age_mod')).toContain('bigint');
+      // Converged: the recreated index is exactly what the model declares — no further work, no churn.
+      expect(indexOps(await v2.getSchemaManager().analyze())).toHaveLength(0);
+    } finally {
+      if (v2) await v2.dispose();
+      const c = createFreshClient();
+      await c.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await c.end();
+    }
+  });
+
+  test('detects a partial predicate that ADDS a cast', async () => {
+    const clientV1 = createFreshClient();
+    const v1 = new PredPlainDb(clientV1);
+    let v2: PredCastDb | null = null;
+    try {
+      await clientV1.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await v1.getSchemaManager().ensureCreated();
+      await v1.dispose();
+
+      (EntityMetadataStore as any).metadata.clear();
+      const clientV2 = createFreshClient();
+      v2 = new PredCastDb(clientV2);
+
+      expect((await v2.getSchemaManager().analyze()).find(o => o.type === 'recreate_index')).toBeDefined();
+    } finally {
+      if (v2) await v2.dispose();
+      const c = createFreshClient();
+      await c.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await c.end();
+    }
+  });
+
+  test('does NOT recreate an unchanged CAST-spelled expression index (the mirror confirms it)', async () => {
+    const client = createFreshClient();
+    const db = new ModCastDb(client);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await db.getSchemaManager().ensureCreated();
+
+      expect(indexOps(await db.getSchemaManager().analyze())).toHaveLength(0);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+      await db.dispose();
     }
   });
 

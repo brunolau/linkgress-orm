@@ -492,8 +492,10 @@ describe('All Collection Strategies Comparison', () => {
             orders: u.orders!.select((o: any) => ({
               status: o.status,
               totalAmount: o.totalAmount,
-            })).toList('orders'),
+            })).orderBy((o: any) => [[o.status, 'ASC'], [o.totalAmount, 'ASC']]).toList('orders'),
           }))
+          // Without an explicit order the strategies may return the users in different orders (was flaky)
+          .orderBy((u: any) => [[u.userId, 'ASC']])
           .toList(),
         (cte: any[], temp: any[], lateral: any[]) => {
           expect(cte).toEqual(temp);

@@ -5,7 +5,7 @@ import { TableSchema, IndexMethod, IndexDefinition } from '../schema/table-build
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
 import { CollationRegistry, CollationDefinition } from '../types/collation-builder';
-import { SequenceConfig } from '../schema/sequence-builder';
+import { SequenceConfig, qualifiedSequenceName, renderCreateSequenceStatement } from '../schema/sequence-builder';
 import { RawSql } from '../query/conditions';
 import {
   buildCreateIndexStatement,
@@ -310,9 +310,7 @@ export class DbSchemaManager {
     }
 
     for (const [_, config] of this.sequenceRegistry.entries()) {
-      const qualifiedName = config.schema
-        ? `"${config.schema}"."${config.name}"`
-        : `"${config.name}"`;
+      const qualifiedName = qualifiedSequenceName(config);
 
       // Check if sequence already exists
       const checkSQL = config.schema
@@ -331,31 +329,7 @@ export class DbSchemaManager {
 
       if (!exists) {
         // Build CREATE SEQUENCE statement
-        let createSQL = `CREATE SEQUENCE ${qualifiedName}`;
-        const options: string[] = [];
-
-        if (config.startWith !== undefined) {
-          options.push(`START WITH ${config.startWith}`);
-        }
-        if (config.incrementBy !== undefined) {
-          options.push(`INCREMENT BY ${config.incrementBy}`);
-        }
-        if (config.minValue !== undefined) {
-          options.push(`MINVALUE ${config.minValue}`);
-        }
-        if (config.maxValue !== undefined) {
-          options.push(`MAXVALUE ${config.maxValue}`);
-        }
-        if (config.cache !== undefined) {
-          options.push(`CACHE ${config.cache}`);
-        }
-        if (config.cycle) {
-          options.push(`CYCLE`);
-        }
-
-        if (options.length > 0) {
-          createSQL += ` ${options.join(' ')}`;
-        }
+        const createSQL = renderCreateSequenceStatement(config);
 
         if (this.logQueries) {
           this.logger(`  Creating sequence ${qualifiedName}...`);
@@ -941,9 +915,7 @@ $$`;
     }
 
     for (const [_, config] of this.sequenceRegistry.entries()) {
-      const qualifiedName = config.schema
-        ? `"${config.schema}"."${config.name}"`
-        : `"${config.name}"`;
+      const qualifiedName = qualifiedSequenceName(config);
 
       if (this.logQueries) {
         this.logger(`  Dropping sequence ${qualifiedName}...`);
@@ -1157,8 +1129,15 @@ $$`;
             });
           } else if (this.recreateChangedIndexes) {
             const comparison = compareIndexDefinition(dbIndex.canonical_def, modelIndex);
-            if (comparison.changed) {
-              recreateCandidates.push({ modelIndex, dbDef: dbIndex.canonical_def, reason: comparison.reason });
+            // `needsConfirmation`: equal only because a model CAST(…) was folded away — an added or moved cast
+            // is invisible to the fast pass, so the mirror comparison below decides (it recreates nothing
+            // that PostgreSQL deparses identically).
+            if (comparison.changed || comparison.needsConfirmation) {
+              recreateCandidates.push({
+                modelIndex,
+                dbDef: dbIndex.canonical_def,
+                reason: comparison.reason ?? 'expression spelled with CAST(…) differs from the stored definition (confirmed against PostgreSQL)',
+              });
             }
           }
         }
@@ -1697,38 +1676,12 @@ $$`;
    * Execute create sequence
    */
   private async executeCreateSequence(config: SequenceConfig): Promise<void> {
-    const qualifiedName = config.schema
-      ? `"${config.schema}"."${config.name}"`
-      : `"${config.name}"`;
+    const qualifiedName = qualifiedSequenceName(config);
 
     this.logger(`  Creating sequence ${qualifiedName}...`);
 
     // Build CREATE SEQUENCE statement
-    let createSQL = `CREATE SEQUENCE ${qualifiedName}`;
-    const options: string[] = [];
-
-    if (config.startWith !== undefined) {
-      options.push(`START WITH ${config.startWith}`);
-    }
-    if (config.incrementBy !== undefined) {
-      options.push(`INCREMENT BY ${config.incrementBy}`);
-    }
-    if (config.minValue !== undefined) {
-      options.push(`MINVALUE ${config.minValue}`);
-    }
-    if (config.maxValue !== undefined) {
-      options.push(`MAXVALUE ${config.maxValue}`);
-    }
-    if (config.cache !== undefined) {
-      options.push(`CACHE ${config.cache}`);
-    }
-    if (config.cycle) {
-      options.push(`CYCLE`);
-    }
-
-    if (options.length > 0) {
-      createSQL += ` ${options.join(' ')}`;
-    }
+    const createSQL = renderCreateSequenceStatement(config);
 
     await this.client.query(createSQL);
     this.logger(`  ✓ Sequence ${qualifiedName} created\n`);

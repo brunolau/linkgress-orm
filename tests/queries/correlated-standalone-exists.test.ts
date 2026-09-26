@@ -77,6 +77,16 @@ describe('Correlated standalone subqueries in exists()', () => {
 					.select(p2 => ({ id: p2.id }))
 					.asSubquery())))
 				.toThrow(/same table/i);
+
+			// ... also as a leg of a UNION subquery (1.0.8 rendered it — "posts"."views" > "posts"."views" — and
+			// the leg compared each row with itself)
+			expect(() => db.posts
+				.where(p => exists(db.posts
+					.where(p2 => and(eq(p2.userId, p.userId), gt(p2.views, p.views)))
+					.select(p2 => ({ id: p2.id }))
+					.unionAll(db.orders.where(o => eq(o.userId, 0)).select(o => ({ id: o.id })))
+					.asSubquery())))
+				.toThrow(/same table/i);
 		});
 	});
 

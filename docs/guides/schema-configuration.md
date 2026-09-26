@@ -501,12 +501,41 @@ model.entity(Member, entity => {
 });
 ```
 
-For complex SQL that can't be expressed with helpers, use `.withExpression()` as an escape hatch:
+For other expressions use `.withExpression()` — raw SQL as an escape hatch, or, better, a builder over
+the table's columns, so the index and the queries that must use it share ONE definition:
 
 ```typescript
+import { literal, lower, regexpReplace, sql } from 'linkgress-orm';
+
+// raw SQL, kept as written
 entity.hasIndex('ix_jsonb_key')
   .withExpression('(data->>\'key\')::int');
+
+// builders — declare them once, use them in the index AND in the query
+const tailKey = (n: SqlOperand<number>) => sql<number>`${n} % ${literal(10000000, 'bigint')}`;
+const digitsKey = (code: SqlOperand<string>) => regexpReplace(code, literal('[^0-9]'), literal(''), literal('g'));
+
+entity.hasIndex('ix_shipment_serial_tail').withExpression(e => tailKey(e.serial));
+// → CREATE INDEX "ix_shipment_serial_tail" ON … (("serial" % CAST(10000000 AS bigint)))
+entity.hasIndex('ix_shipment_label_digits').withExpression(e => digitsKey(e.labelCode));
+// → CREATE INDEX "ix_shipment_label_digits" ON … (regexp_replace("label_code", '[^0-9]', '', 'g'))
+
+// the same builder in a query matches the index expression, so the planner uses the index
+db.shipments.where(s => eq(tailKey(s.serial), 1234567)).toList();
 ```
+
+- The builder receives the table's columns UNQUALIFIED (`"serial"`), carrying their mapper and SQL type
+  so type-dependent helpers render as they do in a query. Navigations are not in scope; declare the
+  properties an expression reads before the index.
+- Constants must be inline — `literal(…)`: an index is matched by its expression TREE, and a bound
+  parameter is no constant there. An expression that binds a parameter (or a placeholder) throws.
+- The text is kept verbatim when it is one function call or one parenthesised group, and wrapped in
+  `( … )` otherwise — a top-level `CAST(…)` included, which PostgreSQL prints as `((x)::t)` — the
+  spelling PostgreSQL's `pg_get_indexdef` prints, so `migrate()` recognises an existing index as unchanged
+  without rebuilding it. The reconcile also treats `CAST(x AS t)` like `x::t`, keeping the grouping of a
+  compound `x`: `CAST(a + b AS bigint) * 2` compares equal to `(a + b)::bigint * 2`, and differs from
+  `a + b * 2`.
+- `hasStatistics(…).withExpression(…)` takes the same builders.
 
 ### Normalized (accent/case-insensitive) Indexes
 
@@ -991,6 +1020,47 @@ sequence('my_sequence')
 ```
 
 **Note:** Custom sequences are automatically created during `ensureCreated()` and `migrate()` operations.
+
+### Runtime-Named Sequences (`runtimeSequence`)
+
+A sequence whose name is computed at run time — one per tenant and year, say — is declared by no model.
+`db.runtimeSequence(config)` gives a `DbSequence` for it, and `nextValueCreatingIfMissing()` creates it
+on first use:
+
+```typescript
+const number = await db
+  .runtimeSequence({ name: `seq_doc_${tenantId}_${year}`, startWith: 1, incrementBy: 1, minValue: 1, cache: 1 })
+  .nextValueCreatingIfMissing();
+// SELECT nextval($1::regclass) as value                         -- $1 = '"seq_doc_7_2026"'
+// only when that fails with 42P01 (no such relation):
+// CREATE SEQUENCE IF NOT EXISTS "seq_doc_7_2026" START WITH 1 INCREMENT BY 1 MINVALUE 1 CACHE 1
+// SELECT nextval($1::regclass) as value
+```
+
+- The CREATE runs only on SQLSTATE 42P01. A concurrent first use that loses the race to create the
+  sequence still draws: PostgreSQL reports the loser's CREATE as 23505 (it waited on the winner's
+  uncommitted catalog row) or 42P07 (the winner committed between the loser's `IF NOT EXISTS` check and
+  its own insert), and both — and 42710 — are swallowed. Any other error propagates, and the second
+  `nextval` is not retried. Any other error of the first `nextval` propagates without a CREATE.
+- Not registered: the schema manager never creates, compares or drops a runtime sequence.
+- Bound to the context's ROOT client, also when called on a transaction's context: a CREATE made inside a
+  caller's transaction would be undone by its rollback (restarting the numbering), and a failed first
+  `nextval` would abort the transaction. A drawn value is consumed whatever the caller does next.
+- …which has two consequences when you call it on a transaction's context (`tx.runtimeSequence(…)`):
+  - **A second pool connection per call.** The transaction holds one connection and the sequence needs
+    another from the same pool. When as many transactions as the pool has connections each wait for
+    one, none gets it — and a `pg.Pool` has no connection timeout by default, so they wait forever.
+    Draw before opening the transaction, or keep the pool larger than the number of concurrent
+    transactions that draw (and set `connectionTimeoutMillis`).
+  - **PGlite refuses it.** PGlite has a single session, held by the transaction, so the call fails at
+    once (`PGliteClient: PGlite has a single session, and the transaction running this callback holds
+    it — …`). Call `db.runtimeSequence(…)` outside `transaction()`.
+- Unlogged: the statements go to the client directly, like `nextValue()`.
+- The name is an identifier, never SQL: quoted (a `"` is doubled, a NUL refused) and schema-qualified
+  when `schema` is set. The options are inlined in the DDL, so each must be an integer within `bigint`
+  (-2^63 … 2^63-1): a number — also above 2^53 — or a JS `bigint`; a fraction, NaN, ±Infinity or a
+  value outside that range throws before any SQL. The same rule applies to the sequences the schema
+  manager creates, which share the options renderer.
 
 ## Default Values
 

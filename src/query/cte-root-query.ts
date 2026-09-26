@@ -2,15 +2,17 @@ import type { DatabaseClient } from '../database/database-client.interface';
 import { QueryExecutor } from '../entity/db-context';
 import type { OrderDirection } from '../entity/db-context';
 import {
+  and,
   Condition,
-  ConditionBuilder,
   FieldRef,
   SqlBuildContext,
   SqlFragment,
   UnwrapSelection,
+  WhereConditionBase,
   sql,
 } from './conditions';
-import { DbCte } from './cte-builder';
+import { assertExplicitAlias } from './aliased-scope';
+import { assertStatementLevelCtes, cteBodyAt, DbCte, declareStatementCtes, isStatementCte, stampChainId } from './cte-builder';
 import {
   BIGINT_LITERAL_READ,
   aggregatedItemReads,
@@ -20,12 +22,13 @@ import {
   holdsSqlValue,
   isScalarLiteralSelection,
   mapAggregatedItems,
+  nextChainId,
   projectionLiteralSql,
 } from './query-builder';
 import { parseOrderBy } from './query-utils';
-import { renumberPlaceholders } from './sql-utils';
 import { Subquery } from './subquery';
-import { selectorProjectingConditions } from './sql-functions';
+import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
+import { renderProjectedFragment } from './set-returning';
 
 /**
  * Join types supported when a CTE is the FROM root.
@@ -50,6 +53,14 @@ export type CteJoinType = 'INNER' | 'LEFT' | 'RIGHT' | 'FULL OUTER' | 'CROSS';
 export type SingleColumnValue<TSelection> = TSelection extends Record<string, any>
   ? TSelection[keyof TSelection]
   : TSelection;
+
+/**
+ * A CTE's row as a condition reads it: one column ref per column, typed by the column's value — what
+ * {@link CteRootQueryBuilder.where} hands its predicate (a projection reads the columns as values).
+ */
+export type CteColumnRefs<TColumns> = {
+  readonly [K in keyof TColumns]-?: FieldRef<K & string, TColumns[K]>;
+};
 
 /** SQL keyword emitted for each {@link CteJoinType}. */
 const CTE_JOIN_SQL: Record<CteJoinType, string> = {
@@ -77,19 +88,21 @@ export function onTrue(): Condition {
 
 /**
  * Build a mock row that yields {@link FieldRef}s for a CTE's columns, qualified
- * with the CTE's own name as the table alias. The same refs
+ * with `alias` (the CTE's own name unless the query aliases its root). The same refs
  * `SelectQueryBuilder.createMockRowForCte` mints (`DbCte.columnRef`), so each
  * carries how its column reads: the body column's own mapper, a json_agg
- * column's item metadata, a literal's type (see projectedColumnRef).
+ * column's item metadata, a literal's type (see projectedColumnRef) — and the
+ * query's chain identity: a query nested in it tells its correlations from its
+ * own rows by it, not by alias name.
  */
-function createCteFieldRefProxy<TColumns extends Record<string, any>>(cte: DbCte<TColumns>): TColumns {
+function createCteFieldRefProxy<TColumns extends Record<string, any>>(cte: DbCte<TColumns>, alias: string, chainId: number): TColumns {
   return new Proxy({} as any, {
     get(_target, prop: string | symbol) {
       if (typeof prop === 'symbol') {
         return undefined;
       }
 
-      return cte.columnRef(prop);
+      return stampChainId(cte.columnRef(prop, alias), chainId);
     },
     has() {
       return true;
@@ -108,12 +121,16 @@ const NUMERIC_REGEX = /^-?\d+(\.\d+)?$/;
 /** The column a selector returning ONE value (`r => r.id`, `() => 'x'`) is projected under. */
 const SCALAR_COLUMN = 'value';
 
+/** @internal {@link SCALAR_COLUMN}, for the set-returning source (set-returning.ts) that reads projections the same way. */
+export const SCALAR_SELECTION_COLUMN = SCALAR_COLUMN;
+
 /**
  * Whether a selector returned ONE value — a column, an expression, a subquery, a literal — rather
  * than an object of fields. It reads as that value: its keys (`__fieldName`, …) used to be
  * projected as the fields of an object, a string as its characters.
+ * @internal
  */
-function isSingleValueSelection(selection: unknown): boolean {
+export function isSingleValueSelection(selection: unknown): boolean {
   return isScalarLiteralSelection(selection)
     || selection instanceof SqlFragment
     || selection instanceof Subquery
@@ -165,12 +182,28 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   private limitValue?: number;
   private offsetValue?: number;
   private lockClause?: string;
+  /** The where() conditions, combined with AND. */
+  protected whereConds: Condition[] = [];
+  /** `FROM "<cte>" AS "<rootAlias>"` — see `DbContext.selectFromCte(cte, alias)`; the CTE's name when undefined. */
+  protected rootAlias?: string;
+  /** @internal The query's chain identity, stamped on the rows it hands out (see createCteFieldRefProxy). */
+  protected chainId: number;
 
   constructor(
     protected rootCte: DbCte<TRootColumns>,
     protected client: DatabaseClient,
-    protected executor?: QueryExecutor
-  ) {}
+    protected executor?: QueryExecutor,
+    rootAlias?: string,
+    chainId?: number
+  ) {
+    this.rootAlias = rootAlias === undefined ? undefined : assertExplicitAlias(rootAlias, 'selectFromCte()');
+    this.chainId = chainId ?? nextChainId();
+  }
+
+  /** The alias the root CTE's row renders under. */
+  protected get rootName(): string {
+    return this.rootAlias ?? this.rootCte.name;
+  }
 
   /** Override the per-query timeout (ms). Pass `0` to disable. */
   withTimeout(timeoutMs: number): this {
@@ -250,14 +283,47 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     const next = new CteRootQueryBuilder<TRootColumns, UnwrapSelection<TNewSelection>>(
       this.rootCte,
       this.client,
-      this.executor
+      this.executor,
+      this.rootAlias,
+      this.chainId
     );
     next.joinSteps = this.joinSteps;
     next.selector = selectorProjectingConditions(selector as any);
     next.orderByFields = this.orderByFields;
     next.limitValue = this.limitValue;
     next.offsetValue = this.offsetValue;
+    next.whereConds = this.whereConds;
     return next;
+  }
+
+  /**
+   * Filter the rows — `WHERE <condition>` after the FROM and its joins, before ORDER BY. The
+   * predicate reads the root CTE's row and, after a join, every joined CTE's (in FROM order),
+   * whatever the projection is. A column of an enclosing query it reads is a correlation: it renders
+   * as that column, and the subquery form (`asSubquery()`) reports it so the enclosing query joins
+   * the navigation it needs. Repeated calls combine with AND; the WHERE's parameters follow the ON
+   * predicates'.
+   *
+   * @example
+   * db.products.with(prices.cte).select(p => ({
+   *   prices: db.selectFromCte(prices.cte)
+   *     .where(r => eq(r.productId, p.id))
+   *     .select(r => r.amount)
+   *     .asSubquery('array'),
+   * }))
+   */
+  where(predicate: (root: CteColumnRefs<TRootColumns>, ...joined: any[]) => Condition): this {
+    const condition = predicate(
+      createCteFieldRefProxy(this.rootCte, this.rootName, this.chainId) as unknown as CteColumnRefs<TRootColumns>,
+      ...this.joinSteps.map(step => createCteFieldRefProxy(step.cte, step.cte.name, this.chainId))
+    );
+
+    if (!(condition instanceof WhereConditionBase)) {
+      throw new Error('selectFromCte().where(): expected a condition (eq(), and(), exists(), a boolean sql fragment, …)');
+    }
+
+    this.whereConds = [...this.whereConds, condition];
+    return this;
   }
 
   /**
@@ -332,9 +398,11 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     const next = new CteJoinedQueryBuilder<TRootColumns, TRight>(
       this.rootCte,
       this.client,
-      this.executor
+      this.executor,
+      this.rootAlias,
+      this.chainId
     );
-    next._inheritJoins([...this.joinSteps, { type, cte, condition }]);
+    next._inheritJoins([...this.joinSteps, { type, cte, condition }], this.whereConds);
     return next;
   }
 
@@ -349,13 +417,15 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     selector: ((...sources: any[]) => any) | undefined,
     orderByFields: Array<{ table: string; field: string; direction: OrderDirection }>,
     limitValue: number | undefined,
-    offsetValue: number | undefined
+    offsetValue: number | undefined,
+    whereConds: Condition[] = []
   ): void {
     this.joinSteps = joinSteps;
     this.selector = selector && selectorProjectingConditions(selector);
     this.orderByFields = orderByFields;
     this.limitValue = limitValue;
     this.offsetValue = offsetValue;
+    this.whereConds = whereConds;
   }
 
   /**
@@ -368,30 +438,36 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     }
 
     const params: unknown[] = [];
-    // Parameters of every CTE body come first, in WITH declaration order
-    // (root, then each join). The bodies already carry sequential `$N`
-    // placeholders assigned by DbCteBuilder, so just concatenate their params.
-    params.push(...this.rootCte.params);
-    for (const step of this.joinSteps) {
-      params.push(...step.cte.params);
-    }
+    // Parameters of every CTE body come first, in WITH declaration order (root, then each join); each
+    // body is renumbered from where ITS parameters land (a builder numbers its CTEs as one block: its
+    // second CTE as the root used to keep `$2` and bind the next CTE's value)
+    const ctes = this.collectCtes();
+    const cteDecls = ctes.map(cte => {
+      const declaration = declareCte(cte, cteBodyAt(cte, params.length + 1));
+      params.push(...cte.params);
+
+      return declaration;
+    });
 
     // The ON predicates are appended after all CTE-body params. Their next free
-    // placeholder index is therefore (paramsSoFar + 1).
+    // placeholder index is therefore (paramsSoFar + 1). Everything nested in the
+    // statement reads its CTEs by name: they are declared here, at statement level.
     const ctx: SqlBuildContext = {
       paramCounter: params.length + 1,
       params,
+      hoistedCteNames: declareStatementCtes(undefined, ctes),
+      // The driver reads the projected values directly: an arrayAgg a value IS renders as JSON on a
+      // driver without native array results (buildSelectParts marks each value's root)
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
     };
 
-    // FROM root
+    // FROM root, then the WHERE (its params follow the ON predicates')
     const fromClause = this.buildFromClause(ctx);
-
-    // Build the WITH clause from every referenced CTE, in declaration order.
-    const cteDecls = this.collectCtes().map(cte => declareCte(cte, cte.query));
+    const whereClause = this.buildWhereClause(ctx);
 
     // Build SELECT from the projection (root + joined CTE FieldRefs).
     const selection = this.evaluateSelection();
-    const selectParts = buildSelectParts(selection, ctx, this.rootCte.name, false);
+    const selectParts = buildSelectParts(selection, ctx, this.rootName, false);
 
     let orderByClause = '';
     if (this.orderByFields.length > 0) {
@@ -412,7 +488,7 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
 
     const sqlText =
       `WITH ${cteDecls.join(', ')}\n` +
-      `SELECT ${selectParts.join(', ')}\n${fromClause}${orderByClause}${limitClause}${lockClause}`;
+      `SELECT ${selectParts.join(', ')}\n${fromClause}${whereClause}${orderByClause}${limitClause}${lockClause}`;
 
     return { sql: sqlText, params: ctx.params };
   }
@@ -443,10 +519,9 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
 
   /**
    * Every CTE this query references, in `WITH` declaration order: the FROM
-   * root first, then each joined CTE. Their bodies carry placeholders numbered
-   * sequentially from `$1` across the whole list (a shared `DbCteBuilder`
-   * assigns them), which is what lets both build paths treat the list as one
-   * contiguous parameter block.
+   * root first, then each joined CTE. Each body is renumbered from where its
+   * own parameters land (see cteBodyAt): the CTEs need not come from one
+   * builder, nor in the order it created them.
    */
   private collectCtes(): DbCte<any>[] {
     return [this.rootCte, ...this.joinSteps.map(step => step.cte)];
@@ -470,6 +545,10 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
    *   the statement-level relation by name. This is the shape that lets several
    *   subqueries share ONE materialization of an expensive candidate set.
    *
+   * The two mix: a CTE declared upstream is read from there, the others are
+   * declared here — each body renumbered from where its own parameters land. A
+   * DIFFERENT CTE under a name the statement declares is refused (see isStatementCte).
+   *
    * @internal
    */
   private buildNestedSql(outerContext: SqlBuildContext): string {
@@ -478,47 +557,41 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     }
 
     const ctes = this.collectCtes();
-    const hoisted = ctes.filter(cte => outerContext.hoistedCteNames?.has(cte.name));
+    const declaredHere = ctes.filter(cte => !isStatementCte(outerContext.hoistedCteNames, cte));
 
-    // A partially-hoisted list cannot be renumbered. Every body's `$N` is
-    // relative to a single contiguous block that starts at the FIRST CTE, so
-    // relocating only some of them would need a per-CTE offset that the baked-in
-    // numbering no longer describes — the survivors would silently bind to the
-    // wrong parameters. Refuse instead of emitting wrong SQL (same stance
-    // `UnionQueryBuilder` takes on a CTE name collision).
-    if (hoisted.length > 0 && hoisted.length !== ctes.length) {
-      const hoistedNames = hoisted.map(cte => `"${cte.name}"`).join(', ');
-      const localNames = ctes.filter(cte => !hoisted.includes(cte)).map(cte => `"${cte.name}"`).join(', ');
-      throw new Error(
-        `Cannot nest this CTE-rooted subquery: ${hoistedNames} ${hoisted.length === 1 ? 'is' : 'are'} already ` +
-          `declared at statement level while ${localNames} ${localNames.includes(',') ? 'are' : 'is'} not. ` +
-          'Attach every CTE the subquery reads to the enclosing statement (.with(...)), or none of them.'
-      );
-    }
-
-    const allHoisted = hoisted.length === ctes.length;
+    // Declared here, inside the subquery: a data-modifying CTE cannot be (PostgreSQL allows it only in
+    // the WITH of the statement that executes, where it runs once)
+    assertStatementLevelCtes(declaredHere, undefined);
 
     // Parameter contract, preserved from the outermost path: every CTE body's
     // parameters come first, in WITH declaration order, before any ON-predicate
-    // or projection parameter. The bodies number their placeholders from `$1`,
-    // so nesting shifts the whole block by however many parameters the
-    // enclosing statement has already bound.
-    const offset = outerContext.paramCounter - 1;
+    // or projection parameter — each body renumbered from where they land.
     const cteDecls: string[] = [];
 
-    if (!allHoisted) {
-      for (const cte of ctes) {
-        outerContext.params.push(...cte.params);
-        outerContext.paramCounter += cte.params.length;
-        cteDecls.push(declareCte(cte, offset === 0 ? cte.query : renumberPlaceholders(cte.query, offset)));
-      }
+    for (const cte of declaredHere) {
+      cteDecls.push(declareCte(cte, cteBodyAt(cte, outerContext.paramCounter)));
+      outerContext.params.push(...cte.params);
+      outerContext.paramCounter += cte.params.length;
     }
 
-    const fromClause = this.buildFromClause(outerContext);
-    // The enclosing query reads these columns: literals render typed (untyped, `true` reached it as 'true')
-    const selectParts = buildSelectParts(this.evaluateSelection(), outerContext, this.rootCte.name, true);
+    // Whatever is nested in this subquery reads these CTEs by name — declared upstream, or just above
+    const outerHoisted = outerContext.hoistedCteNames;
+    outerContext.hoistedCteNames = declareStatementCtes(outerHoisted, ctes);
 
-    let tail = '';
+    let fromClause: string;
+    let whereClause: string;
+    let selectParts: string[];
+
+    try {
+      fromClause = this.buildFromClause(outerContext);
+      whereClause = this.buildWhereClause(outerContext);
+      // The enclosing query reads these columns: literals render typed (untyped, `true` reached it as 'true')
+      selectParts = buildSelectParts(this.evaluateSelection(), outerContext, this.rootName, true);
+    } finally {
+      outerContext.hoistedCteNames = outerHoisted;
+    }
+
+    let tail = whereClause;
     if (this.orderByFields.length > 0) {
       tail += `\nORDER BY ${this.orderByFields.map(({ field, direction }) => `"${field}" ${direction}`).join(', ')}`;
     }
@@ -534,9 +607,12 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
     return `${withClause}SELECT ${selectParts.join(', ')}\n${fromClause}${tail}`;
   }
 
-  /** FROM root + every join step, appending ON-predicate params to `ctx`. */
+  /**
+   * FROM root + every join step, appending ON-predicate params to `ctx` — rendered in `ctx` itself, so
+   * a subquery in an ON predicate sees the statement's CTEs (and its placeholders) too.
+   */
   private buildFromClause(ctx: SqlBuildContext): string {
-    let fromClause = `FROM "${this.rootCte.name}"`;
+    let fromClause = this.rootAlias === undefined ? `FROM "${this.rootCte.name}"` : `FROM "${this.rootCte.name}" AS "${this.rootAlias}"`;
 
     for (const step of this.joinSteps) {
       const keyword = CTE_JOIN_SQL[step.type];
@@ -545,14 +621,89 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
         continue;
       }
 
-      const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams, paramCounter } = condBuilder.build(step.condition!, ctx.paramCounter);
-      ctx.paramCounter = paramCounter;
-      ctx.params.push(...condParams);
-      fromClause += `\n${keyword} "${step.cte.name}" ON ${condSql}`;
+      fromClause += `\n${keyword} "${step.cte.name}" ON ${step.condition!.buildSql(ctx)}`;
     }
 
     return fromClause;
+  }
+
+  /** `\nWHERE <conditions AND-combined>`, or '' — appending the WHERE's params to `ctx`. */
+  private buildWhereClause(ctx: SqlBuildContext): string {
+    if (this.whereConds.length === 0) {
+      return '';
+    }
+
+    const condition = this.whereConds.length === 1 ? this.whereConds[0] : and(...this.whereConds);
+
+    return `\nWHERE ${condition.buildSql(ctx)}`;
+  }
+
+  /**
+   * The refs this query reads from an ENCLOSING query — every ref of its WHERE, ON predicates and
+   * projection that is not a column of one of its own rows: a correlation, which the subquery form
+   * reports so the enclosing query joins the navigations it needs.
+   *
+   * A ref under one of OUR aliases minted by another query (its chain identity) is a correlation to an
+   * enclosing query over the same CTE: inside this query the alias names our own row, so the
+   * correlation would compare that row with itself. Refused — as the entity path refuses a same-table
+   * correlation — unless one side takes a distinct alias (`selectFromCte(cte, alias)`).
+   */
+  private outerFieldRefs(): FieldRef[] {
+    const own = new Set([this.rootName, ...this.joinSteps.map(step => step.cte.name)]);
+    const refs: FieldRef[] = [];
+    const seen = new Set<object>();
+
+    const add = (ref: FieldRef): void => {
+      const alias = (ref as any).__tableAlias;
+
+      if (seen.has(ref)) {
+        return;
+      }
+
+      if (typeof alias === 'string' && own.has(alias)) {
+        const chainId = (ref as any).__chainId;
+
+        if (chainId != null && chainId !== this.chainId) {
+          throw new Error(
+            `selectFromCte(): the query correlates to the enclosing row "${alias}"."${ref.__dbColumnName}" under the alias `
+            + `"${alias}", which names its own CTE row too — inside it both would read the same row and the comparison `
+            + 'would hold for every row. Give one of them a distinct alias: selectFromCte(cte, \'<alias>\').'
+          );
+        }
+
+        return;
+      }
+
+      seen.add(ref);
+      refs.push(ref);
+    };
+
+    const visit = (value: unknown, depth: number): void => {
+      if (value === null || typeof value !== 'object' || depth > 16) {
+        return;
+      }
+
+      if (value instanceof WhereConditionBase) {
+        value.getFieldRefs().forEach(add);
+      } else if (value instanceof Subquery) {
+        value.getOuterFieldRefs().forEach(add);
+      } else if ('__dbColumnName' in value) {
+        add(value as FieldRef);
+      } else if (isNestedProjection(value)) {
+        for (const nested of Object.values(value)) {
+          visit(nested, depth + 1);
+        }
+      }
+    };
+
+    this.whereConds.forEach(condition => visit(condition, 0));
+    this.joinSteps.forEach(step => visit(step.condition, 0));
+
+    if (this.selector) {
+      visit(this.evaluateSelection(), 0);
+    }
+
+    return refs;
   }
 
   /**
@@ -593,7 +744,7 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
 
     const selectionMetadata = mode === 'table' ? this.evaluateSelection() : undefined;
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, this.outerFieldRefs()) as any;
   }
 
   /**
@@ -612,8 +763,8 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   }
 
   private evaluateSelector(): any {
-    const rootMock = createCteFieldRefProxy(this.rootCte);
-    const joinMocks = this.joinSteps.map(step => createCteFieldRefProxy(step.cte));
+    const rootMock = createCteFieldRefProxy(this.rootCte, this.rootName, this.chainId);
+    const joinMocks = this.joinSteps.map(step => createCteFieldRefProxy(step.cte, step.cte.name, this.chainId));
     return this.selector!(rootMock, ...joinMocks);
   }
 }
@@ -632,9 +783,17 @@ export class CteJoinedQueryBuilder<
   private _joinSteps: CteJoinStep[] = [];
 
   /** @internal */
-  _inheritJoins(steps: CteJoinStep[]): void {
+  _inheritJoins(steps: CteJoinStep[], whereConds: Condition[] = []): void {
     this._joinSteps = steps;
-    this._setState(steps, undefined, [], undefined, undefined);
+    this._setState(steps, undefined, [], undefined, undefined, whereConds);
+  }
+
+  /**
+   * {@link CteRootQueryBuilder.where} over the root row and every joined CTE's row, in FROM order —
+   * the single-join case typed as `(root, right)`.
+   */
+  where(predicate: (root: CteColumnRefs<TRootColumns>, right: CteColumnRefs<TRight>, ...more: any[]) => Condition): this {
+    return super.where(predicate as (root: CteColumnRefs<TRootColumns>, ...joined: any[]) => Condition);
   }
 
   /**
@@ -657,9 +816,11 @@ export class CteJoinedQueryBuilder<
     const next = new CteRootQueryBuilder<TRootColumns, UnwrapSelection<TNewSelection>>(
       this._getRootCte(),
       this.client,
-      this.executor
+      this.executor,
+      this.rootAlias,
+      this.chainId
     );
-    next._setState(this._joinSteps, selector as any, [], undefined, undefined);
+    next._setState(this._joinSteps, selector as any, [], undefined, undefined, this.whereConds);
     return next;
   }
 
@@ -696,8 +857,10 @@ function declareCte(cte: DbCte<any>, body: string): string {
  *   unless the enclosing query reads the columns (`typedLiterals`) — then it is a jsonb value. A list
  *   of columns has no one SQL value and is refused.
  * - With `typedLiterals` (a subquery) a literal renders typed from its JS type.
+ * - A set-returning function (`unnest(r.tags)`) renders as its call: a set-returning select-list item.
+ * @internal
  */
-function buildSelectParts(
+export function buildSelectParts(
   selection: Record<string, any>,
   ctx: SqlBuildContext,
   defaultAlias: string,
@@ -708,11 +871,18 @@ function buildSelectParts(
   for (const [key, value] of Object.entries(selection)) {
     const alias = pathPrefix === undefined ? key : `${pathPrefix}__${key}`;
 
-    if (value instanceof SqlFragment) {
-      const fragmentSql = value.buildSql(ctx);
-      parts.push(`${fragmentSql} as "${alias}"`);
-    } else if (value instanceof Subquery) {
-      parts.push(`(${value.buildSql(ctx)}) as "${alias}"`);
+    if (value instanceof SqlFragment || value instanceof Subquery) {
+      // The driver reads the value directly: an arrayAgg (or scalar subquery) it IS renders as JSON
+      // on a driver without native array results — only while this one value renders
+      ctx.jsonArrayRoot = ctx.jsonArrayProjection ? projectedValueRoot(value) : undefined;
+
+      try {
+        parts.push(value instanceof SqlFragment
+          ? `${renderProjectedFragment(value, ctx)} as "${alias}"`
+          : `(${value.buildSql(ctx)}) as "${alias}"`);
+      } finally {
+        ctx.jsonArrayRoot = undefined;
+      }
     } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
       const tableAlias = (value as any).__tableAlias || defaultAlias;
       parts.push(`"${tableAlias}"."${(value as any).__dbColumnName}" as "${alias}"`);
@@ -784,8 +954,10 @@ function compileRead(key: string, rowKey: string, value: any): CteFieldRead {
   }
 
   // A column of the CTE body keeps its text ('01234' used to read back as 1234); an expression's
-  // numeric string (a SUM, a NUMERIC) becomes a number
-  return { key, rowKey, kind: 'value', coerce: coercesNumericText(value.__sqlType) };
+  // numeric string (a SUM, a NUMERIC) becomes a number — unless it is read as a column of its type
+  // (withReadType)
+  const sqlType = value.__sqlType ?? (typeof value.getReadType === 'function' ? value.getReadType() : undefined);
+  return { key, rowKey, kind: 'value', coerce: coercesNumericText(sqlType) };
 }
 
 function readValue(read: CteFieldRead, row: any): any {
@@ -823,8 +995,9 @@ function readValue(read: CteFieldRead, row: any): any {
  * aggregated query's mappers. NULLs are preserved as `null` (faithful to the SQL — a CTE-rooted
  * projection mirrors raw column output, unlike the entity path which maps absent columns to
  * `undefined`).
+ * @internal
  */
-function transformRows(rows: any[], selection: Record<string, any>): any[] {
+export function transformRows(rows: any[], selection: Record<string, any>): any[] {
   // Pre-analyze each selected field once.
   const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key]));
 

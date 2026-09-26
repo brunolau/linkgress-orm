@@ -8,6 +8,7 @@ import { materializeMockSelection } from './query-builder';
 import { FutureQuery } from './future-query';
 import { Subquery } from './subquery';
 import type { DbCte } from './cte-builder';
+import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, sameCteDefinition } from './cte-builder';
 
 /**
  * Union type: UNION removes duplicates, UNION ALL keeps all rows
@@ -35,6 +36,12 @@ export interface UnionLegBuilder {
    * @internal
    */
   _getAttachedCtes?(): DbCte<any>[];
+  /**
+   * The leg's correlations to an enclosing query (a WHERE reading `outer.nav.col`). The union's
+   * subquery reports them so the enclosing query joins those navigations; see `UnionQueryBuilder.asSubquery`.
+   * @internal
+   */
+  _getOuterFieldRefs?(): FieldRef[];
 }
 
 /**
@@ -446,18 +453,11 @@ export class UnionQueryBuilder<TSelection> {
         }
 
         // Identity first — re-attaching the SAME `DbCte` to several legs is the
-        // intended case and a no-op. Otherwise the two definitions must be
-        // indistinguishable to be collapsed; anything else is a name collision the
-        // emitted SQL cannot represent, so fail loudly instead of binding a leg to
-        // somebody else's CTE.
-        const sameDefinition =
-          declared === cte ||
-          (declared.query === cte.query &&
-            declared.materialized === cte.materialized &&
-            declared.params.length === cte.params.length &&
-            declared.params.every((param, index) => Object.is(param, cte.params[index])));
-
-        if (!sameDefinition) {
+        // intended case and a no-op. Otherwise the two definitions must be the same
+        // by content to be collapsed (see sameCteDefinition); anything else is a name
+        // collision the emitted SQL cannot represent, so fail loudly instead of
+        // binding a leg to somebody else's CTE.
+        if (!sameCteDefinition(declared, cte)) {
           throw new Error(
             `Union legs attach two different CTEs named "${cte.name}". A statement-level WITH declares each ` +
               `name once, so the second definition would be silently discarded and its leg would read the ` +
@@ -468,30 +468,52 @@ export class UnionQueryBuilder<TSelection> {
     }
 
     const outerHoistedCteNames = context.hoistedCteNames;
+
+    // A CTE the ENCLOSING statement already declares (this union nested in it as a subquery) is read
+    // from there: declaring it again inside the subquery would re-bind its params and — for a
+    // data-modifying CTE — be invalid SQL. A different CTE under a declared name is refused.
+    const declaredHere = hoistedCtes.filter(cte => !isStatementCte(outerHoistedCteNames, cte));
+
+    if (isNested) {
+      assertStatementLevelCtes(declaredHere, undefined);
+    }
+
+    // Each body is renumbered from where ITS parameters land (a nested union's after the statement's)
+    const withParts: string[] = [];
+
     if (hoistedCtes.length > 0) {
-      for (const cte of hoistedCtes) {
+      for (const cte of declaredHere) {
+        withParts.push(cteDeclarationAt(cte, context.paramCounter));
         context.params.push(...cte.params);
         context.paramCounter += cte.params.length;
       }
 
-      context.hoistedCteNames = new Set([
-        ...(outerHoistedCteNames ?? []),
-        ...hoistedCtes.map(cte => cte.name),
-      ]);
+      context.hoistedCteNames = declareStatementCtes(outerHoistedCteNames, hoistedCtes);
     }
 
     const sqlParts: string[] = [];
 
-    for (let i = 0; i < this.components.length; i++) {
-      const component = this.components[i];
+    // The legs' values reach the driver as they are — unless a UNION compares them (json has no
+    // equality): only then does an arrayAgg a leg projects stay array_agg on a driver without
+    // native array results. Nested, the union is such a value only as the enclosing projection's root.
+    const outerJsonArrayProjection = context.jsonArrayProjection;
+    context.jsonArrayProjection = (isNested ? outerJsonArrayProjection === true : !this.client.supportsBinaryArrayResults())
+      && this.components.every(component => component.unionType !== 'UNION');
 
-      if (i > 0 && component.unionType) {
-        sqlParts.push(component.unionType);
+    try {
+      for (let i = 0; i < this.components.length; i++) {
+        const component = this.components[i];
+
+        if (i > 0 && component.unionType) {
+          sqlParts.push(component.unionType);
+        }
+
+        // Each component query should be wrapped in parentheses
+        const componentSql = component.buildSql(context);
+        sqlParts.push(`(${componentSql})`);
       }
-
-      // Each component query should be wrapped in parentheses
-      const componentSql = component.buildSql(context);
-      sqlParts.push(`(${componentSql})`);
+    } finally {
+      context.jsonArrayProjection = outerJsonArrayProjection;
     }
 
     // Restore whatever the enclosing builder had declared — the hoist is scoped to
@@ -500,10 +522,7 @@ export class UnionQueryBuilder<TSelection> {
 
     let sql = sqlParts.join('\n');
 
-    if (hoistedCtes.length > 0) {
-      const withParts = hoistedCtes.map(
-        cte => `"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`
-      );
+    if (withParts.length > 0) {
       sql = `WITH ${withParts.join(', ')}\n${sql}`;
     }
 
@@ -570,8 +589,11 @@ export class UnionQueryBuilder<TSelection> {
       // chain across the whole composite statement.
       return this.buildSql(outerContext);
     };
+    // Every leg's correlations to the enclosing query, as a single SELECT's subquery reports its
+    // own: a leg reading `outer.nav.col` needs the enclosing query to JOIN that navigation.
+    const outerFieldRefs = this.components.flatMap(component => component.ownerBuilder?._getOuterFieldRefs?.() ?? []);
 
-    return new Subquery(sqlBuilder, mode) as any;
+    return new Subquery(sqlBuilder, mode, undefined, outerFieldRefs) as any;
   }
 
   /**

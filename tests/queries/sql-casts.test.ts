@@ -188,7 +188,7 @@ describe('cast helpers', () => {
 
     test('chain', () => {
       expect(build(jsonbPathText(fieldRef('meta'), 'dims', 'w').castAsInt().castAsString())).toEqual({
-        sql: `CAST(CAST("expr_shelves"."meta"->'dims'->>'w' AS integer) AS text)`,
+        sql: `CAST(CAST(("expr_shelves"."meta"->'dims'->>'w') AS integer) AS text)`,
         params: [],
       });
     });
@@ -221,7 +221,7 @@ describe('cast helpers', () => {
       const condition = jsonbArraySome<{ qty: string }>(fieldRef('meta'), el => gt(el.qty.castAsInt(), 5));
       const ctx: SqlBuildContext = { paramCounter: 1, params: [] };
 
-      expect(condition.buildSql(ctx)).toContain(`WHERE CAST(__elem->>'qty' AS integer) > $1`);
+      expect(condition.buildSql(ctx)).toContain(`WHERE CAST((__elem->>'qty') AS integer) > $1`);
       expect(ctx.params).toEqual([5]);
     });
   });

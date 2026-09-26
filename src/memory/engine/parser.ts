@@ -72,6 +72,12 @@ const SQL_TYPE_ALIASES: Record<string, string> = {
   numeric: 'numeric',
 };
 
+/** How the query reading of an ambiguous `((SELECT …` operand ended: its error, and the token index it stopped at. */
+interface SublinkQueryFailure {
+  error: unknown;
+  at: number;
+}
+
 export class Parser {
   private toks: Token[];
   private p = 0;
@@ -1410,13 +1416,11 @@ export class Parser {
         } while (this.acceptPunct(','));
         this.expectPunct(')');
         this.expectOp('=');
-        if (this.looksLikeSubquery(0)) {
-          this.next();
-          const sub = this.parseSelectStatement();
-          this.expectPunct(')');
-          items.push({ kind: 'multi', targets, source: sub, isSubselect: true, loc });
+        const sub = this.parseParenthesizedSublinkQuery();
+        if (sub.query) {
+          items.push({ kind: 'multi', targets, source: sub.query, isSubselect: true, loc });
         } else {
-          const src = this.parseExprOrDefaultRow();
+          const src = this.parseAfterSublinkQuery(sub.failure, () => this.parseExprOrDefaultRow());
           items.push({ kind: 'multi', targets, source: src, isSubselect: false, loc });
         }
         continue;
@@ -1679,9 +1683,17 @@ export class Parser {
 
   /**
    * Parse an a_expr. Binary operators with precedence strictly greater than `minPrec` are consumed.
+   *
+   * gram.y declares three levels `%nonassoc`: the comparisons (`< > = <= >= <>`), `BETWEEN IN LIKE ILIKE
+   * SIMILAR` (with NOT_LA) and `IS`. Two operators of one such level in a row are a syntax error when the first
+   * one's rule ends in an a_expr — `a = b = c`, `a LIKE b IN (…)`, `a IS DISTINCT FROM b IS NULL` — because
+   * bison then has to choose between reducing it and shifting the second operator. A rule that ends in a
+   * token of its own (`a = ANY (…)`, `a IN (…)`, `a IS NULL`) is reduced first and chains freely.
+   * `nonassoc` is the level of the last such open rule at this loop level (0: none).
    */
   parseExpr(minPrec = 0): A.Expr {
     let left = this.parsePrefix();
+    let nonassoc = 0;
     while (true) {
       const t = this.peek();
       const loc = t.pos;
@@ -1726,14 +1738,19 @@ export class Parser {
         if (prec <= minPrec) {
           break;
         }
+        if (prec === P_CMP && nonassoc === P_CMP) {
+          this.error(t);
+        }
         this.next();
-        // subquery / array operators: op ANY|SOME|ALL ( ... )
+        // subquery / array operators: op ANY|SOME|ALL ( ... ) — closed by its ')'
         if (this.atKw('ANY', 'SOME', 'ALL') && this.atPunct('(', 1)) {
           left = this.parseSubqueryOp(left, [t.value], loc);
+          nonassoc = 0;
           continue;
         }
         const right = this.parseExpr(prec);
         left = { kind: 'AExpr', exprKind: 'OP', name: [t.value], lexpr: left, rexpr: right, loc };
+        nonassoc = prec === P_CMP ? P_CMP : 0;
         continue;
       }
 
@@ -1748,6 +1765,7 @@ export class Parser {
           }
           this.next();
           left = this.makeBool('OR', left, this.parseExpr(P_OR), loc);
+          nonassoc = 0;
           continue;
         case 'AND':
           if (P_AND <= minPrec) {
@@ -1755,12 +1773,18 @@ export class Parser {
           }
           this.next();
           left = this.makeBool('AND', left, this.parseExpr(P_AND), loc);
+          nonassoc = 0;
           continue;
         case 'IS': {
           if (P_IS <= minPrec) {
             return left;
           }
+          if (nonassoc === P_IS) {
+            this.error(t);
+          }
           this.next();
+          // only IS [NOT] DISTINCT FROM ends in an a_expr; every other IS form ends in its keyword
+          nonassoc = 0;
           const not = this.acceptKw('NOT');
           if (this.acceptKw('NULL')) {
             left = { kind: 'NullTest', arg: left, isNot: not, loc };
@@ -1774,6 +1798,7 @@ export class Parser {
             this.expectKw('FROM');
             const right = this.parseExpr(P_IS);
             left = { kind: 'AExpr', exprKind: not ? 'NOT_DISTINCT' : 'DISTINCT', name: ['='], lexpr: left, rexpr: right, loc };
+            nonassoc = P_IS;
           } else if (this.acceptKw('DOCUMENT')) {
             left = this.makeFunc(['xmlexists_document'], [left], loc);
           } else if (this.atKw('JSON')) {
@@ -1814,15 +1839,23 @@ export class Parser {
           if (P_IS <= minPrec) {
             return left;
           }
+          if (nonassoc === P_IS) {
+            this.error(t);
+          }
           this.next();
           left = { kind: 'NullTest', arg: left, isNot: false, loc };
+          nonassoc = 0;
           continue;
         case 'NOTNULL':
           if (P_IS <= minPrec) {
             return left;
           }
+          if (nonassoc === P_IS) {
+            this.error(t);
+          }
           this.next();
           left = { kind: 'NullTest', arg: left, isNot: true, loc };
+          nonassoc = 0;
           continue;
         case 'NOT': {
           const k1 = this.peek(1);
@@ -1832,8 +1865,12 @@ export class Parser {
           if (P_LIKE <= minPrec) {
             return left;
           }
+          if (nonassoc === P_LIKE) {
+            this.error(t);
+          }
           this.next();
           left = this.parseLikeInBetween(left, true, loc);
+          nonassoc = this.endsInOperand(left) ? P_LIKE : 0;
           continue;
         }
         case 'BETWEEN':
@@ -1844,7 +1881,11 @@ export class Parser {
           if (P_LIKE <= minPrec) {
             return left;
           }
+          if (nonassoc === P_LIKE) {
+            this.error(t);
+          }
           left = this.parseLikeInBetween(left, false, loc);
+          nonassoc = this.endsInOperand(left) ? P_LIKE : 0;
           continue;
         case 'AT':
           if (P_AT <= minPrec) {
@@ -1854,11 +1895,13 @@ export class Parser {
             this.p += 3;
             const zone = this.parseExpr(P_AT);
             left = this.makeFunc(['pg_catalog', 'timezone'], [zone, left], loc, 'AT TIME ZONE');
+            nonassoc = 0;
             continue;
           }
           if (this.isKw(this.peek(1), 'LOCAL')) {
             this.p += 2;
             left = this.makeFunc(['pg_catalog', 'timezone'], [left], loc, 'AT LOCAL');
+            nonassoc = 0;
             continue;
           }
           return left;
@@ -1868,6 +1911,7 @@ export class Parser {
           }
           this.next();
           left = { kind: 'CollateClause', arg: left, collname: this.parseAnyName(), loc };
+          nonassoc = 0;
           continue;
         case 'OPERATOR': {
           if (!this.atPunct('(', 1)) {
@@ -1879,10 +1923,12 @@ export class Parser {
           const name = this.parseQualOp();
           if (this.atKw('ANY', 'SOME', 'ALL') && this.atPunct('(', 1)) {
             left = this.parseSubqueryOp(left, name, loc);
+            nonassoc = 0;
             continue;
           }
           const right = this.parseExpr(P_OP);
           left = { kind: 'AExpr', exprKind: 'OP', name, lexpr: left, rexpr: right, loc };
+          nonassoc = 0;
           continue;
         }
         default:
@@ -1890,6 +1936,19 @@ export class Parser {
       }
     }
     return left;
+  }
+
+  /**
+   * Whether a `[NOT] BETWEEN / IN / LIKE / ILIKE / SIMILAR` construct ends in an a_expr (the pattern, the
+   * upper bound) rather than in its own `)` (an IN list or subquery, `LIKE ANY (…)`): only the former
+   * leaves the non-associative level open for a following operator of that level.
+   */
+  private endsInOperand(node: A.Expr): boolean {
+    if (node.kind === 'SubLink' || node.kind === 'BoolExpr') {
+      return false;
+    }
+
+    return !(node.kind === 'AExpr' && (node.exprKind === 'IN' || node.exprKind === 'OP_ANY' || node.exprKind === 'OP_ALL'));
   }
 
   private binaryOpPrec(op: string): number {
@@ -2029,18 +2088,64 @@ export class Parser {
     };
   }
 
-  private parseSubqueryOp(left: A.Expr, name: string[], loc: number): A.Expr {
-    const kind = this.next().kw;
-    const linkType = kind === 'ALL' ? 'ALL' : 'ANY';
-    if (this.looksLikeSubquery(0)) {
+  /**
+   * The query of `op ANY/ALL (<query>)`, `IN (<query>)` or `SET (a, b) = (<query>)`, the `(` just ahead — or
+   * `query: null` when the operand only STARTS with a parenthesised query (`ANY ((SELECT …)::int[])`,
+   * `IN ((SELECT 1), 2)`, `SET (a, b) = ((SELECT 1), 2)`): an expression, which the caller then parses from the
+   * same `(` through {@link parseAfterSublinkQuery}, handing it `failure` — how the query reading ended. Only
+   * an operand opening with `((` is ambiguous; a `(SELECT …` is a query or a syntax error of its own.
+   */
+  private parseParenthesizedSublinkQuery(): { query: A.SelectStmt; failure?: undefined } | { query: null; failure?: SublinkQueryFailure } {
+    if (!this.looksLikeSubquery(0)) {
+      return { query: null };
+    }
+    const ambiguous = this.atPunct('(', 1);
+    const save = this.p;
+    try {
       this.next();
       const sub = this.parseSelectStatement();
       this.expectPunct(')');
-      return { kind: 'SubLink', linkType, testexpr: left, operName: name, subselect: sub, loc };
+      return { query: sub };
+    } catch (e) {
+      if (!ambiguous) {
+        throw e;
+      }
+      const failure: SublinkQueryFailure = { error: e, at: this.p };
+      this.p = save;
+      return { query: null, failure };
     }
-    this.expectPunct('(');
-    const arr = this.parseExpr();
-    this.expectPunct(')');
+  }
+
+  /**
+   * Parses an operand as an expression (`parse`) after its query reading failed (`failure`). When the
+   * expression reading fails at an EARLIER token than the query reading did, the query reading's error is
+   * the one reported: PostgreSQL's parser stops at — and reports — the furthest token either reading reaches
+   * (`IN ((SELECT 1 FROM), 2)`: `at or near ")"`, not the expression reading's `at or near "SELECT"`).
+   */
+  private parseAfterSublinkQuery<T>(failure: SublinkQueryFailure | undefined, parse: () => T): T {
+    if (failure === undefined) {
+      return parse();
+    }
+    try {
+      return parse();
+    } catch (e) {
+      throw this.p < failure.at ? failure.error : e;
+    }
+  }
+
+  private parseSubqueryOp(left: A.Expr, name: string[], loc: number): A.Expr {
+    const kind = this.next().kw;
+    const linkType = kind === 'ALL' ? 'ALL' : 'ANY';
+    const sub = this.parseParenthesizedSublinkQuery();
+    if (sub.query) {
+      return { kind: 'SubLink', linkType, testexpr: left, operName: name, subselect: sub.query, loc };
+    }
+    const arr = this.parseAfterSublinkQuery(sub.failure, () => {
+      this.expectPunct('(');
+      const expr = this.parseExpr();
+      this.expectPunct(')');
+      return expr;
+    });
     return { kind: 'AExpr', exprKind: linkType === 'ALL' ? 'OP_ALL' : 'OP_ANY', name, lexpr: left, rexpr: arr, loc };
   }
 
@@ -2061,19 +2166,20 @@ export class Parser {
         return { kind: 'AExpr', exprKind, name: [not ? 'NOT BETWEEN' : 'BETWEEN'], lexpr: left, rexpr: [low, high], loc };
       }
       case 'IN': {
-        if (this.looksLikeSubquery(0)) {
-          this.next();
-          const sub = this.parseSelectStatement();
-          this.expectPunct(')');
-          const link: A.SubLink = { kind: 'SubLink', linkType: 'ANY', testexpr: left, operName: ['='], subselect: sub, loc };
+        const sub = this.parseParenthesizedSublinkQuery();
+        if (sub.query) {
+          const link: A.SubLink = { kind: 'SubLink', linkType: 'ANY', testexpr: left, operName: ['='], subselect: sub.query, loc };
           if (not) {
             return { kind: 'BoolExpr', op: 'NOT', args: [link], loc };
           }
           return link;
         }
-        this.expectPunct('(');
-        const list = this.parseExprList();
-        this.expectPunct(')');
+        const list = this.parseAfterSublinkQuery(sub.failure, () => {
+          this.expectPunct('(');
+          const items = this.parseExprList();
+          this.expectPunct(')');
+          return items;
+        });
         return { kind: 'AExpr', exprKind: 'IN', name: [not ? '<>' : '='], lexpr: left, rexpr: list, loc };
       }
       case 'LIKE':

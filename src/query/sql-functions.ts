@@ -1,7 +1,9 @@
 import type { DbColumn } from '../entity/db-column';
 import { toPgArrayLiteral } from '../types/custom-types';
 import {
+  and,
   applyToDriverMapper,
+  assertPgTypeName,
   castTo,
   Condition,
   DRIVER_VALUE_MAPPER,
@@ -365,6 +367,21 @@ export function literal<T extends LiteralValue>(
   return castTo<WidenLiteral<T>>(new SqlFragment([text], []), pgType).mapWith(mapper);
 }
 
+/**
+ * {@link literal} typed as the value's declared type instead of its widened one: renders and reads
+ * exactly like `literal(value, pgType)`, but `literalOf<'book' | 'film'>('book')` is a
+ * `SqlFragment<'book' | 'film'>` (a `literal('book')` is a `SqlFragment<string>`), so UNION legs
+ * projecting different discriminators share one declared union type. A value outside the declared
+ * type is a compile error.
+ *
+ * @example
+ * db.books.select(b => ({ kind: literalOf<'book' | 'film'>('book'), id: b.id }))
+ *   .unionAll(db.films.select(f => ({ kind: literalOf<'book' | 'film'>('film'), id: f.id })))
+ */
+export function literalOf<T extends LiteralValue>(value: T, pgType?: PgCastType): SqlFragment<T> {
+  return literal(value, pgType) as unknown as SqlFragment<T>;
+}
+
 /** The values {@link literal} can inline. */
 export type LiteralValue = string | number | bigint | boolean | null;
 
@@ -378,6 +395,70 @@ export type WidenLiteral<T> = T extends string
       : T extends boolean
         ? boolean
         : null;
+
+/**
+ * A bound parameter: renders `$n` and pushes its value — ALWAYS exactly one parameter, whatever the
+ * value (null included), and no other rendering branch (a value is never taken for a column, a
+ * table reference or an expression).
+ */
+class BoundParameter<T> extends SqlFragment<T> {
+  constructor(private readonly boundValue: unknown, private readonly castType: string | undefined) {
+    super([], [], DRIVER_VALUE_MAPPER);
+  }
+
+  override buildSql(context: SqlBuildContext): string {
+    context.params.push(this.boundValue);
+    const marker = `$${context.paramCounter++}`;
+
+    return this.castType === undefined ? marker : `CAST(${marker} AS ${this.castType})`;
+  }
+
+  override getFieldRefs(): FieldRef[] {
+    return [];
+  }
+}
+
+/**
+ * A bound parameter as an expression: `$n`, or `CAST($n AS pgType)` with a type.
+ *
+ * It ALWAYS binds exactly one parameter — `null` / `undefined` bind as NULL — and never inlines, so
+ * the statement text does not depend on the value: `castAsInt(null)` inlines `CAST(NULL AS integer)`
+ * and `eq(col, null)` becomes `col IS NULL` (both change the text, and the latter the meaning),
+ * while `eq(col, param(value, 'integer'))` is `col = CAST($1 AS integer)` for every value — a NULL
+ * value compares as SQL NULL, i.e. matches nothing. Usable anywhere a fragment is: a comparison
+ * operand, a JSON path key (`jsonbPathText(col, param(lang))` renders `(col->>$1)`, no cast), a CASE
+ * arm, a function argument, a boolean operand of `and()` / `or()`.
+ *
+ * The value binds as given — no column's `toDriver` mapper applies. A JS array binds as ONE
+ * PostgreSQL array literal and needs an array type (`param([1, 2], 'integer[]')`); a JSON document
+ * goes through {@link castAsJsonb} / {@link castAsJson}, which serialize it. The type name is
+ * validated like {@link cast}'s. Reads back as the driver delivers the value.
+ *
+ * @example
+ * db.accounts.where(a => or(eq(a.id, param(byId, 'integer')), eq(a.ownerId, param(byOwner, 'integer'))))
+ * db.pages.select(p => ({ title: jsonbPathText(p.titles, param(language)) }))
+ */
+export function param<T>(value: T | null | undefined, pgType?: PgCastType): SqlFragment<T> {
+  if (!isPlainSqlValue(value)) {
+    throw new TypeError('param() binds a JS value — got a column, an expression or a subquery; use it directly');
+  }
+
+  const castType = pgType === undefined ? undefined : assertPgTypeName(pgType);
+
+  if (Array.isArray(value)) {
+    if (castType === undefined || !castType.endsWith(']')) {
+      throw new TypeError('param(): a JS array binds as one PostgreSQL array literal — give it an array type (param(values, \'integer[]\'))');
+    }
+
+    return new BoundParameter<T>(toPgArrayLiteral(value as readonly unknown[]), castType);
+  }
+
+  if (isPlainObject(value)) {
+    throw new TypeError('param() binds a scalar — for a JSON document use castAsJsonb(value) / castAsJson(value), which serialize it');
+  }
+
+  return new BoundParameter<T>(value === undefined ? null : value, castType);
+}
 
 /**
  * A typed SQL NULL: `CAST(NULL AS pgType)`.
@@ -821,14 +902,62 @@ export function concatWs(separator: SqlOperand<string>, ...values: SqlOperand[])
   return callFunction('concat_ws', [separator, ...values]);
 }
 
+/**
+ * `(a || b || …)` — text concatenation that is NULL when ANY operand is NULL (unlike
+ * {@link concat}, which treats NULL as the empty string, and {@link concatWs}, which skips it).
+ *
+ * Columns and fragments render as they are (a navigation's column joins it); a separator written
+ * with {@link literal} stays inline; a plain JS value binds typed as text (`CAST($1 AS text)`) and
+ * `null` / `undefined` are a typed NULL (`CAST(NULL AS text)`). Reads back as the driver delivers
+ * the text — a digits-only result stays a string, NULL stays null.
+ *
+ * @example
+ * db.loans.select(l => ({ issuedBy: concatStrict(l.clerk.firstName, literal(' '), l.clerk.lastName) }))
+ */
+export function concatStrict(...values: SqlOperand[]): SqlFragment<string | null> {
+  if (values.length < 2) {
+    throw new Error('concatStrict() needs at least two operands');
+  }
+
+  const parts: string[] = ['('];
+  for (let i = 1; i < values.length; i++) {
+    parts.push(' || ');
+  }
+  parts.push(')');
+
+  return new SqlFragment<string | null>(
+    parts,
+    values.map(value => (isPlainSqlValue(value) ? castTo(value, 'text') : value)),
+    DRIVER_VALUE_MAPPER
+  );
+}
+
 /** `substring(value, start[, count])` — 1-based start, like PostgreSQL. */
 export function substring(
   value: SqlOperand<string | null | undefined>,
   start: SqlOperand<number>,
   count?: SqlOperand<number>
-): SqlFragment<string> {
+): SqlFragment<string>;
+/**
+ * `substring(value, pattern)` — the POSIX regular-expression form: the part of `value` the pattern's
+ * first parenthesized group matches (the whole match without a group), NULL when nothing matches.
+ * Always the function-call syntax, which is the expression an index written as
+ * `substring(col, '…')` holds; pass the pattern through {@link literal} to inline it.
+ *
+ * @example
+ * db.shelves.where(s => eq(substring(s.code, literal('^[0-9]+-([0-9]+)$')), serial))
+ */
+export function substring(
+  value: SqlOperand<string | null | undefined>,
+  pattern: SqlOperand<string>
+): SqlFragment<string | null>;
+export function substring(
+  value: SqlOperand<string | null | undefined>,
+  startOrPattern: SqlOperand<number> | SqlOperand<string>,
+  count?: SqlOperand<number>
+): SqlFragment<string | null> {
   requireOperand('substring()', value);
-  return callFunction('substring', count === undefined ? [value, start] : [value, start, count]);
+  return callFunction('substring', count === undefined ? [value, startOrPattern] : [value, startOrPattern, count]);
 }
 
 /** `replace(value, from, to)` — replaces every occurrence of `from`. */
@@ -902,6 +1031,30 @@ export function mod(dividend: SqlOperand<number | null | undefined>, divisor: Sq
   const allPlain = isPlainSqlValue(dividend) && isPlainSqlValue(divisor);
   const operands = [dividend, divisor].map(value => (allPlain ? typedOperand(value) : value));
   return new SqlFragment<number>(['mod(', ', ', ')'], operands, NUMBER_RESULT_MAPPER);
+}
+
+/**
+ * `(dividend % divisor)` — the remainder as the `%` OPERATOR, with the sign of the dividend.
+ *
+ * Same result as {@link mod}, but a different expression: `%` is an operator and `mod()` a function
+ * call, and an expression index written with `%` (`CREATE INDEX … ((code % 10000000))`) is only
+ * used by a query that spells the same operator. Keep a constant divisor inline with
+ * {@link literal} (`literal(10000000, 'bigint')`) — a bound one cannot match the index under a
+ * generic plan. Plain operands are typed like `mod()`'s (both plain: from their JS types; otherwise
+ * untyped). Reads back as a JS number; a value compared with it binds unchanged.
+ *
+ * @example
+ * db.accounts.where(a => eq(modulo(a.number, literal(10000000, 'bigint')), lastSevenDigits))
+ */
+export function modulo(
+  dividend: SqlOperand<number | bigint | string | null | undefined>,
+  divisor: SqlOperand<number | bigint>
+): SqlFragment<number> {
+  requireOperand('modulo()', dividend);
+  requireOperand('modulo()', divisor);
+  const allPlain = isPlainSqlValue(dividend) && isPlainSqlValue(divisor);
+  const operands = [dividend, divisor].map(value => (allPlain ? typedOperand(value) : value));
+  return new SqlFragment<number>(['(', ' % ', ')'], operands, NUMBER_RESULT_MAPPER);
 }
 
 // ============================================================================
@@ -1138,8 +1291,11 @@ function jsonbPathFragment<T>(fnName: string, target: unknown, keys: readonly Js
     throw new Error(`${fnName} needs at least one key`);
   }
 
-  // parts[i] precedes values[i]; the last part is the running tail that inline keys extend
-  const parts: string[] = ['', ''];
+  // parts[i] precedes values[i]; the last part is the running tail that inline keys extend. The path is
+  // parenthesised as a whole — `(target->'a'->>'b')` — so it stays ONE operand of whatever it is composed
+  // with: bare, `concatStrict(x, jsonbPathText(t, 'k'))` read `(x || t)->>'k'`, `jsonbRemoveKey(jsonbPath(t,
+  // 'a'), 'k')` read `t->('a' - 'k')`, and a `::type` a template wrote after it cast the key.
+  const parts: string[] = ['(', ''];
   const values: unknown[] = [target];
 
   keys.forEach((key, index) => {
@@ -1155,11 +1311,13 @@ function jsonbPathFragment<T>(fnName: string, target: unknown, keys: readonly Js
     }
   });
 
+  parts[parts.length - 1] += ')';
+
   return new SqlFragment<T>(parts, values, DRIVER_VALUE_MAPPER);
 }
 
 /**
- * A plain JSON path: `target->'a'->'b'` (jsonb result).
+ * A plain JSON path: `(target->'a'->'b')` (jsonb result).
  *
  * Unlike `jsonbSelect`, there is no `#>> '{}'` text round trip: the column is read as the
  * jsonb it is. String keys are inlined as quoted literals, integers are array indexes, and a
@@ -1173,7 +1331,7 @@ export function jsonbPath<T = unknown>(target: SqlOperand, ...keys: JsonbPathKey
 }
 
 /**
- * A plain JSON path read as text: `target->'a'->>'b'`.
+ * A plain JSON path read as text: `(target->'a'->>'b')`.
  *
  * @example
  * db.orders.where(o => eq(jsonbPathText(o.payload, 'shipping', 'country'), 'AT'))
@@ -1302,8 +1460,11 @@ export function jsonbTypeOf(target: SqlOperand): SqlFragment<'object' | 'array' 
   return new SqlFragment(['jsonb_typeof(', ')'], [target], DRIVER_VALUE_MAPPER);
 }
 
-/** A value inside jsonb_build_object / jsonb_build_array: nested plain objects and arrays recurse. */
-function jsonbBuildOperand(value: unknown): unknown {
+/** Which JSON type a `*_build_object` / `*_build_array` call builds. */
+type JsonFlavor = 'json' | 'jsonb';
+
+/** A value inside json(b)_build_object / json(b)_build_array: nested plain objects and arrays recurse. */
+function jsonBuildOperand(flavor: JsonFlavor, value: unknown): unknown {
   // Columns (FieldRefs are plain objects too), fragments and conditions first
   if (!isPlainSqlValue(value)) {
     return value instanceof WhereConditionBase && !(value instanceof SqlFragment)
@@ -1312,14 +1473,51 @@ function jsonbBuildOperand(value: unknown): unknown {
   }
 
   if (Array.isArray(value)) {
-    return jsonbBuildArray(...value);
+    return buildJsonArray(flavor, value);
   }
 
   if (isPlainObject(value)) {
-    return jsonbBuildObject(value);
+    return buildJsonObject(flavor, `${flavor === 'json' ? 'jsonBuildObject' : 'jsonbBuildObject'}()`, value);
   }
 
   return typedOperand(value);
+}
+
+function buildJsonObject<T>(flavor: JsonFlavor, fnName: string, entries: Record<string, unknown>): SqlFragment<T> {
+  if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+    throw new TypeError(`${fnName} expects an object of key → value`);
+  }
+
+  const call = `${flavor}_build_object(`;
+  const keys = Object.keys(entries);
+  if (keys.length === 0) {
+    return new SqlFragment<T>([`${call})`], [], DRIVER_VALUE_MAPPER);
+  }
+
+  const parts: string[] = [];
+  const values: unknown[] = [];
+  keys.forEach((key, index) => {
+    parts.push(`${index === 0 ? call : ', '}${quoteSqlLiteral(key)}, `);
+    values.push(jsonBuildOperand(flavor, entries[key]));
+  });
+  parts.push(')');
+
+  return new SqlFragment<T>(parts, values, DRIVER_VALUE_MAPPER);
+}
+
+function buildJsonArray<T>(flavor: JsonFlavor, values: readonly unknown[]): SqlFragment<T> {
+  const call = `${flavor}_build_array(`;
+  if (values.length === 0) {
+    return new SqlFragment<T>([`${call})`], [], DRIVER_VALUE_MAPPER);
+  }
+
+  const parts: string[] = [call];
+  for (let i = 1; i < values.length; i++) {
+    parts.push(', ');
+  }
+  parts.push(')');
+
+  return new SqlFragment<T>(parts, values.map(value => jsonBuildOperand(flavor, value)), DRIVER_VALUE_MAPPER);
 }
 
 /**
@@ -1332,39 +1530,46 @@ function jsonbBuildOperand(value: unknown): unknown {
  * db.loans.select(l => ({ summary: jsonbBuildObject({ id: l.id, member: { name: l.member.name } }) }))
  */
 export function jsonbBuildObject<T = Record<string, unknown>>(entries: Record<string, unknown>): SqlFragment<T> {
-  if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
-    throw new TypeError('jsonbBuildObject() expects an object of key → value');
-  }
-
-  const keys = Object.keys(entries);
-  if (keys.length === 0) {
-    return new SqlFragment<T>(['jsonb_build_object()'], [], DRIVER_VALUE_MAPPER);
-  }
-
-  const parts: string[] = [];
-  const values: unknown[] = [];
-  keys.forEach((key, index) => {
-    parts.push(`${index === 0 ? 'jsonb_build_object(' : ', '}${quoteSqlLiteral(key)}, `);
-    values.push(jsonbBuildOperand(entries[key]));
-  });
-  parts.push(')');
-
-  return new SqlFragment<T>(parts, values, DRIVER_VALUE_MAPPER);
+  return buildJsonObject<T>('jsonb', 'jsonbBuildObject()', entries);
 }
 
 /** `jsonb_build_array(a, b, …)` — values as in {@link jsonbBuildObject}. */
 export function jsonbBuildArray<T = unknown[]>(...values: unknown[]): SqlFragment<T> {
-  if (values.length === 0) {
-    return new SqlFragment<T>(['jsonb_build_array()'], [], DRIVER_VALUE_MAPPER);
-  }
+  return buildJsonArray<T>('jsonb', values);
+}
 
-  const parts: string[] = ['jsonb_build_array('];
-  for (let i = 1; i < values.length; i++) {
-    parts.push(', ');
-  }
-  parts.push(')');
+/**
+ * `json_build_object('key', value, …)` — the `json` twin of {@link jsonbBuildObject}, with the same
+ * operand rules (keys inlined as quoted literals; columns and fragments as they are; plain values
+ * bound typed from their JS type; conditions as booleans; nested plain objects / arrays as nested
+ * json_build_object / json_build_array calls). `json` keeps the keys in the written order (jsonb
+ * sorts them) and is cheaper to build when the value is only shipped to the client. Reads back as
+ * the driver-parsed JSON.
+ *
+ * @example
+ * db.loans.select(l => ({ summary: jsonBuildObject({ id: l.id, dueAt: l.dueAt }) }))
+ */
+export function jsonBuildObject<T = Record<string, unknown>>(entries: Record<string, unknown>): SqlFragment<T> {
+  return buildJsonObject<T>('json', 'jsonBuildObject()', entries);
+}
 
-  return new SqlFragment<T>(parts, values.map(jsonbBuildOperand), DRIVER_VALUE_MAPPER);
+/** `json_build_array(a, b, …)` — the `json` twin of {@link jsonbBuildArray}; values as in {@link jsonBuildObject}. */
+export function jsonBuildArray<T = unknown[]>(...values: unknown[]): SqlFragment<T> {
+  return buildJsonArray<T>('json', values);
+}
+
+/**
+ * `(target #>> '{}')` — the whole jsonb value as text: a JSON string unquoted (`"x"` → `x`), a
+ * number or boolean as its text, an object or array as its JSON text; SQL NULL and JSON `null` give
+ * NULL. Unlike `castAsString(target)` (`jsonb::text`), a string keeps no quotes. Reads back as the
+ * driver delivers the text (a digits-only value stays a string).
+ *
+ * @example
+ * db.pages.select(p => ({ slug: jsonbValueText(p.slug) }))
+ */
+export function jsonbValueText(target: SqlOperand): SqlFragment<string | null> {
+  requireOperand('jsonbValueText()', target);
+  return new SqlFragment<string | null>(['(', " #>> '{}')"], [jsonbOperand(target)], DRIVER_VALUE_MAPPER);
 }
 
 /** `to_jsonb(value)` — any SQL value as jsonb. */
@@ -1373,38 +1578,537 @@ export function toJsonb<T = unknown>(value: SqlOperand): SqlFragment<T> {
   return callFunction<T>('to_jsonb', [value]);
 }
 
+/** Whether a plain JS value holds a column, an expression or a subquery anywhere in it. */
+function holdsSqlOperand(value: unknown, depth: number = 0): boolean {
+  if (!isPlainSqlValue(value)) {
+    return true;
+  }
+
+  if (depth > 16) {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(item => holdsSqlOperand(item, depth + 1));
+  }
+
+  return isPlainObject(value) && Object.values(value).some(item => holdsSqlOperand(item, depth + 1));
+}
+
 /**
  * `jsonb_path_exists(target, path[, vars[, silent]])` — an SQL/JSON path predicate.
  *
- * `vars` is serialized to jsonb and referenced from the path as `$name`; `silent: true`
- * suppresses the structural errors (missing keys, type mismatches) a `strict` path raises.
+ * The path is a string — bound as ONE parameter, `CAST($1 AS jsonpath)` — or a fragment, which
+ * renders verbatim: `literal(path, 'jsonpath')` keeps the path INLINE (`CAST('…' AS jsonpath)`), so
+ * a statement repeating the predicate per rule binds nothing for it.
+ *
+ * `vars` (referenced from the path as `$name`) is a plain object serialized to jsonb, or a fragment
+ * rendered verbatim — `jsonbBuildObject({ day: expr })` passes per-row SQL values. A plain object
+ * holding columns or expressions is refused (its JSON would be the objects themselves): build it
+ * with `jsonbBuildObject`. `silent: true` suppresses the structural errors (missing keys, type
+ * mismatches) a `strict` path raises; with `vars` or `silent` given, the call has all four
+ * arguments (`…, false)` when not silent).
  *
  * @example
  * db.events.where(e => jsonbPathExists(e.slots, '$[*] ? (@.from <= $day && @.to >= $day)', { vars: { day } }))
+ * db.events.where(e => jsonbPathExists(e.closures, literal('strict $[*] ? (@.from <= $d)', 'jsonpath'), {
+ *   vars: jsonbBuildObject({ d: e.localDay }),
+ *   silent: true,
+ * }))
  */
 export function jsonbPathExists(
   target: SqlOperand,
-  path: string,
-  options?: { vars?: Record<string, unknown>; silent?: boolean }
+  path: string | SqlFragment<string>,
+  options?: { vars?: Record<string, unknown> | SqlFragment<unknown>; silent?: boolean }
 ): SqlFragment<boolean> {
   requireOperand('jsonbPathExists()', target);
 
-  if (typeof path !== 'string' || !path.trim()) {
-    throw new Error('jsonbPathExists(): the path must be a non-empty SQL/JSON path string');
-  }
+  let pathOperand: unknown;
 
-  const pathOperand = castTo(path, 'jsonpath');
+  if (path instanceof SqlFragment) {
+    pathOperand = path;
+  } else if (typeof path === 'string' && path.trim()) {
+    pathOperand = castTo(path, 'jsonpath');
+  } else {
+    throw new Error('jsonbPathExists(): the path must be a non-empty SQL/JSON path string, or a fragment (literal(path, \'jsonpath\') keeps it inline)');
+  }
 
   if (options?.vars === undefined && options?.silent === undefined) {
     return new SqlFragment<boolean>(['jsonb_path_exists(', ', ', ')'], [target, pathOperand]);
   }
 
-  const vars = jsonbOperand(options?.vars ?? {});
+  const vars = options?.vars;
+  let varsOperand: unknown;
+
+  if (vars instanceof SqlFragment || !isPlainSqlValue(vars)) {
+    // A fragment — or a jsonb column, a placeholder, a raw expression — IS the vars operand, rendered as it
+    // stands (as before 1.0.9). Only a PLAIN object is serialized, and one holding columns cannot be.
+    varsOperand = vars;
+  } else {
+    if (holdsSqlOperand(vars)) {
+      throw new Error(
+        'jsonbPathExists(): vars holds a column or an expression, which cannot be serialized — '
+        + 'build the vars in SQL with jsonbBuildObject({ … }) and pass that fragment'
+      );
+    }
+
+    varsOperand = jsonbOperand(vars ?? {});
+  }
+
   return new SqlFragment<boolean>(
     ['jsonb_path_exists(', ', ', ', ', `, ${options?.silent ? 'true' : 'false'})`],
-    [target, pathOperand, vars]
+    [target, pathOperand, varsOperand]
   );
 }
+
+// ============================================================================
+// Aggregate fragments (agg)
+// ============================================================================
+
+/**
+ * One ORDER BY key of a list aggregate: a column or an expression (ascending), or
+ * `[key, 'ASC' | 'DESC']`. A plain JS value is refused — it would order by a constant.
+ */
+export type AggOrderKey = SqlOperand | readonly [SqlOperand, 'ASC' | 'DESC'];
+
+/** Options of the list aggregates (`arrayAgg`, `jsonAgg`, `jsonbAgg`). */
+export interface AggListOptions {
+  /** `DISTINCT` — each distinct argument value once (NULL is a value here, like in PostgreSQL). */
+  distinct?: boolean;
+  /** `ORDER BY` inside the aggregate: the order of the list's elements. */
+  orderBy?: AggOrderKey | readonly AggOrderKey[];
+}
+
+/** What an {@link AggregateFragment} renders. @internal */
+export interface AggregateSpec {
+  /** The function, lower-case (`count`, `array_agg`, …) */
+  readonly name: string;
+  /** Its argument; `undefined` renders `*` (count(*)) */
+  readonly argument?: unknown;
+  readonly distinct: boolean;
+  readonly orderBy: ReadonlyArray<readonly [unknown, 'ASC' | 'DESC']>;
+  readonly filter?: Condition;
+  readonly mapper: any;
+}
+
+/** A mapper normalized to the object that has `fromDriver` (a custom type builder unwrapped). */
+function readMapperOf(value: unknown): { fromDriver(value: unknown): unknown; toDriver?: unknown } | undefined {
+  let mapper = getValueMapper(value);
+
+  if (mapper && typeof mapper.getType === 'function') {
+    mapper = mapper.getType();
+  }
+
+  return mapper && typeof mapper.fromDriver === 'function' ? mapper : undefined;
+}
+
+/** How a list of the operand's values reads: each element through the operand's mapper. */
+function arrayReadMapper(argument: unknown): any {
+  const element = readMapperOf(argument);
+
+  if (element === undefined || element === DRIVER_VALUE_MAPPER) {
+    return DRIVER_VALUE_MAPPER;
+  }
+
+  return {
+    fromDriver: (value: unknown) => (Array.isArray(value)
+      ? value.map(item => (item === null || item === undefined ? item : element.fromDriver(item)))
+      : value),
+  };
+}
+
+/** `name(…)` parts / values: `[DISTINCT] <argument> [ORDER BY <key> <dir>, …]) [FILTER (WHERE <cond>)]`. */
+function compileAggregate(spec: AggregateSpec): { parts: string[]; values: unknown[] } {
+  // parts[i] precedes values[i]; the last part is the running tail
+  const parts: string[] = [`${spec.name}(`];
+  const values: unknown[] = [];
+  const text = (sqlText: string): void => {
+    parts[parts.length - 1] += sqlText;
+  };
+  const value = (operand: unknown): void => {
+    values.push(operand);
+    parts.push('');
+  };
+
+  if (spec.argument === undefined) {
+    text('*');
+  } else {
+    if (spec.distinct) {
+      text('DISTINCT ');
+    }
+    value(typedOperand(spec.argument));
+  }
+
+  spec.orderBy.forEach(([key, direction], index) => {
+    text(index === 0 ? ' ORDER BY ' : ', ');
+    value(key);
+    text(` ${direction}`);
+  });
+
+  text(')');
+
+  if (spec.filter !== undefined) {
+    text(' FILTER (WHERE ');
+    value(bareCondition(spec.filter));
+    text(')');
+  }
+
+  return { parts, values };
+}
+
+/**
+ * What a projected value renders as, through the wrappers that only rename or re-read it:
+ * `.as()` / `.mapWith()` / `.withReadType()` of a fragment subclass (an aggregate) and
+ * `Subquery.asExpression()` wrap their target as the ONE value of an otherwise empty fragment
+ * (`sql\`${x}\`` is the same shape). The driver reads the root of a projected value directly.
+ * @internal
+ */
+export function projectedValueRoot(value: unknown): unknown {
+  let current = value;
+
+  for (let depth = 0; depth < 16 && current instanceof SqlFragment && current.constructor === SqlFragment; depth++) {
+    // A plain fragment's template (read the way sql.join reads it)
+    const { sqlParts, values } = current as unknown as { sqlParts: readonly string[]; values: readonly unknown[] };
+    const inner = values.length === 1 && sqlParts.length === 2 && sqlParts[0] === '' && sqlParts[1] === '' ? values[0] : undefined;
+
+    if (inner === null || typeof inner !== 'object') {
+      break;
+    }
+
+    current = inner;
+  }
+
+  return current;
+}
+
+function isAggOrderTuple(value: unknown): value is readonly [unknown, string] {
+  return Array.isArray(value) && value.length === 2 && typeof value[1] === 'string' && /^(asc|desc)$/i.test(value[1]);
+}
+
+/** The ORDER BY keys of a list aggregate, validated: `[key, direction]` pairs. */
+function aggregateOrderKeys(fnName: string, orderBy: AggListOptions['orderBy']): Array<readonly [unknown, 'ASC' | 'DESC']> {
+  if (orderBy === undefined) {
+    return [];
+  }
+
+  const keys: readonly unknown[] = isAggOrderTuple(orderBy) || !Array.isArray(orderBy) ? [orderBy] : orderBy;
+
+  return keys.map(entry => {
+    const [key, direction] = isAggOrderTuple(entry) ? entry : [entry, 'ASC'];
+
+    if (isPlainSqlValue(key)) {
+      throw new TypeError(
+        `${fnName}: an ORDER BY key must be a column or an expression (optionally as [key, 'ASC' | 'DESC']) — got ${
+          key === null ? 'null' : Array.isArray(key) ? 'an array' : typeof key
+        }`
+      );
+    }
+
+    return [key, direction.toUpperCase() as 'ASC' | 'DESC'] as const;
+  });
+}
+
+/**
+ * An aggregate as an expression — built by {@link agg}: `count(*)`, `sum(x)`, `array_agg(DISTINCT x
+ * ORDER BY y DESC)`, … — with an optional `FILTER (WHERE …)` added by {@link filter}. Immutable:
+ * `filter()` returns a new fragment.
+ *
+ * A select of aggregate fragments without a `groupBy()` is a whole-set aggregate: ONE row, also over
+ * zero input rows (a count is 0 there, every other aggregate NULL — a list aggregate NULL, not `[]`:
+ * for an always-array wrap `jsonAgg` / `jsonbAgg` in `coalesce(…, literal('[]', 'json'))` and
+ * `arrayAgg` in `coalesce(…, literal('{}', 'integer[]'))` — the array type of its elements). Its
+ * `count()` is refused (it would count the input rows). Inside a scalar subquery it is an aggregate
+ * per enclosing row — `asSubquery('scalar')` of one aggregate reads like the aggregate; inside a
+ * grouped select, an aggregate per group (of the keys it reads through `g.key`).
+ */
+export class AggregateFragment<T> extends SqlFragment<T> {
+  private readonly spec: AggregateSpec;
+
+  /** @internal — aggregates are built through {@link agg}. */
+  constructor(spec: AggregateSpec) {
+    const compiled = compileAggregate(spec);
+    super(compiled.parts, compiled.values, spec.mapper);
+    this.spec = spec;
+  }
+
+  /**
+   * `<aggregate> FILTER (WHERE <condition>)` — aggregate only the rows the condition holds for. A
+   * second call is ANDed with the first. Returns a new fragment.
+   *
+   * @example
+   * agg.count().filter(eq(l.returned, literal(false)))
+   */
+  filter(condition: Condition): AggregateFragment<T> {
+    const accepted = filterConditionOf(condition);
+
+    if (accepted === undefined) {
+      throw new TypeError(`agg.${this.spec.name}().filter() expects a condition (eq(), and(), a boolean sql fragment, …)`);
+    }
+
+    return new AggregateFragment<T>({
+      ...this.spec,
+      filter: this.spec.filter === undefined ? accepted : and(this.spec.filter, accepted),
+    });
+  }
+
+  /**
+   * On a driver that cannot decode native array results (Bun's binary protocol), the `array_agg`
+   * a projection reads back directly — the value the query builders mark as the context's
+   * `jsonArrayRoot` — renders as JSON: `json_agg(…)` with the same arguments, or, for a list of
+   * int8 / numeric / money values, `to_json(CAST(array_agg(…) AS text[]))`: each element its exact
+   * text (a JSON number loses an int8's precision), under the aggregate's own DISTINCT / ORDER BY.
+   * Wherever SQL consumes the list — a function argument, an operand, a WHERE, a HAVING, a CTE
+   * body, a compared UNION leg — it stays `array_agg`.
+   */
+  override buildSql(context: SqlBuildContext): string {
+    const sqlText = super.buildSql(context);
+
+    if (this.spec.name !== 'array_agg' || context.jsonArrayRoot !== this) {
+      return sqlText;
+    }
+
+    return deliversElementsAsText(this.spec.argument)
+      ? `to_json(CAST(${sqlText} AS text[]))`
+      : `json_agg${sqlText.slice('array_agg'.length)}`;
+  }
+}
+
+/** Element types a JSON number cannot carry exactly (int8 beyond 2^53, numeric) — or not as the driver reads them (money). */
+const TEXT_ELEMENT_TYPE = /^\s*(bigint|int8|bigserial|serial8|numeric|decimal|money)\b/i;
+
+/** Numeric types whose MIN / MAX reads back as a JS number (the drivers deliver numeric and int8 as text). */
+const NUMERIC_EXTREME_TYPE = /^\s*(smallint|integer|int|int2|int4|int8|bigint|smallserial|serial|serial2|serial4|bigserial|serial8|decimal|numeric|real|float4|float8|double precision)\b/i;
+
+/** The SQL type an operand is known to have: a column's declared type, or a fragment's read type. */
+function operandSqlType(operand: unknown): string | undefined {
+  return declaredSqlType(operand) ?? (operand instanceof SqlFragment ? operand.getReadType() : undefined);
+}
+
+function deliversElementsAsText(argument: unknown): boolean {
+  const sqlType = operandSqlType(argument);
+  return sqlType !== undefined && TEXT_ELEMENT_TYPE.test(sqlType);
+}
+
+/**
+ * What `filter()` aggregates by: a condition, or a condition by shape — a collection navigation's
+ * `exists()` snapshot renders `EXISTS (…)` and reports its refs, but is no WhereConditionBase.
+ * A subquery (a value, not a condition) is not one. `undefined` for anything else.
+ */
+function filterConditionOf(condition: unknown): Condition | undefined {
+  if (condition instanceof WhereConditionBase) {
+    return condition;
+  }
+
+  const candidate = condition as { buildSql?: unknown; getFieldRefs?: unknown } | null | undefined;
+
+  return candidate !== null && typeof candidate === 'object'
+    && typeof candidate.buildSql === 'function' && typeof candidate.getFieldRefs === 'function'
+    ? new BareCondition(candidate as unknown as WhereConditionBase)
+    : undefined;
+}
+
+/**
+ * Whether an operand binds a parameter where it renders: rendered twice (an argument and its
+ * DISTINCT ORDER BY key), it binds a new `$n` each time — two different expressions to PostgreSQL.
+ */
+function bindsParameters(operand: unknown): boolean {
+  if (operand === null || typeof operand !== 'object' || typeof (operand as { buildSql?: unknown }).buildSql !== 'function') {
+    return false;
+  }
+
+  try {
+    const probe: SqlBuildContext = { paramCounter: 1, params: [] };
+    (operand as { buildSql(context: SqlBuildContext): string }).buildSql(probe);
+    return probe.params.length > 0;
+  } catch {
+    // Not renderable on its own (it needs its query): the statement build reports it
+    return false;
+  }
+}
+
+/**
+ * Whether a projection holds an aggregate fragment — at its top, in a nested object or inside an
+ * `sql` expression — which makes a select without `groupBy()` a whole-set aggregate: ONE row. A
+ * subquery's aggregate is its own. Getters (navigations) are not followed. @internal
+ */
+export function holdsAggregateFragment(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === null || typeof value !== 'object' || '__dbColumnName' in value) {
+    return false;
+  }
+
+  if (value instanceof AggregateFragment) {
+    return true;
+  }
+
+  const values: readonly unknown[] = value instanceof SqlFragment
+    // A plain fragment's template values (read the way sql.join reads them)
+    ? ((value as unknown as { values?: readonly unknown[] }).values ?? [])
+    : isPlainObject(value)
+      ? Object.values(Object.getOwnPropertyDescriptors(value)).filter(d => 'value' in d).map(d => d.value)
+      : [];
+
+  return values.some(inner => holdsAggregateFragment(inner, depth + 1));
+}
+
+/**
+ * How a SCALAR subquery's value reads, from its selection (the value itself, or an object of
+ * exactly one value): an aggregate fragment through its mapper (`.as()` / `.mapWith()` of one
+ * included), a read-typed fragment as its read type. `undefined` for anything else — a projected
+ * scalar subquery otherwise reads raw, as it always did. @internal
+ */
+export function scalarSubqueryRead(selection: unknown): { mapper?: unknown; readType?: string } | undefined {
+  const value = isPlainObject(selection) && Object.keys(selection).length === 1 ? Object.values(selection)[0] : selection;
+
+  if (!(value instanceof SqlFragment)) {
+    return undefined;
+  }
+
+  const readType = value.getReadType();
+  if (readType !== undefined) {
+    return { readType };
+  }
+
+  const mapper = value.getMapper();
+
+  return mapper !== undefined && projectedValueRoot(value) instanceof AggregateFragment ? { mapper } : undefined;
+}
+
+function aggregate<T>(
+  fnName: string,
+  name: string,
+  argument: unknown,
+  mapper: any,
+  options?: { distinct?: boolean; orderBy?: AggListOptions['orderBy'] }
+): AggregateFragment<T> {
+  if (argument === undefined) {
+    throw new Error(`${fnName}: the operand is undefined — pass a column, a fragment or a value`);
+  }
+
+  const distinct = options?.distinct === true;
+  const orderBy = aggregateOrderKeys(fnName, options?.orderBy);
+
+  // With DISTINCT PostgreSQL requires every ORDER BY key to be the argument, character for character
+  if (distinct && orderBy.some(([key]) => bindsParameters(key))) {
+    throw new TypeError(
+      `${fnName}: with DISTINCT, an ORDER BY key must render exactly as the argument — this one binds a `
+      + 'parameter, which renders a new $n each time, so PostgreSQL rejects it. Inline its constants with literal().'
+    );
+  }
+
+  return new AggregateFragment<T>({ name, argument, distinct, orderBy, mapper });
+}
+
+/**
+ * How a MIN / MAX reads — like the grouped `g.min()` / `g.max()`: through the operand's mapper; as a
+ * JS number for a numeric or int8 operand (the drivers deliver those as text); else as delivered.
+ */
+function extremeReadMapper(operand: unknown): any {
+  const sqlType = operandSqlType(operand);
+
+  return readMapperOf(operand)
+    ?? (sqlType !== undefined && NUMERIC_EXTREME_TYPE.test(sqlType) ? NUMBER_RESULT_MAPPER : DRIVER_VALUE_MAPPER);
+}
+
+/** The aggregate functions of {@link agg}. */
+export interface AggregateFunctions {
+  /** `count(*)` — the number of rows (0 over no rows); read as a JS number. */
+  count(): AggregateFragment<number>;
+  /** `count(value)` — the rows whose value is not NULL. */
+  count(value: SqlOperand): AggregateFragment<number>;
+  /** `count(DISTINCT value)` — the distinct non-NULL values. */
+  countDistinct(value: SqlOperand): AggregateFragment<number>;
+  /** `sum([DISTINCT] value)` — NULL over no rows; read as a JS number (numeric / int8 text converted). */
+  sum(value: SqlOperand, options?: { distinct?: boolean }): AggregateFragment<number | null>;
+  /** `avg([DISTINCT] value)` — NULL over no rows; read as a JS number. */
+  avg(value: SqlOperand, options?: { distinct?: boolean }): AggregateFragment<number | null>;
+  /**
+   * `min(value)` — read like `g.min()`: a mapped column through its mapper, a numeric / int8 operand
+   * as a JS number, anything else as the driver delivers it.
+   */
+  min<T>(value: SqlOperand<T>): AggregateFragment<T | null>;
+  /**
+   * `max(value)` — read like `g.max()`: a mapped column through its mapper, a numeric / int8 operand
+   * as a JS number, anything else as the driver delivers it.
+   */
+  max<T>(value: SqlOperand<T>): AggregateFragment<T | null>;
+  /** `bit_or(value)` — the OR of the non-NULL values (NULL over none); a JS number. */
+  bitOr(value: SqlOperand<number | null | undefined>): AggregateFragment<number | null>;
+  /** `bit_and(value)` — the AND of the non-NULL values (NULL over none); a JS number. */
+  bitAnd(value: SqlOperand<number | null | undefined>): AggregateFragment<number | null>;
+  /**
+   * `array_agg([DISTINCT] value [ORDER BY …])` — NULL over no rows; each element read like the operand
+   * (through its mapper). Projected as the value itself on a driver without native array results,
+   * it renders as JSON (see {@link AggregateFragment.buildSql}); wherever SQL consumes it, it stays
+   * `array_agg`. For an always-array default: `coalesce(agg.arrayAgg(x), literal('{}', 'integer[]'))`.
+   */
+  arrayAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null>;
+  /** `json_agg([DISTINCT] value [ORDER BY …])` — NULL over no rows; the driver-parsed JSON, no per-element mapping. */
+  jsonAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null>;
+  /** `jsonb_agg([DISTINCT] value [ORDER BY …])` — NULL over no rows; the driver-parsed JSON, no per-element mapping. */
+  jsonbAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null>;
+}
+
+/**
+ * Aggregates as expressions — `count(*)`, `count(DISTINCT x)`, `sum`, `avg`, `min`, `max`, `bit_or`,
+ * `bit_and`, `array_agg` / `json_agg` / `jsonb_agg` with `DISTINCT` and `ORDER BY` — each with an
+ * optional `.filter(condition)` (`FILTER (WHERE …)`).
+ *
+ * A select of them (no `groupBy()`) aggregates the whole filtered set into one row; inside
+ * `asSubquery('scalar')` they make a correlated aggregate subquery; inside a grouped select they
+ * aggregate each group. Function names render lower-case; an ORDER BY key always carries its
+ * direction.
+ *
+ * @example
+ * // Whole-set: one row, whatever the filter matches
+ * db.loans.where(l => eq(l.memberId, id)).select(l => ({
+ *   total: agg.count(),
+ *   open: agg.count().filter(isNull(l.returnedAt)),
+ *   titles: agg.arrayAgg(l.bookId, { distinct: true, orderBy: [[l.bookId, 'ASC']] }),
+ * }))
+ *
+ * @example
+ * // A correlated aggregate per row
+ * db.members.select(m => ({
+ *   loans: db.loans.where(l => eq(l.memberId, m.id)).select(() => agg.count()).asSubquery('scalar'),
+ * }))
+ */
+export const agg: AggregateFunctions = Object.freeze({
+  count(value?: SqlOperand): AggregateFragment<number> {
+    return arguments.length === 0
+      ? new AggregateFragment<number>({ name: 'count', distinct: false, orderBy: [], mapper: NUMBER_RESULT_MAPPER })
+      : aggregate<number>('agg.count()', 'count', value, NUMBER_RESULT_MAPPER);
+  },
+  countDistinct(value: SqlOperand): AggregateFragment<number> {
+    return aggregate<number>('agg.countDistinct()', 'count', value, NUMBER_RESULT_MAPPER, { distinct: true });
+  },
+  sum(value: SqlOperand, options?: { distinct?: boolean }): AggregateFragment<number | null> {
+    return aggregate<number | null>('agg.sum()', 'sum', value, NUMBER_RESULT_MAPPER, { distinct: options?.distinct });
+  },
+  avg(value: SqlOperand, options?: { distinct?: boolean }): AggregateFragment<number | null> {
+    return aggregate<number | null>('agg.avg()', 'avg', value, NUMBER_RESULT_MAPPER, { distinct: options?.distinct });
+  },
+  min<T>(value: SqlOperand<T>): AggregateFragment<T | null> {
+    return aggregate<T | null>('agg.min()', 'min', value, extremeReadMapper(value));
+  },
+  max<T>(value: SqlOperand<T>): AggregateFragment<T | null> {
+    return aggregate<T | null>('agg.max()', 'max', value, extremeReadMapper(value));
+  },
+  bitOr(value: SqlOperand<number | null | undefined>): AggregateFragment<number | null> {
+    return aggregate<number | null>('agg.bitOr()', 'bit_or', value, NUMBER_RESULT_MAPPER);
+  },
+  bitAnd(value: SqlOperand<number | null | undefined>): AggregateFragment<number | null> {
+    return aggregate<number | null>('agg.bitAnd()', 'bit_and', value, NUMBER_RESULT_MAPPER);
+  },
+  arrayAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null> {
+    return aggregate<T[] | null>('agg.arrayAgg()', 'array_agg', value, arrayReadMapper(value), options);
+  },
+  jsonAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null> {
+    return aggregate<T[] | null>('agg.jsonAgg()', 'json_agg', value, DRIVER_VALUE_MAPPER, options);
+  },
+  jsonbAgg<T>(value: SqlOperand<T>, options?: AggListOptions): AggregateFragment<T[] | null> {
+    return aggregate<T[] | null>('agg.jsonbAgg()', 'jsonb_agg', value, DRIVER_VALUE_MAPPER, options);
+  },
+});
 
 // ============================================================================
 // Array columns

@@ -177,6 +177,20 @@ export interface SqlBuildContext {
    */
   useJsonArrayAggregation?: boolean;
   /**
+   * The root of the ONE projected value being built that the driver reads back directly, while that
+   * driver cannot decode native arrays (see `projectedValueRoot`): the `agg.arrayAgg` it is renders
+   * `json_agg`, a scalar subquery it is projects its own value that way. Set per projected value by
+   * the projection code — an `arrayAgg` that SQL consumes (a function argument, an operand, a
+   * WHERE, a HAVING, a CTE body, a compared UNION leg) is never that root and stays `array_agg`.
+   * @internal
+   */
+  jsonArrayRoot?: unknown;
+  /**
+   * The select built under this context (a UNION leg, a subquery that is such a root) projects
+   * values the driver reads back directly, on a driver without native array results. @internal
+   */
+  jsonArrayProjection?: boolean;
+  /**
    * Table names that the LATERAL collection being built renders under a generated alias
    * (`lib_editions` → `lateral_0_editions`). An `exists()` / `count()` over a collection of its
    * item, nested in its WHERE or projection, correlates to that alias: the table is not visible
@@ -234,6 +248,19 @@ export function applyToDriverMapper(value: any, mapper: any): any {
     : value;
 }
 
+/**
+ * A subquery used as a comparison operand — duck-typed, subquery.ts imports this module. It renders
+ * as `(<subquery sql>)` in the statement's parameter sequence and reports its correlation refs.
+ * @internal
+ */
+export function isSubqueryOperand(value: unknown): value is { buildSql(context: SqlBuildContext): string; getOuterFieldRefs(): FieldRef[] } {
+  return typeof value === 'object' && value !== null && !(value instanceof WhereConditionBase)
+    && typeof (value as any).buildSql === 'function' && typeof (value as any).getOuterFieldRefs === 'function';
+}
+
+/** A comparison operand that is a scalar subquery: `eq(col, db.t.where(…).select(…).asSubquery('scalar'))`. */
+export type ScalarSubqueryOperand<V> = Subquery<V, 'scalar'>;
+
 function isSqlFragmentLiteral(value: any): boolean {
   return !(
     getValueMapper(value) ||
@@ -282,6 +309,13 @@ export abstract class WhereConditionBase {
     // SqlFragment — build it to get raw SQL (e.g. sql`${field}::varchar(255)`)
     if (field instanceof SqlFragment) {
       return field.buildSql(context!);
+    }
+    // A scalar subquery operand — it used to render its object text: `"[object Object]" IS NULL`
+    if (isSubqueryOperand(field)) {
+      if (!context) {
+        throw new Error('A subquery operand renders within a statement — it needs the build context');
+      }
+      return `(${field.buildSql(context)})`;
     }
     if (typeof field === 'object' && '__dbColumnName' in field) {
       // Check if field has a table alias
@@ -346,6 +380,11 @@ export abstract class WhereConditionBase {
       return value.buildSql(context);
     }
 
+    // A scalar subquery — it used to take the literal branch below and bind the Subquery OBJECT
+    if (isSubqueryOperand(value)) {
+      return `(${value.buildSql(context)})`;
+    }
+
     if (this.isFieldRef(value)) {
       // Value is a field reference, use it with table alias if present
       if ('__tableAlias' in value && (value as any).__tableAlias) {
@@ -383,17 +422,22 @@ export abstract class WhereComparisonBase<V = any> extends WhereConditionBase {
    */
   override getFieldRefs(): FieldRef[] {
     const refs: FieldRef[] = [];
-    if (this.field instanceof SqlFragment) {
-      refs.push(...this.field.getFieldRefs());
-    } else if (this.isFieldRef(this.field)) {
-      refs.push(this.field);
-    }
-    if (this.value instanceof SqlFragment) {
-      refs.push(...this.value.getFieldRefs());
-    } else if (this.value !== undefined && this.isFieldRef(this.value)) {
-      refs.push(this.value);
+    this.collectOperandRefs(this.field, refs);
+    if (this.value !== undefined) {
+      this.collectOperandRefs(this.value, refs);
     }
     return refs;
+  }
+
+  /** The refs one operand reads: a fragment's tree, a subquery's correlation refs, a column. */
+  protected collectOperandRefs(operand: unknown, refs: FieldRef[]): void {
+    if (operand instanceof SqlFragment) {
+      refs.push(...operand.getFieldRefs());
+    } else if (isSubqueryOperand(operand)) {
+      refs.push(...operand.getOuterFieldRefs());
+    } else if (this.isFieldRef(operand)) {
+      refs.push(operand);
+    }
   }
 
   /**
@@ -445,7 +489,11 @@ export class LogicalCondition extends WhereConditionBase {
       return '1=1';
     }
 
-    const parts = this.conditions.map(c => c.buildSql(context));
+    // A raw `sql` operand is the caller's text — `a OR b` inside an AND must keep its grouping.
+    // NOT parenthesizes its operand anyway; comparisons, helpers and nested AND / OR group themselves.
+    const parts = this.conditions.map(c => (this.operator !== 'not' && isRawSqlFragment(c)
+      ? `(${c.buildSql(context)})`
+      : c.buildSql(context)));
 
     switch (this.operator) {
       case 'and':
@@ -694,16 +742,8 @@ export class BetweenComparison<V = any> extends WhereComparisonBase<V> {
    */
   override getFieldRefs(): FieldRef[] {
     const refs = super.getFieldRefs();
-    if (this.min instanceof SqlFragment) {
-      refs.push(...this.min.getFieldRefs());
-    } else if (this.isFieldRef(this.min)) {
-      refs.push(this.min);
-    }
-    if (this.max instanceof SqlFragment) {
-      refs.push(...this.max.getFieldRefs());
-    } else if (this.isFieldRef(this.max)) {
-      refs.push(this.max);
-    }
+    this.collectOperandRefs(this.min, refs);
+    this.collectOperandRefs(this.max, refs);
     return refs;
   }
 
@@ -735,94 +775,94 @@ export type Condition = WhereConditionBase;
 // ============================================================================
 
 export function eq<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new EqComparison<V>(field!, value!);
+  return new EqComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function ne<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new NeComparison<V>(field!, value!);
+  return new NeComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function gt<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new GtComparison<V>(field!, value!);
+  return new GtComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function gte<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new GteComparison<V>(field!, value!);
+  return new GteComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function lt<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new LtComparison<V>(field!, value!);
+  return new LtComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function lte<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  value: FieldLike<V> | V | Placeholder<any> | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  value: FieldLike<V> | ScalarSubqueryOperand<V> | V | Placeholder<any> | undefined
 ): Condition {
-  return new LteComparison<V>(field!, value!);
+  return new LteComparison<V>(field as FieldLike<V>, value as FieldLike<V> | V);
 }
 
 export function like<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  value: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  value: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new LikeComparison(field!, value!);
+  return new LikeComparison(field as FieldLike<string>, value as FieldLike<string> | string);
 }
 
 export function ilike<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  value: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  value: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new ILikeComparison(field!, value!);
+  return new ILikeComparison(field as FieldLike<string>, value as FieldLike<string> | string);
 }
 
 export function startsWith<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  value: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  value: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new StartsWithComparison(field!, value!);
+  return new StartsWithComparison(field as FieldLike<string>, value as FieldLike<string> | string);
 }
 
 export function regexMatches<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  pattern: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new RegexMatchesComparison(field!, pattern!);
+  return new RegexMatchesComparison(field as FieldLike<string>, pattern as FieldLike<string> | string);
 }
 
 export function regexMatchesCaseInsensitive<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  pattern: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new RegexMatchesCaseInsensitiveComparison(field!, pattern!);
+  return new RegexMatchesCaseInsensitiveComparison(field as FieldLike<string>, pattern as FieldLike<string> | string);
 }
 
 export function regexNoMatch<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  pattern: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new RegexNoMatchComparison(field!, pattern!);
+  return new RegexNoMatchComparison(field as FieldLike<string>, pattern as FieldLike<string> | string);
 }
 
 export function regexNoMatchCaseInsensitive<T extends string>(
-  field: FieldLike<string> | T | undefined,
-  pattern: FieldLike<string> | string | Placeholder<any> | undefined
+  field: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | T | undefined,
+  pattern: FieldLike<string> | ScalarSubqueryOperand<string | null | undefined> | string | Placeholder<any> | undefined
 ): Condition {
-  return new RegexNoMatchCaseInsensitiveComparison(field!, pattern!);
+  return new RegexNoMatchCaseInsensitiveComparison(field as FieldLike<string>, pattern as FieldLike<string> | string);
 }
 
 // ============================================================================
@@ -838,6 +878,10 @@ export function regexNoMatchCaseInsensitive<T extends string>(
  * Wrap a field or value in `public.search_normalize(...)`. Usable both inside a
  * `sql\`\`` template and as a building block for the normalized helpers below.
  *
+ * Projected, it reads back as the text the function returns — a digits-only value such as
+ * `'01'` stays the string `'01'`, NULL reads `null` (the driver value, like every helper whose
+ * result type is explicit).
+ *
  * @example
  * db.users.where(u => sql<boolean>`
  *   ${searchNormalize(u.username)} LIKE ${searchNormalize(containsSearch(query))}
@@ -846,7 +890,7 @@ export function regexNoMatchCaseInsensitive<T extends string>(
 export function searchNormalize<V = string>(
   value: FieldLike<V> | string | Placeholder<any>
 ): SqlFragment<string> {
-  return new SqlFragment<string>(['public.search_normalize(', ')'], [value]);
+  return new SqlFragment<string>(['public.search_normalize(', ')'], [value], DRIVER_VALUE_MAPPER);
 }
 
 /** Build a `%value%` (contains) LIKE pattern. */
@@ -866,14 +910,15 @@ export function endsWithSearch(value: string): string {
 
 /**
  * Accent/case-insensitive equality:
- * `search_normalize(field) = search_normalize(value)`.
+ * `(search_normalize(field) = search_normalize(value))` — parenthesized like every helper, so it stays
+ * one operand wherever it is composed (`eq(flag, normalizedEq(…))` compared `flag = a = b`, a syntax error).
  */
 export function normalizedEq<T extends string>(
   field: FieldLike<string> | T,
   value: FieldLike<string> | string | Placeholder<any>
 ): Condition {
   return new SqlFragment<boolean>(
-    ['', ' = ', ''],
+    ['(', ' = ', ')'],
     [searchNormalize(field as any), searchNormalize(value)]
   );
 }
@@ -881,14 +926,14 @@ export function normalizedEq<T extends string>(
 /**
  * Accent/case-insensitive `LIKE`. The `pattern` is normalized too, so pass the
  * wildcards yourself (or build them with `containsSearch` / `startsWithSearch`):
- * `search_normalize(field) LIKE search_normalize(pattern)`.
+ * `(search_normalize(field) LIKE search_normalize(pattern))`.
  */
 export function normalizedLike<T extends string>(
   field: FieldLike<string> | T,
   pattern: FieldLike<string> | string | Placeholder<any>
 ): Condition {
   return new SqlFragment<boolean>(
-    ['', ' LIKE ', ''],
+    ['(', ' LIKE ', ')'],
     [searchNormalize(field as any), searchNormalize(pattern)]
   );
 }
@@ -896,14 +941,14 @@ export function normalizedLike<T extends string>(
 /**
  * Accent/case-insensitive prefix match. The wildcard is appended after
  * normalization, so callers pass a plain prefix:
- * `search_normalize(field) LIKE search_normalize(value) || '%'`.
+ * `(search_normalize(field) LIKE search_normalize(value) || '%')`.
  */
 export function normalizedStartsWith<T extends string>(
   field: FieldLike<string> | T,
   value: FieldLike<string> | string | Placeholder<any>
 ): Condition {
   return new SqlFragment<boolean>(
-    ['', ' LIKE ', " || '%'"],
+    ['(', ' LIKE ', " || '%')"],
     [searchNormalize(field as any), searchNormalize(value)]
   );
 }
@@ -922,12 +967,12 @@ export function normalizedStartsWith<T extends string>(
  * exact-length operator it has always been.
  */
 export function inArray<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
   values: V[]
 ): Condition {
   return inArrayUsesOpt
-    ? renderInArrayOpt<T, V>(field, values)
-    : new InComparison<V>(field!, values);
+    ? renderInArrayOpt<T, V>(field as FieldLike<V>, values)
+    : new InComparison<V>(field as FieldLike<V>, values);
 }
 
 /**
@@ -936,12 +981,12 @@ export function inArray<T extends string, V>(
  * through {@link notInArrayOpt}'s rendering.
  */
 export function notInArray<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
   values: V[]
 ): Condition {
   return inArrayUsesOpt
-    ? renderNotInArrayOpt<T, V>(field, values)
-    : new NotInComparison<V>(field!, values);
+    ? renderNotInArrayOpt<T, V>(field as FieldLike<V>, values)
+    : new NotInComparison<V>(field as FieldLike<V>, values);
 }
 
 // ============================================================================
@@ -996,7 +1041,7 @@ function toArrayParameter<V>(column: unknown, values: readonly V[]): string {
 }
 
 /**
- * `column = ANY($1::type[])` — membership against a list bound as ONE parameter.
+ * `(column = ANY($1::type[]))` — membership against a list bound as ONE parameter.
  *
  * The array-form counterpart to {@link inArray}. `inArray` renders one
  * placeholder per element, so its statement text changes with the list length;
@@ -1015,9 +1060,13 @@ function toArrayParameter<V>(column: unknown, values: readonly V[]): string {
  * An empty list yields `= ANY('{}')`, which is FALSE — the same result as
  * `inArray`'s `1=0`, without a second statement text.
  *
+ * Parenthesized like every helper: a fragment is spliced into the expression it is an operand of as
+ * it renders, and a bare `x = ANY(…)` compared with a column (`eq(flag, eqAny(…))`) read
+ * `flag = x = ANY(…)` — a syntax error.
+ *
  * @example
  * db.orderItems.where(oi => eqAny(oi.productPriceId, boundPriceIds))
- * // "oi"."product_price_id" = ANY($1::integer[])
+ * // ("oi"."product_price_id" = ANY($1::integer[]))
  *
  * @example
  * // Navigation properties resolve their JOIN like any other condition
@@ -1028,13 +1077,13 @@ export function eqAny<V>(
   values: readonly V[]
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['', ' = ANY(', `${arrayElementCast(column)})`],
+    ['(', ' = ANY(', `${arrayElementCast(column)}))`],
     [column!, toArrayParameter(column, values)]
   );
 }
 
 /**
- * `column <> ALL($1::type[])` — the negation of {@link eqAny}, and the array-form
+ * `(column <> ALL($1::type[]))` — the negation of {@link eqAny}, and the array-form
  * counterpart to {@link notInArray}.
  *
  * NULL semantics match `NOT IN` exactly: a NULL column, or a NULL anywhere in
@@ -1043,14 +1092,14 @@ export function eqAny<V>(
  *
  * @example
  * db.orderItems.where(oi => neAll(oi.productPriceId, excludedPriceIds))
- * // "oi"."product_price_id" <> ALL($1::integer[])
+ * // ("oi"."product_price_id" <> ALL($1::integer[]))
  */
 export function neAll<V>(
   column: FieldLike<V> | DbColumn<V> | undefined,
   values: readonly V[]
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['', ' <> ALL(', `${arrayElementCast(column)})`],
+    ['(', ' <> ALL(', `${arrayElementCast(column)}))`],
     [column!, toArrayParameter(column, values)]
   );
 }
@@ -1292,7 +1341,7 @@ function renderNotInArrayOpt<T extends string, V>(
  * @example
  * db.products.where(p => inArrayOpt(p.id, productIds));
  * // productIds.length <= 8:  "product"."id" IN ($1, $2, $3)
- * // productIds.length  > 8:  "product"."id" = ANY($1::integer[])
+ * // productIds.length  > 8:  ("product"."id" = ANY($1::integer[]))
  */
 export function inArrayOpt<T extends string, V>(
   column: FieldLike<V> | DbColumn<V> | T | undefined,
@@ -1315,23 +1364,23 @@ export function notInArrayOpt<T extends string, V>(
 }
 
 export function isNull<T extends string, V>(
-  field: FieldLike<V> | T | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined
 ): Condition {
-  return new IsNullComparison<V>(field!);
+  return new IsNullComparison<V>(field as FieldLike<V>);
 }
 
 export function isNotNull<T extends string, V>(
-  field: FieldLike<V> | T | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined
 ): Condition {
-  return new IsNotNullComparison<V>(field!);
+  return new IsNotNullComparison<V>(field as FieldLike<V>);
 }
 
 export function between<T extends string, V>(
-  field: FieldLike<V> | T | undefined,
-  min: FieldLike<V> | V | undefined,
-  max: FieldLike<V> | V | undefined
+  field: FieldLike<V> | ScalarSubqueryOperand<V> | T | undefined,
+  min: FieldLike<V> | ScalarSubqueryOperand<V> | V | undefined,
+  max: FieldLike<V> | ScalarSubqueryOperand<V> | V | undefined
 ): Condition {
-  return new BetweenComparison<V>(field!, min!, max!);
+  return new BetweenComparison<V>(field as FieldLike<V>, min as FieldLike<V> | V, max as FieldLike<V> | V);
 }
 
 export function and(...conditions: Condition[]): Condition {
@@ -1412,14 +1461,17 @@ export function coalesce(
 }
 
 /**
- * JSONB merge helper - emits `COALESCE(target, '{}'::jsonb) || (patch)::jsonb`.
+ * JSONB merge helper - emits `(COALESCE(target, '{}'::jsonb) || (patch)::jsonb)`.
  *
  * Convenience wrapper for the common pattern of merging a JSONB patch onto a
  * column that may be null. Safe under concurrent writes because the `||`
  * operator is evaluated atomically by PostgreSQL per row.
  *
  * The patch is parenthesised before its cast, so a compound patch (`sql\`${a} || ${b}\``)
- * is cast as a whole — without the parentheses the cast bound to its last operand only.
+ * is cast as a whole — without the parentheses the cast bound to its last operand only. The whole
+ * merge is parenthesised too, so it stays ONE operand of whatever it is composed with: bare,
+ * `jsonbRemoveKey(jsonbMerge(t, p), 'k')` read `t || (p - 'k')` (the key of `t` survived) and
+ * `concatStrict('x', jsonbMerge(t, p))` concatenated the two documents' texts.
  *
  * @param target - The JSONB column (or SqlFragment) to merge onto. May be null.
  *                 Accept the column proxy directly (e.g. `p.integrationInfo`) — at
@@ -1438,7 +1490,7 @@ export function jsonbMerge<T extends object = any>(
   patch: FieldLike<T> | SqlFragment<T> | T
 ): SqlFragment<T> {
   return new SqlFragment<T>(
-    ['COALESCE(', `, '{}'::jsonb) || (`, ')::jsonb'],
+    ['(COALESCE(', `, '{}'::jsonb) || (`, ')::jsonb)'],
     [target, patch]
   );
 }
@@ -1608,7 +1660,11 @@ function flagMaskCast(column: unknown): string {
 
 /**
  * Creates a SQL condition to check if a flag is set in a numeric column
- * Uses bitwise AND to check if the specific bit is non-zero
+ * Uses bitwise AND to check if the specific bit is non-zero: `((column & $1) != 0)`.
+ *
+ * The flag predicates are parenthesised as a whole, like every helper: bare, `(column & $1) != 0`
+ * compared with a column (`eq(active, flagHas(…))`) was a syntax error, and as an IN / BETWEEN
+ * subject it bound its `!= 0` to the IN list.
  *
  * @param column - The numeric column containing flags
  * @param flag - The flag value to check for
@@ -1627,7 +1683,7 @@ export function flagHas<T extends number>(
   flag: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', `${flagMaskCast(column)}) != 0`],
+    ['((', ' & ', `${flagMaskCast(column)}) != 0)`],
     [column, flag]
   );
 }
@@ -1649,7 +1705,7 @@ export function flagHasAll<T extends number>(
 ): SqlFragment<boolean> {
   const cast = flagMaskCast(column);
   return new SqlFragment<boolean>(
-    ['(', ' & ', `${cast}) = `, cast],
+    ['((', ' & ', `${cast}) = `, `${cast})`],
     [column, flags, flags]
   );
 }
@@ -1670,7 +1726,7 @@ export function flagHasAny<T extends number>(
   flags: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', `${flagMaskCast(column)}) != 0`],
+    ['((', ' & ', `${flagMaskCast(column)}) != 0)`],
     [column, flags]
   );
 }
@@ -1691,7 +1747,7 @@ export function flagHasNone<T extends number>(
   flag: T
 ): SqlFragment<boolean> {
   return new SqlFragment<boolean>(
-    ['(', ' & ', `${flagMaskCast(column)}) = 0`],
+    ['((', ' & ', `${flagMaskCast(column)}) = 0)`],
     [column, flag]
   );
 }
@@ -1779,12 +1835,14 @@ export function jsonbSelect<TJsonb, TKey extends keyof TJsonb & string = keyof T
   jsonbField: FieldLike<any> | DbColumn<any> | undefined,
   key: TKey
 ): SqlFragment<TJsonb[TKey]> {
-  // Build the JSONB extraction SQL: (column #>> '{}')::jsonb->'propertyName'
+  // Build the JSONB extraction SQL: ((column #>> '{}')::jsonb->'propertyName')
   // This converts JSONB to text, then back to JSONB, then extracts the property.
   // The key is inlined as a properly quoted literal (a quote in the key used to break out
   // of it). For a plain `->` path without the text round trip, use jsonbPath().
+  // Parenthesised as a whole: bare, `->` took the right operand of a `||` / `@>` it was composed
+  // under as its own left operand, and a `::type` written after it cast the KEY.
   return new SqlFragment<TJsonb[TKey]>(
-    ['(', ` #>> '{}')::jsonb->${quoteSqlLiteral(key)}`],
+    ['((', ` #>> '{}')::jsonb->${quoteSqlLiteral(key)})`],
     [jsonbField]
   ).as(key);
 }
@@ -1807,9 +1865,10 @@ export function jsonbSelectText<TJsonb, TKey extends keyof TJsonb & string = key
   jsonbField: FieldLike<any> | DbColumn<any> | undefined,
   key: TKey
 ): SqlFragment<string> {
-  // Build the JSONB text extraction SQL: column->>'propertyName' (the key quoted as a literal)
+  // Build the JSONB text extraction SQL: (column->>'propertyName') (the key quoted as a literal),
+  // parenthesised so it stays one operand: `concatStrict(x, jsonbSelectText(…))` read `(x || column)->>'k'`
   return new SqlFragment<string>(
-    ['', `->>${quoteSqlLiteral(key)}`],
+    ['(', `->>${quoteSqlLiteral(key)})`],
     [jsonbField]
   ).as(key);
 }
@@ -1841,7 +1900,8 @@ export type JsonbElement<T> = SqlFragment<T> & {
  */
 function createJsonbElementProxy<T>(alias: string, path: string[] = []): JsonbElement<T> {
   // Build the ->> expression for the current path
-  // Uses -> for intermediate segments, ->> for the last segment (text extraction)
+  // Uses -> for intermediate segments, ->> for the last segment (text extraction), parenthesised
+  // like every helper's operator expression: `startsWith(x, e.prefix)` read `(x ^@ __elem)->>'prefix'`
   const buildExpression = (): string => {
     if (path.length === 0) return alias;
     let expr = alias;
@@ -1849,7 +1909,7 @@ function createJsonbElementProxy<T>(alias: string, path: string[] = []): JsonbEl
       expr += `->${quoteSqlLiteral(path[i])}`;
     }
     expr += `->>${quoteSqlLiteral(path[path.length - 1])}`;
-    return expr;
+    return `(${expr})`;
   };
 
   // Create a SqlFragment for this path (pure SQL text, no interpolated values)
@@ -1953,7 +2013,7 @@ class JsonbArraySomeCondition extends WhereConditionBase {
  * // → WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(
  * //       CASE WHEN jsonb_typeof("shelf"."tags") = 'array' THEN "shelf"."tags" ELSE '[]'::jsonb END
  * //     ) AS __elem
- * //     WHERE (__elem->>'kind' = $1 AND __elem->'meta'->>'ref' IS NOT NULL))
+ * //     WHERE ((__elem->>'kind') = $1 AND (__elem->'meta'->>'ref') IS NOT NULL))
  * ```
  */
 export function jsonbArraySome<T>(
@@ -2222,6 +2282,8 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   private values: any[];
   private mapper?: any; // TypeMapper - imported separately to avoid circular dep
   private alias?: string;
+  /** The SQL type a projection reads this value as (see {@link withReadType}); no mapper then. */
+  private readType?: string;
 
   constructor(parts: string[], values: any[], mapper?: any, alias?: string) {
     super();
@@ -2232,12 +2294,35 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
   }
 
   /**
+   * A copy of this fragment with another mapper / alias / read type. A SUBCLASS renders and reports
+   * its refs its own way (`ExistsCondition` has no parts of its own — it overrides `buildSql`), so
+   * its copy wraps it and delegates to it: rebuilt from the (empty) parts, `exists(sub).as('x')`
+   * used to render nothing at all (`,  as "x"`) and to lose the subquery's outer refs.
+   */
+  private derive<U>(mapper: any, alias: string | undefined, readType: string | undefined): SqlFragment<U> {
+    const copy = this.constructor === SqlFragment
+      ? new SqlFragment<U>(this.sqlParts, this.values, mapper, alias)
+      : new SqlFragment<U>(['', ''], [this], mapper, alias);
+
+    copy.readType = readType;
+
+    // A copy of raw SQL is still raw SQL (an and() / or() operand groups it)
+    if (isRawSqlFragment(this)) {
+      RAW_SQL_FRAGMENTS.add(copy);
+    }
+
+    return copy;
+  }
+
+  /**
    * Set custom type mapper for bidirectional transformation
    * Can accept either:
    * - A function (value: TDriver) => TData for inline transformations — the fragment's value type
    *   is what the function returns (an unannotated parameter is `any`; it used to be an implicit
    *   `any` error, and the return type was ignored)
    * - A CustomTypeBuilder with full toDriver/fromDriver methods
+   *
+   * The mapper replaces a read type set by {@link withReadType}.
    */
   mapWith<TData, TDriver = any>(mapper: (value: TDriver) => TData): SqlFragment<TData>;
   mapWith<TData = TValueType>(mapper: object): SqlFragment<TData>;
@@ -2249,14 +2334,42 @@ export class SqlFragment<TValueType = any> extends WhereConditionBase {
       ? { fromDriver: (v: TDriver) => v == null ? v : mapper(v) }
       : mapper;
 
-    return new SqlFragment<TData>(this.sqlParts, this.values, normalizedMapper, this.alias);
+    return this.derive<TData>(normalizedMapper, this.alias, undefined);
   }
 
   /**
    * Set column alias for SELECT clause
    */
   as(alias: string): SqlFragment<TValueType> {
-    return new SqlFragment<TValueType>(this.sqlParts, this.values, this.mapper, alias);
+    return this.derive<TValueType>(this.mapper, alias, this.readType);
+  }
+
+  /**
+   * Read this value back the way a COLUMN of `pgType` reads — no SQL changes. Without it a fragment
+   * that carries no mapper (a raw `sql` template, a subquery expression) reads through the generic
+   * conversion, which turns every numeric-looking string into a number: a text value `'007'` comes
+   * back as `7`. Read as a column of its type instead:
+   *
+   * - a numeric string becomes a number only for a numeric type (`integer`, `bigint`, `numeric`, …);
+   *   text, uuid, json, … stay as the driver delivers them;
+   * - SQL NULL reads `undefined` at the top level of a projection and `null` inside a nested object;
+   * - inside a collection's items the value stays as the JSON delivers it.
+   *
+   * The fragment's mapper is dropped (a later `.mapWith()` sets one again and wins). The read type is
+   * kept by `.as()`, and by every place a projection is read back: `selectDistinct`, UNION legs,
+   * QueryBatch parts, grouped selects (which keep NULL as null), CTE and table-subquery columns,
+   * and a projected `asSubquery('scalar')` whose one value it is.
+   *
+   * @example
+   * db.books.select(b => ({ title: sql<string>`${b.meta}->>${lang}`.withReadType('text') }))
+   */
+  withReadType<U = TValueType>(pgType: PgCastType): SqlFragment<U> {
+    return this.derive<U>(undefined, this.alias, assertPgTypeName(pgType));
+  }
+
+  /** The SQL type set by {@link withReadType}, if any (internal use). */
+  getReadType(): string | undefined {
+    return this.readType;
   }
 
   /**
@@ -2494,7 +2607,20 @@ function sqlTemplate<TValueType = any>(
   strings: TemplateStringsArray,
   ...values: any[]
 ): SqlFragment<TValueType> {
-  return new SqlFragment<TValueType>(Array.from(strings), values);
+  const fragment = new SqlFragment<TValueType>(Array.from(strings), values);
+  RAW_SQL_FRAGMENTS.add(fragment);
+  return fragment;
+}
+
+/**
+ * The fragments whose text is the caller's own — written with the `sql` tag or put together by
+ * `sql.join` — and their `.as()` / `.mapWith()` / `.withReadType()` copies. As an `and()` / `or()`
+ * operand such a fragment renders in parentheses: it may hold a top-level OR.
+ */
+const RAW_SQL_FRAGMENTS = new WeakSet<SqlFragment<any>>();
+
+function isRawSqlFragment(value: unknown): boolean {
+  return value instanceof SqlFragment && RAW_SQL_FRAGMENTS.has(value);
 }
 
 /**
@@ -2545,15 +2671,20 @@ function join<T = any>(fragments: SqlFragment<T>[], separator: SqlFragment<any> 
   const parts: string[] = [];
   const values: any[] = [];
 
+  // A fragment SUBCLASS (exists(), a CASE, …) renders its own way — its parts may be empty — so it
+  // joins as one interpolated value, exactly as `sql\`${fragment}\`` would render it
+  const partsOf = (fragment: SqlFragment<any>): { fragmentParts: string[]; fragmentValues: any[] } =>
+    fragment.constructor === SqlFragment
+      ? { fragmentParts: (fragment as any).sqlParts as string[], fragmentValues: (fragment as any).values as any[] }
+      : { fragmentParts: ['', ''], fragmentValues: [fragment] };
+
   for (let i = 0; i < fragments.length; i++) {
     const fragment = fragments[i];
-    const fragmentParts = (fragment as any).sqlParts as string[];
-    const fragmentValues = (fragment as any).values as any[];
+    const { fragmentParts, fragmentValues } = partsOf(fragment);
 
     if (i > 0) {
       // Add separator
-      const sepParts = (separator as any).sqlParts as string[];
-      const sepValues = (separator as any).values as any[];
+      const { fragmentParts: sepParts, fragmentValues: sepValues } = partsOf(separator);
 
       // Merge last part of current result with separator's first part
       if (parts.length > 0) {
@@ -2581,7 +2712,9 @@ function join<T = any>(fragments: SqlFragment<T>[], separator: SqlFragment<any> 
     }
   }
 
-  return new SqlFragment<T>(parts, values);
+  const joined = new SqlFragment<T>(parts, values);
+  RAW_SQL_FRAGMENTS.add(joined);
+  return joined;
 }
 
 /**

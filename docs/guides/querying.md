@@ -170,6 +170,12 @@ const users = await db.users
   .toList();
 ```
 
+Chained `.where()` calls are ANDed. A raw `sql` condition as an operand of `and()` / `or()` — or of
+that chaining — renders in parentheses of its own, so its text keeps its grouping:
+`.where(u => sql\`${u.age} > 40 OR ${u.age} < 30\`).where(u => eq(u.isActive, true))` is
+`(("age" > 40 OR "age" < 30) AND "is_active" = $1)`. (Before 1.0.9 it rendered without them, and
+AND bound tighter than the fragment's OR.)
+
 **Available Condition Functions:**
 - Comparison: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`
 - Logical: `and`, `or`, `not`
@@ -193,14 +199,15 @@ db.orderItems.where(oi => inArray(oi.productPriceId, priceIds));
 ```
 
 `eqAny` / `neAll` bind the whole list as a **single** parameter, cast to the
-column's declared element type:
+column's declared element type (parenthesized, like every helper, so the predicate stays one operand
+wherever it is composed):
 
 ```typescript
 db.orderItems.where(oi => eqAny(oi.productPriceId, priceIds));
-// "oi"."product_price_id" = ANY($1::integer[])
+// ("oi"."product_price_id" = ANY($1::integer[]))
 
 db.orderItems.where(oi => neAll(oi.productPriceId, excludedIds));
-// "oi"."product_price_id" <> ALL($1::integer[])
+// ("oi"."product_price_id" <> ALL($1::integer[]))
 ```
 
 The cast is resolved from the column itself, including through custom mappers —
@@ -241,7 +248,7 @@ and `notInArrayOpt` does the same with `notInArray` / `neAll`:
 ```typescript
 db.widgets.where(w => inArrayOpt(w.slotId, slotIds));
 // slotIds.length <= threshold:  "w"."slot_id" IN ($1, $2, $3)
-// slotIds.length  > threshold:  "w"."slot_id" = ANY($1::integer[])
+// slotIds.length  > threshold:  ("w"."slot_id" = ANY($1::integer[]))
 ```
 
 Results match `inArray` / `notInArray` for every list, the empty one included.
@@ -309,7 +316,7 @@ LinkgressConfig.inArrayUsesOpt = true;               // off by default
 
 db.widgets.where(w => inArray(w.slotId, slotIds));   // plain inArray…
 // slotIds.length <= threshold:  "w"."slot_id" IN ($1, $2, $3)
-// slotIds.length  > threshold:  "w"."slot_id" = ANY($1::integer[])
+// slotIds.length  > threshold:  ("w"."slot_id" = ANY($1::integer[]))
 ```
 
 With it on, `inArray` and `notInArray` render exactly what `inArrayOpt` and
@@ -489,6 +496,9 @@ const activeCount = await db.users
   .where(u => eq(u.isActive, true))
   .count();
 ```
+
+`count()` counts the rows the query selects. A select of aggregate fragments without `groupBy()`
+(`select(() => ({ n: agg.count() }))`) is always ONE row, so its `count()` is refused.
 
 ### Sum, Min, Max, Average
 
@@ -1201,11 +1211,12 @@ const nonAdmins = await db.users
   .toList();
 ```
 
-**Flag Operator Reference:**
-- `flagHas(column, flag)` - Check if flag is set: `(column & flag) != 0`
-- `flagHasAll(column, flags)` - Check if ALL flags are set: `(column & flags) = flags`
-- `flagHasAny(column, flags)` - Check if ANY flag is set: `(column & flags) != 0`
-- `flagHasNone(column, flag)` - Check if flag is NOT set: `(column & flag) = 0`
+**Flag Operator Reference** (each predicate renders as ONE parenthesized expression, so it can be
+compared or combined like a column — `eq(u.isAdmin, flagHas(u.permissions, Permission.Admin))`):
+- `flagHas(column, flag)` - Check if flag is set: `((column & flag) != 0)`
+- `flagHasAll(column, flags)` - Check if ALL flags are set: `((column & flags) = flags)`
+- `flagHasAny(column, flags)` - Check if ANY flag is set: `((column & flags) != 0)`
+- `flagHasNone(column, flag)` - Check if flag is NOT set: `((column & flag) = 0)`
 
 ### startsWith Operator
 
@@ -1274,15 +1285,15 @@ import { normalizedEq, normalizedLike, normalizedStartsWith, searchNormalize, co
 
 // equality, ignoring accents and case
 await db.users.where(u => normalizedEq(u.email, 'José')).toList();
-// → WHERE public.search_normalize("email") = public.search_normalize($1)
+// → WHERE (public.search_normalize("email") = public.search_normalize($1))
 
 // prefix match (the wildcard is appended after normalization)
 await db.users.where(u => normalizedStartsWith(u.name, 'jo')).toList();
-// → WHERE public.search_normalize("name") LIKE public.search_normalize($1) || '%'
+// → WHERE (public.search_normalize("name") LIKE public.search_normalize($1) || '%')
 
 // substring search — build the pattern with containsSearch / startsWithSearch / endsWithSearch
 await db.users.where(u => normalizedLike(u.name, containsSearch(query))).toList();
-// → WHERE public.search_normalize("name") LIKE public.search_normalize($1)   -- $1 = '%query%'
+// → WHERE (public.search_normalize("name") LIKE public.search_normalize($1))   -- $1 = '%query%'
 
 // low-level building blocks inside a sql`` template
 await db.users
@@ -1294,8 +1305,8 @@ await db.users
 
 | Function | Description |
 |----------|-------------|
-| `normalizedEq(field, value)` | `search_normalize(field) = search_normalize(value)` |
-| `normalizedLike(field, pattern)` | `search_normalize(field) LIKE search_normalize(pattern)` (pass your own wildcards) |
+| `normalizedEq(field, value)` | `(search_normalize(field) = search_normalize(value))` |
+| `normalizedLike(field, pattern)` | `(search_normalize(field) LIKE search_normalize(pattern))` (pass your own wildcards) |
 | `normalizedStartsWith(field, value)` | prefix match; `'%'` appended after normalization |
 | `searchNormalize(fieldOrValue)` | `public.search_normalize(...)` as a composable `SqlFragment` |
 | `containsSearch` / `startsWithSearch` / `endsWithSearch` | build `%x%` / `x%` / `%x` LIKE patterns |
@@ -1538,6 +1549,23 @@ const searchByAge = db.users
 // Both conditions use targetAge = 35
 const result = await searchByAge.execute({ targetAge: 35 });
 ```
+
+### Values That Are Not Placeholders
+
+Every other value the query binds — a literal operand (`eq(u.isActive, true)`), a `param()`, a
+CTE's parameters — is bound on every execution with the value it had when the query was prepared;
+only the placeholders change:
+
+```typescript
+const activeFrom = db.users
+  .where(u => and(eq(u.isActive, true), gte(u.age, sql.placeholder('minAge'))))
+  .prepare('activeFrom');   // $1 = true (fixed), $2 = minAge
+
+await activeFrom.execute({ minAge: 30 });
+```
+
+(Before 1.0.9 those values were sent as NULL: `eq(u.isActive, true)` in a prepared query matched no
+row.)
 
 ### PreparedQuery Utilities
 

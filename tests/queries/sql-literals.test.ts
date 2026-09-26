@@ -110,7 +110,8 @@ describe('literals, typed NULLs and conditions as values', () => {
     });
 
     test('wraps a boolean fragment in parentheses', () => {
-      expect(build(asBoolean(flagHas(qty, 4)))).toEqual({ sql: '(("expr_shelves"."qty" & $1) != 0)', params: [4] });
+      // flagHas renders ONE parenthesized expression of its own; asBoolean adds its group around any fragment
+      expect(build(asBoolean(flagHas(qty, 4)))).toEqual({ sql: '((("expr_shelves"."qty" & $1) != 0))', params: [4] });
     });
 
     test('keeps the condition refs visible', () => {
@@ -128,27 +129,27 @@ describe('literals, typed NULLs and conditions as values', () => {
     const meta = fieldRef('meta', { sqlType: 'jsonb' });
 
     test('jsonbSelectText escapes a quote in the key', () => {
-      expect(build(jsonbSelectText<any>(meta, "it's"))).toEqual({ sql: `"expr_shelves"."meta"->>'it''s'`, params: [] });
+      expect(build(jsonbSelectText<any>(meta, "it's"))).toEqual({ sql: `("expr_shelves"."meta"->>'it''s')`, params: [] });
     });
 
     test('jsonbSelect escapes a quote in the key and keeps its re-parse', () => {
-      expect(build(jsonbSelect<any>(meta, "x'y"))).toEqual({ sql: `("expr_shelves"."meta" #>> '{}')::jsonb->'x''y'`, params: [] });
+      expect(build(jsonbSelect<any>(meta, "x'y"))).toEqual({ sql: `(("expr_shelves"."meta" #>> '{}')::jsonb->'x''y')`, params: [] });
     });
 
     test('a key that tries to break out stays a key', () => {
       const built = build(jsonbSelectText<any>(meta, "a' OR '1'='1"));
-      expect(built.sql).toBe(`"expr_shelves"."meta"->>'a'' OR ''1''=''1'`);
+      expect(built.sql).toBe(`("expr_shelves"."meta"->>'a'' OR ''1''=''1')`);
     });
 
     test('jsonbArraySome element paths are quoted too', () => {
       const condition = jsonbArraySome<any>(meta, el => eq(el["it's"], 'x'));
       const ctx: SqlBuildContext = { paramCounter: 1, params: [] };
-      expect(condition.buildSql(ctx)).toContain(`__elem->>'it''s' = $1`);
+      expect(condition.buildSql(ctx)).toContain(`(__elem->>'it''s') = $1`);
     });
 
-    test('ordinary keys render exactly as before', () => {
-      expect(build(jsonbSelectText<any>(meta, 'genre')).sql).toBe(`"expr_shelves"."meta"->>'genre'`);
-      expect(build(jsonbSelect<any>(meta, 'genre')).sql).toBe(`("expr_shelves"."meta" #>> '{}')::jsonb->'genre'`);
+    test('ordinary keys render as plain quoted literals', () => {
+      expect(build(jsonbSelectText<any>(meta, 'genre')).sql).toBe(`("expr_shelves"."meta"->>'genre')`);
+      expect(build(jsonbSelect<any>(meta, 'genre')).sql).toBe(`(("expr_shelves"."meta" #>> '{}')::jsonb->'genre')`);
     });
   });
 

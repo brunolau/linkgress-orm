@@ -146,6 +146,12 @@ export function projectedColumnRef(key: string, alias: string, metaValue: unknow
     } else {
       // An expression — an `sql` fragment, a condition, a grouped query's aggregate, a collection
       fieldRef.__cteKind = 'expression';
+
+      // A fragment read as a column of its type (withReadType) reads so through the reader too
+      const readType = typeof meta.getReadType === 'function' ? meta.getReadType() : undefined;
+      if (readType !== undefined) {
+        fieldRef.__sqlType = readType;
+      }
     }
   } else {
     // A column the ref cannot tell anything about (a data-modifying CTE's RETURNING column, a
@@ -202,6 +208,235 @@ export function projectedValueRef(key: string, alias: string, metaValue: unknown
 }
 
 /**
+ * `value` — a column ref, or an object of refs (a nested value, see {@link projectedValueRef}) — with
+ * every ref stamped with a query-chain identity (see `isForeignChainRef`). Only for refs minted for
+ * the caller (a CTE's refs are fresh objects on every read).
+ * @internal
+ */
+export function stampChainId<T>(value: T, chainId: number): T {
+  if (value !== null && typeof value === 'object') {
+    if ('__dbColumnName' in (value as object)) {
+      (value as any).__chainId = chainId;
+    } else {
+      for (const nested of Object.values(value as object)) {
+        stampChainId(nested, chainId);
+      }
+    }
+  }
+
+  return value;
+}
+
+/**
+ * A statement compiled without being executed — `update(...).toStatement(selector)`,
+ * `delete().toStatement(selector)`: its SQL text with `$1`-based placeholders and its parameters, typed
+ * by the row its RETURNING produces (`TRow`, a phantom: nothing carries it at runtime). Attach it as a
+ * data-modifying CTE with {@link DbCteBuilder.withMutation}, whose CTE is then typed by `TRow`.
+ */
+export interface CompiledStatement<TRow = unknown> {
+  sql: string;
+  params: any[];
+  /** Phantom type of the RETURNING row — never set at runtime. */
+  readonly __rowType?: TRow;
+}
+
+/** Where a compiled statement keeps its RETURNING selection (non-enumerable: `{ sql, params }` compares as before). */
+const RETURNING_SELECTION = '__returningSelection';
+
+/**
+ * Attaches the RETURNING selection `toStatement(selector)` compiled to the statement — how
+ * {@link DbCteBuilder.withMutation} reads each column (its type, its mapper). @internal
+ */
+export function attachReturningSelection<T extends { sql: string; params: any[] }>(statement: T, selection: Record<string, unknown> | undefined): T {
+  if (selection !== undefined) {
+    Object.defineProperty(statement, RETURNING_SELECTION, { value: selection, enumerable: false });
+  }
+
+  return statement;
+}
+
+/** The RETURNING selection attached by {@link attachReturningSelection}, if any. */
+function returningSelectionOf(statement: { sql: string; params: any[] }): Record<string, any> | undefined {
+  return (statement as any)[RETURNING_SELECTION];
+}
+
+/**
+ * The CTEs declared at statement level, as the set of their NAMES every nested build receives
+ * (`SqlBuildContext.hoistedCteNames`) — carrying their definitions, so that a nested query attaching a
+ * DIFFERENT CTE under a declared name is refused (see {@link isStatementCte}) instead of silently
+ * reading the statement's. A plain `Set` of names (built elsewhere) is honoured by name alone.
+ */
+class StatementCteNames extends Set<string> {
+  constructor(readonly definitions: ReadonlyMap<string, DbCte<any> | undefined>) {
+    super(definitions.keys());
+  }
+}
+
+/**
+ * The statement-level CTE set a builder hands to what it nests: the enclosing statement's (`inherited`)
+ * plus `ctes` — an inherited name keeps the enclosing statement's definition. @internal
+ */
+export function declareStatementCtes(inherited: ReadonlySet<string> | undefined, ctes: readonly DbCte<any>[]): Set<string> {
+  const definitions = new Map<string, DbCte<any> | undefined>();
+
+  for (const name of inherited ?? []) {
+    definitions.set(name, inherited instanceof StatementCteNames ? inherited.definitions.get(name) : undefined);
+  }
+
+  for (const cte of ctes) {
+    if (!definitions.has(cte.name)) {
+      definitions.set(cte.name, cte);
+    }
+  }
+
+  return new StatementCteNames(definitions);
+}
+
+/**
+ * Two CTEs that render the same relation — the same by CONTENT: the same object, or (a definition built
+ * twice, e.g. by a factory called for the statement and again for a nested query) the same body once both
+ * are numbered from `$1` — whatever offset their builders were at — the same `MATERIALIZED` flag, and the
+ * same parameters by value (see {@link sameBoundValue}). A data-modifying CTE is one execution of its
+ * statement: it is the same only as the same instance.
+ * @internal
+ */
+export function sameCteDefinition(a: DbCte<any>, b: DbCte<any>): boolean {
+  if (a === b) {
+    return true;
+  }
+
+  return !a.dataModifying && !b.dataModifying
+    && a.materialized === b.materialized
+    && a.params.length === b.params.length
+    && cteBodyAt(a, 1) === cteBodyAt(b, 1)
+    && a.params.every((param, index) => sameBoundValue(param, b.params[index]));
+}
+
+/**
+ * Whether two parameter values bind the same value: equal primitives (`Object.is`), Dates of the same time,
+ * byte views (Buffer, Uint8Array, …) of the same bytes, arrays of such values element by element, and plain
+ * objects (JSON documents) of the same JSON text — which is what a driver sends for them. Any other object
+ * is the same only as the same instance.
+ */
+function sameBoundValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) {
+    return true;
+  }
+
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+    return false;
+  }
+
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && Object.is(a.getTime(), b.getTime());
+  }
+
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    return ArrayBuffer.isView(a) && ArrayBuffer.isView(b) && sameBytes(a, b);
+  }
+
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, index) => sameBoundValue(item, b[index]));
+  }
+
+  if (!isPlainObject(a) || !isPlainObject(b)) {
+    return false;
+  }
+
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    // Not serializable (a bigint inside): no driver could bind it either
+    return false;
+  }
+}
+
+function sameBytes(a: ArrayBufferView, b: ArrayBufferView): boolean {
+  if (a.byteLength !== b.byteLength) {
+    return false;
+  }
+
+  const left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+  const right = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+
+  return left.every((byte, index) => byte === right[index]);
+}
+
+function isPlainObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Whether `cte` is declared by an enclosing statement (`hoisted`): a nested build then reads it by
+ * name — neither declaring it again nor binding its parameters. A DIFFERENT CTE under a declared name
+ * (different by content, see {@link sameCteDefinition}) is refused: inside the statement the name reads
+ * the statement's CTE, so the nested query would read the other one's rows without a word.
+ * @internal
+ */
+export function isStatementCte(hoisted: ReadonlySet<string> | undefined, cte: DbCte<any>): boolean {
+  if (!hoisted?.has(cte.name)) {
+    return false;
+  }
+
+  const declared = hoisted instanceof StatementCteNames ? hoisted.definitions.get(cte.name) : undefined;
+
+  if (declared !== undefined && !sameCteDefinition(declared, cte)) {
+    throw new Error(
+      `The CTE "${cte.name}" a nested query attaches is not the CTE "${cte.name}" its statement declares: inside the `
+      + 'statement the name reads the statement\'s CTE, so the nested query would read the other one\'s rows. '
+      + 'Rename one of them, or attach the same DbCte to both.'
+    );
+  }
+
+  return true;
+}
+
+/**
+ * The body of `cte` with its placeholders renumbered for its parameters bound from `$slot` on: a body
+ * is numbered from its builder's offset at its creation ({@link DbCte.paramBase}), whatever other
+ * CTEs of its builder the statement declares with it.
+ * @internal
+ */
+export function cteBodyAt(cte: DbCte<any>, slot: number): string {
+  const shift = slot - cte.paramBase;
+
+  return shift === 0 ? cte.query : renumberPlaceholders(cte.query, shift);
+}
+
+/** `"<name>" AS [MATERIALIZED ](<body>)`, its parameters bound from `$slot` on (see {@link cteBodyAt}). @internal */
+export function cteDeclarationAt(cte: DbCte<any>, slot: number): string {
+  return `"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cteBodyAt(cte, slot)})`;
+}
+
+/**
+ * The refusal of a data-modifying CTE declared inside a nested subquery (see
+ * {@link assertStatementLevelCtes}) — its own class, so that a build probing where such a CTE would be
+ * read can tell it from any other error. @internal
+ */
+export class NestedDataModifyingCteError extends Error {
+  constructor(readonly cteName: string) {
+    super(
+      `CTE "${cteName}" is data-modifying: a data-modifying CTE must be declared at statement level — `
+      + 'attach it with .with() on the executing query'
+    );
+  }
+}
+
+/** How a CTE declared inside a nested subquery is refused when it is data-modifying. @internal */
+export function assertStatementLevelCtes(ctes: readonly DbCte<any>[], hoisted: ReadonlySet<string> | undefined): void {
+  for (const cte of ctes) {
+    if (cte.dataModifying && !isStatementCte(hoisted, cte)) {
+      throw new NestedDataModifyingCteError(cte.name);
+    }
+  }
+}
+
+/** Names that are never columns of a CTE: read by JS itself (`await`, JSON, coercion, inspection). */
+const NON_COLUMN_KEYS: ReadonlySet<string> = new Set(['then', 'toJSON', 'constructor', 'valueOf', 'toString', 'inspect', 'asymmetricMatch', 'nodeType', 'tagName']);
+
+/**
  * Represents a Common Table Expression (CTE) with strong typing
  */
 export class DbCte<TColumns> {
@@ -219,6 +454,21 @@ export class DbCte<TColumns> {
    */
   public readonly materialized: boolean;
 
+  /**
+   * A DML statement (`DbCteBuilder.withMutation`): PostgreSQL allows it only in the `WITH` of the
+   * statement that executes, and runs it once there. Declaring it inside a nested subquery is refused
+   * (see {@link assertStatementLevelCtes}).
+   */
+  public readonly dataModifying: boolean;
+
+  /**
+   * The placeholder number the body's parameters start at: its builder numbers the bodies of all its
+   * CTEs as one block (`a` from `$1`, `b` after `a`'s). A statement renumbers each body from where ITS
+   * parameters land (see {@link cteBodyAt}) — a builder's second CTE used without the first, or two
+   * builders' CTEs in one WITH, used to keep `$2` / `$1` and bind another CTE's (or the WHERE's) values.
+   */
+  public readonly paramBase: number;
+
   constructor(
     public readonly name: string,
     public readonly query: string,
@@ -226,10 +476,14 @@ export class DbCte<TColumns> {
     public readonly columnDefs: TColumns,
     public readonly selectionMetadata?: Record<string, any>,
     aggregationColumns?: string[],
-    materialized?: boolean
+    materialized?: boolean,
+    dataModifying?: boolean,
+    paramBase?: number
   ) {
     this.aggregationColumns = new Set(aggregationColumns || []);
     this.materialized = materialized ?? false;
+    this.dataModifying = dataModifying ?? false;
+    this.paramBase = paramBase ?? 1;
   }
 
   /**
@@ -266,14 +520,29 @@ export class DbCte<TColumns> {
       __cteName: this.name,
       __tableAlias: effectiveAlias,
     };
+    const columns = Object.keys(this.columnDefs || {});
 
-    for (const key of Object.keys(this.columnDefs || {})) {
+    for (const key of columns) {
       // The same ref the internal CTE mock rows mint, so refs behave identically wherever FieldRefs
       // are accepted
       ref[key] = this.columnRef(key, effectiveAlias);
     }
 
-    return ref as CteTableRef<TColumns>;
+    if (columns.length > 0 || !this.dataModifying) {
+      return ref as CteTableRef<TColumns>;
+    }
+
+    // A CTE whose columns are known only to its type (`withMutation(name, statement)` types them from
+    // the statement's RETURNING): a column is minted when it is read
+    return new Proxy(ref, {
+      get: (target, prop) => {
+        if (typeof prop === 'symbol' || prop in target || NON_COLUMN_KEYS.has(prop)) {
+          return target[prop as any];
+        }
+
+        return this.columnRef(prop, effectiveAlias);
+      },
+    }) as CteTableRef<TColumns>;
   }
 
   /**
@@ -339,6 +608,12 @@ export class DbCteBuilder {
       materialized?: boolean;
     }
   ): { cte: DbCte<TSelection> } {
+    // A CTE body is nested in the statement that declares it: a data-modifying CTE the query carries
+    // cannot be declared there
+    if (typeof (query as any)._getAttachedCtes === 'function') {
+      assertStatementLevelCtes((query as any)._getAttachedCtes(), undefined);
+    }
+
     const context: SqlBuildContext = {
       paramCounter: this.paramOffset,
       params: [],
@@ -356,6 +631,7 @@ export class DbCteBuilder {
 
     let sql: string;
     let selectionResult: Record<string, any>;
+    const paramBase = this.paramOffset;
 
     // Grouped query builders (`.groupBy(...).select(...)`, possibly with a
     // trailing `.leftJoin(...)`) render their body — including SUM/COUNT/MIN/MAX
@@ -395,7 +671,9 @@ export class DbCteBuilder {
       columnDefs,
       selectionResult,
       undefined,
-      options?.materialized
+      options?.materialized,
+      false,
+      paramBase
     );
     this.ctes.push(cte);
 
@@ -415,28 +693,52 @@ export class DbCteBuilder {
    * PostgreSQL only allows DML CTEs at the top-level statement — attach to the
    * query that executes directly, never inside another CTE.
    *
+   * Read it with `db.selectFromCte(cte)…asSubquery()` inside the query that carries it (`.with(cte)`):
+   * every nested read of the statement reads the ONE statement-level declaration by name. A
+   * data-modifying CTE declared anywhere else — inside a nested subquery, inside another CTE's body — is
+   * refused: PostgreSQL rejects it there, and run naively it would execute once per occurrence.
+   *
    * @param cteName Name of the CTE (referenced from raw fragments as `"name"`).
-   * @param statement Compiled DML — `{ sql, params }` with $1-based placeholders.
-   * @param columns Column names the statement's RETURNING exposes (typing only).
+   * @param statement Compiled DML — `{ sql, params }` with $1-based placeholders. A
+   *   {@link CompiledStatement} from `toStatement(selector)` types the CTE's columns by its RETURNING.
+   * @param columns Column names the statement's RETURNING exposes (typing only) — the older form,
+   *   which types every column as its name.
    */
+  withMutation<TRow>(
+    cteName: string,
+    statement: CompiledStatement<TRow>
+  ): { cte: DbCte<TRow> };
   withMutation<TColumns extends Record<string, string>>(
     cteName: string,
     statement: { sql: string; params: any[] },
     columns: TColumns
-  ): { cte: DbCte<TColumns> } {
+  ): { cte: DbCte<TColumns> };
+  withMutation(
+    cteName: string,
+    statement: { sql: string; params: any[] },
+    columns?: Record<string, string>
+  ): { cte: DbCte<any> } {
+    const paramBase = this.paramOffset;
     const offset = this.paramOffset - 1;
     const sql = offset === 0 ? statement.sql : renumberPlaceholders(statement.sql, offset);
 
     this.paramOffset += statement.params.length;
 
-    const cte = new DbCte<TColumns>(
+    const cte = new DbCte<any>(
       cteName,
       sql,
       statement.params,
-      columns,
+      // Without a columns map the columns are known to the type only (DbCte.as() mints them on read)
+      columns ?? {},
+      // A statement toStatement(selector) compiled carries its RETURNING selection: a column reads with
+      // the type and mapper of what it returns (untyped, a text column's '0042' read as 42 and a
+      // mapped column as its stored value). The (name, statement, columns) overload is the pre-1.0.9
+      // form and keeps its untyped reads, so a program written against it reads what it always did.
+      columns === undefined ? returningSelectionOf(statement) : undefined,
       undefined,
-      undefined,
-      false
+      false,
+      true,
+      paramBase
     );
     this.ctes.push(cte);
 
@@ -468,6 +770,7 @@ export class DbCteBuilder {
     keySelector: (value: TSelection) => TKey,
     aggregationAlias?: TAlias
   ): DbCte<UnwrapSelection<TKey> & { [K in TAlias]: Array<AggregatedItemType<TSelection, TKey>> }> {
+    const paramBase = this.paramOffset;
     const context: SqlBuildContext = {
       paramCounter: this.paramOffset,
       params: [],
@@ -582,7 +885,7 @@ export class DbCteBuilder {
     };
 
     // Pass the aggregation alias as an aggregation column so it can be COALESCE'd in LEFT JOINs
-    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, selectionMetadata, [finalAggregationAlias]);
+    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, selectionMetadata, [finalAggregationAlias], false, false, paramBase);
     this.ctes.push(cte);
 
     return cte;

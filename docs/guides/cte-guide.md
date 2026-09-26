@@ -304,6 +304,12 @@ const result = await db.users
   .toList();
 ```
 
+A builder numbers its CTEs' parameters as one block (`$1` for the first body, `$2`… after it). Each `DbCte`
+remembers where its body starts (`paramBase`), and every statement renumbers each body from where **its**
+parameters land: CTEs of several builders, a builder's second CTE on its own, or its CTEs in another order all
+bind their own values. (Before 1.0.9 a builder's second CTE used without the first kept `$2`, and bound the next
+value of the statement.)
+
 ## Querying from a CTE (FULL OUTER / RIGHT / CROSS joins)
 
 The examples above attach a CTE to an **entity-rooted** query
@@ -364,6 +370,66 @@ A selector returning one value (a column, an expression, a literal) reads as the
 typed for the enclosing query. An array of columns is refused. (A string used to render as a column of
 that NAME, a nested object and a subquery were bound as parameters, and a one-value selector projected
 the ref's own keys.)
+
+### Filtering: `where()`
+
+`.where(predicate)` filters a CTE-rooted query. The predicate receives one column ref per source, in FROM
+order — the root CTE's row, then each joined CTE's — and renders as `WHERE <condition>` after the FROM and its
+joins, before the ORDER BY. Repeated calls combine with AND; its parameters follow the CTE bodies' and the ON
+predicates'. `where()` and `select()` can be called in either order.
+
+```typescript
+db.selectFromCte(older.cte)
+  .where(r => gt(r.age, 32))
+  .where(r => lt(r.age, 100))
+  .select(r => ({ id: r.id }))
+  .orderBy(r => [[r.id, 'DESC']]);
+```
+
+```sql
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age" FROM "users" WHERE "users"."age" > $1)
+SELECT "older_users"."id" as "id"
+FROM "older_users"
+WHERE ("older_users"."age" > $2 AND "older_users"."age" < $3)
+ORDER BY "id" DESC
+-- params: [31, 32, 100]
+```
+
+A ref of any other query correlates: nested as a subquery (`.asSubquery(...)`), the query renders in the
+enclosing statement's parameter sequence and reports the correlation, so the enclosing query joins the
+navigations it reads:
+
+```typescript
+db.posts
+  .with(older.cte)
+  .select(p => ({
+    title: p.title,
+    authorOlderAge: db.selectFromCte(older.cte).where(r => eq(r.id, p.user!.id)).select(r => r.age).asSubquery('scalar'),
+  }));
+```
+
+### Aliasing the root: `selectFromCte(cte, alias)`
+
+`db.selectFromCte(cte, 'o')` renders `FROM "<cte>" AS "o"`; the root row's columns render `"o"."<column>"`.
+A CTE-rooted subquery correlated to an enclosing query over the **same** CTE — another `selectFromCte(cte)`, or
+an entity query that joined the CTE — needs it: both rows would otherwise be named after the CTE, and inside the
+subquery the name reads its own row (`"older_users"."age" > "older_users"."age"`, true for every row). Such a
+correlation is refused (`… Give one of them a distinct alias: selectFromCte(cte, '<alias>')`):
+
+```typescript
+db.selectFromCte(older.cte).select(o => ({
+  id: o.id,
+  olderCount: db.selectFromCte(older.cte, 'other')
+    .where(r => gt(r.age, o.age))
+    .select(() => sql<number>`count(*)`.mapWith(Number))
+    .asSubquery('scalar'),
+}));
+// … (SELECT count(*) as "value" FROM "older_users" AS "other" WHERE "other"."age" > "older_users"."age") …
+```
+
+The rows of a CTE-rooted query carry its identity: an entity query nested in its `where()` reads them as
+correlations, also when the CTE is named like one of that query's navigations (a CTE named `user` read by a
+`db.posts` query that has a `user` navigation).
 
 ### The `onTrue()` helper and `ON TRUE`
 
@@ -452,6 +518,118 @@ statement keeps a single, sequential `$1..$n` numbering.
 
 > **Tip:** Call `.toSql()` (or `.buildQuery()` for `{ sql, params }`) on a CTE-rooted
 > query to inspect the generated SQL without executing it.
+
+## CTEs Read from Nested Subqueries (statement-level declaration)
+
+A CTE attached to the executing query with `.with(cte)` — or the CTEs of a CTE-rooted query — is declared
+**once**, in the statement's `WITH`. Every nested build of that statement reads it **by name**: its WHERE, its
+projected subqueries and fragments, its ORDER BY expressions, its collections, a UNION leg, a subquery nested
+inside a subquery, a nested query that attaches the same CTE again. The body is not declared again and its
+parameters are bound once.
+
+```typescript
+const older = new DbCteBuilder().with(
+  'older_users',
+  db.users.where(u => gt(u.age, 31)).select(u => ({ id: u.id, age: u.age }))
+);
+
+await db.users
+  .where(u => inSubquery(u.id, db.selectFromCte(older.cte).select(r => ({ id: r.id })).asSubquery('array')))
+  .with(older.cte)
+  .select(u => ({
+    name: u.username,
+    olderAge: db.selectFromCte(older.cte).where(r => eq(r.id, u.id)).select(r => r.age).asSubquery('scalar'),
+  }))
+  .toList();
+```
+
+```sql
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age" FROM "users" WHERE "users"."age" > $1)
+SELECT "users"."username" as "name",
+       (SELECT "older_users"."age" as "value" FROM "older_users" WHERE "older_users"."id" = "users"."id") as "olderAge"
+FROM "users"
+WHERE "users"."id" IN (SELECT "older_users"."id" as "id" FROM "older_users")
+-- params: [31]
+```
+
+Before 1.0.9 every nested `selectFromCte(...)` re-declared the CTE inside its parentheses —
+`IN (WITH "older_users" AS (… $2) SELECT …)` — and bound its body's parameters again.
+
+A subquery that attaches a CTE the executing statement does **not** declare still declares it inside itself,
+as `(WITH "cte" AS (…) SELECT …)`; the body's parameters are numbered after those the statement bound before
+it. A subquery whose CTEs are only partly declared by the statement reads those from there and declares the
+rest itself (a CTE-rooted subquery used to refuse that).
+
+The statement's CTEs are matched by **content**, not by name: a nested query that attaches a CTE that is
+**different** under a name the statement declares is refused — `The CTE "<name>" a nested query attaches is not
+the CTE "<name>" its statement declares …` — because inside the statement that name reads the statement's CTE
+(the nested query used to read the other one's rows silently). "Different" means different by content: the
+same definition built twice — by a factory called for the statement and again for a nested query, also from
+builders at other parameter offsets — is the same CTE when its body (numbered from `$1`), its `MATERIALIZED`
+flag and its parameters **by value** are equal (a `Date` by its time, a `Buffer` / typed array by its bytes, an
+array element by element, a JSON document by its JSON text; any other object only as the same instance). The
+same rule decides whether two UNION legs attach one CTE. A data-modifying CTE (`withMutation`) is one execution
+of its statement: it is the same only as the same `DbCte` instance.
+
+`min()`, `max()` and `sum()` declare the query's `.with()` CTEs too (they used to drop them: a join to a CTE
+met `relation "<cte>" does not exist`), as `count()`, `exists()` and `toList()` do.
+
+## Data-Modifying CTEs: `withMutation()`
+
+`DbCteBuilder.withMutation(name, statement)` attaches a compiled `UPDATE` / `DELETE` — `.toStatement(selector)`
+on an update or a delete — as a data-modifying CTE. The selector is the statement's `RETURNING` list, and it
+types the CTE's columns:
+
+```typescript
+const gate = new DbCteBuilder().withMutation(
+  'gate',
+  db.users
+    .where(u => and(eq(u.id, userId), lt(u.age, 30)))     // a compare-and-set: the UPDATE matches 0 or 1 row
+    .update(u => ({ age: add(u.age, 1) }))
+    .toStatement(u => ({ id: u.id, age: u.age }))          // CompiledStatement<{ id: number; age: number }>
+);
+
+const rows = await db.users
+  .where(u => inSubquery(u.id, db.selectFromCte(gate.cte).select(g => ({ id: g.id })).asSubquery('array')))
+  .with(gate.cte)
+  .select(u => ({
+    id: u.id,
+    loadedAge: u.age,                                                                  // the pre-update snapshot
+    newAge: db.selectFromCte(gate.cte).select(g => ({ age: g.age })).asSubquery('scalar'),   // RETURNING
+  }))
+  .toList();
+```
+
+```sql
+WITH "gate" AS (UPDATE "users" SET "age" = ("users"."age" + $1) WHERE ("users"."id" = $2 AND "users"."age" < $3) RETURNING "id" AS "id", "age" AS "age")
+SELECT "users"."id" as "id", "users"."age" as "loadedAge", (SELECT "gate"."age" as "age" FROM "gate") as "newAge"
+FROM "users"
+WHERE "users"."id" IN (SELECT "gate"."id" as "id" FROM "gate")
+```
+
+The UPDATE runs **once**, whatever number of places read the CTE; when the compare-and-set loses, the gate is
+empty and so is the load.
+
+- `toStatement(selector)` returns a `CompiledStatement<TRow>` — `{ sql, params }` typed by the RETURNING row.
+  `withMutation(name, statement)` returns `{ cte: DbCte<TRow> }`, so
+  `db.selectFromCte(gate.cte).select(g => ({ id: g.id }))` is typed — and each column reads the way its RETURNING
+  value does: a text column stays text (`'0042'`), a column with a custom mapper reads through it, an expression
+  as an expression. (The compiled statement carries its RETURNING selection as a non-enumerable property; a
+  hand-written `{ sql, params }` has none, and its columns read like expressions.) The
+  `withMutation(name, statement, columns)` overload keeps working.
+- The `'temptable'` collection strategy runs a query's collections as statements of their own, after the
+  statement that executes the mutation: a temp-table collection that READS the data-modifying CTE (through a
+  `selectFromCte(…)` subquery, in its WHERE, its item or a collection nested in it) is refused before anything
+  runs. Use the `'cte'` or `'lateral'` strategy for such a query (the UPDATE then runs once, in the one
+  statement). Temp-table collections that never read the CTE run as before: the UPDATE runs once, in the base
+  statement. (A raw `sql` fragment naming the CTE in such a collection is not recognised as a read: that
+  statement fails with `relation "<cte>" does not exist`, after the base statement has run, as it did before.)
+- **A data-modifying CTE is declared at statement level only**: attach it with `.with()` on the executing
+  query. Declared inside a nested subquery — a `selectFromCte(gate.cte)…asSubquery()` in a query that does not
+  carry it, a subquery that carries it itself, a CTE body built over a query carrying it — it is refused:
+  `CTE "gate" is data-modifying: a data-modifying CTE must be declared at statement level — attach it with
+  .with() on the executing query`. (PostgreSQL rejects a data-modifying `WITH` nested in a subquery; before
+  1.0.9 the query builder emitted one per reading subquery, i.e. one UPDATE per occurrence.)
 
 ## Type Safety
 

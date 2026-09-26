@@ -4,7 +4,85 @@ import type { PartitionStrategy, PartitioningConfig } from '../schema/table-buil
 import { TypeMapper } from '../types/type-mapper';
 import { CollationDefinition } from '../types/collation-builder';
 import { DbColumn } from './db-column';
-import { SqlFragment } from '../query/conditions';
+import { SqlFragment, WhereConditionBase, type SqlBuildContext } from '../query/conditions';
+import { createColumnRow, type ColumnRow } from './column-row';
+import { isBareIndexElement } from '../migration/index-sql';
+
+/**
+ * An expression of an index (or of an extended-statistics object): raw SQL, or a builder over the table's
+ * columns — `e => lower(e.name)`, `e => sql\`${e.n} % ${literal(10000000, 'bigint')}\`` — so the index and
+ * the queries that must use it share ONE definition.
+ */
+export type IndexExpression<TEntity> = string | ((entity: ColumnRow<TEntity>) => SqlFragment<unknown> | WhereConditionBase);
+
+/**
+ * The SQL of an index / statistics expression. A builder receives the table's columns as UNQUALIFIED refs
+ * (`"name"` — no table alias is in scope in `CREATE INDEX`; the refs carry their mapper and SQL type, so
+ * type-dependent helpers render as in a query) and renders with a fresh context: an expression binding a
+ * parameter or a placeholder is refused — an index is matched by its expression TREE, and a bound constant
+ * is no constant there. The text is kept verbatim when it is one function call or one parenthesised group
+ * (PostgreSQL's own spelling in `pg_get_indexdef`, which keeps the reconcile's fast comparison exact) and
+ * wrapped in `( … )` otherwise.
+ */
+function renderIndexExpression<TEntity extends DbEntity>(
+  entityClass: EntityConstructor<TEntity>,
+  expression: IndexExpression<TEntity>,
+  owner: string
+): string {
+  if (typeof expression === 'string') {
+    return expression;
+  }
+
+  const rendered = expression(indexColumnRow(entityClass, owner)) as unknown;
+
+  if (rendered !== null && typeof rendered === 'object' && '__dbColumnName' in rendered && !(rendered instanceof WhereConditionBase)) {
+    // a plain column is an element of its own
+    return `"${(rendered as { __dbColumnName: string }).__dbColumnName}"`;
+  }
+
+  if (!(rendered instanceof WhereConditionBase)) {
+    throw new TypeError(`${owner}: an expression builder must return an SQL expression (a column, a fragment or a condition)`);
+  }
+
+  const context: SqlBuildContext = { paramCounter: 1, params: [] };
+  const text = rendered.buildSql(context);
+
+  if (context.params.length > 0 || context.paramCounter !== 1 || (context.placeholders?.size ?? 0) > 0) {
+    throw new Error(`${owner}: index expression binds a parameter — inline constants with literal()`);
+  }
+
+  return isBareIndexElement(text) ? text : `(${text})`;
+}
+
+/**
+ * The column row an index expression builder receives: one unqualified ref per property configured so far
+ * (declare the properties before the index), navigations refused, any other property refused by name.
+ */
+function indexColumnRow<TEntity extends DbEntity>(entityClass: EntityConstructor<TEntity>, owner: string): ColumnRow<TEntity> {
+  const metadata = EntityMetadataStore.getOrCreateMetadata(entityClass);
+  const columns: Record<string, ColumnBuilder> = {};
+  const relations: Record<string, unknown> = {};
+
+  for (const [prop, property] of metadata.properties) {
+    columns[prop as string] = property.columnBuilder;
+  }
+
+  for (const prop of metadata.navigations.keys()) {
+    relations[prop as string] = true;
+  }
+
+  const row = createColumnRow<TEntity>({ name: metadata.tableName, columns, relations }, null, owner);
+
+  return new Proxy(row, {
+    get: (target, prop, receiver) => {
+      if (typeof prop === 'string' && !(prop in target)) {
+        throw new Error(`${owner}: e.${prop} is not a column of "${metadata.tableName}"`);
+      }
+
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
 
 /**
  * Fluent API for configuring entity properties
@@ -807,19 +885,28 @@ export class IndexBuilder<TEntity extends DbEntity> {
   }
 
   /**
-   * Set raw SQL expressions for expression-based index columns.
-   * When set, expressions are used instead of column names.
-   * Use with helper functions like lower() and unaccent() for composability.
+   * Set the expressions of an expression index — used instead of column names: raw SQL, or a builder over
+   * the table's columns, so the index and the queries that must use it share ONE definition:
    *
    * @example
-   * entity.hasIndex('idx_name_unaccent')
-   *   .withExpression(lower(unaccent('name')))
+   * // raw SQL, kept as written
+   * entity.hasIndex('idx_email_lower').withExpression('lower("email")');
    *
-   * entity.hasIndex('idx_multi')
-   *   .withExpression(lower('email'), lower(unaccent('name')))
+   * // builders: the columns render unqualified; constants must be inline (`literal()`), a bound parameter
+   * // throws — an index is matched by its expression tree
+   * const tailKey = (n: SqlOperand<number>) => sql<number>`${n} % ${literal(10000000, 'bigint')}`;
+   * entity.hasIndex('ix_serial_tail').withExpression(e => tailKey(e.serial));   // ("serial" % CAST(10000000 AS bigint))
+   * entity.hasIndex('ix_name_lower').withExpression(e => lower(e.name));       // lower("name")
+   * // … and the query spelled with the same builder uses the index:
+   * db.shipments.where(s => eq(tailKey(s.serial), 1234567))
+   *
+   * A builder's text is kept verbatim when it is one function call or one parenthesised group, and wrapped
+   * in `( … )` otherwise — PostgreSQL's own `pg_get_indexdef` spelling, so migrate() compares it exactly.
+   * Declare the properties an expression reads before the index.
    */
-  withExpression(...expressions: string[]): this {
-    this.indexMetadata.expressions = expressions;
+  withExpression(...expressions: Array<IndexExpression<TEntity>>): this {
+    const owner = `Index "${this.indexMetadata.name}"`;
+    this.indexMetadata.expressions = expressions.map(expression => renderIndexExpression(this.entityClass, expression, owner));
     return this;
   }
 
@@ -913,16 +1000,21 @@ export class StatisticsBuilder<TEntity extends DbEntity> {
   ) {}
 
   /**
-   * Append raw SQL entries to the statistics `ON` list — the escape hatch for
-   * expressions the selector helpers cannot express (infix operators, casts).
-   * PostgreSQL requires each expression entry to be parenthesized.
+   * Append entries to the statistics `ON` list — expressions the selector helpers cannot express (infix
+   * operators, casts): raw SQL (PostgreSQL requires an expression entry that is not a function call to be
+   * parenthesized), or a builder over the table's columns, rendered like an index expression builder
+   * (unqualified columns, no bound parameter, wrapped in `( … )` unless one call or one group).
    *
    * @example
    * entity.hasStatistics('stx_flags_system')
    *   .withExpression('("flags" & 1::smallint)')
+   *
+   * entity.hasStatistics('stx_flags_system')
+   *   .withExpression(e => sql`${e.flags} & ${literal(1, 'smallint')}`)   // ("flags" & CAST(1 AS smallint))
    */
-  withExpression(...expressions: string[]): this {
-    this.statisticsMetadata.expressions.push(...expressions);
+  withExpression(...expressions: Array<IndexExpression<TEntity>>): this {
+    const owner = `Statistics "${this.statisticsMetadata.name}"`;
+    this.statisticsMetadata.expressions.push(...expressions.map(expression => renderIndexExpression(this.entityClass, expression, owner)));
     return this;
   }
 

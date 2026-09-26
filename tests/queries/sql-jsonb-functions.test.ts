@@ -18,38 +18,38 @@ describe('JSONB helpers', () => {
   const qty = fieldRef('qty', { sqlType: 'integer' });
 
   describe('paths', () => {
-    test('a plain -> path, no text round trip', () => {
-      expect(build(jsonbPath(meta, 'dims'))).toEqual({ sql: `"expr_shelves"."meta"->'dims'`, params: [] });
-      expect(build(jsonbPath(meta, 'dims', 'w'))).toEqual({ sql: `"expr_shelves"."meta"->'dims'->'w'`, params: [] });
+    test('a plain -> path, no text round trip — parenthesized as one operand', () => {
+      expect(build(jsonbPath(meta, 'dims'))).toEqual({ sql: `("expr_shelves"."meta"->'dims')`, params: [] });
+      expect(build(jsonbPath(meta, 'dims', 'w'))).toEqual({ sql: `("expr_shelves"."meta"->'dims'->'w')`, params: [] });
     });
 
     test('the text form ends in ->>', () => {
-      expect(build(jsonbPathText(meta, 'genre')).sql).toBe(`"expr_shelves"."meta"->>'genre'`);
-      expect(build(jsonbPathText(meta, 'dims', 'w')).sql).toBe(`"expr_shelves"."meta"->'dims'->>'w'`);
+      expect(build(jsonbPathText(meta, 'genre')).sql).toBe(`("expr_shelves"."meta"->>'genre')`);
+      expect(build(jsonbPathText(meta, 'dims', 'w')).sql).toBe(`("expr_shelves"."meta"->'dims'->>'w')`);
     });
 
     test('integers are array indexes; negative ones count from the end', () => {
-      expect(build(jsonbPath(meta, 'tags', 0)).sql).toBe(`"expr_shelves"."meta"->'tags'->0`);
-      expect(build(jsonbPathText(meta, 'tags', -1)).sql).toBe(`"expr_shelves"."meta"->'tags'->>(-1)`);
+      expect(build(jsonbPath(meta, 'tags', 0)).sql).toBe(`("expr_shelves"."meta"->'tags'->0)`);
+      expect(build(jsonbPathText(meta, 'tags', -1)).sql).toBe(`("expr_shelves"."meta"->'tags'->>(-1))`);
     });
 
     test('keys are quoted literals', () => {
-      expect(build(jsonbPathText(meta, "it's")).sql).toBe(`"expr_shelves"."meta"->>'it''s'`);
-      expect(build(jsonbPathText(meta, 'a\\b')).sql).toBe(`"expr_shelves"."meta"->>E'a\\\\b'`);
+      expect(build(jsonbPathText(meta, "it's")).sql).toBe(`("expr_shelves"."meta"->>'it''s')`);
+      expect(build(jsonbPathText(meta, 'a\\b')).sql).toBe(`("expr_shelves"."meta"->>E'a\\\\b')`);
     });
 
     test('a fragment key binds as a parameter — one statement text for every key', () => {
-      expect(build(jsonbPathText(meta, sql`${'sk'}`))).toEqual({ sql: `"expr_shelves"."meta"->>$1`, params: ['sk'] });
-      expect(build(jsonbPathText(meta, 'names', sql`${'en'}`))).toEqual({ sql: `"expr_shelves"."meta"->'names'->>$1`, params: ['en'] });
+      expect(build(jsonbPathText(meta, sql`${'sk'}`))).toEqual({ sql: `("expr_shelves"."meta"->>$1)`, params: ['sk'] });
+      expect(build(jsonbPathText(meta, 'names', sql`${'en'}`))).toEqual({ sql: `("expr_shelves"."meta"->'names'->>$1)`, params: ['en'] });
       expect(build(jsonbPath(meta, sql`${'a'}`, 'b', sql`${'c'}`))).toEqual({
-        sql: `"expr_shelves"."meta"->$1->'b'->$2`,
+        sql: `("expr_shelves"."meta"->$1->'b'->$2)`,
         params: ['a', 'c'],
       });
     });
 
     test('a named placeholder is a key too', () => {
       const ctx: SqlBuildContext = { paramCounter: 1, params: [] };
-      expect(jsonbPathText(meta, sql.placeholder('lang')).buildSql(ctx)).toBe(`"expr_shelves"."meta"->>$1`);
+      expect(jsonbPathText(meta, sql.placeholder('lang')).buildSql(ctx)).toBe(`("expr_shelves"."meta"->>$1)`);
       expect(ctx.placeholders?.get('lang')).toBe(1);
     });
 
@@ -100,7 +100,7 @@ describe('JSONB helpers', () => {
     });
 
     test('array length and type', () => {
-      expect(build(jsonbArrayLength(jsonbPath(meta, 'tags'))).sql).toBe(`jsonb_array_length("expr_shelves"."meta"->'tags')`);
+      expect(build(jsonbArrayLength(jsonbPath(meta, 'tags'))).sql).toBe(`jsonb_array_length(("expr_shelves"."meta"->'tags'))`);
       expect(build(jsonbTypeOf(meta)).sql).toBe('jsonb_typeof("expr_shelves"."meta")');
     });
 

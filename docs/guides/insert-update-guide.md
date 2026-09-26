@@ -173,6 +173,52 @@ console.log(users.length); // 3
 - Significantly faster than individual inserts
 - All inserts are atomic (all succeed or all fail)
 
+### Insert from a Query (`insertFrom`)
+
+`insertFrom(source, map, options?)` inserts the rows of a table subquery — `INSERT … SELECT` — in ONE
+statement: compute a value from the table's current rows and write it in the same snapshot, without a
+read round trip in between.
+
+```typescript
+import { add, between, coalesce, lte } from 'linkgress-orm';
+
+// the next number of a band: COALESCE(MAX(number), MIN) + gap — an aggregate without GROUP BY, one row
+const next = db.badges
+  .where(b => between(b.number, MIN, MAX))
+  .select(b => ({ number: b.number }))
+  .groupBy(() => ({}))
+  .select(g => ({ next: add(coalesce(g.max(b => b.number), MIN), gap) }))
+  .asSubquery('table');
+
+const minted = await db.badges
+  .insertFrom(next, src => ({ number: src.next, holderId, tier: 'gold', active: true }), {
+    where: src => lte(src.next, MAX),        // band exhausted → no row, [] from returning()
+    expectedErrorCodes: ['23505'],           // a concurrent twin took the number: the caller retries
+  })
+  .returning(b => ({ id: b.id, number: b.number }));
+// INSERT INTO "badges" ("number", "holder_id", "tier", "active")
+// SELECT "src"."next", CAST($6 AS integer), CAST($7 AS smallint), CAST($8 AS boolean)
+// FROM (SELECT (COALESCE(MAX("badges"."number"), $4) + $5) as "next" FROM "badges" WHERE …) AS "src"
+// WHERE "src"."next" <= $9
+// RETURNING "id" AS "id", "number" AS "number"
+```
+
+- `map` receives the source row — `src.<column>` renders `"src"."<column>"` — and returns the values by
+  column, in its key order: a source ref, an `sql` expression or helper (inline, its parameters in
+  sequence), or a plain value, bound through the column's mapper and CAST to the column's type (an untyped
+  parameter in a SELECT list would resolve as text). The cast never carries a typmod — a `char(n)` column
+  casts to `bpchar`, a `bit(n)` one to `varbit` (the bare `char` / `bit` mean `(1)` and would truncate
+  silently) — so the assignment pads, or raises 22001 for an over-long value, exactly like
+  `INSERT … VALUES`. `null` inserts a typed NULL; `undefined` leaves the column out (its default applies). A
+  key that is no column, or a source column the subquery does not project, is refused.
+- Parameters number in build order: the source's, the SELECT list's, then `where`'s.
+- `.returning()` / `.returning(selector)` read the inserted rows as `insertBulk` does; awaiting the builder
+  itself resolves `undefined`. Zero source rows — or a `where` that holds for none — insert nothing.
+- It runs on the context's executor, so inside `db.transaction()` it is part of the transaction.
+- `expectedErrorCodes`: SQLSTATEs the statement is expected to fail with. Such a failure is still thrown,
+  but the failed-query logger ([`logFailedQueries`](./configuration.md)) does not report it; any other
+  failure is reported as always.
+
 ## Update Operations
 
 Linkgress ORM uses a **fluent API** for update operations. You first specify the condition using `.where()`, then call `.update()` with the data.
@@ -247,6 +293,33 @@ const renamed = await db.users
 The selector gets the updated row's columns, navigations and collections — typed like an insert's
 (`EntityQuery`), so conditions and collection aggregates type-check. See
 [What `.returning(selector)` can select](#what-returningselector-can-select).
+
+### The Row Before the Update: `old` (PostgreSQL 18)
+
+The selector's second argument is PostgreSQL 18's `old` row — the row's own columns BEFORE the update
+(for a DELETE, the deleted row). Read through each column's own mapper, as `row.<column>` is:
+
+```typescript
+const [task] = await db.tasks
+  .where(t => eq(t.id, taskId))
+  .update({ status: TaskStatus.Done })
+  .returning((t, old) => ({
+    id: t.id,
+    status: t.status,
+    previousStatus: old.status,            // did THIS call make the transition?
+    changed: ne(t.status, old.status),     // old columns work inside expressions too
+  }));
+// UPDATE "tasks" SET "status" = $1 WHERE "tasks"."id" = $2
+// RETURNING "id" AS "id", "status" AS "status", old."status" AS "previousStatus", ("status" != old."status") AS "changed"
+
+const removed = await db.tasks.where(t => eq(t.id, taskId)).delete().returning((t, old) => ({ id: t.id, note: old.note }));
+```
+
+- `old` has the table's own columns only; a navigation of it throws.
+- `old` cannot be combined with navigations, collections or nested objects in one RETURNING (that
+  RETURNING runs the mutation as a CTE, where the old row is out of scope) — it throws; read the old
+  values in a flat RETURNING of the row's own columns.
+- It is typed as the table's column row (`ColumnRow<TEntity>`).
 
 ### Update with Affected Count
 
@@ -438,6 +511,82 @@ await db.counters.upsertBulk(rows, {
   either row, a condition (as a boolean) or a plain value. Navigations are not in scope in an
   INSERT and throw.
 - `MutationBatch.addUpsertBulk` accepts the same `updateSet` / `updateWhere`.
+
+### Upsert onto a Partial Unique Index (`targetWhere`)
+
+A PARTIAL unique index (`UNIQUE (owner_ref, slot) WHERE is_current = true`) is the conflict target only
+when the `ON CONFLICT` names its predicate: `targetWhere` must IMPLY the index's predicate (equal or
+stronger), or PostgreSQL raises 42P10 ("there is no unique or exclusion constraint matching the ON
+CONFLICT specification").
+
+```typescript
+await db.links.upsertBulk(rows, {
+  primaryKey: ['ownerRef', 'slot'],
+  targetWhere: e => eq(e.isCurrent, literal(true)),
+  updateColumns: ['note'],
+});
+// … ON CONFLICT ("owner_ref", "slot") WHERE "is_current" = TRUE DO UPDATE SET "note" = EXCLUDED."note"
+
+await db.identities.upsertBulk(rows, {
+  primaryKey: ['provider', 'subject'],
+  targetWhere: e => and(eq(e.active, literal(true)), isNotNull(e.subject)),
+  updateColumnFilter: () => false,          // DO NOTHING
+});
+// … ON CONFLICT ("provider", "subject") WHERE ("active" = TRUE AND "subject" IS NOT NULL) DO NOTHING
+```
+
+- The typed predicate receives the row's columns UNQUALIFIED (the table is the only relation in scope
+  there); navigations throw.
+- It must not bind anything — write constants with `literal()`. PostgreSQL infers the arbiter index at
+  PLAN time; a bound `$n` is no constant in a generic plan (a prepared statement after its fifth
+  execution), where the statement would then fail with 42P10. A predicate that binds a value or a
+  placeholder throws before anything runs.
+- SQL text keeps working (`targetWhere: 'is_current = true'`), unchecked.
+- The same option: `values(…).onConflict(…).targetWhere(…)` and `MutationBatch.addUpsertBulk`'s config.
+- The in-memory database infers the arbiter as PostgreSQL does for the usual spellings — `literal(v)` and
+  `literal(v, pgType)`, `isNotNull(x)` and `not(isNull(x))`, a strict call such as `lower(x)` for an
+  `x IS NOT NULL` predicate — so a wrong `targetWhere` fails there too (42P10). It proves less than the
+  server in a few documented forms (OR, range proofs, general constant folding; see
+  [In-Memory Database](./in-memory-database.md)): there a RIGHT predicate can fail in memory, never the
+  reverse.
+
+## Row-Guarded Inserts in a `MutationBatch` (`rowGuard`)
+
+`MutationBatch.addInsertBulk(table, rows, id, { rowGuard })` writes each candidate row only when a
+per-row predicate holds for it — the batch's leg becomes
+
+```sql
+INSERT INTO "t" (<cols>)
+SELECT v."c1", … FROM (VALUES <cells>) AS v(<cols>)
+WHERE <guard>
+```
+
+and the rows it blocked show up as a short `getAffectedCount(key)`. The guard is a typed condition over
+the candidate row `v` (its refs render `"v"."<column>"`), or raw SQL over `v."<column>"`:
+
+```typescript
+const batch = new MutationBatch();
+const key = batch.addInsertBulk(db.redemptions, rows, 'redemptions', {
+  // insert a candidate only while its holder has no active grant for the code
+  rowGuard: v => notExists(
+    db.grants
+      .where(g => and(eq(g.codeId, v.codeId), eq(g.holderId, v.holderId), eq(g.active, literal(true))))
+      .select(() => ({ one: literal(1) }))
+      .asSubquery()
+  ),
+});
+await batch.executeBatch();
+if (batch.getAffectedCount(key!) !== rows.length) { /* some candidates were refused */ }
+```
+
+- A typed guard may bind parameters: they continue the leg's VALUES numbering, and the batch renumbers
+  them with the rest of the leg. Every `v.<column>` it reads must be a column some row provides (it
+  throws otherwise), and navigations of `v` are not in scope. `v` is typed as the table's column row.
+- A raw guard takes no parameters of its own (a bare `$N` throws); blank guards throw.
+- The guard judges the rows committed before the statement (PostgreSQL snapshot rules): it cannot see
+  the leg's own rows, and it is not a cross-transaction arbiter — serialize concurrent writers first
+  (an advisory lock, a row lock).
+- Not combinable with `onConflictDoNothing` / `overridingSystemValue`.
 
 ## Bulk Update with SET Expressions (`set` / `where`)
 
@@ -631,10 +780,16 @@ await db.transaction(async (tx) => {
 
 - Keys: one integer (int8 range), a `(classId, key)` pair (int4 each), or a string hashed with
   `hashtext()`. The pair form keeps unrelated lock families apart.
+- The form follows the number of arguments passed: `(classId, key)` is always a pair, and a pair
+  whose key is `null`, `undefined` or not an integer / string throws — it can never become a
+  different lock (`(classId, null)` used to lock key 0, `(classId, undefined)` the single key
+  `classId`).
 - `tryAdvisoryXactLock` returns `true` when this transaction holds the lock (advisory locks are
   re-entrant) and `false` when another session holds it.
 - `advisoryXactLockAll` deduplicates and sorts the keys (all integers or all strings), so two
-  transactions locking overlapping sets cannot deadlock on each other.
+  transactions locking overlapping sets cannot deadlock on each other. The order is an SQL
+  guarantee: `SELECT pg_advisory_xact_lock($1, t.k) FROM unnest(CAST($2 AS integer[])) WITH
+  ORDINALITY AS t(k, ord) ORDER BY t.ord` (strings: `hashtext(t.k)` over `text[]`).
 - All three must be called on the context `db.transaction()` hands you: outside a transaction
   the lock would end with the statement, so they throw instead.
 

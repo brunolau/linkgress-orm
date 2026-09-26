@@ -1,4 +1,7 @@
 import type { DatabaseClient } from '../database/database-client.interface';
+import type { ColumnRow } from '../entity/column-row';
+import type { DbEntityTable } from '../entity/db-context';
+import type { DbEntity } from '../entity/entity-base';
 import type { Condition } from './conditions';
 import { renumberPlaceholders } from './query-batch';
 import { hasBarePlaceholder } from './sql-utils';
@@ -10,16 +13,41 @@ export interface MutationBatchKey {
   readonly id: string;
 }
 
+/** The column row of an entity — `any` for an untyped table (a `ColumnRow<any>` would have no columns). */
+type ColumnRowOf<TEntity> = 0 extends (1 & TEntity) ? any : ColumnRow<TEntity>;
+
 /**
- * Upsert leg configuration: the conflict key, the columns taking `= EXCLUDED."col"`, and the
- * same typed conflict-arm expressions `upsertBulk` accepts (`updateSet` over
- * `(existing, excluded)`, `updateWhere`).
+ * The per-row WHERE of a row-guarded insert leg (see {@link MutationBatch.addInsertBulk}): raw SQL over
+ * `v."<db_column>"`, or a typed condition over the candidate row `v` — a column row whose refs render
+ * `"v"."<db_column>"` (navigations are not in scope there).
  */
-export interface UpsertLegConfig {
+export type RowGuard<TEntity = any> = string | ((v: ColumnRowOf<TEntity>) => Condition);
+
+/** Options of an insert leg ({@link MutationBatch.addInsertBulk}). */
+export interface InsertLegOptions<TEntity = any> {
+  overridingSystemValue?: boolean;
+  onConflictDoNothing?: boolean;
+  rowGuard?: RowGuard<TEntity>;
+}
+
+/**
+ * The `ON CONFLICT (…) WHERE` arbiter predicate of an upsert leg: raw SQL, or a typed condition over the
+ * target row's columns, rendered UNQUALIFIED and without parameters (see `EntityUpsertConfig.targetWhere`).
+ */
+export type ArbiterPredicate<TEntity = any> = string | ((row: ColumnRowOf<TEntity>) => Condition);
+
+/**
+ * Upsert leg configuration: the conflict key, the columns taking `= EXCLUDED."col"`, the
+ * same typed conflict-arm expressions `upsertBulk` accepts (`updateSet` over
+ * `(existing, excluded)`, `updateWhere`) and the arbiter predicate (`targetWhere`) that makes a
+ * PARTIAL unique index the conflict target.
+ */
+export interface UpsertLegConfig<TEntity = any> {
   primaryKey: string | string[];
   updateColumns?: string[];
   updateSet?: (existing: any, excluded: any) => Record<string, unknown>;
   updateWhere?: (existing: any, excluded: any) => Condition;
+  targetWhere?: ArbiterPredicate<TEntity>;
 }
 
 /**
@@ -47,7 +75,8 @@ interface MutationCapableTable {
   ): { sql: string; params: any[] } | null;
   _buildGuardedInsertBulkStatement(
     data: Record<string, any>[],
-    guardPredicate: string
+    guardPredicate: RowGuard,
+    usage?: string
   ): { sql: string; params: any[] } | null;
   _buildBulkUpdateStatement(
     data: Record<string, any>[],
@@ -62,7 +91,7 @@ interface MutationCapableTable {
   ): { sql: string; params: any[] } | null;
   _buildUpsertBulkStatement(
     values: Record<string, any>[],
-    config: UpsertLegConfig
+    config: UpsertLegConfig<any>
   ): { sql: string; params: any[] } | null;
   _buildDependentInsertSelectStatement(
     row: Record<string, any>,
@@ -148,10 +177,20 @@ export class MutationBatch {
    * SELECT .. FROM (VALUES ..) AS v(..) WHERE <guard>` — so each candidate row
    * is written only when the predicate holds for it; blocked rows insert
    * nothing and show up as a short {@link getAffectedCount}. The predicate is
-   * raw SQL evaluated per candidate row with the row exposed as `v` — refer to
-   * a cell as `v."<db_column_name>"` — and takes no parameters of its own (a
-   * bare `$N` in the guard throws at registration; cross-leg renumbering would
-   * silently rebind it). It cannot see the leg's own inserted rows (PostgreSQL
+   * evaluated per candidate row with the row exposed as `v`:
+   *
+   * - a typed condition over the candidate row, `rowGuard: v => Condition` —
+   *   `v.<prop>` renders `"v"."<db_column>"`, the condition may bind parameters
+   *   (they continue the leg's VALUES numbering, so the batch renumbers them with
+   *   the rest of the leg) and correlate subqueries to `v`
+   *   (`notExists(db.x.where(x => eq(x.ownerId, v.ownerId)).select(…).asSubquery())`).
+   *   Every `v.<prop>` it reads must be a column some row provides; navigations
+   *   of `v` are not in scope;
+   * - raw SQL referring to a cell as `v."<db_column_name>"`, taking no
+   *   parameters of its own (a bare `$N` in the guard throws at registration;
+   *   cross-leg renumbering would silently rebind it).
+   *
+   * The guard cannot see the leg's own inserted rows (PostgreSQL
    * snapshot rules), so guard only batches whose rows are mutually
    * independent. Nor is the guard a cross-transaction race arbiter: it judges
    * only rows committed before the statement's snapshot (READ COMMITTED), so
@@ -161,40 +200,48 @@ export class MutationBatch {
    * later statement then re-snapshots and the guard is effective. Mutually
    * exclusive with `onConflictDoNothing` / `overridingSystemValue`.
    */
-  addInsertBulk(
-    table: MutationCapableTable,
+  addInsertBulk<TEntity extends DbEntity = any>(
+    table: DbEntityTable<TEntity> | MutationCapableTable,
     rows: Record<string, any>[],
     id: string,
-    options?: { overridingSystemValue?: boolean; onConflictDoNothing?: boolean; rowGuard?: string }
+    options?: InsertLegOptions<TEntity>
   ): MutationBatchKey | null {
     if (rows.length === 0) {
       return null;
     }
 
+    const leg = table as MutationCapableTable;
+
     this.assertRegisterable(id);
     MutationBatch.assertSingleStatementBudget(rows, id);
 
-    if (options?.rowGuard != null && (options.onConflictDoNothing || options.overridingSystemValue)) {
+    const rowGuard = options?.rowGuard;
+
+    if (rowGuard != null && (options!.onConflictDoNothing || options!.overridingSystemValue)) {
       throw new Error(`MutationBatch: leg "${id}" combines rowGuard with onConflictDoNothing/overridingSystemValue — the guarded insert compiles to INSERT .. SELECT and supports neither`);
     }
 
-    if (options?.rowGuard != null && options.rowGuard.trim() === '') {
+    if (rowGuard != null && typeof rowGuard !== 'string' && typeof rowGuard !== 'function') {
+      throw new TypeError(`MutationBatch: leg "${id}" rowGuard must be SQL text or a function (v) => Condition`);
+    }
+
+    if (typeof rowGuard === 'string' && rowGuard.trim() === '') {
       throw new Error(`MutationBatch: leg "${id}" has a blank rowGuard — pass a predicate or omit the option`);
     }
 
-    if (options?.rowGuard != null && hasBarePlaceholder(options.rowGuard)) {
+    if (typeof rowGuard === 'string' && hasBarePlaceholder(rowGuard)) {
       throw new Error(`MutationBatch: leg "${id}" rowGuard contains a bare $N placeholder — guards take no parameters (values must come from v."col" or joins), and cross-leg renumbering would silently rebind it`);
     }
 
-    const built = options?.rowGuard != null
-      ? table._buildGuardedInsertBulkStatement(rows, options.rowGuard)
-      : table._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
+    const built = rowGuard != null
+      ? leg._buildGuardedInsertBulkStatement(rows, rowGuard as RowGuard, `MutationBatch: leg "${id}" rowGuard`)
+      : leg._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
 
     if (!built) {
       return null;
     }
 
-    this.legs.push({ id, sql: built.sql, params: built.params, client: table._getClient(), executor: table._getExecutor() });
+    this.legs.push({ id, sql: built.sql, params: built.params, client: leg._getClient(), executor: leg._getExecutor() });
 
     return { id };
   }
@@ -298,12 +345,14 @@ export class MutationBatch {
    * the statement). Returns null for an empty row array. `options.returning`
    * (prop names) exposes the upserted rows to {@link getLegRows} — raw JSON
    * values (json_agg readback, no fromDriver pass), suited to scalar
-   * accumulator reads.
+   * accumulator reads. `config.targetWhere` is the arbiter predicate of a
+   * PARTIAL unique index, as `upsertBulk` takes it (typed: unqualified,
+   * bind-free — a predicate that binds anything throws at registration).
    */
-  addUpsertBulk(
-    table: MutationCapableTable,
+  addUpsertBulk<TEntity extends DbEntity = any>(
+    table: DbEntityTable<TEntity> | MutationCapableTable,
     rows: Record<string, any>[],
-    config: UpsertLegConfig,
+    config: UpsertLegConfig<TEntity>,
     id: string,
     options?: { returning?: string[] }
   ): MutationBatchKey | null {
@@ -311,23 +360,25 @@ export class MutationBatch {
       return null;
     }
 
+    const leg = table as MutationCapableTable;
+
     this.assertRegisterable(id);
     MutationBatch.assertSingleStatementBudget(rows, id);
 
-    const built = table._buildUpsertBulkStatement(rows, config);
+    const built = leg._buildUpsertBulkStatement(rows, config);
 
     if (!built) {
       return null;
     }
 
-    const returningCols = table._resolveColumnDbNames(options?.returning ?? []);
+    const returningCols = leg._resolveColumnDbNames(options?.returning ?? []);
 
     this.legs.push({
       id,
       sql: built.sql,
       params: built.params,
-      client: table._getClient(),
-      executor: table._getExecutor(),
+      client: leg._getClient(),
+      executor: leg._getExecutor(),
       returningSql: returningCols.length > 0 ? returningCols.map(c => `"${c.dbName}" AS "${c.prop}"`).join(', ') : undefined,
       readRows: returningCols.length > 0,
     });

@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { sql, RawSql, SqlFragment } from '../../src';
+import { and, coalesce, eq, gt, isNull, lt, not, or, sql, RawSql, SqlFragment } from '../../src';
 
 describe('SQL Raw and Helper Functions', () => {
   describe('sql.raw()', () => {
@@ -331,6 +331,31 @@ describe('SQL Raw and Helper Functions', () => {
       expect(result).toBe('name = $5');
       expect(context.params).toEqual(['a', 'b', 'c', 'd', 'Test']);
       expect(context.paramCounter).toBe(6);
+    });
+  });
+
+  describe('a raw fragment as an and() / or() operand', () => {
+    const render = (condition: { buildSql(context: any): string }): string => condition.buildSql({ paramCounter: 1, params: [] });
+    const age = { __dbColumnName: 'age', __fieldName: 'age', __tableAlias: 'users' } as any;
+    const active = { __dbColumnName: 'is_active', __fieldName: 'isActive', __tableAlias: 'users' } as any;
+
+    test('keeps its own grouping: it renders in parentheses', () => {
+      expect(render(and(sql<boolean>`${age} > 40 OR ${age} < 30`, eq(active, true))))
+        .toBe('(("users"."age" > 40 OR "users"."age" < 30) AND "users"."is_active" = $1)');
+      expect(render(or(sql<boolean>`a`, sql<boolean>`b`))).toBe('((a) OR (b))');
+      expect(render(and(sql.join([sql`a`, sql`b`], sql` OR `), sql`c`))).toBe('((a OR b) AND (c))');
+      // .as() / .mapWith() copies of a raw fragment are raw too
+      expect(render(and(sql<boolean>`a OR b`.as('x'), sql<boolean>`c`))).toBe('((a OR b) AND (c))');
+      // one operand, and NOT, which parenthesizes its operand anyway
+      expect(render(and(sql<boolean>`a OR b`))).toBe('(a OR b)');
+      expect(render(not(sql<boolean>`a OR b`))).toBe('NOT (a OR b)');
+    });
+
+    test('comparisons, helpers and nested and() / or() render as before', () => {
+      expect(render(and(eq(active, true), gt(age, 30)))).toBe('("users"."is_active" = $1 AND "users"."age" > $2)');
+      expect(render(or(and(eq(active, true), gt(age, 30)), lt(age, 20))))
+        .toBe('(("users"."is_active" = $1 AND "users"."age" > $2) OR "users"."age" < $3)');
+      expect(render(and(isNull(age), coalesce(active, false)))).toBe('("users"."age" IS NULL AND COALESCE("users"."is_active", $1))');
     });
   });
 });

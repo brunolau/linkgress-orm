@@ -70,6 +70,12 @@ its current behaviour. The failure line always carries the statement text, which
 with `logQueries: true` sees the SQL twice on a failure — once as debug output, once in the
 self-contained error line.
 
+A statement that is EXPECTED to fail now and then — a unique violation a caller detects and
+retries — can say so, so it does not raise an error line each time: `insertFrom(…, …, {
+expectedErrorCodes: ['23505'] })` still throws such a failure, but does not report it; any other
+failure is reported as always. The option rides the executor per statement
+(`StatementExecutionOptions.expectedErrorCodes`), so other builders can offer it too.
+
 ### Slow-query detection
 
 Providing `onQueryTakingTooLong` turns detection on. The query is **not** cancelled — this is a

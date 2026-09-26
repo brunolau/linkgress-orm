@@ -33,8 +33,10 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Column types
   - Relationships (one-to-many, many-to-one)
   - Indexes and constraints (including unique indexes with `.isUnique()`)
+  - Expression indexes from query builders (`withExpression(e => …)`)
   - Default values
   - Custom types
+  - Sequences, including runtime-named ones (`runtimeSequence`, `nextValueCreatingIfMissing`)
 
 - **[Migrations](./guides/migrations.md)** - Database migrations and schema management
   - Automatic migrations (currently supported)
@@ -59,16 +61,21 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 
 - **[SQL Expression Helpers](./guides/sql-expressions.md)** - Built-in spellings of common SQL expressions
   - Casts (`cast`, `castAsInt`, `castAsString`, … and `.cast*()` on every fragment)
-  - Literals, typed NULLs, conditions as values
+  - Literals (`literal`, `literalOf`), bound parameters (`param`), typed NULLs, conditions as values
+  - Reading a fragment as a column type (`.withReadType()`)
   - CASE (`caseWhen`, `caseOf`), GREATEST / LEAST / NULLIF, IS DISTINCT FROM
-  - String, math and date/time functions, intervals
-  - JSONB paths, mutations and predicates; array-column operators
+  - String, math and date/time functions, intervals (`concatStrict`, `modulo`, regex `substring`)
+  - JSON paths, builders (`jsonbBuildObject`, `jsonBuildObject`), mutations and predicates; array-column operators
+  - Aggregates as expressions (`agg.count().filter(…)`, `agg.arrayAgg(x, { distinct, orderBy })`, …)
 
 - **[Insert/Update/Upsert/BULK](./guides/insert-update-guide.md)** - Insert, update, and delete operations
   - Fluent API for update and delete (`.where().update()`, `.where().delete()`)
-  - RETURNING clause support with selectors
+  - RETURNING clause support with selectors, and PostgreSQL 18's `old` row (`.returning((row, old) => …)`)
   - Bulk insert and update, with SET expressions (`bulkUpdate` `set` / `where`)
-  - Upsert (INSERT ... ON CONFLICT), with SET expressions (`updateSet` / `updateWhere`)
+  - INSERT … SELECT (`insertFrom`), with expected SQLSTATEs kept out of the failure log
+  - Upsert (INSERT ... ON CONFLICT), with SET expressions (`updateSet` / `updateWhere`) and partial-index
+    arbiters (`targetWhere`)
+  - Row-guarded inserts in a `MutationBatch` (`rowGuard`)
   - Advisory transaction locks
   - Type safety and performance tips
 
@@ -104,7 +111,23 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Array subqueries
   - EXISTS/NOT EXISTS
   - IN/NOT IN with subqueries
+  - Array membership (`eqAnySubquery` / `neAllSubquery`)
+  - A scalar subquery as an expression (`asExpression()`) and as a comparison operand
   - Subqueries in JOINs
+
+- **[Aliased Subquery Scopes](./guides/aliased-scopes.md)** - `db.<table>.as(alias)`: correlated subqueries under explicit aliases
+  - Scalar `(SELECT …)`, `EXISTS` / `NOT EXISTS` as fragments
+  - Joins, WHERE, ORDER BY, LIMIT; same-table correlations
+  - Usable in projections, WHERE, UPDATE, CTE bodies, collections, other scopes
+
+- **[Set-Returning Functions](./guides/set-returning-functions.md)** - `unnest`, `unnestZip`, `jsonbArrayElements`, `jsonbEachText`
+  - As projection values that multiply rows
+  - As row sources: `fromSet()`, `db.selectFromSet()`, `crossJoinLateral()`
+
+- **[CTE Guide](./guides/cte-guide.md)** - Common Table Expressions
+  - CTE-rooted queries (`db.selectFromCte`) with every join flavour and `where()`
+  - CTEs declared once per statement, read by name from nested subqueries
+  - Data-modifying CTEs (`withMutation`) with typed `toStatement()` rows
 
 
 ## Quick Links

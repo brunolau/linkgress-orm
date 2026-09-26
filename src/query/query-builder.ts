@@ -1,5 +1,6 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
 import { pgTypeOfValue, selectorProjectingConditions } from './sql-functions';
+import { holdsAggregateFragment, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
@@ -16,10 +17,17 @@ import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from 
 import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } from './future-query';
 import type { ColumnConfig } from '../schema/column-builder';
+import { createColumnRow } from '../entity/column-row';
 import { MockRowCache } from './mock-row-cache';
 import { NavigationPathCache } from './navigation-path-cache';
 import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, NavigationAliasPlan, quoteTableReference } from './join-utils';
 import type { NavigationPathNode } from './join-utils';
+import {
+  assertStatementLevelCtes, attachReturningSelection, cteDeclarationAt, declareStatementCtes, isStatementCte, NestedDataModifyingCteError, stampChainId,
+} from './cte-builder';
+import { assertExplicitAlias } from './aliased-scope';
+import { createSetRow, holdsSetReturningValue, lateralSetJoinsSql, lateralSetRefs, renderProjectedFragment, SetReturningFunction } from './set-returning';
+import type { LateralSetJoin, SetRow } from './set-returning';
 
 /**
  * Field type categories for optimized result transformation
@@ -782,6 +790,13 @@ export interface QueryContext {
    */
   useJsonArrayAggregation?: boolean;
   /**
+   * The driver reads this select's projected values directly and cannot decode native arrays: each
+   * projected value's root is marked (SqlBuildContext.jsonArrayRoot), so an `agg.arrayAgg` that IS
+   * the value renders as JSON. Set by the executing entry points (and handed to a UNION ALL leg or
+   * a scalar subquery that is such a value) — never inherited by anything nested.
+   */
+  jsonArrayProjection?: boolean;
+  /**
    * Names of CTEs an enclosing builder has already declared at statement level
    * (see {@link SqlBuildContext.hoistedCteNames}). Attached CTEs whose name is
    * listed here contribute neither params nor a `WITH` entry from this builder.
@@ -861,12 +876,14 @@ export function assertProjectionArrayOfValues(value: unknown, path: string, wher
  * flattened columns (see DbCte.columnRef).
  * @internal
  */
-export function createCteMockRow<TCteColumns extends Record<string, any>>(cte: DbCte<TCteColumns>): TCteColumns {
+export function createCteMockRow<TCteColumns extends Record<string, any>>(cte: DbCte<TCteColumns>, chainId?: number): TCteColumns {
   return new Proxy({} as any, {
     get(_target, prop: string | symbol) {
       if (typeof prop === 'symbol') return undefined;
 
-      return cte.columnRef(prop);
+      // Stamped with the joining query's chain: a query nested in it tells its correlation from its own
+      // row of the same CTE (see CteRootQueryBuilder.outerFieldRefs)
+      return chainId === undefined ? cte.columnRef(prop) : stampChainId(cte.columnRef(prop), chainId);
     },
     has() {
       return true;
@@ -967,6 +984,15 @@ interface FieldRead {
  * the inner collection's own navigation.
  */
 let chainIdSeq = 0;
+
+/**
+ * A fresh chain identity from the same sequence, for the rows minted outside a query builder — an
+ * aliased scope's rows, a set's rows, a CTE-rooted query's rows — so a query nested in them reads
+ * their refs as correlations (see isForeignChainRef) instead of resolving them by alias NAME. @internal
+ */
+export function nextChainId(): number {
+  return ++chainIdSeq;
+}
 
 export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   /** @internal Chain identity — see chainIdSeq. */
@@ -1393,7 +1419,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     condition: (left: TRow, right: TRight) => Condition,
     selector: (left: TRow, right: TRight) => TSelection
   ): SelectQueryBuilder<UnwrapSelection<TSelection>> {
-    const joinCondition = condition(this._createMockRow(), createCteMockRow(cte as DbCte<any>) as TRight);
+    const joinCondition = condition(this._createMockRow(), createCteMockRow(cte as DbCte<any>, this.chainId) as TRight);
     const updatedJoins = [...this.manualJoins, {
       type,
       table: cte.name,
@@ -1405,7 +1431,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
 
     // Fresh mocks for every selector invocation
     const wrappedSelector = () =>
-      materializeMockSelection(selector(this._createMockRow() as TRow, createCteMockRow(cte as DbCte<any>) as TRight));
+      materializeMockSelection(selector(this._createMockRow() as TRow, createCteMockRow(cte as DbCte<any>, this.chainId) as TRight));
 
     return new SelectQueryBuilder(
       this.schema,
@@ -1598,6 +1624,8 @@ export class SelectQueryBuilder<TSelection> {
   private schemaRegistry?: Map<string, TableSchema>;
   private ctes: DbCte<any>[] = [];  // Track CTEs attached to this query
   private collectionStrategy?: CollectionStrategyType;
+  /** Set-returning functions joined to every row (`crossJoinLateral`), rendered after the navigation joins. */
+  private lateralSets: LateralSetJoin[] = [];
 
   /**
    * Get qualified table name with schema prefix if specified
@@ -1621,7 +1649,8 @@ export class SelectQueryBuilder<TSelection> {
     schemaRegistry?: Map<string, TableSchema>,
     ctes?: DbCte<any>[],
     collectionStrategy?: CollectionStrategyType,
-    chainId?: number
+    chainId?: number,
+    lateralSets?: LateralSetJoin[]
   ) {
     this.schema = schema;
     this.client = client;
@@ -1639,6 +1668,7 @@ export class SelectQueryBuilder<TSelection> {
     this.schemaRegistry = schemaRegistry;
     this.ctes = ctes || [];
     this.collectionStrategy = collectionStrategy;
+    this.lateralSets = lateralSets || [];
   }
 
   /**
@@ -1704,7 +1734,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1884,6 +1915,15 @@ export class SelectQueryBuilder<TSelection> {
    */
   _getAttachedCtes(): DbCte<any>[] {
     return this.ctes;
+  }
+
+  /**
+   * This query's correlations to an enclosing query — what {@link asSubquery} reports. Read by
+   * {@link UnionQueryBuilder.asSubquery}, whose legs correlate exactly as a single subquery does.
+   * @internal
+   */
+  _getOuterFieldRefs(): FieldRef[] {
+    return this.extractOuterFieldRefs();
   }
 
   /**
@@ -2105,7 +2145,8 @@ export class SelectQueryBuilder<TSelection> {
       this.manualJoins,
       this.joinCounter,
       this.schemaRegistry,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     );
   }
 
@@ -2168,7 +2209,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2268,7 +2310,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2340,7 +2383,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2402,7 +2446,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2476,8 +2521,113 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
+  }
+
+  /**
+   * Join a set-returning function to every row — `CROSS JOIN LATERAL <call> AS "<alias>"(<columns>)`,
+   * after the FROM table and its navigation joins, before the WHERE — and project the rows it
+   * multiplies into. `source` reads the row (a column, a navigation's column: the function's argument
+   * is correlated to it); `selector` reads the row and the set's row (`set.value`, `set.key`, …), whose
+   * columns read back as the driver delivers them. A row whose set is empty (NULL, `[]`) drops out, as
+   * a CROSS JOIN drops it. The query stays a query of this table: `where`, `orderBy`, `groupBy` (a
+   * grouping by an expression of the set wraps the joined rows as usual), `count()`, `asSubquery()`.
+   *
+   * @example
+   * db.logs
+   *   .where(l => isNotNull(l.breakdown))
+   *   .crossJoinLateral(l => jsonbArrayElements(l.breakdown), (l, entry) => ({
+   *     slotId: l.slotId,
+   *     category: castAsInt(jsonbPathText(entry.value, 'category')),
+   *     count: castAsInt(jsonbPathText(entry.value, 'count')),
+   *   }), 'entry')
+   *   .groupBy(r => ({ slotId: r.slotId, category: r.category }))
+   *   .select(g => ({ slotId: g.key.slotId, category: g.key.category, net: castAsInt(g.sum(r => r.count)) }))
+   */
+  crossJoinLateral<TSetRow extends Record<string, unknown>, TNewSelection>(
+    source: (row: TSelection) => SetReturningFunction<TSetRow>,
+    selector: (row: TSelection, set: SetRow<TSetRow>) => TNewSelection,
+    alias: string
+  ): SelectQueryBuilder<UnwrapSelection<TNewSelection>> {
+    assertExplicitAlias(alias, 'crossJoinLateral()');
+
+    // The set's columns render under the alias: it must name nothing else of the statement
+    if (
+      alias === this.schema.name
+      || Object.prototype.hasOwnProperty.call(this.schema.relations, alias)
+      || this.manualJoins.some(join => join.alias === alias)
+      || this.ctes.some(cte => cte.name === alias)
+      || this.lateralSets.some(join => join.alias === alias)
+    ) {
+      throw new Error(
+        `crossJoinLateral(): the alias "${alias}" already names the table, a navigation, a join or a CTE of this query — pick another`
+      );
+    }
+
+    const mockRow = this._createMockRow();
+    const set = source(materializeMockSelection(this.selector(mockRow)) as TSelection);
+
+    if (!(set instanceof SetReturningFunction)) {
+      throw new Error('crossJoinLateral(): the source must return a set-returning function — unnest(…), unnestZip(…), jsonbArrayElements(…), jsonbEachText(…)');
+    }
+
+    // The set's row belongs to this query's chain: a query nested in the projection reads it as a correlation
+    const setRow = createSetRow(set, alias, this.chainId);
+    const composedSelector = (row: any) => selector(materializeMockSelection(this.selector(row)) as TSelection, setRow);
+
+    return new SelectQueryBuilder(
+      this.schema,
+      this.client,
+      composedSelector,
+      this.whereCond,
+      this.limitValue,
+      this.offsetValue,
+      this.orderByFields,
+      this.executor,
+      this.manualJoins,
+      this.joinCounter,
+      this.isDistinct,
+      this.schemaRegistry,
+      this.ctes,
+      this.collectionStrategy,
+      this.chainId,
+      [...this.lateralSets, { set, alias }]
+    ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
+  }
+
+  /**
+   * The refs the lateral sets' functions read from this query's rows (their arguments) — joined and
+   * planned like the projection's.
+   */
+  private lateralSetArgumentRefs(): FieldRef[] {
+    return lateralSetRefs(this.lateralSets);
+  }
+
+  /**
+   * `\nCROSS JOIN LATERAL …` for every lateral set, rendered in the statement's parameter sequence.
+   */
+  private lateralSetJoinsClause(context: QueryContext): string {
+    if (this.lateralSets.length === 0) {
+      return '';
+    }
+
+    const buildContext: SqlBuildContext = {
+      paramCounter: context.paramCounter,
+      params: context.allParams,
+      placeholders: context.placeholders,
+      hoistedCteNames: context.hoistedCteNames,
+    };
+    // The joins render before the sets: one whose ON reads a set is refused
+    const sql = lateralSetJoinsSql(this.lateralSets, buildContext, this.manualJoins);
+    context.paramCounter = buildContext.paramCounter;
+
+    if (buildContext.placeholders) {
+      context.placeholders = buildContext.placeholders;
+    }
+
+    return sql;
   }
 
   /**
@@ -2541,7 +2691,7 @@ export class SelectQueryBuilder<TSelection> {
    * Create a mock row for CTE columns
    */
   private createMockRowForCte<TCteColumns extends Record<string, any>>(cte: DbCte<TCteColumns>): TCteColumns {
-    return createCteMockRow(cte);
+    return createCteMockRow(cte, this.chainId);
   }
 
   /**
@@ -2568,7 +2718,8 @@ export class SelectQueryBuilder<TSelection> {
       this.schemaRegistry,
       this.ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     );
   }
 
@@ -2718,6 +2869,7 @@ export class SelectQueryBuilder<TSelection> {
         ctes: new Map(),
         cteCounter: 0,
         useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+        jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
         paramCounter: 1,
         allParams: [],
         collectionStrategy: this.collectionStrategy,
@@ -2726,6 +2878,8 @@ export class SelectQueryBuilder<TSelection> {
 
       const mockRow = tracer.trace('createMockRow', () => this._createMockRow());
       const selectionResult = tracer.trace('evaluateSelector', () => materializeMockSelection(this.selector(mockRow)));
+      // COUNT(*) OVER() is computed before a set-returning projection value multiplies the rows
+      this.assertCountableProjection('countOver', selectionResult);
 
       const { sql, params, nestedPaths } = tracer.trace('buildQuery', () => this.buildQuery(selectionResult, context));
       tracer.endPhase();
@@ -2848,6 +3002,8 @@ export class SelectQueryBuilder<TSelection> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: context.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
+      // The union decides: a UNION ALL leg's values reach the driver as they are, a compared leg's do not
+      jsonArrayProjection: context.jsonArrayProjection === true,
       paramCounter: context.paramCounter,
       allParams: context.params,
       collectionStrategy: this.collectionStrategy,
@@ -2940,6 +3096,7 @@ export class SelectQueryBuilder<TSelection> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -3000,6 +3157,7 @@ export class SelectQueryBuilder<TSelection> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -3284,6 +3442,7 @@ export class SelectQueryBuilder<TSelection> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       collectionStrategy: this.collectionStrategy,
@@ -3310,6 +3469,13 @@ export class SelectQueryBuilder<TSelection> {
         this.assertJoinedCollectionStrategy(collection.builder, context);
       }
 
+      // Its collections run as statements of their own, after the one executing a data-modifying CTE: one
+      // that reads such a CTE is refused before anything runs (it used to be refused only once the
+      // mutation had committed). Collections that never read it run as they always did
+      if (this.ctes.some(cte => cte.dataModifying)) {
+        this.assertTempTableCollectionsSkipMutations(collections, context);
+      }
+
       // Two-phase execution for temp table strategy
       results = await this.executeWithTempTables(selectionResult, context, collections, tracer);
     } else {
@@ -3321,6 +3487,51 @@ export class SelectQueryBuilder<TSelection> {
     tracer.logSummary(results.length);
 
     return results;
+  }
+
+  /**
+   * Refuses — before anything runs — a temp-table collection whose statement would read a data-modifying
+   * CTE of this query: each collection runs as a statement of its own, after the one that executes the
+   * CTE, where a nested read would have to declare (and run) it again. Each collection is built as that
+   * statement — no statement-level CTE in scope — in its single-statement form, which builds the same
+   * subqueries and runs nothing: a read of a data-modifying CTE shows as the nested declaration the build
+   * refuses ({@link NestedDataModifyingCteError}). Any other build error is left to the run, as before.
+   */
+  private assertTempTableCollectionsSkipMutations(
+    collections: Array<{ name: string; path: string[]; builder: CollectionQueryBuilder<any> }>,
+    context: QueryContext
+  ): void {
+    for (const collection of collections) {
+      const probe: QueryContext = {
+        ctes: new Map(),
+        cteCounter: 0,
+        paramCounter: 1,
+        allParams: [],
+        collectionStrategy: context.collectionStrategy,
+        executor: context.executor,
+        useJsonArrayAggregation: context.useJsonArrayAggregation,
+      };
+
+      try {
+        // Without parent ids a temp-table collection renders its single-statement (CTE) form
+        collection.builder.buildCTE(probe);
+      } catch (error) {
+        if (!(error instanceof NestedDataModifyingCteError)) {
+          continue;
+        }
+
+        if (!this.ctes.some(cte => cte.dataModifying && cte.name === error.cteName)) {
+          // A data-modifying CTE the collection attaches itself: refused wherever it is nested
+          throw error;
+        }
+
+        throw new Error(
+          `The CTE "${error.cteName}" is data-modifying and the collection "${collection.name}" reads it: the temptable `
+          + 'collection strategy runs the collections as statements of their own, after the one that executes it — run '
+          + 'this query with the \'cte\' or \'lateral\' collection strategy'
+        );
+      }
+    }
   }
 
   /**
@@ -4208,6 +4419,7 @@ export class SelectQueryBuilder<TSelection> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
       placeholders: new Map(),
@@ -4244,7 +4456,9 @@ export class SelectQueryBuilder<TSelection> {
       context.paramCounter - 1,
       this.client,
       transformFn,
-      name
+      name,
+      // Every value the build bound (literals, param(), CTE parameters) — the placeholders fill the rest
+      [...context.allParams]
     );
   }
 
@@ -4281,6 +4495,11 @@ export class SelectQueryBuilder<TSelection> {
     whereSql: string;
     whereParams: any[];
   } {
+    // An UPDATE / DELETE has no place for a set-returning function joined to its rows
+    if (this.lateralSets.length > 0) {
+      throw new Error('crossJoinLateral(): a query over a set-returning join cannot update or delete — filter the table itself (e.g. with exists(fromSet(...)...))');
+    }
+
     return this.withNavigationPlan(undefined, this.whereCond, () => {
       const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
       this.detectAndAddJoinsFromCondition(this.whereCond, whereJoins);
@@ -4296,7 +4515,7 @@ export class SelectQueryBuilder<TSelection> {
     const queryBuilder = this;
 
     const executeDelete = async <TResult>(
-      returning?: undefined | true | ((row: TSelection) => TResult) | 'count'
+      returning?: undefined | true | ((row: TSelection, old: any) => TResult) | 'count'
     ): Promise<any> => {
       // Build WHERE clause
       if (!queryBuilder.whereCond) {
@@ -4350,7 +4569,7 @@ export class SelectQueryBuilder<TSelection> {
         const { sql, params, read } = queryBuilder.buildReturningWithNavigation(
           deleteSql,
           whereParams,
-          returning as ((row: TSelection) => TResult),
+          returning as ((row: TSelection, old: any) => TResult),
           navigationInfo
         );
 
@@ -4445,7 +4664,8 @@ export class SelectQueryBuilder<TSelection> {
         sql += ` RETURNING ${returningClause.sql}`;
       }
 
-      return { sql, params: whereParams };
+      // How each RETURNING column reads — for a data-modifying CTE over the statement (withMutation)
+      return attachReturningSelection({ sql, params: whereParams }, returningClause?.selection);
     };
 
     return {
@@ -4468,7 +4688,7 @@ export class SelectQueryBuilder<TSelection> {
       toStatement(selector?: (row: TSelection) => any) {
         return compileDelete(selector);
       },
-      returning<TResult>(selector?: (row: TSelection) => TResult) {
+      returning<TResult>(selector?: (row: TSelection, old: any) => TResult) {
         const returningConfig = selector ?? true;
         return {
           then<T1 = any, T2 = never>(
@@ -4506,7 +4726,7 @@ export class SelectQueryBuilder<TSelection> {
     const queryBuilder = this;
 
     const executeUpdate = async <TResult>(
-      returning?: undefined | true | ((row: TSelection) => TResult) | 'count'
+      returning?: undefined | true | ((row: TSelection, old: any) => TResult) | 'count'
     ): Promise<any> => {
       // Build WHERE clause
       if (!queryBuilder.whereCond) {
@@ -4606,7 +4826,7 @@ export class SelectQueryBuilder<TSelection> {
         const { sql, params, read } = queryBuilder.buildReturningWithNavigation(
           updateSql,
           values,
-          returning as ((row: TSelection) => TResult),
+          returning as ((row: TSelection, old: any) => TResult),
           navigationInfo
         );
 
@@ -4734,7 +4954,8 @@ export class SelectQueryBuilder<TSelection> {
         sql += ` RETURNING ${returningClause.sql}`;
       }
 
-      return { sql, params: values };
+      // How each RETURNING column reads — for a data-modifying CTE over the statement (withMutation)
+      return attachReturningSelection({ sql, params: values }, returningClause?.selection);
     };
 
     return {
@@ -4757,7 +4978,7 @@ export class SelectQueryBuilder<TSelection> {
       toStatement<TResult>(selector?: (row: TSelection) => TResult): { sql: string; params: any[] } {
         return compileUpdate(selector);
       },
-      returning<TResult>(selector?: (row: TSelection) => TResult) {
+      returning<TResult>(selector?: (row: TSelection, old: any) => TResult) {
         const returningConfig = selector ?? true;
         return {
           then<T1 = any, T2 = never>(
@@ -4781,11 +5002,11 @@ export class SelectQueryBuilder<TSelection> {
    * @internal
    */
   private buildUpdateDeleteReturningClause<TResult>(
-    returning: undefined | true | ((row: TSelection) => TResult),
+    returning: undefined | true | ((row: TSelection, old: any) => TResult),
     qualifyWithTable: boolean = false,
     paramContext?: { paramCounter: number; params: any[] },
     compiled: boolean = false
-  ): { sql: string; columns: string[]; read?: ReturningReadPlan } | null {
+  ): { sql: string; columns: string[]; read?: ReturningReadPlan; selection?: Record<string, unknown> } | null {
     if (returning === undefined) {
       return null;
     }
@@ -4805,32 +5026,72 @@ export class SelectQueryBuilder<TSelection> {
       throw new Error('toStatement(): the RETURNING selector must return an object — its keys name the columns the compiled statement returns.');
     }
 
-    // Expressions append their parameters to the statement's (RETURNING ends the statement text);
-    // headline use case: PG18 `old."col"` capture
+    // Expressions append their parameters to the statement's (RETURNING ends the statement text). A
+    // column of the `old` row renders under PostgreSQL 18's `old.` qualifier, which needs no table prefix.
     const rendered = renderPlainReturning(selection, {
       isOwnColumn: ref => this.isMutatedRowColumn(ref),
-      columnSql: ref => `${tablePrefix}"${ref.__dbColumnName}"`,
+      columnSql: ref => (SelectQueryBuilder.returningOldRefs.has(ref) ? `old."${ref.__dbColumnName}"` : `${tablePrefix}"${ref.__dbColumnName}"`),
       columnMapper: ref => this.returningColumnMapper(ref),
       context: paramContext ?? { paramCounter: 1, params: [] },
       constantsAsParams: compiled,
     });
 
-    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar } };
+    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar }, selection };
+  }
+
+  /**
+   * The refs of the `old` rows RETURNING selectors received (see createReturningOldRow): a column of the
+   * mutated table read BEFORE the mutation — its own column for every purpose but its rendering.
+   */
+  private static readonly returningOldRefs = new WeakSet<object>();
+
+  /**
+   * The `old` row a RETURNING selector receives as its second argument (PostgreSQL 18): the mutated
+   * table's own columns, rendered `old."<column>"` (refs qualified `"old"` where a nested build renders
+   * them itself — the same relation name) and read through the column's own mapper, as the row's own
+   * columns are. Navigations are not in scope. `read()` reports whether the selector touched it.
+   */
+  private createReturningOldRow(): { row: unknown; read: () => boolean } {
+    const row = createColumnRow(this.schema, 'old', 'RETURNING old') as Record<string, unknown>;
+    let read = false;
+
+    for (const prop of Object.keys(this.schema.columns)) {
+      SelectQueryBuilder.returningOldRefs.add(row[prop] as object);
+    }
+
+    const tracked = new Proxy(row, {
+      get: (target, prop, receiver) => {
+        read = true;
+
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    return { row: tracked, read: () => read };
   }
 
   /**
    * A RETURNING selector's selection over the mutated row (see returningSelection) — evaluated over
-   * this query's projection when it has one.
+   * this query's projection when it has one — and whether it read the `old` row (its second argument).
    */
-  private evaluateReturning(returning: (row: TSelection) => unknown): { selection: Record<string, unknown>; scalar: boolean } {
+  private evaluateReturning(returning: (row: TSelection, old: any) => unknown): { selection: Record<string, unknown>; scalar: boolean; readsOld: boolean } {
     const mockRow = this._createMockRow();
     const selectedMock = materializeMockSelection(this.selector(mockRow));
+    const old = this.createReturningOldRow();
+    const selection = returningSelection(returning(selectedMock as TSelection, old.row));
 
-    return returningSelection(returning(selectedMock as TSelection));
+    return { ...selection, readsOld: old.read() };
   }
 
-  /** Whether a ref reads the mutated row itself (not a navigation's table, not another query's row). */
+  /**
+   * Whether a ref reads the mutated row itself (not a navigation's table, not another query's row) —
+   * the row after the mutation, or the `old` row before it.
+   */
   private isMutatedRowColumn(ref: FieldRef): boolean {
+    if (SelectQueryBuilder.returningOldRefs.has(ref)) {
+      return true;
+    }
+
     const tableAlias = (ref as any).__tableAlias as string | undefined;
 
     return (!tableAlias || tableAlias === this.schema.name) && !isForeignChainRef(ref, this.chainId);
@@ -4869,7 +5130,7 @@ export class SelectQueryBuilder<TSelection> {
    */
   private mapDeleteReturningResults<TResult>(
     rows: any[],
-    returning: undefined | true | ((row: TSelection) => TResult),
+    returning: undefined | true | ((row: TSelection, old: any) => TResult),
     read?: ReturningReadPlan
   ): any[] {
     if (returning === true || read === undefined) {
@@ -4901,7 +5162,7 @@ export class SelectQueryBuilder<TSelection> {
    * @internal
    */
   private detectNavigationInReturning<TResult>(
-    returning: true | ((row: TSelection) => TResult)
+    returning: true | ((row: TSelection, old: any) => TResult)
   ): {
     hasNavigation: boolean;
     selection: any;
@@ -4916,11 +5177,21 @@ export class SelectQueryBuilder<TSelection> {
     }
 
     // Analyze the returning selector
-    const { selection } = this.evaluateReturning(returning);
+    const { selection, readsOld } = this.evaluateReturning(returning);
 
     // Joined under the navigation plan of the selection; buildReturningWithNavigation renders a
     // second evaluation of the same selector under the same (deterministic) plan
-    return this.withNavigationPlan(selection, undefined, () => this.resolveReturningNavigation(selection));
+    const navigation = this.withNavigationPlan(selection, undefined, () => this.resolveReturningNavigation(selection));
+
+    if (navigation && readsOld) {
+      throw new Error(
+        'RETURNING old cannot be combined with navigations or collections (nor nested objects) in one RETURNING: '
+        + 'that RETURNING runs the mutation as a CTE, where PostgreSQL\'s old row is out of scope — read the old '
+        + 'values in a flat RETURNING of the row\'s own columns'
+      );
+    }
+
+    return navigation;
   }
 
   /** The body of {@link detectNavigationInReturning}, run under the selection's navigation plan. */
@@ -4972,7 +5243,7 @@ export class SelectQueryBuilder<TSelection> {
           const tableAlias = fieldRef.__tableAlias as string | undefined;
           // A navigation of the plan collects the aliases of its whole path
           const planned = this.collectPlannedAliases(fieldRef, allTableAliases);
-          if (tableAlias && tableAlias !== this.schema.name) {
+          if (tableAlias && tableAlias !== this.schema.name && !SelectQueryBuilder.returningOldRefs.has(fieldRef)) {
             // Navigation field
             if (!planned) {
               allTableAliases.add(tableAlias);
@@ -5049,7 +5320,7 @@ export class SelectQueryBuilder<TSelection> {
   private buildReturningWithNavigation<TResult>(
     mutationSql: string,
     mutationParams: any[],
-    returning: true | ((row: TSelection) => TResult),
+    returning: true | ((row: TSelection, old: any) => TResult),
     navigationInfo: {
       selection: any;
       joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
@@ -5058,7 +5329,7 @@ export class SelectQueryBuilder<TSelection> {
       collectionFields?: Map<string, any>;
     }
   ): { sql: string; params: any[]; nestedPaths?: Set<string>; read: ReturningReadPlan } {
-    const { selection, scalar } = this.evaluateReturning(returning as (row: TSelection) => TResult);
+    const { selection, scalar } = this.evaluateReturning(returning as (row: TSelection, old: any) => TResult);
 
     // The navigation plan detectNavigationInReturning resolved navigationInfo.joins under — the
     // plan is a function of the selection's shape, so this evaluation gets the same aliases
@@ -5718,6 +5989,10 @@ ${joinClauses.join('\n')}`;
       const sqlBuildContext = {
         paramCounter: context.paramCounter,
         params: context.allParams,
+        useJsonArrayAggregation: context.useJsonArrayAggregation,
+        hoistedCteNames: context.hoistedCteNames,
+        // A nested object's value is a column of its own: the driver reads it directly
+        jsonArrayRoot: context.jsonArrayProjection ? projectedValueRoot(nestedValue) : undefined,
       };
       const fragment = nestedValue instanceof SqlFragment ? nestedValue : new SqlFragment(['', ''], [nestedValue]);
       const fragmentSql = fragment.buildSql(sqlBuildContext);
@@ -5926,7 +6201,8 @@ ${joinClauses.join('\n')}`;
    * Records the navigation paths a projection traverses: its field refs, the refs inside its `sql`
    * fragments and nested objects, and navigation rows projected whole (which render from the table
    * their first column's ref names). Collections and subqueries plan their own; the path a collection
-   * hangs off (when it starts at the root) goes to `collectionPaths`.
+   * hangs off (when it starts at the root) goes to `collectionPaths`, the refs by which a projected
+   * subquery reads our row are recorded with the lowest precedence (NavigationAliasPlan.addSecondaryRef).
    */
   private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan, collectionPaths: string[][]): void {
     if (value === null || typeof value !== 'object') {
@@ -5959,7 +6235,18 @@ ${joinClauses.join('\n')}`;
       return;
     }
 
-    if (Array.isArray(value) || value instanceof ReferenceQueryBuilder || value instanceof Subquery) {
+    if (value instanceof Subquery) {
+      // A projected subquery plans its own navigations; the refs by which it reads OUR row are ours —
+      // with the lowest precedence for a plain alias: every alias the query's own paths render under
+      // (which raw `sql` may name) stays what it is without the subquery, whose path takes a path alias
+      // when another path owns the name
+      for (const ref of value.getOuterFieldRefs()) {
+        plan.addSecondaryRef(ref);
+      }
+      return;
+    }
+
+    if (Array.isArray(value) || value instanceof ReferenceQueryBuilder) {
       return;
     }
 
@@ -6157,6 +6444,11 @@ ${joinClauses.join('\n')}`;
         for (const fieldRef of value.getFieldRefs()) {
           addExplicitJoinPath((fieldRef as any).__joinPath, joins);
         }
+      } else if (value instanceof Subquery) {
+        // Only the refs by which a projected subquery reads OUR row — never its own selection's
+        for (const fieldRef of value.getOuterFieldRefs()) {
+          addExplicitJoinPath((fieldRef as any).__joinPath, joins);
+        }
       } else if ('__dbColumnName' in value) {
         addExplicitJoinPath((value as any).__joinPath, joins);
       } else if (!Array.isArray(value)) {
@@ -6231,6 +6523,10 @@ ${joinClauses.join('\n')}`;
       } else if (value instanceof CollectionQueryBuilder) {
         // What a projected collection reads from OUR row — a column of a navigation of ours, in its
         // WHERE, projection or ORDER BY — must be in scope for its subquery to bind
+        this.collectTableAliasesFromSelection(value.getOuterFieldRefs(), allTableAliases);
+      } else if (value instanceof Subquery) {
+        // So must what a projected subquery reads from OUR row (its correlation), as for the same
+        // subquery in a WHERE exists(): `"user"."age"` used to render with no JOIN of "user"
         this.collectTableAliasesFromSelection(value.getOuterFieldRefs(), allTableAliases);
       } else if (value && typeof value === 'object' && !Array.isArray(value)) {
         // Recursively check nested objects
@@ -6467,16 +6763,68 @@ ${joinClauses.join('\n')}`;
    * Build SQL query — under the navigation plan of the projection and the WHERE (see withNavigationPlan)
    */
   private buildQuery(selection: any, context: QueryContext): { sql: string; params: any[]; nestedPaths: Set<string> } {
-    return this.withNavigationPlan(selection, this.whereCond, () => this.buildQueryBody(selection, context), this.orderByRefs());
+    return this.withNavigationPlan(
+      selection,
+      this.whereCond,
+      () => this.withStatementCtes(context, inherited => this.buildQueryBody(selection, context, inherited)),
+      [...this.orderByRefs(), ...this.lateralSetArgumentRefs()]
+    );
   }
 
-  /** The body of {@link buildQuery}. */
-  private buildQueryBody(selection: any, context: QueryContext): { sql: string; params: any[]; nestedPaths: Set<string> } {
-    // Handle user-defined CTEs first - their params need to come before main query params
+  /**
+   * Runs one build with this query's own `.with()` CTEs added to the set of CTEs declared at
+   * statement level (`context.hoistedCteNames`), so every nested build of the statement — its WHERE,
+   * projected subqueries and fragments, ORDER BY expressions, collections — reads them by name instead
+   * of re-declaring them inside itself (and re-binding their parameters): a `db.selectFromCte(cte)…
+   * asSubquery()` nested in the query that carries `cte` used to emit its own `WITH` — which, for a
+   * data-modifying CTE, is invalid SQL that would run the statement once per occurrence. `build`
+   * receives the set as it was before: the CTEs an ENCLOSING builder declared, which this one must
+   * neither declare again nor bind the parameters of.
+   */
+  private withStatementCtes<T>(context: QueryContext, build: (inherited: Set<string> | undefined) => T): T {
+    const inherited = context.hoistedCteNames;
+
+    if (this.ctes.length === 0) {
+      return build(inherited);
+    }
+
+    // The set carries the CTEs' definitions: a nested query attaching a different CTE of a declared
+    // name is refused (see isStatementCte)
+    context.hoistedCteNames = declareStatementCtes(inherited, this.ctes);
+
+    try {
+      return build(inherited);
+    } finally {
+      context.hoistedCteNames = inherited;
+    }
+  }
+
+  /**
+   * This query's own CTEs — those an enclosing builder does not declare already (`inheritedCtes`, read
+   * by name) — as WITH entries, their parameters appended to `context`: each body renumbered from
+   * where ITS parameters land (see cteBodyAt), nested in a statement or not.
+   */
+  private declareOwnCtes(context: QueryContext, inheritedCtes: Set<string> | undefined): string[] {
+    const entries: string[] = [];
+
     for (const cte of this.ctes) {
+      if (isStatementCte(inheritedCtes, cte)) {
+        continue;
+      }
+
+      entries.push(cteDeclarationAt(cte, context.paramCounter));
       context.allParams.push(...cte.params);
       context.paramCounter += cte.params.length;
     }
+
+    return entries;
+  }
+
+  /** The body of {@link buildQuery}. `inheritedCtes`: see {@link withStatementCtes}. */
+  private buildQueryBody(selection: any, context: QueryContext, inheritedCtes?: Set<string>): { sql: string; params: any[]; nestedPaths: Set<string> } {
+    // Handle user-defined CTEs first - their params need to come before main query params. One an
+    // enclosing builder already declared is read from there (no params, no WITH entry here)
+    const ownCteEntries = this.declareOwnCtes(context, inheritedCtes);
 
     const selectParts: string[] = [];
     const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string; parentKey?: string }> = [];
@@ -6495,6 +6843,12 @@ ${joinClauses.join('\n')}`;
       this.detectAndAddJoinsFromSelection(orderByRefs, joins);
     }
 
+    // So are the navigations a lateral set's function reads (crossJoinLateral)
+    const lateralRefs = this.lateralSetArgumentRefs();
+    if (lateralRefs.length > 0) {
+      this.detectAndAddJoinsFromSelection(lateralRefs, joins);
+    }
+
     // So is the path a projected collection correlates through
     this.addCollectionPathJoins(selection, joins, context.collectionStrategy || 'lateral');
 
@@ -6509,12 +6863,15 @@ ${joinClauses.join('\n')}`;
 
     // Handle case where selection is a single value (not an object with properties)
     if (selection instanceof SqlFragment) {
-      // Single SQL fragment - just build it directly
+      // Single SQL fragment - just build it directly (a set-returning function as its call)
       const sqlBuildContext = {
         paramCounter: context.paramCounter,
         params: context.allParams,
+        useJsonArrayAggregation: context.useJsonArrayAggregation,
+        hoistedCteNames: context.hoistedCteNames,
+        jsonArrayRoot: context.jsonArrayProjection ? projectedValueRoot(selection) : undefined,
       };
-      const fragmentSql = selection.buildSql(sqlBuildContext);
+      const fragmentSql = renderProjectedFragment(selection, sqlBuildContext);
       context.paramCounter = sqlBuildContext.paramCounter;
       selectParts.push(fragmentSql);
     } else if (isScalarLiteralSelection(selection)) {
@@ -6559,17 +6916,23 @@ ${joinClauses.join('\n')}`;
           const sqlBuildContext = {
             paramCounter: context.paramCounter,
             params: context.allParams,
+            useJsonArrayAggregation: context.useJsonArrayAggregation,
+            hoistedCteNames: context.hoistedCteNames,
+            jsonArrayRoot: context.jsonArrayProjection ? value : undefined,
           };
           const subquerySql = (value as Subquery).buildSql(sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;
           selectParts.push(`(${subquerySql}) as "${key}"`);
         } else if (value instanceof SqlFragment) {
-          // SQL Fragment - build the SQL expression
+          // SQL Fragment - build the SQL expression (a set-returning function as its call)
           const sqlBuildContext = {
             paramCounter: context.paramCounter,
             params: context.allParams,
+            useJsonArrayAggregation: context.useJsonArrayAggregation,
+            hoistedCteNames: context.hoistedCteNames,
+            jsonArrayRoot: context.jsonArrayProjection ? projectedValueRoot(value) : undefined,
           };
-          const fragmentSql = value.buildSql(sqlBuildContext);
+          const fragmentSql = renderProjectedFragment(value, sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;
           selectParts.push(`${fragmentSql} as "${key}"`);
         } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
@@ -6916,9 +7279,7 @@ ${joinClauses.join('\n')}`;
 
     // Add user-defined CTEs (from .with() method)
     // Note: CTE params were already added to context.allParams at the start of buildQuery
-    for (const cte of this.ctes) {
-      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
-    }
+    allCtes.push(...ownCteEntries);
 
     // Add generated CTEs (from collection queries)
     if (context.ctes.size > 0) {
@@ -6941,7 +7302,7 @@ ${joinClauses.join('\n')}`;
 
       // Build ON condition
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders);
+      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders, context.hoistedCteNames);
       context.paramCounter = newParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...condParams);
       if (joinPlaceholders) {
@@ -6957,6 +7318,7 @@ ${joinClauses.join('\n')}`;
         const subqueryBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames: context.hoistedCteNames,
         };
         const subquerySql = (manualJoin as any).subquery.buildSql(subqueryBuildContext);
         context.paramCounter = subqueryBuildContext.paramCounter;
@@ -6985,6 +7347,10 @@ ${joinClauses.join('\n')}`;
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
+
+    // Set-returning functions joined to every row (crossJoinLateral): after the navigation joins
+    // their arguments may read
+    fromClause += this.lateralSetJoinsClause(context);
 
     // Join CTEs and LATERAL subqueries for collections
     for (const { cteName, isCTE, joinClause, parentKey } of collectionFields) {
@@ -7027,25 +7393,18 @@ ${joinClauses.join('\n')}`;
     return this.withNavigationPlan(
       selection,
       this.whereCond,
-      () => this.buildQueryCoreBody(selection, context, includeOrderLimitOffset),
-      includeOrderLimitOffset ? this.orderByRefs() : undefined
+      () => this.withStatementCtes(context, inherited => this.buildQueryCoreBody(selection, context, includeOrderLimitOffset, inherited)),
+      [...(includeOrderLimitOffset ? this.orderByRefs() : []), ...this.lateralSetArgumentRefs()]
     );
   }
 
-  /** The body of {@link buildQueryCore}, run under its navigation plan. */
-  private buildQueryCoreBody(selection: any, context: QueryContext, includeOrderLimitOffset: boolean): { sql: string; params: any[]; nestedPaths: Set<string> } {
+  /** The body of {@link buildQueryCore}, run under its navigation plan. `inheritedCtes`: see {@link withStatementCtes}. */
+  private buildQueryCoreBody(selection: any, context: QueryContext, includeOrderLimitOffset: boolean, inheritedCtes?: Set<string>): { sql: string; params: any[]; nestedPaths: Set<string> } {
     // Handle user-defined CTEs first - their params need to come before main query params.
     // A CTE the enclosing builder already hoisted to statement level (UNION) has had both
     // its params and its WITH entry contributed there; pushing them again would duplicate
     // the params and shift every placeholder in this leg.
-    for (const cte of this.ctes) {
-      if (context.hoistedCteNames?.has(cte.name)) {
-        continue;
-      }
-
-      context.allParams.push(...cte.params);
-      context.paramCounter += cte.params.length;
-    }
+    const ownCteEntries = this.declareOwnCtes(context, inheritedCtes);
 
     const selectParts: string[] = [];
     const collectionFields: Array<{ name: string; cteName: string; isCTE: boolean; joinClause?: string; selectExpression?: string; parentKey?: string }> = [];
@@ -7066,6 +7425,12 @@ ${joinClauses.join('\n')}`;
       }
     }
 
+    // So are the navigations a lateral set's function reads (crossJoinLateral)
+    const lateralRefs = this.lateralSetArgumentRefs();
+    if (lateralRefs.length > 0) {
+      this.detectAndAddJoinsFromSelection(lateralRefs, joins);
+    }
+
     // So is the path a projected collection correlates through
     this.addCollectionPathJoins(selection, joins, context.collectionStrategy || 'lateral');
 
@@ -7083,8 +7448,11 @@ ${joinClauses.join('\n')}`;
       const sqlBuildContext = {
         paramCounter: context.paramCounter,
         params: context.allParams,
+        useJsonArrayAggregation: context.useJsonArrayAggregation,
+        hoistedCteNames: context.hoistedCteNames,
+        jsonArrayRoot: context.jsonArrayProjection ? projectedValueRoot(selection) : undefined,
       };
-      const fragmentSql = selection.buildSql(sqlBuildContext);
+      const fragmentSql = renderProjectedFragment(selection, sqlBuildContext);
       context.paramCounter = sqlBuildContext.paramCounter;
       selectParts.push(fragmentSql);
     } else if (isScalarLiteralSelection(selection)) {
@@ -7136,6 +7504,9 @@ ${joinClauses.join('\n')}`;
           const sqlBuildContext = {
             paramCounter: context.paramCounter,
             params: context.allParams,
+            useJsonArrayAggregation: context.useJsonArrayAggregation,
+            hoistedCteNames: context.hoistedCteNames,
+            jsonArrayRoot: context.jsonArrayProjection ? value : undefined,
           };
           const subquerySql = (value as Subquery).buildSql(sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;
@@ -7144,8 +7515,11 @@ ${joinClauses.join('\n')}`;
           const sqlBuildContext = {
             paramCounter: context.paramCounter,
             params: context.allParams,
+            useJsonArrayAggregation: context.useJsonArrayAggregation,
+            hoistedCteNames: context.hoistedCteNames,
+            jsonArrayRoot: context.jsonArrayProjection ? projectedValueRoot(value) : undefined,
           };
-          const fragmentSql = value.buildSql(sqlBuildContext);
+          const fragmentSql = renderProjectedFragment(value, sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;
           selectParts.push(`${fragmentSql} as "${key}"`);
         } else if (typeof value === 'object' && value !== null && '__dbColumnName' in value) {
@@ -7321,16 +7695,8 @@ ${joinClauses.join('\n')}`;
     // Build final query with CTEs
     let finalQuery = '';
 
-    const allCtes: string[] = [];
-
-    for (const cte of this.ctes) {
-      // Hoisted to statement level by the enclosing UNION - declared there, not here.
-      if (context.hoistedCteNames?.has(cte.name)) {
-        continue;
-      }
-
-      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
-    }
+    // Hoisted to statement level by the enclosing UNION - declared there, not here.
+    const allCtes: string[] = [...ownCteEntries];
 
     if (context.ctes.size > 0) {
       for (const [cteName, { sql }] of context.ctes.entries()) {
@@ -7350,7 +7716,7 @@ ${joinClauses.join('\n')}`;
     for (const manualJoin of this.manualJoins) {
       const joinTypeStr = manualJoin.type === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN';
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders);
+      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders, context.hoistedCteNames);
       context.paramCounter = newParamCounter;
       context.allParams.push(...condParams);
       if (joinPlaceholders) {
@@ -7363,6 +7729,7 @@ ${joinClauses.join('\n')}`;
         const subqueryBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames: context.hoistedCteNames,
         };
         const subquerySql = (manualJoin as any).subquery.buildSql(subqueryBuildContext);
         context.paramCounter = subqueryBuildContext.paramCounter;
@@ -7385,6 +7752,9 @@ ${joinClauses.join('\n')}`;
       const joinTableName = this.getQualifiedTableName(join.targetTable, join.targetSchema);
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
+
+    // Set-returning functions joined to every row (crossJoinLateral), as in buildQueryBody
+    fromClause += this.lateralSetJoinsClause(context);
 
     // Join CTEs / LATERAL subqueries for collection projections inside the UNION
     // leg. Mirror the buildQuery flow at line ~4678. CTE legs join by parent_id;
@@ -7569,9 +7939,10 @@ ${joinClauses.join('\n')}`;
     if (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function') {
       const mapper = disableMappers ? undefined : fromDriverMapper((value as any).getMapper());
 
+      // Without a mapper: read like a column of the fragment's read type (withReadType), if any
       return mapper
         ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper }
-        : { key, type: FieldType.SIMPLE, value, coerce: true, keepNull: nested };
+        : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).getReadType?.()), keepNull: nested };
     }
 
     // FieldRef with potential mapper
@@ -7608,6 +7979,17 @@ ${joinClauses.join('\n')}`;
 
       // A navigation's text column keeps its text: '01234' used to read back as the number 1234
       return { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).__sqlType), keepNull: nested };
+    }
+
+    // A scalar subquery of ONE aggregate or read-typed fragment reads like that value (asSubquery('scalar'))
+    const scalarRead = value instanceof Subquery ? value.getScalarRead() : undefined;
+
+    if (scalarRead !== undefined) {
+      const mapper = disableMappers ? undefined : fromDriverMapper(scalarRead.mapper);
+
+      return mapper
+        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper }
+        : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText(scalarRead.readType), keepNull: nested };
     }
 
     // Default: simple value
@@ -7735,13 +8117,17 @@ ${joinClauses.join('\n')}`;
     return this.withNavigationPlan(
       undefined,
       this.whereCond,
-      () => this.buildAggregationQueryBody(aggregation, fieldToAggregate, context),
-      [fieldToAggregate]
+      // Its `.with()` CTEs are declared too, at statement level (they used to be dropped: a join or a
+      // raw read of a CTE met `relation "<cte>" does not exist`)
+      () => this.withStatementCtes(context, inherited => this.buildAggregationQueryBody(aggregation, fieldToAggregate, context, inherited)),
+      [fieldToAggregate, ...this.lateralSetArgumentRefs()]
     );
   }
 
-  /** The body of {@link buildAggregationQuery}, run under its navigation plan. */
-  private buildAggregationQueryBody(aggregation: 'MIN' | 'MAX' | 'SUM', fieldToAggregate: any, context: QueryContext): { sql: string; params: any[] } {
+  /** The body of {@link buildAggregationQuery}, run under its navigation plan. `inheritedCtes`: see {@link withStatementCtes}. */
+  private buildAggregationQueryBody(aggregation: 'MIN' | 'MAX' | 'SUM', fieldToAggregate: any, context: QueryContext, inheritedCtes?: Set<string>): { sql: string; params: any[] } {
+    const ownCteEntries = this.declareOwnCtes(context, inheritedCtes);
+
     // Extract the field name from FieldRef object
     let fieldName: string;
     let tableAlias: string = this.schema.name;
@@ -7760,6 +8146,12 @@ ${joinClauses.join('\n')}`;
     // Detect navigation property joins from WHERE condition (same as buildAggregateQuery)
     const navJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     this.detectAndAddJoinsFromCondition(this.whereCond, navJoins);
+
+    // ...and from the lateral sets' function arguments (crossJoinLateral)
+    const lateralRefs = this.lateralSetArgumentRefs();
+    if (lateralRefs.length > 0) {
+      this.detectAndAddJoinsFromSelection(lateralRefs, navJoins);
+    }
 
     // Build WHERE clause
     let whereClause = '';
@@ -7781,7 +8173,7 @@ ${joinClauses.join('\n')}`;
     for (const manualJoin of this.manualJoins) {
       const joinTypeStr = manualJoin.type === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN';
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newJoinParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders);
+      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newJoinParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders, context.hoistedCteNames);
       context.paramCounter = newJoinParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...condParams);
       if (joinPlaceholders) {
@@ -7793,6 +8185,7 @@ ${joinClauses.join('\n')}`;
         const subqueryBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames: context.hoistedCteNames,
         };
         const subquerySql = (manualJoin as any).subquery.buildSql(subqueryBuildContext);
         context.paramCounter = subqueryBuildContext.paramCounter;
@@ -7816,7 +8209,11 @@ ${joinClauses.join('\n')}`;
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
-    const sql = `SELECT ${aggregation}("${tableAlias}"."${fieldName}") as result\n${fromClause}\n${whereClause}`.trim();
+    // Set-returning functions joined to every row (crossJoinLateral)
+    fromClause += this.lateralSetJoinsClause(context);
+
+    const withClause = ownCteEntries.length > 0 ? `WITH ${ownCteEntries.join(', ')}\n` : '';
+    const sql = `${withClause}SELECT ${aggregation}("${tableAlias}"."${fieldName}") as result\n${fromClause}\n${whereClause}`.trim();
 
     return {
       sql,
@@ -7828,28 +8225,74 @@ ${joinClauses.join('\n')}`;
    * Build aggregate query (count or exists)
    */
   private buildAggregateQuery(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
-    return this.withNavigationPlan(undefined, this.whereCond, () => this.buildAggregateQueryBody(context, type));
+    // The statement never renders the projection: it is evaluated — once — for the two guards only. A
+    // selector that cannot run on the mock row (count() / exists() never evaluated it before 1.0.9) holds
+    // neither a set-returning value nor an aggregate that could be seen, and counts as it always did
+    let selection: unknown;
+    let projected: unknown;
+    let evaluated = false;
+
+    try {
+      selection = this.selector(this._createMockRow());
+      projected = materializeMockSelection(selection);
+      evaluated = true;
+    } catch {
+      // no projection to check
+    }
+
+    if (evaluated) {
+      this.assertCountableProjection(type, projected);
+
+      // A select of aggregates without groupBy() is ONE row — COUNT(*) over the base rows would not say so
+      if (type === 'count' && holdsAggregateFragment(selection)) {
+        throw new Error(
+          'count(): this select projects aggregates (agg.*) without groupBy() — a whole-set aggregate, always ONE row. '
+          + 'Count the rows of a select without them.'
+        );
+      }
+    }
+
+    return this.withNavigationPlan(
+      undefined,
+      this.whereCond,
+      () => this.withStatementCtes(context, inherited => this.buildAggregateQueryBody(context, type, inherited)),
+      this.lateralSetArgumentRefs()
+    );
   }
 
-  /** The body of {@link buildAggregateQuery}, run under its navigation plan. */
-  private buildAggregateQueryBody(context: QueryContext, type: 'count' | 'exists'): { sql: string; params: any[] } {
-    // User-defined CTEs first, exactly as buildQuery does: their params occupy the
-    // opening slots of the statement because DbCte bodies carry placeholders numbered
-    // from $1. Without this, `.with(cte).count()` / `.exists()` dropped the WITH clause
-    // entirely and PostgreSQL answered `relation "<cte>" does not exist` (42P01) for any
-    // query whose WHERE referenced the CTE.
-    for (const cte of this.ctes) {
-      if (context.hoistedCteNames?.has(cte.name)) {
-        continue;
-      }
-
-      context.allParams.push(...cte.params);
-      context.paramCounter += cte.params.length;
+  /**
+   * `count()`, `exists()` and `countOver()` count the rows of the FROM (and its joins, lateral sets
+   * included): a set-returning function projected as a value multiplies the rows AFTER that — or drops
+   * a row whose set is empty — so they would answer for other rows than `toList()` reads. Refused.
+   */
+  private assertCountableProjection(method: string, projected: unknown): void {
+    if (holdsSetReturningValue(projected)) {
+      throw new Error(
+        `${method}(): the projection holds a set-returning function (unnest(…), jsonbArrayElements(…), …), which multiplies `
+        + `the rows after ${method === 'exists' ? 'EXISTS' : 'COUNT(*)'} sees them — join the set with crossJoinLateral(…) to `
+        + `${method === 'exists' ? 'test' : 'count'} its rows`
+      );
     }
+  }
+
+  /** The body of {@link buildAggregateQuery}, run under its navigation plan. `inheritedCtes`: see {@link withStatementCtes}. */
+  private buildAggregateQueryBody(context: QueryContext, type: 'count' | 'exists', inheritedCtes?: Set<string>): { sql: string; params: any[] } {
+    // User-defined CTEs first, exactly as buildQuery does: their params occupy the
+    // opening slots of the statement. Without this, `.with(cte).count()` / `.exists()`
+    // dropped the WITH clause entirely and PostgreSQL answered `relation "<cte>" does not
+    // exist` (42P01) for any query whose WHERE referenced the CTE.
+    const ownCteEntries = this.declareOwnCtes(context, inheritedCtes);
 
     // Detect navigation property joins from WHERE condition
     const joins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     this.detectAndAddJoinsFromCondition(this.whereCond, joins);
+
+    // ...and from the lateral sets' function arguments (crossJoinLateral): a count counts the rows
+    // the sets multiply into
+    const lateralRefs = this.lateralSetArgumentRefs();
+    if (lateralRefs.length > 0) {
+      this.detectAndAddJoinsFromSelection(lateralRefs, joins);
+    }
 
     // Build WHERE clause
     let whereClause = '';
@@ -7872,7 +8315,7 @@ ${joinClauses.join('\n')}`;
     for (const manualJoin of this.manualJoins) {
       const joinTypeStr = manualJoin.type === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN';
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newJoinParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders);
+      const { sql: condSql, params: condParams, placeholders: joinPlaceholders, paramCounter: newJoinParamCounter } = condBuilder.build(manualJoin.condition, context.paramCounter, context.placeholders, context.hoistedCteNames);
       context.paramCounter = newJoinParamCounter;  // Use returned counter (handles both params and placeholders)
       context.allParams.push(...condParams);
       if (joinPlaceholders) {
@@ -7884,6 +8327,7 @@ ${joinClauses.join('\n')}`;
         const subqueryBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames: context.hoistedCteNames,
         };
         const subquerySql = (manualJoin as any).subquery.buildSql(subqueryBuildContext);
         context.paramCounter = subqueryBuildContext.paramCounter;
@@ -7911,6 +8355,9 @@ ${joinClauses.join('\n')}`;
       fromClause += `\n${joinType} ${joinTableName} AS "${join.alias}" ON ${onConditions.join(' AND ')}`;
     }
 
+    // Set-returning functions joined to every row (crossJoinLateral)
+    fromClause += this.lateralSetJoinsClause(context);
+
     // Build SELECT clause based on type
     const selectClause = type === 'count'
       ? 'SELECT COUNT(*) as count'
@@ -7918,14 +8365,7 @@ ${joinClauses.join('\n')}`;
 
     // WITH clause - same assembly as buildQuery, so an aggregate can reference the
     // CTEs attached to the query it is aggregating.
-    const allCtes: string[] = [];
-    for (const cte of this.ctes) {
-      if (context.hoistedCteNames?.has(cte.name)) {
-        continue;
-      }
-
-      allCtes.push(`"${cte.name}" AS ${cte.materialized ? 'MATERIALIZED ' : ''}(${cte.query})`);
-    }
+    const allCtes: string[] = [...ownCteEntries];
 
     if (context.ctes.size > 0) {
       for (const [cteName, { sql: cteSql }] of context.ctes.entries()) {
@@ -7972,11 +8412,17 @@ ${joinClauses.join('\n')}`;
   ): Subquery<TMode extends 'scalar' ? ResolveFieldRefs<TSelection> : TMode extends 'array' ? ResolveFieldRefs<TSelection>[] : ResolveCollectionResults<TSelection>, TMode> {
     // Create a function that builds the subquery SQL when called
     const sqlBuilder = (outerContext: SqlBuildContext & { tableAlias?: string }): string => {
+      // A CTE this subquery carries that the enclosing statement does not declare is declared inside
+      // the subquery — which a data-modifying CTE cannot be
+      assertStatementLevelCtes(this.ctes, outerContext.hoistedCteNames);
+
       // Create a fresh context for this subquery, inheriting placeholders from outer context
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
         useJsonArrayAggregation: outerContext.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
+        // Set (by Subquery.buildSql) when this subquery IS a projected value the driver reads directly
+        jsonArrayProjection: outerContext.jsonArrayProjection === true,
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         placeholders: outerContext.placeholders,  // Pass placeholders through for prepared statements
@@ -8011,12 +8457,15 @@ ${joinClauses.join('\n')}`;
       selectionMetadata = materializeMockSelection(this.selector(mockRow));
     }
 
+    // A scalar subquery of ONE aggregate (or read-typed fragment) reads like it (see compileFieldRead)
+    const scalarRead = mode === 'scalar' ? scalarSubqueryRead(this.selector(this._createMockRow())) : undefined;
+
     // Extract outer field refs from the WHERE condition
     // These are field refs that reference tables other than this subquery's table
     // and need to be propagated to the outer query for JOIN detection
     const outerFieldRefs = this.extractOuterFieldRefs();
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata, outerFieldRefs) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, outerFieldRefs, scalarRead) as any;
   }
 
   /**
@@ -8024,15 +8473,23 @@ ${joinClauses.join('\n')}`;
    * These are field refs with a __tableAlias that doesn't match this query's schema.
    */
   private extractOuterFieldRefs(): FieldRef[] {
-    if (!this.whereCond) {
+    // The lateral sets' function arguments may correlate to an enclosing query too
+    const lateralRefs = this.lateralSetArgumentRefs();
+
+    if (!this.whereCond && lateralRefs.length === 0) {
       return [];
     }
 
-    const allRefs = this.whereCond.getFieldRefs();
+    const allRefs = [...(this.whereCond ? this.whereCond.getFieldRefs() : []), ...lateralRefs];
     const outerRefs: FieldRef[] = [];
     const currentTableName = this.schema.name;
 
     for (const ref of allRefs) {
+      // A column of one of our own lateral sets (crossJoinLateral) is no correlation
+      if (this.lateralSets.some(join => join.alias === (ref as any).__tableAlias)) {
+        continue;
+      }
+
       // Check if this ref is from an outer query (different table alias)
       if ('__tableAlias' in ref && ref.__tableAlias) {
         const tableAlias = ref.__tableAlias as string;
@@ -10294,9 +10751,10 @@ export class CollectionQueryBuilder<TItem = any> {
 
   /**
    * Records the navigation paths a selector result traverses — the same values detectNavigationJoins
-   * walks: field refs, the refs inside `sql` fragments and nested objects, and, for a collection
-   * nested in the selector, the refs by which it correlates to our item. The path such a collection
-   * hangs off (when it starts at our item) goes to `nestedPaths`.
+   * walks: field refs, the refs inside `sql` fragments and nested objects, for a collection nested in
+   * the selector the refs by which it correlates to our item, and — with the lowest precedence for a
+   * plain alias — the refs by which a subquery of the item reads it. The path such a collection hangs
+   * off (when it starts at our item) goes to `nestedPaths`.
    */
   private addSelectionToNavigationPlan(value: unknown, plan: NavigationAliasPlan, nestedPaths: string[][]): void {
     if (value === null || typeof value !== 'object') {
@@ -10324,6 +10782,17 @@ export class CollectionQueryBuilder<TItem = any> {
 
       if (nestedPath.length > 0 && nestedPath[0].sourceAlias === this.targetTable) {
         nestedPaths.push(nestedPath.map(step => step.alias));
+      }
+      return;
+    }
+
+    if (value instanceof Subquery) {
+      // A subquery of the item's projection reads our item's navigations through these refs: each
+      // is planned — so it reads its own path, not another path's join of the same relation name —
+      // with the lowest precedence for a plain alias (see NavigationAliasPlan.addSecondaryRef). Its
+      // own properties are no fields to walk
+      for (const ref of value.getOuterFieldRefs()) {
+        plan.addSecondaryRef(ref);
       }
       return;
     }
@@ -10454,6 +10923,10 @@ export class CollectionQueryBuilder<TItem = any> {
           // that subquery renders `"genre"."lendable"`, leaves the ref to us as foreign, and relies
           // on this FROM to bind it. getOuterFieldRefs() reports exactly its foreign refs; the
           // caller resolves the ones that are ours under the same rules as our own WHERE.
+          nestedCorrelationRefs?.push(...value.getOuterFieldRefs());
+        } else if (value instanceof Subquery) {
+          // A projected subquery correlates to our item as a nested collection does: the navigations
+          // of our item it reads are joined here (its own properties are no fields to walk)
           nestedCorrelationRefs?.push(...value.getOuterFieldRefs());
         } else if (value && typeof value === 'object' && !Array.isArray(value)) {
           // Recursively check nested objects
@@ -11068,11 +11541,28 @@ export class CollectionQueryBuilder<TItem = any> {
           // rendered inside this lateral must anchor its λ-root on the lateral's
           // generated alias (see CollectionQueryBuilder.buildSql rootAnchor).
           lateralTableAliasMap: context.lateralTableAliasMap,
+          // A subquery in the item's projection reads the statement's CTEs by name
+          hoistedCteNames: context.hoistedCteNames,
         };
         const fragmentSql = field.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
         // Its `mapWith` reads the item's value back, as it does in a root projection
         return { alias, expression: fragmentSql, mapper: fragmentReadMapper(field) };
+      } else if (field instanceof Subquery) {
+        // A subquery of the item's projection (`db.t.where(… p.col …).asSubquery('scalar')`): rendered in
+        // parentheses in our parameter sequence, as a fragment interpolating it renders. It used to fall
+        // through to the literal path — bound as a parameter, the item read back the serialized Subquery
+        const subqueryContext: SqlBuildContext = {
+          paramCounter: context.paramCounter,
+          params: context.allParams,
+          placeholders: context.placeholders,
+          lateralTableAliasMap: context.lateralTableAliasMap,
+          hoistedCteNames: context.hoistedCteNames,
+        };
+        const subquerySql = field.buildSql(subqueryContext);
+        context.paramCounter = subqueryContext.paramCounter;
+
+        return { alias, expression: `(${subquerySql})` };
       } else if (field instanceof CollectionQueryBuilder) {
         // Nested collection query builder, built as a subquery of this one. Inside a temp-table
         // aggregation — a statement of its own, with no WITH list of its enclosing query — it
@@ -11363,6 +11853,7 @@ export class CollectionQueryBuilder<TItem = any> {
             params: context.allParams,
             placeholders: context.placeholders,
             lateralTableAliasMap: context.lateralTableAliasMap,
+            hoistedCteNames: context.hoistedCteNames,
           };
           aggregateExpression = selectedField.buildSql(sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;

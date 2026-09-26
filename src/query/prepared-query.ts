@@ -9,6 +9,9 @@ import type { DatabaseClient, QueryResult } from '../database/database-client.in
  * 2. Type-safe placeholders - Named parameters with validation
  * 3. Developer ergonomics - Cleaner API for reusable queries
  *
+ * Every other value the query binds — a literal (`eq(u.isActive, true)`), a `param()`, a CTE's
+ * parameters — is bound on every execution as it was when the query was prepared.
+ *
  * @example
  * const getUserById = db.users
  *   .where(u => eq(u.id, sql.placeholder('userId')))
@@ -30,12 +33,20 @@ import type { DatabaseClient, QueryResult } from '../database/database-client.in
  */
 export class PreparedQuery<TResult, TParams extends Record<string, any> = Record<string, any>> {
   /**
+   * Every `$n` of the statement: the value the build bound for it, or — a placeholder's slot —
+   * `null` until an execution fills it.
+   */
+  private readonly boundTemplate: unknown[];
+
+  /**
    * @param sql - The prepared SQL query string with $1, $2, etc. placeholders
    * @param placeholderMap - Map of placeholder names to their 1-indexed parameter positions
    * @param paramCount - Total number of parameters in the query
    * @param client - The database client for execution
    * @param transformFn - Function to transform raw database rows to the result type
    * @param name - Optional name for the prepared query (for debugging)
+   * @param boundParams - The values the build bound for every NON-placeholder `$n`, in `$n` order
+   *   (placeholders take a number but bind nothing at build time)
    */
   constructor(
     private readonly sql: string,
@@ -43,8 +54,15 @@ export class PreparedQuery<TResult, TParams extends Record<string, any> = Record
     private readonly paramCount: number,
     private readonly client: DatabaseClient,
     private readonly transformFn: (rows: any[]) => TResult[],
-    public readonly name: string
-  ) {}
+    public readonly name: string,
+    boundParams: readonly unknown[] = []
+  ) {
+    const placeholderSlots = new Set(placeholderMap.values());
+    let next = 0;
+
+    this.boundTemplate = Array.from({ length: paramCount }, (_, index) =>
+      placeholderSlots.has(index + 1) || next >= boundParams.length ? null : boundParams[next++]);
+  }
 
   /**
    * Execute the prepared query with the given parameters
@@ -57,8 +75,8 @@ export class PreparedQuery<TResult, TParams extends Record<string, any> = Record
    * const result = await preparedQuery.execute({ userId: 10 });
    */
   async execute(params: TParams): Promise<TResult[]> {
-    // Build params array from named params using placeholderMap
-    const paramArray = new Array(this.paramCount).fill(null);
+    // The bound values as built, each placeholder's slot from the named params
+    const paramArray = [...this.boundTemplate];
 
     for (const [name, index] of this.placeholderMap) {
       if (!(name in params)) {

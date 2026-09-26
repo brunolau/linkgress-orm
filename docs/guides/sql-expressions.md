@@ -1,14 +1,16 @@
 # SQL Expression Helpers
 
 Built-in, type-safe spellings of the SQL expressions that otherwise end up hand-written in
-`sql` templates: casts, literals, `CASE`, `GREATEST` / `LEAST` / `NULLIF`, `IS DISTINCT FROM`,
-string, math and date/time functions, JSONB paths and mutations, and array-column operators.
+`sql` templates: casts, literals, bound parameters, `CASE`, `GREATEST` / `LEAST` / `NULLIF`,
+`IS DISTINCT FROM`, string, math and date/time functions, JSON paths, builders and mutations,
+array-column operators and aggregates.
 
 ```typescript
 import {
-  cast, castAsInt, caseWhen, caseOf, literal, typedNull, asBoolean,
-  greatest, least, nullIf, isDistinctFrom, lower, concatWs, round,
-  atTimeZone, dateTrunc, datePart, addInterval, jsonbPathText, jsonbSet, arrayContains,
+  cast, castAsInt, caseWhen, caseOf, literal, literalOf, param, typedNull, asBoolean,
+  greatest, least, nullIf, isDistinctFrom, lower, concatWs, concatStrict, round, modulo,
+  atTimeZone, dateTrunc, datePart, addInterval, jsonbPathText, jsonbValueText, jsonbSet,
+  jsonBuildObject, arrayContains, agg,
 } from 'linkgress-orm';
 ```
 
@@ -17,6 +19,29 @@ so helpers nest in each other, in `sql` templates, in `select`, `where`, `orderB
 assignments and upsert values. Column references inside them keep their navigation
 information: `lower(book.author.name)` joins `author` exactly as `book.author.name` alone would,
 at any depth of nesting.
+
+## Composing helpers: every helper is ONE operand
+
+A helper splices its operands into its own SQL as they render, so every helper renders ONE
+self-delimited expression — a function call, `CAST(… AS …)`, `CASE … END`, a subquery, `EXISTS (…)`
+or a parenthesized group — and no operator it is composed with can take part of it:
+
+```typescript
+jsonbRemoveKey(jsonbMerge(doc, patch), 'k')        // ((COALESCE(doc, '{}'::jsonb) || (patch)::jsonb) - 'k')
+concatStrict(jsonbPathText(doc, 'first'), literal(' '), jsonbPathText(doc, 'last'))
+                                                    // ((doc->>'first') || ' ' || (doc->>'last'))
+isDistinctFrom(notExists(sub), flag)               // ((NOT EXISTS (…)) IS DISTINCT FROM flag)
+eq(book.featured, eqAny(book.id, featuredIds))     // "featured" = ("id" = ANY($1::integer[]))
+sql<number>`${jsonbPathText(doc, 'qty')}::int`      // (doc->>'qty')::int
+```
+
+(Before 1.0.9 the JSON paths, `jsonbMerge`, `eqAny` / `neAll`, the `flagHas*` predicates, the
+`normalized*` predicates, `notExists`, `eqAnySubquery` / `neAllSubquery` and a `jsonbArraySome`
+element path rendered their operator bare: the first line above removed `'k'` from the patch only,
+the second failed with `operator does not exist: text ->> unknown`, the third negated the whole
+`IS DISTINCT FROM`.) Conditions built by the comparison helpers (`eq`, `like`, `isNull`, `and`, …)
+are no fragments: a fragment they are interpolated into parenthesizes them. A raw `sql` template is
+the caller's text and composes as written — `and()` / `or()` parenthesize it.
 
 ## How plain values are sent
 
@@ -45,8 +70,35 @@ values compared or unified with it.
 Helpers whose result type is explicit — casts, string functions, JSON paths, literals, CASE —
 return the driver's value **exactly** (NULL stays `null`): a text result such as `'01234'` stays
 a string. (A fragment without one of these goes through the generic result conversion, which
-turns numeric-looking strings into numbers.) Math helpers (`round`, `floor`, `ceil`, `abs`, `mod`)
-and `datePart` read back as JS numbers.
+turns numeric-looking strings into numbers.) Math helpers (`round`, `floor`, `ceil`, `abs`, `mod`,
+`modulo`) and `datePart` read back as JS numbers.
+
+### Reading a fragment as a column type: `withReadType()`
+
+A fragment that carries no mapper — a raw `sql` template, a subquery expression
+(`asExpression()`), a `coalesce` over such operands — reads through the generic conversion: a
+text value `'007'` comes back as the number `7`, and a top-level NULL as `undefined`.
+`.withReadType(pgType)` makes the projection read it the way a COLUMN of that type reads, with no
+change to the SQL:
+
+```typescript
+db.books.select(b => ({
+  title: sql<string>`${b.titles}->>${lang}`.withReadType('text'),  // '007' stays '007'
+  weight: sql<number>`${b.meta}->>'weight'`.withReadType('numeric'), // '1.50' → 1.5
+}))
+```
+
+- a numeric string becomes a number only for a numeric type (`integer`, `bigint`, `numeric`, …);
+  `text`, `uuid`, `json`, … keep what the driver delivers;
+- SQL NULL reads `undefined` at the top level of a projection and `null` inside a nested object
+  (a grouped select keeps NULL as `null`, as it does for every field); inside a collection's items
+  the value stays as the JSON delivers it;
+- the fragment's mapper is dropped — a later `.mapWith()` sets one again and wins;
+- the read type is kept by `.as()`, by `selectDistinct`, by UNION legs (they read through the first
+  leg), by QueryBatch parts, by a grouped select, by the columns of a CTE or a table subquery that
+  projects it, and by a projected `asSubquery('scalar')` whose one value it is.
+
+The type name is validated like a cast's.
 
 ## Casts
 
@@ -101,6 +153,7 @@ literal('book')                 // 'book' — inlined, quoted safely
 literal(-5)                     // (-5)
 literal(true)                   // TRUE
 literal('x', 'varchar(8)')      // CAST('x' AS varchar(8))
+literalOf<'book' | 'film'>('book')  // 'book' — typed as the union, not as string
 typedNull<string>('text')       // CAST(NULL AS text)
 asBoolean(gte(member.age, 18))  // a condition as a boolean value
 quoteSqlLiteral("it's")         // "'it''s'" — the quoting behind literal()
@@ -125,6 +178,42 @@ const rows = await db.books
   .unionAll(db.films.select(f => ({ kind: literal('film'), title: f.title, isbn: typedNull<string>('text') })))
   .toList();
 ```
+
+`literal('book')` is a `SqlFragment<string>`. When the legs' discriminators should share a declared
+union type, use `literalOf`: it renders and reads exactly like `literal()`, but
+`literalOf<'book' | 'film'>('book')` is a `SqlFragment<'book' | 'film'>` (and a value outside the
+union is a compile error), so `rows[i].kind` is typed `'book' | 'film'`.
+
+## Bound parameters: `param()`
+
+```typescript
+param(value)                 // $1 — the value bound as given
+param(value, 'integer')      // CAST($1 AS integer)
+param([1, 2], 'integer[]')   // CAST($1 AS integer[]) — ONE array-literal parameter
+```
+
+`param()` is a parameter as an expression. It ALWAYS binds exactly one parameter — `null` and
+`undefined` bind as NULL — and never inlines, so the statement text does not depend on the value:
+
+```typescript
+// One text for every lookup form: unused keys bind NULL, which matches nothing
+db.accounts.where(a => and(
+  or(eq(a.id, param(byId, 'integer')), eq(a.ownerId, param(byOwner, 'integer'))),
+  or(param(anyOwner, 'boolean'), eq(a.ownerId, param(owner, 'integer'))),
+))
+
+// A JSON key bound instead of inlined: one statement text for every language
+db.pages.select(p => ({ title: jsonbPathText(p.titles, param(language)) }))   // "titles"->>$1
+```
+
+- Inside `eq()` it is compared, never rewritten: `eq(col, param(null, 'integer'))` is
+  `col = CAST($1 AS integer)` (no row matches), where `eq(col, null)` is `col IS NULL`, and
+  `castAsInt(null)` inlines `CAST(NULL AS integer)` (a different statement text).
+- The value binds as given — the compared column's `toDriver` mapper does not apply.
+- A JS array needs an array type and binds as its array literal (every driver accepts it); a JSON
+  document goes through `castAsJsonb` / `castAsJson`, which serialize it. A column or an expression
+  is refused (use it directly).
+- Reads back as the driver delivers the value. The type name is validated like a cast's.
 
 ## CASE
 
@@ -172,7 +261,9 @@ lower(x)   upper(x)   trim(x, chars?)   trimStart(x, chars?)   trimEnd(x, chars?
 length(x)                        // char_length
 concat(a, b, …)                  // NULL counts as ''
 concatWs(separator, a, b, …)     // skips NULLs
+concatStrict(a, b, …)            // (a || b || …) — NULL when ANY operand is NULL
 substring(x, start, count?)      // 1-based
+substring(x, pattern)            // POSIX regex: the first group's match, NULL without a match
 replace(x, from, to)
 regexpReplace(x, pattern, replacement, flags?)
 ```
@@ -180,14 +271,28 @@ regexpReplace(x, pattern, replacement, flags?)
 To match an expression index written with literal arguments, pass them through `literal()`:
 `regexpReplace(card.number, literal('[^0-9]'), literal(''), literal('g'))`.
 
+- `concatStrict` renders `(a || ' ' || b)`: columns and fragments as they are, `literal(' ')`
+  inline, a plain value bound as text (`CAST($1 AS text)`), `null` / `undefined` a typed NULL.
+  It needs at least two operands and reads the text as delivered (a digits-only result stays a
+  string, NULL stays null). `concat()` is unchanged (NULL counts as `''`).
+- `substring(x, pattern)` always renders the function-call form `substring(x, 'pattern')` — the
+  expression an index written that way holds — never `SUBSTRING(x FROM …)`.
+
 ## Math
 
 ```typescript
 round(x)  round(x, digits)  floor(x)  ceil(x)  abs(x)  mod(dividend, divisor)
+modulo(dividend, divisor)        // (dividend % divisor) — the operator, not mod()
 ```
 
 `round(x, digits)` casts `x` to numeric first (PostgreSQL has no `round(double precision,
 integer)`). Results read back as JS numbers.
+
+`modulo` computes what `mod` does, as the `%` OPERATOR: an expression index written with `%`
+(`CREATE INDEX … ((code % 10000000))`) is only used by a query spelling the same operator, never by
+`mod()`. Keep a constant divisor inline so a generic plan can still match the index:
+`eq(modulo(account.number, literal(10000000, 'bigint')), lastDigits)`. A value compared with it binds
+unchanged.
 
 ## Date and time
 
@@ -216,10 +321,11 @@ subInterval(value, '1 day')          // (value - interval)
 ## JSONB
 
 ```typescript
-jsonbPath(doc, 'dims', 'w')          // doc->'dims'->'w'   (jsonb)
-jsonbPathText(doc, 'dims', 'w')      // doc->'dims'->>'w'  (text)
+jsonbPath(doc, 'dims', 'w')          // (doc->'dims'->'w')   (jsonb)
+jsonbPathText(doc, 'dims', 'w')      // (doc->'dims'->>'w')  (text)
 jsonbPathText(doc, 'tags', 0)        // integers are array indexes (negative: from the end)
-jsonbPathText(doc, sql`${lang}`)     // a fragment key binds — one statement text for every key
+jsonbPathText(doc, param(lang))      // a bound key — (doc->>$1), one statement text for every key
+jsonbValueText(doc)                  // (doc #>> '{}') — the whole value as text
 
 jsonbSet(doc, ['dims', 'w'], 99, { createMissing? })
 jsonbRemoveKey(doc, 'a', 'b')        // doc - key(s)
@@ -232,7 +338,9 @@ jsonbHasAllKeys(doc, ['a', 'b'])          // ?&
 jsonbArrayLength(x)   jsonbTypeOf(x)   toJsonb(x)
 jsonbBuildObject({ id: book.id, author: { name: book.author.name }, fixed: 'v1' })
 jsonbBuildArray(a, b, …)
+jsonBuildObject({ … })   jsonBuildArray(a, b, …)   // the json twins
 jsonbPathExists(doc, '$.slots[*] ? (@.from <= $day)', { vars: { day }, silent? })
+jsonbPathExists(doc, literal('$.slots[*] ? (@.from <= $d)', 'jsonpath'), { vars: jsonbBuildObject({ d: row.day }) })
 ```
 
 - Unlike `jsonbSelect`, `jsonbPath` / `jsonbPathText` read the column as the jsonb it is — no
@@ -249,6 +357,17 @@ jsonbPathExists(doc, '$.slots[*] ? (@.from <= $day)', { vars: { day }, silent? }
   `caseWhen(eq(jsonbTypeOf(x), 'array'), jsonbArrayLength(x))`.
 - With `silent: true`, a strict path's structural error yields NULL instead of aborting the
   statement.
+- `jsonbPathExists` takes the path as a string — bound as ONE parameter, `CAST($1 AS jsonpath)` —
+  or as a fragment rendered verbatim: `literal(path, 'jsonpath')` keeps it INLINE, so a statement
+  repeating the predicate binds nothing for it. `vars` is a plain object (serialized to jsonb) or
+  a fragment rendered verbatim — `jsonbBuildObject({ d: expr })` passes per-row SQL values. A plain
+  `vars` object holding columns or expressions is refused (build it with `jsonbBuildObject`).
+- `jsonbValueText(doc)` is the whole value as text: a JSON string unquoted (`"x"` → `x`), a number
+  or boolean as its text, an object or array as its JSON text; SQL NULL and JSON `null` give NULL.
+  (`castAsString(doc)` — `jsonb::text` — keeps a string's quotes.)
+- `jsonBuildObject` / `jsonBuildArray` build `json` with exactly the operand rules of the `jsonb`
+  builders. `json` keeps the keys in the written order (jsonb sorts them) and is cheaper to build
+  when the value only travels to the client. Both read back as the driver-parsed JSON.
 
 ## Array columns
 
@@ -266,6 +385,99 @@ A JS list binds as ONE array-literal parameter cast to the column's declared arr
 statement text does not change with the list length. (`eqAny(column, list)` is the reverse
 shape: a scalar column against a list.)
 
+## Aggregates (`agg`)
+
+```typescript
+agg.count()                          // count(*)
+agg.count(x)                         // count(x) — the non-NULL values
+agg.countDistinct(x)                 // count(DISTINCT x)
+agg.sum(x, { distinct? })            // sum([DISTINCT] x)
+agg.avg(x, { distinct? })            // avg([DISTINCT] x)
+agg.min(x)   agg.max(x)              // min(x) / max(x)
+agg.bitOr(x) agg.bitAnd(x)           // bit_or(x) / bit_and(x)
+agg.arrayAgg(x, { distinct?, orderBy? })   // array_agg([DISTINCT] x [ORDER BY …])
+agg.jsonAgg(x, { distinct?, orderBy? })    // json_agg(…)
+agg.jsonbAgg(x, { distinct?, orderBy? })   // jsonb_agg(…)
+agg.count().filter(condition)        // count(*) FILTER (WHERE condition)
+```
+
+Aggregates as fragments. A select of them WITHOUT `groupBy()` aggregates the whole filtered set
+into ONE row — also over zero input rows, where a count is 0 and every other aggregate NULL:
+
+```typescript
+const [stats] = await db.loans
+  .where(l => eq(l.memberId, memberId))
+  .select(l => ({
+    loans: agg.count(),
+    open: agg.count().filter(isNull(l.returnedAt)),
+    books: agg.countDistinct(l.bookId),
+    lastDue: agg.max(l.dueAt),                          // read through the column's mapper
+    titles: agg.arrayAgg(l.book.title, { distinct: true, orderBy: [[l.book.title, 'ASC']] }),
+  }))
+  .toList();
+```
+
+Such a select is one row, so its `count()` is refused (a COUNT over the input rows would say
+otherwise) — count the rows of a select without aggregates.
+
+Inside `asSubquery('scalar')` they make an aggregate per enclosing row — projected, such a
+subquery of ONE aggregate reads like the aggregate itself (`agg.max(text)` keeps `'007'`, a mapped
+column's MIN / MAX goes through its mapper) — and inside a grouped select
+(`groupBy(...).select(g => …)`) an aggregate per group, over the keys it reads through `g.key` — in
+the plain `GROUP BY` form and in the subquery form of an expression-keyed grouping alike:
+
+```typescript
+db.members.select(m => ({
+  loans: db.loans.where(l => eq(l.memberId, m.id)).select(() => agg.count()).asSubquery('scalar'),
+  items: db.loans.where(l => eq(l.memberId, m.id))
+    .select(l => coalesce(agg.jsonAgg(jsonBuildArray(l.id, l.dueAt), { orderBy: [[l.dueAt, 'DESC']] }), literal('[]', 'json')))
+    .asSubquery('scalar'),
+}))
+```
+
+- Function names render lower-case; an ORDER BY key always carries its direction (`ASC` by
+  default). A key is a column or an expression, optionally `[key, 'ASC' | 'DESC']`; a plain JS value
+  is refused.
+- `.filter(condition)` appends ` FILTER (WHERE <condition>)`, the condition rendered bare
+  (`and()` / `or()` keep their own parentheses, a raw `sql` operand of them gets its own). A second
+  `.filter()` is ANDed with the first. A collection's `exists()` is a condition here too. The
+  fragments are immutable: `.filter()` returns a new one.
+- Parameters number in textual order: the argument, the ORDER BY keys, the FILTER.
+- With `distinct`, PostgreSQL requires every ORDER BY key to render exactly as the argument: a key
+  that binds a parameter (`sql\`${x} || ${'!'}\``) renders a new `$n` each time and is refused up
+  front — inline its constants with `literal()`.
+- A list aggregate over zero rows is NULL, not `[]`. For an always-array wrap `jsonAgg` / `jsonbAgg`
+  in `coalesce(…, literal('[]', 'json'))` (or `'jsonb'`), and `arrayAgg` in
+  `coalesce(…, literal('{}', 'integer[]'))` — the array type of its elements.
+- Reads: `count`, `countDistinct`, `sum`, `avg`, `bitOr`, `bitAnd` → JS numbers (int8 / numeric text
+  converted; NULL stays null); `min` / `max` → like `g.min()` / `g.max()`: through the operand's
+  mapper (a mapped timestamp column reads as its mapped type), as a JS number for an unmapped
+  numeric / int8 operand, else as the driver delivers the value; `arrayAgg` → an array whose
+  ELEMENTS go through the operand's mapper; `jsonAgg` / `jsonbAgg` → the driver-parsed JSON, no
+  per-element mapping (timestamps inside stay the JSON strings PostgreSQL produced; a column behind
+  a custom mapper stays its stored value, although the element type names the mapped type —
+  aggregate a `jsonBuildObject` / `jsonBuildArray` of the values you want, typed explicitly).
+- The unmapped ELEMENTS of an `arrayAgg` are what the driver's native array decoding makes of them:
+  an int8 is a string everywhere, a numeric a JS number on node-postgres and in memory but a string
+  (`'1.50'`) on postgres.js, Bun and PGlite. Map them (`.mapWith(…)`) if the type must not depend on
+  the driver.
+- On a driver that cannot decode native array results (Bun's binary protocol,
+  `supportsBinaryArrayResults() === false`) the list the driver reads directly — a projected
+  `arrayAgg` (through `.as()` / `.mapWith()` / `.withReadType()`), a nested object's, a grouped or
+  CTE-rooted select's, a UNION ALL leg's, and that of a projected `asSubquery('scalar')` of one —
+  renders as JSON: `json_agg(…)` with the same arguments, and for int8 / numeric / money elements
+  `to_json(CAST(array_agg(…) AS text[]))`, so each element arrives as its exact text in the
+  aggregate's own DISTINCT / ORDER BY order (a JSON number would lose an int8's precision). A
+  date / timestamp element then arrives as its JSON text (`'2024-03-10T23:30:00'`), as inside a
+  collection, where the native array read a `Date`. Wherever SQL consumes the list — a function
+  argument (`cardinality(…)`), an operand, a `coalesce` / CASE, a WHERE or HAVING, a CTE body, a
+  UNION / INTERSECT / EXCEPT leg (their rows are compared; json has no equality) — it stays
+  `array_agg`: the value reaching the driver there is a native array.
+- postgres.js decodes a NULL ELEMENT of a native array wrongly (`'NULL'` in a `text[]`, `NaN` in an
+  `int4[]`) — a known driver defect, for every native-array read on it, `arrayAgg` included.
+  Filter NULLs out (`.filter(isNotNull(x))`) or use `jsonAgg` where elements can be NULL on that
+  driver.
+
 ## Conditions nested in fragments
 
 A condition interpolated into a fragment — `sql\`${eq(book.author.name, x)}\``, a CASE branch,
@@ -273,8 +485,15 @@ A condition interpolated into a fragment — `sql\`${eq(book.author.name, x)}\``
 detection sees through any nesting. (Before 1.0.7 a navigation used only inside such a nested
 condition was never joined.)
 
+A fragment that renders its own way — `exists(...)`, `notExists(...)`, an aggregate, a CASE —
+keeps its SQL and its references through `.as()`, `.mapWith()`, `.withReadType()` and
+`sql.join(...)`. (Before 1.0.9 `exists(sub).as('x')` rendered an empty expression, `,  as "x"`, and
+dropped the subquery's outer references.)
+
 ## See Also
 
 - [Querying](./querying.md) — the query builder and the condition operators
+- [Subquery Guide](./subquery-guide.md) — `eqAnySubquery` / `neAllSubquery`, `asExpression()`,
+  subqueries as comparison operands
 - [Insert/Update/Upsert/BULK](./insert-update-guide.md) — expressions as UPDATE / upsert values,
   `updateSet` / `set`, advisory locks

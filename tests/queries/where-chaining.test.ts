@@ -179,6 +179,20 @@ describe('WHERE Clause Chaining', () => {
       });
     });
 
+    test('a raw OR fragment keeps its grouping when another where() is chained after it', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // alice (25, active), bob (35, active), charlie (45, inactive): only alice is both
+        const users = await db.users
+          .where(u => sql<boolean>`${u.age} > 40 OR ${u.age} < 30`)
+          .where(u => eq(u.isActive, true))
+          .toList();
+
+        expect(users.map(u => u.username)).toEqual(['alice']);
+      });
+    });
+
     test('should chain where with like condition', async () => {
       await withDatabase(async (db) => {
         await seedTestData(db);

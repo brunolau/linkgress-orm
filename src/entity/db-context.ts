@@ -1,10 +1,12 @@
 import { DatabaseClient, QueryResult, TransactionalClient, QueryExecutionOptions } from '../database/database-client.interface';
+import { sqlStateOf } from '../database/sql-state';
 import { TableBuilder, TableSchema, InferTableType } from '../schema/table-builder';
 import { DbColumn, UnwrapDbColumns, InsertData, UpdateData, UpsertData, ExtractDbColumns, ExtractDbColumnKeys } from './db-column';
+import { createColumnRow, type ColumnRow } from './column-row';
 import { DbEntity, EntityConstructor, EntityMetadataStore } from './entity-base';
 import { DbModelConfig } from './model-config';
 import { JoinQueryBuilder } from '../query/join-builder';
-import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, UnwrapSelection, FieldRef, WhereConditionBase, inArray } from '../query/conditions';
+import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, UnwrapSelection, FieldRef, WhereConditionBase, inArray, type FieldLike } from '../query/conditions';
 import { LinkgressConfig } from '../config/linkgress-config';
 import {
   ResolveCollectionResults,
@@ -31,9 +33,12 @@ import { InferRowType } from '../schema/row-type';
 import { DbSchemaManager } from '../migration/db-schema-manager';
 import { splitViewsFromRegistry } from '../migration/view-sql';
 import { renderViewDefinition } from '../migration/view-query-sql';
-import { DbSequence, SequenceConfig } from '../schema/sequence-builder';
+import { DbSequence, SequenceConfig, renderSequenceOptions } from '../schema/sequence-builder';
 import type { DbCte } from '../query/cte-builder';
+import { projectedColumnRef } from '../query/cte-builder';
 import { CteRootQueryBuilder } from '../query/cte-root-query';
+import { AliasedScope } from '../query/aliased-scope';
+import { SetQueryBuilder } from '../query/set-returning';
 import type { Subquery } from '../query/subquery';
 import type { UnionQueryBuilder } from '../query/union-builder';
 import type { FutureQuery, FutureSingleQuery, FutureCountQuery } from '../query/future-query';
@@ -748,6 +753,19 @@ export class TimeTracer {
 export type LoggingOptions = QueryOptions;
 
 /**
+ * Per-statement options a builder hands the context's executor with one statement.
+ */
+export interface StatementExecutionOptions extends Pick<QueryExecutionOptions, 'prepare'> {
+  /**
+   * SQLSTATEs this statement is EXPECTED to fail with — a race the caller detects and retries (a unique
+   * violation, `23505`, when two writers mint the same number), a probe. Such a failure is still thrown, but
+   * the failed-query logger ({@link QueryOptions.logFailedQueries}) does not report it. Any other failure is
+   * reported as always.
+   */
+  expectedErrorCodes?: readonly string[];
+}
+
+/**
  * Query executor with optional logging
  */
 export class QueryExecutor {
@@ -865,7 +883,7 @@ export class QueryExecutor {
     }
   }
 
-  async query(sql: string, params?: any[], execution?: Pick<QueryExecutionOptions, 'prepare'>): Promise<QueryResult> {
+  async query(sql: string, params?: any[], execution?: StatementExecutionOptions): Promise<QueryResult> {
     const logger = this.options.logger || defaultLogger;
     const timing = this.beginTiming();
 
@@ -883,7 +901,11 @@ export class QueryExecutor {
       this.finishTiming(timing, logger, sql, params);
       return result;
     } catch (error) {
-      this.logFailure(logger, error, sql, params);
+      const sqlState = execution?.expectedErrorCodes ? sqlStateOf(error) : undefined;
+
+      if (sqlState === undefined || !execution!.expectedErrorCodes!.includes(sqlState)) {
+        this.logFailure(logger, error, sql, params);
+      }
       throw error;
     }
   }
@@ -1036,9 +1058,10 @@ export interface UpsertConfig {
   overridingSystemValue?: boolean;
 
   /**
-   * WHERE clause for the conflict target
+   * WHERE clause for the conflict target: SQL text, or a typed predicate over the row's columns
+   * (see {@link EntityUpsertConfig.targetWhere})
    */
-  targetWhere?: string;
+  targetWhere?: string | ((row: any) => Condition);
 
   /**
    * WHERE clause for the UPDATE SET
@@ -1185,6 +1208,32 @@ export interface FluentInsertMany<TEntity extends DbEntity> extends PromiseLike<
 }
 
 /**
+ * The source row {@link DbEntityTable.insertFrom} hands its `map` and `where`: one ref per column of the
+ * source subquery, rendering `"src"."<column>"`.
+ */
+export type InsertFromSourceRow<TSource> = { readonly [K in keyof TSource]: FieldRef<K & string, TSource[K]> };
+
+/**
+ * What {@link DbEntityTable.insertFrom} inserts, by column: a source ref (`src.total`), an `sql` expression
+ * (inline, its parameters in sequence), or a plain value — bound through the column's mapper and cast to the
+ * column's type. `undefined` leaves the column out (its default applies); `null` inserts a typed NULL.
+ */
+export type InsertFromValues<TEntity> = {
+  [K in keyof ExtractDbColumns<TEntity>]?: ExtractDbColumns<TEntity>[K] | FieldLike<any> | WhereConditionBase | null;
+};
+
+/** Options of {@link DbEntityTable.insertFrom}. */
+export interface InsertFromOptions<TSource> {
+  /** Insert only the source rows this condition holds for (`WHERE <condition>` over `"src"`). */
+  where?: (src: InsertFromSourceRow<TSource>) => Condition;
+  /**
+   * SQLSTATEs the statement is expected to fail with (a unique violation a caller retries): still thrown,
+   * not reported by the failed-query logger — see {@link StatementExecutionOptions.expectedErrorCodes}.
+   */
+  expectedErrorCodes?: readonly string[];
+}
+
+/**
  * Fluent update operation
  */
 export interface FluentUpdate<TEntity extends DbEntity> extends PromiseLike<void> {
@@ -1227,47 +1276,55 @@ export type FluentMerge<TEntity extends DbEntity> = FluentUpsert<TEntity>;
  * `TRow` is what a `.returning(selector)` reads the deleted row as: over an entity table its
  * columns, navigations and collections (`EntityQuery`), so conditions, `sql` expressions and
  * collection aggregates over them type-check — it was typed as the row's plain values.
+ * `TOld` is the `old` row the selector receives as its second argument (PostgreSQL 18).
  */
-export interface FluentDelete<TSelection, TRow = TSelection> extends PromiseLike<void> {
+export interface FluentDelete<TSelection, TRow = TSelection, TOld = any> extends PromiseLike<void> {
   /** Return the number of deleted rows */
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the deleted rows */
   returning(): PromiseLike<TSelection[]>;
-  /** Return selected columns from the deleted rows (SqlFragment fields unwrap to their value type) */
-  returning<TResult>(selector: (row: TRow) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  /**
+   * Return selected columns from the deleted rows (SqlFragment fields unwrap to their value type).
+   * `old` (PostgreSQL 18) is the deleted row's own columns, rendered `old."<column>"` and read through
+   * the column's mapper; it cannot be combined with navigations or collections in one RETURNING.
+   */
+  returning<TResult>(selector: (row: TRow, old: TOld) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
   /**
    * Compile this DELETE into `{ sql, params }` WITHOUT executing it — same
    * WHERE/USING semantics as execution (navigation joins in the WHERE become
    * `DELETE … USING`, fragment-capable RETURNING included; navigation RETURNING
    * is not supported here). Attach the result as a data-modifying CTE via
-   * {@link DbCteBuilder.withMutation}.
+   * {@link DbCteBuilder.withMutation} — typed by the selector's row.
    */
-  toStatement<TResult>(selector?: (row: TRow) => TResult): {
-    sql: string;
-    params: any[];
-  };
+  toStatement<TResult>(selector?: (row: TRow) => TResult): import('../query/cte-builder').CompiledStatement<UnwrapSelection<TResult>>;
 }
 
 /**
  * Fluent update operation for SelectQueryBuilder
  * Used with db.table.where(...).update(data)
  *
- * `TRow` is what a `.returning(selector)` reads the updated row as (see {@link FluentDelete}).
+ * `TRow` is what a `.returning(selector)` reads the updated row as (see {@link FluentDelete}), `TOld`
+ * the `old` row it receives as its second argument.
  */
-export interface FluentQueryUpdate<TSelection, TRow = TSelection> extends PromiseLike<void> {
+export interface FluentQueryUpdate<TSelection, TRow = TSelection, TOld = any> extends PromiseLike<void> {
   /** Return the number of updated rows */
   affectedCount(): PromiseLike<number>;
   /** Return all columns from the updated rows */
   returning(): PromiseLike<TSelection[]>;
-  /** Return selected columns from the updated rows (SqlFragment fields unwrap to their value type) */
-  returning<TResult>(selector: (row: TRow) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
+  /**
+   * Return selected columns from the updated rows (SqlFragment fields unwrap to their value type).
+   * `old` (PostgreSQL 18) is the row's own columns BEFORE the update, rendered `old."<column>"` and read
+   * through the column's mapper — `(row, old) => ({ status: row.status, previous: old.status })`; it
+   * cannot be combined with navigations or collections in one RETURNING.
+   */
+  returning<TResult>(selector: (row: TRow, old: TOld) => TResult): PromiseLike<UnwrapSelection<TResult>[]>;
   /**
    * Compile this UPDATE into `{ sql, params }` WITHOUT executing it — same
    * SET/WHERE semantics as execution (SqlFragment values, fragment-capable
    * RETURNING; navigation RETURNING unsupported). Attach the result as a
-   * data-modifying CTE via {@link DbCteBuilder.withMutation}.
+   * data-modifying CTE via {@link DbCteBuilder.withMutation} — typed by the selector's row.
    */
-  toStatement<TResult>(selector?: (row: TRow) => TResult): { sql: string; params: any[] };
+  toStatement<TResult>(selector?: (row: TRow) => TResult): import('../query/cte-builder').CompiledStatement<UnwrapSelection<TResult>>;
 }
 
 /**
@@ -1281,7 +1338,7 @@ export class InsertBuilder<TSchema extends TableSchema> {
   private updateColumnFilter?: (columnName: string) => boolean;
   /** `doUpdate({ set })`: the values a conflicting row is updated TO, by property name */
   private setValues?: Record<string, unknown>;
-  private targetWhereClause?: string;
+  private targetWhereClause?: string | ((row: any) => Condition);
   private setWhereClause?: string;
   private overridingSystemValue: boolean = false;
 
@@ -1350,9 +1407,11 @@ export class InsertBuilder<TSchema extends TableSchema> {
   }
 
   /**
-   * Set target WHERE clause for ON CONFLICT
+   * Set target WHERE clause for ON CONFLICT — the arbiter predicate of a PARTIAL unique index: SQL text, or
+   * a typed predicate over the row's columns (unqualified, bind-free — see
+   * {@link EntityUpsertConfig.targetWhere})
    */
-  targetWhere(where: string): this {
+  targetWhere(where: string | ((row: any) => Condition)): this {
     this.targetWhereClause = where;
     return this;
   }
@@ -1429,8 +1488,9 @@ export class InsertBuilder<TSchema extends TableSchema> {
       }
 
       // Add target WHERE clause
-      if (this.targetWhereClause) {
-        sql += ` WHERE ${this.targetWhereClause}`;
+      const arbiterPredicate = renderArbiterPredicate(this.schema, this.targetWhereClause);
+      if (arbiterPredicate) {
+        sql += ` WHERE ${arbiterPredicate}`;
       }
 
       if (this.conflictAction === 'nothing') {
@@ -1877,7 +1937,7 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
     primaryKeys: string[],
     updateColumnFilter: (colId: string) => boolean,
     overridingSystemValue: boolean,
-    targetWhere?: string,
+    targetWhere?: string | ((row: any) => Condition),
     setWhere?: string
   ): Promise<InferTableType<TableSchema>[]> {
     const builder = new InsertBuilder(this.schema, this.client, this.executor);
@@ -2074,6 +2134,42 @@ function renderValuesCell(value: unknown, mapper: any, context: SqlBuildContext,
   return `$${context.paramCounter++}${cast}`;
 }
 
+/**
+ * The `ON CONFLICT (…) WHERE <predicate>` of an upsert — the arbiter predicate that makes a PARTIAL unique
+ * index the conflict target — or `undefined` for none. Raw SQL is used as given. A typed predicate receives
+ * the target row's columns as UNQUALIFIED refs (`"is_current"`, the spelling of the index predicate; the
+ * table is the only relation in scope there) and must not bind anything: PostgreSQL infers the arbiter
+ * index at PLAN time, and in a generic plan (a prepared statement after its fifth execution) a `$n` is not
+ * a constant, the implication proof fails and the statement raises 42P10 — so a bound value or a
+ * placeholder is refused here, before anything runs. Navigations are not in scope.
+ */
+function renderArbiterPredicate(
+  schema: { name: string; columns: Record<string, unknown>; relations: Record<string, unknown> },
+  targetWhere: string | ((row: any) => Condition) | undefined
+): string | undefined {
+  if (typeof targetWhere !== 'function') {
+    return targetWhere || undefined;
+  }
+
+  const condition = targetWhere(createColumnRow(schema, null, 'upsert targetWhere'));
+
+  if (!(condition instanceof WhereConditionBase)) {
+    throw new TypeError('upsert targetWhere must return a condition');
+  }
+
+  const context: SqlBuildContext = { paramCounter: 1, params: [] };
+  const predicate = condition.buildSql(context);
+
+  if (context.params.length > 0 || context.paramCounter !== 1 || (context.placeholders?.size ?? 0) > 0) {
+    throw new Error(
+      'upsert targetWhere: the conflict-arbiter predicate must not bind parameters — PostgreSQL infers the '
+      + 'partial unique index from it at plan time; write constants with literal()'
+    );
+  }
+
+  return predicate;
+}
+
 /** The column refs an assigned value reads (a bare ref, or the refs of a fragment / condition). */
 function collectRefsOf(value: unknown): FieldRef[] {
   if (value instanceof WhereConditionBase) {
@@ -2122,6 +2218,11 @@ function int8Param(name: string, value: unknown): string {
 
 export class DataContext<TSchema extends ContextSchema = any> {
   protected client: DatabaseClient;
+  /**
+   * The client the context was created with — a transaction's context keeps it: statements that must
+   * outlive the transaction (a runtime sequence's CREATE) run on it.
+   */
+  protected rootClient: DatabaseClient;
   private schemaRegistry = new Map<string, TableSchema>();
   private tableAccessors = new Map<string, TableAccessor<any>>();
   private executor?: QueryExecutor;
@@ -2129,6 +2230,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
   constructor(client: DatabaseClient, schema: TSchema, queryOptions?: QueryOptions) {
     this.client = client;
+    this.rootClient = client;
     this.queryOptions = queryOptions;
 
     // Create executor if logging is enabled
@@ -2254,7 +2356,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
   advisoryXactLock(key: AdvisoryLockKey): Promise<void>;
   advisoryXactLock(classId: number, key: AdvisoryLockKey): Promise<void>;
   async advisoryXactLock(first: AdvisoryLockKey, second?: AdvisoryLockKey): Promise<void> {
-    const call = this.advisoryLockCall('advisoryXactLock', 'pg_advisory_xact_lock', first, second);
+    const call = this.advisoryLockCall('advisoryXactLock', 'pg_advisory_xact_lock', arguments.length >= 2, first, second);
     await this.runLockStatement(`SELECT ${call.sql}`, call.params);
   }
 
@@ -2267,7 +2369,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
   tryAdvisoryXactLock(key: AdvisoryLockKey): Promise<boolean>;
   tryAdvisoryXactLock(classId: number, key: AdvisoryLockKey): Promise<boolean>;
   async tryAdvisoryXactLock(first: AdvisoryLockKey, second?: AdvisoryLockKey): Promise<boolean> {
-    const call = this.advisoryLockCall('tryAdvisoryXactLock', 'pg_try_advisory_xact_lock', first, second);
+    const call = this.advisoryLockCall('tryAdvisoryXactLock', 'pg_try_advisory_xact_lock', arguments.length >= 2, first, second);
     const result = await this.runLockStatement(`SELECT ${call.sql} AS "acquired"`, call.params);
     return result.rows[0]?.acquired === true;
   }
@@ -2276,7 +2378,9 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * Take the transaction-scoped advisory lock of every key in ONE statement, in a fixed order
    * (duplicates removed, numbers ascending / strings in code-unit order), so two transactions
    * locking overlapping key sets can never deadlock on each other. All keys of one call must
-   * be of one kind: integers (int4) or strings (hashed with `hashtext()`).
+   * be of one kind: integers (int4) or strings (hashed with `hashtext()`). The order is an SQL
+   * guarantee — `unnest(…) WITH ORDINALITY … ORDER BY t.ord`: PostgreSQL evaluates the volatile
+   * lock call after the sort — not the executor's scan order.
    *
    * @example
    * await db.transaction(async tx => {
@@ -2305,7 +2409,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     if (allStrings) {
       const unique = Array.from(new Set(keys as string[])).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       await this.runLockStatement(
-        'SELECT pg_advisory_xact_lock($1, hashtext(k)) FROM unnest(CAST($2 AS text[])) AS t(k)',
+        'SELECT pg_advisory_xact_lock($1, hashtext(t.k)) FROM unnest(CAST($2 AS text[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord',
         [classId, toPgArrayLiteral(unique)]
       );
       return;
@@ -2319,7 +2423,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
     const unique = Array.from(new Set(numbers)).sort((a, b) => a - b);
 
     await this.runLockStatement(
-      'SELECT pg_advisory_xact_lock($1, k) FROM unnest(CAST($2 AS integer[])) AS t(k)',
+      'SELECT pg_advisory_xact_lock($1, t.k) FROM unnest(CAST($2 AS integer[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord',
       [classId, toPgArrayLiteral(unique)]
     );
   }
@@ -2338,16 +2442,21 @@ export class DataContext<TSchema extends ContextSchema = any> {
     }
   }
 
-  /** The `fn(…)` call text and params of an advisory lock over one key or a (classId, key) pair. */
+  /**
+   * The `fn(…)` call text and params of an advisory lock over one key or a (classId, key) pair. `pair` is
+   * how many arguments the caller PASSED (`arguments.length >= 2`), never whether the second is defined:
+   * `(classId, undefined)` taking the one-key overload would lock the single key `classId` instead.
+   */
   private advisoryLockCall(
     method: string,
     fn: string,
+    pair: boolean,
     first: AdvisoryLockKey,
     second: AdvisoryLockKey | undefined
   ): { sql: string; params: any[] } {
     this.assertAdvisoryTransaction(method);
 
-    if (second === undefined) {
+    if (!pair) {
       if (typeof first === 'string') {
         return { sql: `${fn}(hashtext($1))`, params: [first] };
       }
@@ -2361,6 +2470,11 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
     if (typeof second === 'string') {
       return { sql: `${fn}($1, hashtext($2))`, params: [first, second] };
+    }
+
+    // null used to pass as key 0 (`Number(null)`), a boolean as 0 / 1
+    if (typeof second !== 'number' && typeof second !== 'bigint') {
+      throw new TypeError(`${method}: the key of a key pair must be an integer or a string, got ${String(second)}`);
     }
 
     const key = Number(second);
@@ -2402,11 +2516,36 @@ export class DataContext<TSchema extends ContextSchema = any> {
    *   }))
    *   .toList();
    * ```
+   *
+   * `alias` renders the root as `FROM "<cte>" AS "<alias>"` (its columns `"<alias>"."<column>"`): a
+   * subquery over a CTE correlated to an enclosing query over the SAME CTE needs one — both rows would
+   * otherwise be named after the CTE, and such a correlation is refused.
    */
   selectFromCte<TRootColumns extends Record<string, any>>(
-    rootCte: DbCte<TRootColumns>
+    rootCte: DbCte<TRootColumns>,
+    alias?: string
   ): CteRootQueryBuilder<TRootColumns> {
-    return new CteRootQueryBuilder(rootCte, this.client, this.executor);
+    return new CteRootQueryBuilder(rootCte, this.client, this.executor, alias);
+  }
+
+  /**
+   * A query over a set-returning function — `SELECT … FROM <call> AS "<alias>"(<columns>)` — run on
+   * this context: `.where()`, `.select()`, `.orderBy()`, `.limit()`, then `.toList()` /
+   * `.firstOrDefault()`. The set's columns read back as the driver delivers them (text stays text).
+   * The alias defaults to the function's name. `fromSet()` builds the same query without a context,
+   * to embed it.
+   *
+   * @example
+   * const rows = await db
+   *   .selectFromSet(unnest(names, 'text'), 'n')
+   *   .select(n => ({ name: n.value, key: lower(n.value) }))
+   *   .toList();
+   */
+  selectFromSet<TRow extends Record<string, unknown>>(
+    set: import('../query/set-returning').SetReturningFunction<TRow>,
+    alias?: string
+  ): import('../query/set-returning').SetQueryBuilder<TRow, TRow> {
+    return SetQueryBuilder.create(set, alias, this.client, this.executor);
   }
 
   /**
@@ -2473,6 +2612,7 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
     // Set up the transactional client
     txContext.client = txClient;
+    txContext.rootClient = this.rootClient;
 
     // Share read-only schema registry
     (txContext as any).schemaRegistry = this.schemaRegistry;
@@ -2580,9 +2720,27 @@ export type EntityUpsertConfig<TEntity extends DbEntity> = {
   overridingSystemValue?: boolean;
 
   /**
-   * WHERE clause for the conflict target
+   * The arbiter predicate of the conflict target — `ON CONFLICT (<cols>) WHERE <predicate>` — that
+   * makes a PARTIAL unique index the arbiter. PostgreSQL infers the index when this predicate implies
+   * the index's own (equal or stronger); otherwise the statement raises 42P10.
+   *
+   * SQL text, or a typed predicate over the row's columns:
+   *
+   * ```typescript
+   * // index: UNIQUE (owner_ref, slot) WHERE is_current = true
+   * db.links.upsertBulk(rows, {
+   *   primaryKey: ['ownerRef', 'slot'],
+   *   targetWhere: e => eq(e.isCurrent, literal(true)),
+   * });
+   * // → ON CONFLICT ("owner_ref", "slot") WHERE "is_current" = TRUE DO UPDATE …
+   * ```
+   *
+   * The typed predicate's columns render UNQUALIFIED (navigations are not in scope) and it must not
+   * bind anything — write constants with `literal()`: PostgreSQL infers the arbiter at PLAN time, and a
+   * bound `$n` is no constant in a generic plan (a prepared statement after its fifth execution), where
+   * the statement would then fail with 42P10. A predicate that binds a value or a placeholder throws.
    */
-  targetWhere?: string;
+  targetWhere?: string | ((row: ColumnRow<TEntity>) => Condition);
 
   /**
    * WHERE clause for the UPDATE SET
@@ -2952,6 +3110,16 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   with(...ctes: import('../query/cte-builder').DbCte<any>[]): IEntityQueryable<TEntity>;
 
   /**
+   * Join a set-returning function to every row (`CROSS JOIN LATERAL <call> AS "<alias>"(…)`) and
+   * project the rows it multiplies into — see SelectQueryBuilder.crossJoinLateral.
+   */
+  crossJoinLateral<TSetRow extends Record<string, unknown>, TSelection>(
+    source: (entity: EntityQuery<TEntity>) => import('../query/set-returning').SetReturningFunction<TSetRow>,
+    selector: (entity: EntityQuery<TEntity>, set: import('../query/set-returning').SetRow<TSetRow>) => TSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>>;
+
+  /**
    * Left join with another table, CTE, or subquery
    */
   leftJoin<TRight extends DbEntity, TSelection>(
@@ -3028,7 +3196,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Delete records matching the current WHERE condition
    * Returns a fluent builder that can be awaited directly or chained with .returning()
    */
-  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>>;
+  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>, ColumnRow<TEntity>>;
 
   /**
    * Update records matching the current WHERE condition
@@ -3043,7 +3211,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   update(
     data: UpdateData<TEntity>
       | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
-  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>>;
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>, ColumnRow<TEntity>>;
 
   /**
    * Create a prepared query for efficient reusable parameterized execution
@@ -3213,6 +3381,16 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   groupBy<TGroupingKey>(
     selector: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TGroupingKey
   ): import('../query/grouped-query').GroupedQueryBuilder<TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, TGroupingKey>;
+
+  /**
+   * Join a set-returning function to every row (`CROSS JOIN LATERAL <call> AS "<alias>"(…)`) and
+   * project the rows it multiplies into — see SelectQueryBuilder.crossJoinLateral.
+   */
+  crossJoinLateral<TSetRow extends Record<string, unknown>, TNewSelection>(
+    source: (row: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => import('../query/set-returning').SetReturningFunction<TSetRow>,
+    selector: (row: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection, set: import('../query/set-returning').SetRow<TSetRow>) => TNewSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TNewSelection>>;
 
   // Aggregations
   min<TResult = TSelection>(selector?: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : TSelection) => TResult): Promise<TResult | null>;
@@ -3392,6 +3570,16 @@ export class EntityInsertBuilder<TEntity extends DbEntity> {
   }
 
   /**
+   * The arbiter predicate of the conflict target — `ON CONFLICT (…) WHERE <predicate>` — that makes a
+   * PARTIAL unique index the arbiter: SQL text, or a typed predicate over the row's columns, rendered
+   * unqualified and bind-free (see {@link EntityUpsertConfig.targetWhere}).
+   */
+  targetWhere(where: string | ((row: ColumnRow<TEntity>) => Condition)): this {
+    this.builder.targetWhere(where);
+    return this;
+  }
+
+  /**
    * Execute the insert/upsert
    */
   async execute(): Promise<UnwrapDbColumns<TEntity>[]> {
@@ -3452,6 +3640,29 @@ export class DbEntityTable<TEntity extends DbEntity> {
    */
   _getSchemaRegistry(): Map<string, TableSchema> {
     return (this.context as any).schemaRegistry;
+  }
+
+  /**
+   * This table under an explicit alias, as the root of a correlated subquery: join more aliased
+   * tables, filter, order, limit, and turn it into ONE expression — `scalar(...)`, `exists()`,
+   * `notExists()`. Its row is column-only (`"<alias>"."col"`); whatever else a callback reads is an
+   * outer ref of the enclosing statement (joined there when it is a navigation). See
+   * {@link AliasedScope}.
+   *
+   * @example
+   * db.users.select(u => ({
+   *   name: u.username,
+   *   topPost: db.posts.as('p2')
+   *     .where(p => eq(p.userId, u.id))
+   *     .orderBy(p => [[p.views, 'DESC']])
+   *     .limit(1)
+   *     .scalar(p => p.title),
+   * }))
+   */
+  // `TScope` is always TEntity (it has no other source): declared on the method, the row type does
+  // not make DbEntityTable<T> incomparable with DbEntityTable<any>
+  as<TScope extends DbEntity = TEntity>(alias: string): AliasedScope<[import('./column-row').ColumnRow<TScope>]> {
+    return AliasedScope.forTable<TScope>(this._getSchema(), alias);
   }
 
   /**
@@ -4085,6 +4296,19 @@ export class DbEntityTable<TEntity extends DbEntity> {
   }
 
   /**
+   * Join a set-returning function to every row of the table (`CROSS JOIN LATERAL <call> AS
+   * "<alias>"(…)`) and project the rows it multiplies into — see
+   * {@link IEntityQueryable.crossJoinLateral}.
+   */
+  crossJoinLateral<TSetRow extends Record<string, unknown>, TSelection>(
+    source: (entity: EntityQuery<TEntity>) => import('../query/set-returning').SetReturningFunction<TSetRow>,
+    selector: (entity: EntityQuery<TEntity>, set: import('../query/set-returning').SetRow<TSetRow>) => TSelection,
+    alias: string
+  ): EntitySelectQueryBuilder<TEntity, UnwrapSelection<TSelection>> {
+    return (this.asEntityQueryable() as any).crossJoinLateral(source, selector, alias);
+  }
+
+  /**
    * Entity queryable over all rows (select-all shape) — shared bootstrap for
    * filter-joins invoked directly on the table.
    */
@@ -4407,6 +4631,183 @@ export class DbEntityTable<TEntity extends DbEntity> {
         };
       }
     };
+  }
+
+  /**
+   * `INSERT … SELECT` from a table subquery, in ONE statement:
+   *
+   *   INSERT INTO <table> (<cols>) SELECT <values> FROM (<source>) AS "src" [WHERE <condition>] [RETURNING …]
+   *
+   * `map` receives the source row (`src.<column>` renders `"src"."<column>"`) and returns the values by
+   * column, in its key order: a source ref, an `sql` expression (inline, its parameters in sequence), or a
+   * plain value — bound through the column's mapper and CAST to the column's type (an untyped parameter in
+   * a SELECT list would resolve as text). `undefined` leaves a column out. The parameters number in build
+   * order: the source's, the SELECT list's, then `where`'s. Zero source rows, or a `where` that holds for
+   * none, insert nothing (`[]` from `.returning()`). Runs on the context's executor — inside its
+   * transaction when the context is a transaction's.
+   *
+   * `expectedErrorCodes` names SQLSTATEs the statement is expected to fail with — a unique violation a
+   * caller retries when two writers compute the same next number: still thrown, but not reported by the
+   * failed-query logger.
+   *
+   * @example
+   * // the next number of a band: COALESCE(MAX(number), MIN) + gap — an aggregate without GROUP BY, one row
+   * const next = db.badges
+   *   .where(b => between(b.number, MIN, MAX))
+   *   .groupBy(() => ({}))
+   *   .select(g => ({ next: add(coalesce(g.max(b => b.number), MIN), gap) }))
+   *   .asSubquery('table');
+   *
+   * const [badge] = await db.badges
+   *   .insertFrom(next, src => ({ number: src.next, holderId, active: true }), {
+   *     where: src => lte(src.next, MAX),        // band exhausted → no row
+   *     expectedErrorCodes: ['23505'],           // a concurrent twin took the number: retried by the caller
+   *   })
+   *   .returning(b => ({ id: b.id, number: b.number }));
+   */
+  insertFrom<TSource extends Record<string, any>>(
+    source: Subquery<TSource, 'table'>,
+    map: (src: InsertFromSourceRow<TSource>) => InsertFromValues<TEntity>,
+    options?: InsertFromOptions<TSource>
+  ): FluentInsertMany<TEntity> {
+    const table = this;
+    const execution: StatementExecutionOptions | undefined = options?.expectedErrorCodes
+      ? { expectedErrorCodes: options.expectedErrorCodes }
+      : undefined;
+
+    const executeInsertFrom = async <TResult>(
+      returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
+    ): Promise<any> => table.runInsertStatement(table.buildInsertFromStatement(source, map, options?.where), returning, execution);
+
+    return {
+      then<TResult1 = void, TResult2 = never>(
+        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+      ): PromiseLike<TResult1 | TResult2> {
+        return executeInsertFrom(undefined).then(onfulfilled, onrejected);
+      },
+      returning<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
+        const returningConfig = selector ?? true;
+        return {
+          then<T1 = any, T2 = never>(
+            onfulfilled?: ((value: any) => T1 | PromiseLike<T1>) | null,
+            onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null
+          ): PromiseLike<T1 | T2> {
+            return executeInsertFrom(returningConfig).then(onfulfilled, onrejected);
+          }
+        };
+      }
+    };
+  }
+
+  /** The bare statement of {@link insertFrom} (no RETURNING). @internal */
+  private buildInsertFromStatement<TSource extends Record<string, any>>(
+    source: Subquery<TSource, 'table'>,
+    map: (src: InsertFromSourceRow<TSource>) => InsertFromValues<TEntity>,
+    where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined
+  ): { sql: string; params: any[] } {
+    const candidate = source as any;
+
+    if (candidate == null || typeof candidate.buildSql !== 'function' || typeof candidate.isTable !== 'function' || !candidate.isTable()) {
+      throw new TypeError("insertFrom: the source must be a table subquery — build it with .asSubquery('table')");
+    }
+
+    const schema = this._getSchema();
+    const src = DbEntityTable.insertFromSourceRow<TSource>(source);
+    const values = map(src);
+
+    if (values === null || typeof values !== 'object') {
+      throw new TypeError('insertFrom: map must return an object of column values');
+    }
+
+    const context: SqlBuildContext = { paramCounter: 1, params: [] };
+    const sourceSql = source.buildSql(context);
+    const columns: string[] = [];
+    const selectList: string[] = [];
+
+    for (const [prop, value] of Object.entries(values)) {
+      if (value === undefined) {
+        continue;
+      }
+
+      const colBuilder = schema.columns[prop];
+
+      if (!colBuilder) {
+        throw new Error(`insertFrom: "${prop}" is not a column of "${schema.name}"`);
+      }
+
+      const config = (colBuilder as any).build();
+      columns.push(`"${config.name}"`);
+      selectList.push(DbEntityTable.insertFromValueSql(value, config, context));
+    }
+
+    if (columns.length === 0) {
+      throw new Error(`insertFrom: map returned no column value for "${schema.name}"`);
+    }
+
+    let sql = `INSERT INTO ${this._getQualifiedTableName()} (${columns.join(', ')}) SELECT ${selectList.join(', ')} FROM (${sourceSql}) AS "src"`;
+
+    if (where) {
+      sql += ` WHERE ${where(src).buildSql(context)}`;
+    }
+
+    return { sql, params: context.params };
+  }
+
+  /**
+   * The source row of {@link insertFrom}: a `"src"."<column>"` ref per column of the source's projection
+   * (each carrying how its column reads). A column the projection does not have is refused.
+   */
+  private static insertFromSourceRow<TSource extends Record<string, any>>(source: Subquery<TSource, 'table'>): InsertFromSourceRow<TSource> {
+    const metadata = source.getSelectionMetadata();
+    const row: Record<string, any> = {};
+
+    if (metadata === undefined) {
+      return new Proxy(row, {
+        get: (target, prop) => (typeof prop === 'string' ? (target[prop] ??= projectedColumnRef(prop, 'src', undefined)) : undefined),
+      }) as InsertFromSourceRow<TSource>;
+    }
+
+    for (const key of Object.keys(metadata)) {
+      row[key] = projectedColumnRef(key, 'src', metadata[key]);
+    }
+
+    return new Proxy(row, {
+      get: (target, prop) => {
+        if (typeof prop === 'string' && !(prop in target)) {
+          throw new Error(`insertFrom: the source has no column "${prop}" (it projects ${Object.keys(target).map(k => `"${k}"`).join(', ')})`);
+        }
+
+        return target[prop as string];
+      },
+    }) as InsertFromSourceRow<TSource>;
+  }
+
+  /**
+   * One SELECT-list value of {@link insertFrom}: a ref as the column it reads, an expression inline, a plain
+   * value bound through the column's mapper and cast to the column's type (a NULL as a typed NULL).
+   */
+  private static insertFromValueSql(value: unknown, config: any, context: SqlBuildContext): string {
+    if (value instanceof WhereConditionBase) {
+      return value.buildSql(context);
+    }
+
+    if (value !== null && typeof value === 'object' && '__dbColumnName' in (value as object)) {
+      const ref = value as any;
+
+      return ref.__tableAlias ? `"${ref.__tableAlias}"."${ref.__dbColumnName}"` : `"${ref.__dbColumnName}"`;
+    }
+
+    const pgType = DbEntityTable.valuesCastType(config.type);
+    const mapped = config.mapper ? config.mapper.toDriver(value) : value;
+
+    if (mapped === null || mapped === undefined) {
+      return `CAST(NULL AS ${pgType})`;
+    }
+
+    context.params.push(mapped);
+
+    return `CAST($${context.paramCounter++} AS ${pgType})`;
   }
 
   /**
@@ -5035,7 +5436,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       columns.push({
         propName,
         dbName: colConfig.name,
-        pgType: DbEntityTable.PG_TYPE_MAP[colConfig.type] || colConfig.type,
+        pgType: DbEntityTable.valuesCastType(colConfig.type),
         mapper: colConfig.mapper,
       });
     }
@@ -5087,14 +5488,28 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     overridingSystemValue?: boolean,
     onConflictDoNothing?: boolean
   ): Promise<any[] | void> {
-    const executor = this._getExecutor();
-    const client = this._getClient();
-
     const built = this._buildInsertBulkStatement(data, overridingSystemValue, onConflictDoNothing);
 
     if (!built) {
       return returning === undefined ? undefined : [];
     }
+
+    return this.runInsertStatement(built, returning);
+  }
+
+  /**
+   * Run a bare INSERT statement of this table with its RETURNING — the navigation RETURNING (the insert
+   * as a CTE the navigations join onto) when the selector reads one, else the plain list — on the
+   * context's executor, and read the rows back. Shared by insertBulk and insertFrom.
+   * @internal
+   */
+  private async runInsertStatement<TReturning>(
+    built: { sql: string; params: any[] },
+    returning: TReturning,
+    execution?: StatementExecutionOptions
+  ): Promise<any[] | void> {
+    const executor = this._getExecutor();
+    const client = this._getClient();
 
     // Check if RETURNING uses navigation properties
     const navigationInfo = returning && returning !== true && typeof returning === 'function'
@@ -5111,7 +5526,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       );
 
       const result = executor
-        ? await executor.query(sql, queryParams)
+        ? await executor.query(sql, queryParams, execution)
         : await client.query(sql, queryParams);
 
       return this.readReturning(result.rows, read);
@@ -5126,7 +5541,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     }
 
     const result = executor
-      ? await executor.query(sql, built.params)
+      ? await executor.query(sql, built.params, execution)
       : await client.query(sql, built.params);
 
     if (!returningClause) {
@@ -5230,10 +5645,15 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
    * and the caller detects them through the affected count (via
    * `MutationBatch.getAffectedCount`).
    *
-   * The predicate is raw SQL (the same contract as `hasIndex().where(…)`),
-   * evaluated per candidate row with the row exposed under the `v` alias — refer
-   * to a cell as `v."<db_column_name>"`. It takes no parameters of its own;
+   * The predicate is evaluated per candidate row with the row exposed under the
+   * `v` alias. As raw SQL (the same contract as `hasIndex().where(…)`) it refers
+   * to a cell as `v."<db_column_name>"` and takes no parameters of its own;
    * anything else it needs must be reachable by joining from the row's columns.
+   * As a function it receives the candidate row `v` — a column row whose refs
+   * render `"v"."<db_column>"` — and returns a condition that may bind
+   * parameters: its build context continues the cells' numbering. Every `v`
+   * column it reads must be one of the compiled VALUES columns (`usage` names the
+   * guard in that error and in the navigation refusal).
    *
    * Cells reuse the insertWithChildren `$n::type` cast technique so a bare
    * `VALUES` source keeps correct column types. Returns null for an empty row
@@ -5256,7 +5676,8 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
    */
   _buildGuardedInsertBulkStatement(
     data: InsertData<TEntity>[],
-    guardPredicate: string
+    guardPredicate: string | ((v: ColumnRow<TEntity>) => Condition),
+    usage: string = 'insertBulk rowGuard'
   ): { sql: string; params: any[] } | null {
     if (data.length === 0) {
       return null;
@@ -5266,13 +5687,43 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     const columnList = compiled.columns.map(c => `"${c.dbName}"`).join(', ');
     const selectList = compiled.columns.map(c => `v."${c.dbName}"`).join(', ');
     const valueRows = compiled.valueRows.map(row => `(${row})`).join(', ');
+    const guardSql = typeof guardPredicate === 'function'
+      ? this.renderTypedRowGuard(guardPredicate, compiled, usage)
+      : guardPredicate;
 
     return {
       sql: `INSERT INTO ${this._getQualifiedTableName()} (${columnList})
 SELECT ${selectList} FROM (VALUES ${valueRows}) AS v(${columnList})
-WHERE ${guardPredicate}`,
+WHERE ${guardSql}`,
       params: compiled.params,
     };
+  }
+
+  /**
+   * The SQL of a typed row guard over the candidate row `v`, continuing the VALUES cells' parameter
+   * numbering (its parameters append to `compiled.params`). A `v` column no row provides has no cell
+   * to read — refused, as bulkUpdate refuses a `values.<prop>` no row provides.
+   */
+  private renderTypedRowGuard(
+    guard: (v: ColumnRow<TEntity>) => Condition,
+    compiled: { columns: Array<{ propName: string; dbName: string }>; params: any[] },
+    usage: string
+  ): string {
+    const condition = guard(createColumnRow<TEntity>(this._getSchema(), 'v', usage));
+
+    if (!(condition instanceof WhereConditionBase)) {
+      throw new TypeError(`${usage} must return a condition`);
+    }
+
+    const provided = new Set(compiled.columns.map(c => c.dbName));
+
+    for (const ref of condition.getFieldRefs()) {
+      if ((ref as any).__tableAlias === 'v' && !provided.has(ref.__dbColumnName)) {
+        throw new Error(`${usage} reads v.${ref.__fieldName}, but no row provides "${ref.__fieldName}"`);
+      }
+    }
+
+    return condition.buildSql({ paramCounter: compiled.params.length + 1, params: compiled.params });
   }
 
   /**
@@ -5461,7 +5912,7 @@ WHERE ${guardPredicate}`,
     updateColumns: string[] | undefined,
     updateColumnFilter: ((colId: string) => boolean) | undefined,
     overridingSystemValue: boolean,
-    targetWhere: string | undefined,
+    targetWhere: string | ((row: ColumnRow<TEntity>) => Condition) | undefined,
     setWhere: string | undefined,
     expressions?: UpsertExpressionConfig
   ): { sql: string; params: any[] } {
@@ -5546,8 +5997,9 @@ WHERE ${guardPredicate}`,
 
     sql += ` ON CONFLICT (${conflictCols})`;
 
-    if (targetWhere) {
-      sql += ` WHERE ${targetWhere}`;
+    const arbiterPredicate = renderArbiterPredicate(schema, targetWhere);
+    if (arbiterPredicate) {
+      sql += ` WHERE ${arbiterPredicate}`;
     }
 
     // Typed conflict-arm expressions: `existing` reads the target row by its table name,
@@ -5639,31 +6091,7 @@ WHERE ${guardPredicate}`,
    * @internal
    */
   private createColumnRowProxy(alias: string, usage: string): any {
-    const schema = this._getSchema();
-    const row: any = {};
-
-    for (const [propName, colBuilder] of Object.entries(schema.columns)) {
-      const config = (colBuilder as any).build();
-      const ref = {
-        __fieldName: propName,
-        __dbColumnName: config.name,
-        __tableAlias: alias,
-        __mapper: config.mapper,
-        __sqlType: config.type,
-      };
-      Object.defineProperty(row, propName, { get: () => ref, enumerable: true });
-    }
-
-    for (const relName of Object.keys(schema.relations)) {
-      Object.defineProperty(row, relName, {
-        get: () => {
-          throw new Error(`${usage}: navigation "${relName}" is not available — only the row's own columns are in scope`);
-        },
-        enumerable: false,
-      });
-    }
-
-    return row;
+    return createColumnRow(this._getSchema(), alias, usage);
   }
 
   /**
@@ -5737,8 +6165,8 @@ WHERE ${guardPredicate}`,
   /**
    * Bare `INSERT .. ON CONFLICT` compile (no RETURNING) for the MutationBatch
    * upsert leg — the {@link buildUpsertStatementCore} assembly with a narrow
-   * plain config (prop-name primaryKey + updateColumns; no chunking, no
-   * targetWhere/setWhere/system-value overrides in v1).
+   * plain config (prop-name primaryKey + updateColumns + the arbiter
+   * predicate; no chunking, no setWhere/system-value overrides).
    * @internal
    */
   _buildUpsertBulkStatement(
@@ -5748,6 +6176,7 @@ WHERE ${guardPredicate}`,
       updateColumns?: string[];
       updateSet?: (existing: any, excluded: any) => Record<string, unknown>;
       updateWhere?: (existing: any, excluded: any) => Condition;
+      targetWhere?: string | ((row: ColumnRow<TEntity>) => Condition);
     }
   ): { sql: string; params: any[] } | null {
     if (values.length === 0) {
@@ -5762,7 +6191,7 @@ WHERE ${guardPredicate}`,
       config.updateColumns,
       undefined,
       false,
-      undefined,
+      config.targetWhere,
       undefined,
       config.updateSet || config.updateWhere
         ? { updateSet: config.updateSet, updateWhere: config.updateWhere }
@@ -5912,7 +6341,7 @@ RETURNING 1`;
     updateColumns: string[] | undefined,
     updateColumnFilter: ((colId: string) => boolean) | undefined,
     overridingSystemValue: boolean,
-    targetWhere: string | undefined,
+    targetWhere: string | ((row: ColumnRow<TEntity>) => Condition) | undefined,
     setWhere: string | undefined,
     returning: TReturning,
     expressions?: UpsertExpressionConfig
@@ -6141,11 +6570,7 @@ RETURNING 1`;
     // `unknown`/text (serial pseudo-types cast to their integer base).
     const castForType = (sqlType?: string): string => {
       if (!sqlType || sqlType === 'array') return '';
-      const baseType = sqlType === 'serial' ? 'integer'
-        : sqlType === 'smallserial' ? 'smallint'
-        : sqlType === 'bigserial' ? 'bigint'
-        : sqlType;
-      return `::${baseType}`;
+      return `::${DbEntityTable.valuesCastType(sqlType)}`;
     };
 
     const valuesClauses: string[] = [];
@@ -6385,7 +6810,7 @@ RETURNING 1`;
   update(
     data: UpdateData<TEntity>
       | ((row: EntityQuery<TEntity>) => UpdateData<TEntity>)
-  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>> {
+  ): FluentQueryUpdate<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>, ColumnRow<TEntity>> {
     // Every row: the query update over a condition every row meets — the same SET rendering
     // (column mappers, sql fragments), RETURNING (navigations, collections, sql expressions),
     // affected count and toStatement() as `where(...).update()`. This path used to bind values
@@ -6524,6 +6949,29 @@ RETURNING 1`;
     'macaddr': 'macaddr',
     'macaddr8': 'macaddr8',
   };
+
+  /**
+   * Types whose bare name carries a typmod of 1 — `char` is `character(1)`, `bit` is `bit(1)` — mapped to their
+   * unbounded forms. An explicit cast to the bare name truncates SILENTLY (`CAST('ABCDEF' AS char)` is `'A'`).
+   */
+  private static readonly UNBOUNDED_CAST_TYPES = new Map<string, string>([
+    ['char', 'bpchar'],
+    ['character', 'bpchar'],
+    ['bit', 'varbit'],
+  ]);
+
+  /**
+   * The type a bound value is cast to for a column of type `columnType` — the `CAST($n AS <type>)` of an
+   * `insertFrom` SELECT list and the `$n::<type>` cells of the cast-annotated VALUES (row-guarded / dependent-insert
+   * `MutationBatch` legs, `insertWithChildren`, `bulkUpdate`, `mergeBulk`). It never carries a typmod: the
+   * assignment to the column then pads, rounds or raises (22001) exactly as `INSERT … VALUES` does.
+   * @internal
+   */
+  private static valuesCastType(columnType: string): string {
+    const pgType = DbEntityTable.PG_TYPE_MAP[columnType] || columnType;
+
+    return DbEntityTable.UNBOUNDED_CAST_TYPES.get(pgType) ?? pgType;
+  }
 
   /**
    * Execute a single bulk update batch
@@ -6700,7 +7148,7 @@ RETURNING 1`;
     for (const propName of allColumnsSet) {
       const colConfig = (schema.columns[propName] as any).build();
       const dbName = colConfig.name;
-      const pgType = DbEntityTable.PG_TYPE_MAP[colConfig.type] || colConfig.type;
+      const pgType = DbEntityTable.valuesCastType(colConfig.type);
       const isPK = primaryKeySet.has(propName);
 
       const info = { propName, dbName, pgType, isPK, mapper: colConfig.mapper };
@@ -6806,7 +7254,7 @@ WHERE ${effectiveWhereClause}`.trim();
    *   await db.users.where(u => eq(u.id, 1)).delete() // Delete with condition
    *   const deleted = await db.users.where(u => eq(u.id, 1)).delete().returning()
    */
-  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>> {
+  delete(): FluentDelete<UnwrapDbColumns<TEntity>, EntityQuery<TEntity>, ColumnRow<TEntity>> {
     // Every row: the query delete over a condition every row meets — the same RETURNING
     // (navigations, collections, sql expressions), affected count and toStatement() as
     // `where(...).delete()`
@@ -7743,6 +8191,36 @@ export abstract class DatabaseContext extends DataContext {
       this.sequenceInstances.set(key, instance);
     }
     return instance;
+  }
+
+  /**
+   * A sequence named at RUN time — one per tenant and year, say — that no model declares: draw from it
+   * with {@link DbSequence.nextValueCreatingIfMissing}, which creates it (`CREATE SEQUENCE IF NOT EXISTS`
+   * with these options) on first use.
+   *
+   * - Not registered: the schema manager never creates, compares or drops it, and nothing is cached
+   *   (the names are unbounded).
+   * - Bound to the context's ROOT client, also when called on a transaction's context: a CREATE made
+   *   inside a caller's transaction would be undone by its rollback and restart the numbering, and a
+   *   failed first `nextval` would abort the transaction. A drawn value is consumed either way. On a
+   *   transaction's context each call therefore needs a SECOND pool connection (concurrent transactions
+   *   that each wait for one can exhaust the pool — `pg.Pool` waits forever by default), and PGlite, which
+   *   has one session, refuses the call outright: prefer calling it on the root context, outside
+   *   `transaction()`.
+   * - Its statements go to the client directly — unlogged, like `DbSequence.nextValue()`.
+   * - The name is an identifier, never SQL: quoted (a `"` doubled, a NUL refused), schema-qualified when
+   *   `schema` is set, else resolved through the search path. The options are inlined in the DDL: each
+   *   must be an integer within bigint — a number, or a JS bigint (checked here).
+   *
+   * @example
+   * const number = await db
+   *   .runtimeSequence({ name: `seq_doc_${tenantId}_${year}`, startWith: 1, incrementBy: 1, minValue: 1, cache: 1 })
+   *   .nextValueCreatingIfMissing();
+   */
+  runtimeSequence(config: SequenceConfig): DbSequence {
+    renderSequenceOptions(config);
+
+    return new DbSequence(this.rootClient, { ...config });
   }
 
   /**

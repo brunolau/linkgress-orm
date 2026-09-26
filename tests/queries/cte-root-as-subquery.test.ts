@@ -1,6 +1,5 @@
 import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { expectToReject } from '../utils/expect-rejects';
 import { DbCteBuilder, and, eq, gt, inSubquery, notInSubquery, onTrue } from '../../src';
 
 /**
@@ -203,14 +202,15 @@ describe('CteRootQueryBuilder.asSubquery()', () => {
     });
   });
 
-  test('structural: a PARTIALLY hoisted CTE list is refused rather than mis-numbered', async () => {
+  test('structural: a PARTIALLY hoisted CTE list declares the rest inside the subquery, each body numbered from its own parameters', async () => {
     await withDatabase(async (db) => {
       await seedTestData(db);
 
       // Two CTEs from ONE builder: `older_users` numbers from $1, `busy_posts`
-      // continues at $2. Only the first is attached to the statement, so the
-      // second could not be shifted onto a correct slot — the subquery must
-      // refuse instead of silently binding `busy_posts` to the wrong parameter.
+      // continues at $2. Only the first is attached to the statement: the
+      // subquery reads it from there and declares `busy_posts` itself, its body
+      // renumbered from ITS base to the slot its parameter lands on. (This was
+      // refused while a builder's bodies could only be shifted as one block.)
       const cteBuilder = new DbCteBuilder();
       const older = olderUsers(db, cteBuilder);
       const busy = cteBuilder.with(
@@ -231,10 +231,14 @@ describe('CteRootQueryBuilder.asSubquery()', () => {
         .with(older.cte)
         .unionAll(db.posts.where(p => gt(p.views, 0)).select(p => ({ id: p.id })));
 
-      await expectToReject(
-        async () => union.count(),
-        /already\s+declared at statement level while "busy_posts" is not/
-      );
+      const { sql: builtSql, params } = union.buildSql();
+      expect(builtSql.startsWith('WITH "older_users" AS MATERIALIZED (')).toBe(true);
+      expect(builtSql).toContain('IN (WITH "busy_posts" AS MATERIALIZED (');
+      expect(builtSql).toContain('"posts"."views" > $2');
+      expect(params).toEqual([30, 120, 0]);
+
+      // bob and charlie (older, and some post is busy) + the three posts
+      expect(await union.count()).toBe(5);
     });
   });
 

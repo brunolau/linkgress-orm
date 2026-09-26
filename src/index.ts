@@ -290,6 +290,36 @@ export type {
   JsonbPathKey,
 } from './query/sql-functions';
 
+// 1.0.9 expression helpers: bound parameters, typed literals, NULL-propagating ||, %, whole-value
+// jsonb text, json builders, aggregate fragments (agg) and subquery-array membership
+export {
+  param,
+  literalOf,
+  concatStrict,
+  modulo,
+  jsonbValueText,
+  jsonBuildObject,
+  jsonBuildArray,
+  agg,
+  AggregateFragment,
+} from './query/sql-functions';
+
+export type {
+  LiteralValue,
+  AggListOptions,
+  AggOrderKey,
+  AggregateFunctions,
+} from './query/sql-functions';
+
+export {
+  eqAnySubquery,
+  neAllSubquery,
+} from './query/subquery';
+
+export type {
+  ScalarSubqueryOperand,
+} from './query/conditions';
+
 // Subquery support
 export {
   Subquery,
@@ -404,6 +434,28 @@ export type {
   ExtractDbColumns,
   ExtractDbColumnKeys,
 } from './entity/db-column';
+
+export type {
+  ColumnRow,
+} from './entity/column-row';
+
+// Typed row guards and arbiter predicates, INSERT … SELECT, expression builders for indexes
+export type {
+  RowGuard,
+  InsertLegOptions,
+  ArbiterPredicate,
+} from './query/mutation-batch';
+
+export type {
+  InsertFromSourceRow,
+  InsertFromValues,
+  InsertFromOptions,
+  StatementExecutionOptions,
+} from './entity/db-context';
+
+export type {
+  IndexExpression,
+} from './entity/entity-builder';
 
 
 
@@ -619,3 +671,34 @@ export function startInMemoryDatabaseThread(options?: import('./memory').InMemor
 
   return InMemoryDatabaseThread.start(options);
 }
+
+// Aliased subquery scopes, set-returning functions, typed mutation CTEs (1.0.9)
+export {
+  AliasedScope,
+} from './query/aliased-scope';
+
+export type {
+  AliasedScopeOrderKey,
+} from './query/aliased-scope';
+
+export type {
+  CompiledStatement,
+} from './query/cte-builder';
+
+export type {
+  CteColumnRefs,
+} from './query/cte-root-query';
+
+export {
+  SetReturningFunction,
+  SetQueryBuilder,
+  unnest,
+  unnestZip,
+  jsonbArrayElements,
+  jsonbEachText,
+  fromSet,
+} from './query/set-returning';
+
+export type {
+  SetRow,
+} from './query/set-returning';

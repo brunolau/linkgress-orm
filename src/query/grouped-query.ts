@@ -11,6 +11,7 @@ import {
   ReferenceQueryBuilder,
   aggregatedItemReads,
   assertProjectionArrayOfValues,
+  coercesNumericText,
   getColumnNameMapForSchema,
   getRelationEntriesForSchema,
   getTargetSchemaForRelation,
@@ -18,8 +19,11 @@ import {
   projectionLiteralSql,
 } from './query-builder';
 import { DbCte, isCte, projectedValueRef } from './cte-builder';
+import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte } from './cte-builder';
 import { formatJoinValue, NavigationAliasPlan } from './join-utils';
-import { selectorProjectingConditions } from './sql-functions';
+import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
+import { lateralSetJoinsSql, lateralSetRefs } from './set-returning';
+import type { LateralSetJoin } from './set-returning';
 
 /**
  * Query context for tracking CTEs and parameters
@@ -31,6 +35,8 @@ interface QueryContext {
   allParams: any[];
   /** True when the driver cannot decode native ARRAY result columns (BunClient). */
   useJsonArrayAggregation?: boolean;
+  /** The driver reads this select's fields directly and cannot decode native arrays (see the query builder's). */
+  jsonArrayProjection?: boolean;
   /**
    * Names of CTEs an enclosing builder has already declared at statement level
    * (see {@link SqlBuildContext.hoistedCteNames}). Carried so anything nested in
@@ -298,6 +304,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
   private schemaRegistry?: Map<string, TableSchema>;
+  /** The grouped query's set-returning joins (`crossJoinLateral` before `groupBy`). */
+  private lateralSets: LateralSetJoin[] = [];
 
   constructor(
     schema: TableSchema,
@@ -309,7 +317,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
     schemaRegistry?: Map<string, TableSchema>,
-    chainId?: number
+    chainId?: number,
+    lateralSets?: LateralSetJoin[]
   ) {
     this.schema = schema;
     this.client = client;
@@ -321,6 +330,7 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
     this.joinCounter = joinCounter || 0;
     this.schemaRegistry = schemaRegistry;
     this.chainId = chainId;
+    this.lateralSets = lateralSets || [];
   }
 
   /**
@@ -369,7 +379,8 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       this.manualJoins,
       this.joinCounter,
       this.schemaRegistry,
-      this.chainId
+      this.chainId,
+      this.lateralSets
     );
   }
 
@@ -411,6 +422,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   private manualJoins: ManualJoinDefinition[] = [];
   private joinCounter: number = 0;
   private schemaRegistry?: Map<string, TableSchema>;
+  /** Set-returning functions joined to every row before grouping (`crossJoinLateral`). */
+  private lateralSets: LateralSetJoin[] = [];
 
   constructor(
     schema: TableSchema,
@@ -427,8 +440,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     manualJoins?: ManualJoinDefinition[],
     joinCounter?: number,
     schemaRegistry?: Map<string, TableSchema>,
-    chainId?: number
+    chainId?: number,
+    lateralSets?: LateralSetJoin[]
   ) {
+    this.lateralSets = lateralSets || [];
     this.chainId = chainId;
     this.schema = schema;
     this.client = client;
@@ -525,6 +540,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       ctes: new Map(),
       cteCounter: 0,
       useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
       paramCounter: 1,
       allParams: [],
     };
@@ -644,6 +660,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
           return typeof mapper.fromDriver === 'function' ? mapper.fromDriver(value) : value;
         });
+      }
+      // A read-typed fragment (withReadType) reads like a column of its type: numeric text of a
+      // numeric type becomes a number, any other type stays as delivered (NULL stays null here)
+      else if (typeof (mockValue as any).getReadType === 'function' && coercesNumericText((mockValue as any).getReadType() ?? 'text')) {
+        readers.set(key, value => (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : value));
       }
       // Non-aggregate field without mapper - keep as is
     }
@@ -827,6 +848,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         ctes: new Map(),
         cteCounter: 0,
         useJsonArrayAggregation: outerContext.useJsonArrayAggregation ?? !this.client.supportsBinaryArrayResults(),
+        // Set (by Subquery.buildSql) when this subquery IS a projected value the driver reads directly
+        jsonArrayProjection: outerContext.jsonArrayProjection === true,
         paramCounter: outerContext.paramCounter,
         allParams: outerContext.params,
         // See SelectQueryBuilder.asSubquery — the statement-level CTE set must
@@ -1087,7 +1110,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const state: GroupedBuildState = { mockOriginalSelection, mockGroupingKey, mockResult, havingCond, aggregateArguments };
 
     return this.withNavigationPlan(
-      [mockOriginalSelection, mockGroupingKey, ...aggregateArguments.values()],
+      [mockOriginalSelection, mockGroupingKey, ...aggregateArguments.values(), ...lateralSetRefs(this.lateralSets)],
       havingCond,
       () => this.buildQueryBody(context, state, hasSqlFragmentInGroupBy)
     );
@@ -1178,6 +1201,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     // project (an expression written inside g.sum(...), a column of an entity row)
     this.detectAndAddJoinsFromSelection([...state.aggregateArguments.values()], navigationJoins);
 
+    // ... and from the lateral sets' function arguments (crossJoinLateral before groupBy)
+    this.detectAndAddJoinsFromSelection(lateralSetRefs(this.lateralSets), navigationJoins);
+
     // Detect joins from WHERE condition
     this.detectAndAddJoinsFromCondition(this.whereCond, navigationJoins);
 
@@ -1205,7 +1231,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     for (const manualJoin of this.manualJoins) {
       const joinTypeStr = manualJoin.type === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN';
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params: condParams } = condBuilder.build(manualJoin.condition, context.paramCounter);
+      const { sql: condSql, params: condParams } = condBuilder.build(manualJoin.condition, context.paramCounter, undefined, context.hoistedCteNames);
       context.paramCounter += condParams.length;
       context.allParams.push(...condParams);
 
@@ -1214,6 +1240,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         const subqueryBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames: context.hoistedCteNames,
         };
         const subquerySql = (manualJoin as any).subquery.buildSql(subqueryBuildContext);
         context.paramCounter = subqueryBuildContext.paramCounter;
@@ -1221,6 +1248,17 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       } else {
         baseFromClause += `\n${joinTypeStr} "${manualJoin.table}" AS "${manualJoin.alias}" ON ${condSql}`;
       }
+    }
+
+    // Set-returning functions joined to every row before grouping (crossJoinLateral)
+    if (this.lateralSets.length > 0) {
+      const lateralContext: SqlBuildContext = {
+        paramCounter: context.paramCounter,
+        params: context.allParams,
+        hoistedCteNames: context.hoistedCteNames,
+      };
+      baseFromClause += lateralSetJoinsSql(this.lateralSets, lateralContext, this.manualJoins);
+      context.paramCounter = lateralContext.paramCounter;
     }
 
     // Build WHERE clause
@@ -1244,6 +1282,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       params: context.allParams,
       hoistedCteNames: context.hoistedCteNames,
       typedLiterals: context.typedLiterals,
+      // Read by the SELECT list only (buildSelectParts): a HAVING never renders a list as JSON
+      jsonArrayProjection: context.jsonArrayProjection,
     };
 
     try {
@@ -1363,11 +1403,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       return undefined;
     };
 
+    // A key or an argument renders qualified by the subquery ("q1"."id"): a subquery nested in the
+    // SELECT or the HAVING (an aliased scope, a set or CTE-rooted subquery) renders it in its OWN
+    // scope, where a bare "id" is its own table's column — the correlation compared a row with itself
     const renderer: GroupedRenderer = {
       argument: (argument, aggregate) => {
         const keyAlias = typeof argument === 'object' && argument !== null ? keyAliasOf(argument) : undefined;
         if (keyAlias !== undefined) {
-          return `"${keyAlias}"`;
+          return `"q1"."${keyAlias}"`;
         }
 
         // The same column or expression is projected once
@@ -1385,11 +1428,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           argumentAliases.set(identity, alias);
         }
 
-        return `"${alias}"`;
+        return `"q1"."${alias}"`;
       },
       key: value => {
         const alias = keyAliasOf(value);
-        return alias === undefined ? undefined : `"${alias}"`;
+        return alias === undefined ? undefined : `"q1"."${alias}"`;
       },
     };
 
@@ -1423,7 +1466,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     this.withSubstitutions(state, renderer, buildContext, () => {
       for (const [alias, value] of Object.entries(state.mockResult as object)) {
-        selectParts.push(`${this.projectionSql(alias, value, state, renderer, buildContext)} as "${alias}"`);
+        // The driver reads each field directly: an arrayAgg a field IS renders as JSON where it must
+        buildContext.jsonArrayRoot = buildContext.jsonArrayProjection ? projectedValueRoot(value) : undefined;
+
+        try {
+          selectParts.push(`${this.projectionSql(alias, value, state, renderer, buildContext)} as "${alias}"`);
+        } finally {
+          buildContext.jsonArrayRoot = undefined;
+        }
       }
     });
 
@@ -2266,6 +2316,10 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     mode: TMode = 'table' as TMode
   ): Subquery<TMode extends 'scalar' ? ResolveFieldRefs<TSelection> : TMode extends 'array' ? ResolveFieldRefs<TSelection>[] : ResolveFieldRefs<TSelection>, TMode> {
     const sqlBuilder = (outerContext: SqlBuildContext & { tableAlias?: string }): string => {
+      // The joined CTE is declared inside the subquery unless the statement declares it: a
+      // data-modifying one cannot be
+      assertStatementLevelCtes(this.getReferencedCtes(), outerContext.hoistedCteNames);
+
       const context: QueryContext = {
         ctes: new Map(),
         cteCounter: 0,
@@ -2354,13 +2408,19 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
    * @param skipCteClause If true, don't include WITH clause (for embedding in outer CTEs)
    */
   private buildQuery(context: QueryContext, skipCteClause: boolean = false): { sql: string; params: any[] } {
-    // Build CTE clause if needed (unless we're being embedded in another CTE)
+    // Build CTE clause if needed (unless we're being embedded in another CTE, or the enclosing statement
+    // declares it already): its body renumbered from where its parameters land
     let cteClause = '';
-    if (this.cte && !skipCteClause) {
-      cteClause = `WITH "${this.cte.name}" AS (${this.cte.query})\n`;
+    if (this.cte && !skipCteClause && !isStatementCte(context.hoistedCteNames, this.cte)) {
+      cteClause = `WITH ${cteDeclarationAt(this.cte, context.paramCounter)}\n`;
       context.allParams.push(...this.cte.params);
       context.paramCounter += this.cte.params.length;
     }
+
+    // Everything nested in the statement — the projection's subqueries, the grouped subquery, the ON
+    // predicate — reads the joined CTE by name: it is declared at statement level (they used to declare
+    // it again, and bind its parameters again, inside themselves)
+    const hoistedCteNames = this.cte ? declareStatementCtes(context.hoistedCteNames, [this.cte]) : context.hoistedCteNames;
 
     // Build SELECT clause from result selector
     const mockLeft = this.createLeftMock();
@@ -2383,6 +2443,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
         const sqlBuildContext = {
           paramCounter: context.paramCounter,
           params: context.allParams,
+          hoistedCteNames,
         };
         // A subquery renders parenthesized, as the fragment interpolating it renders it
         const fragment = value instanceof SqlFragment ? value : new SqlFragment(['', ''], [value]);
@@ -2405,6 +2466,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const leftSqlContext = {
       paramCounter: context.paramCounter,
       params: context.allParams,
+      hoistedCteNames,
     };
     const leftSql = this.leftSubquery.buildSql(leftSqlContext);
     context.paramCounter = leftSqlContext.paramCounter;
@@ -2414,7 +2476,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     // Build JOIN clause
     const joinTypeStr = this.joinType === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN';
     const condBuilder = new ConditionBuilder();
-    const { sql: condSql, params: condParams } = condBuilder.build(this.joinCondition, context.paramCounter);
+    const { sql: condSql, params: condParams } = condBuilder.build(this.joinCondition, context.paramCounter, undefined, hoistedCteNames);
     context.paramCounter += condParams.length;
     context.allParams.push(...condParams);
 
@@ -2426,6 +2488,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       const rightSqlContext = {
         paramCounter: context.paramCounter,
         params: context.allParams,
+        hoistedCteNames,
       };
       const rightSql = (this.rightSource as Subquery<TRight, 'table'>).buildSql(rightSqlContext);
       context.paramCounter = rightSqlContext.paramCounter;

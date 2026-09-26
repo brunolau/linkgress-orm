@@ -216,6 +216,17 @@ const usersWithStats = await db.users
 }[]
 ```
 
+**How the value reads.** A projected scalar subquery reads through the generic conversion, like a
+raw `sql` fragment: a numeric-looking string becomes a number (a digits-only text `'007'` reads
+`7`) and a NULL reads `undefined`. Two kinds read like the value they project instead:
+
+- ONE aggregate fragment — `select(p => agg.max(p.title))` keeps `'007'`, `agg.max` of a mapped
+  column goes through its mapper, and a NULL reads `null`, as the aggregate reads at the top level;
+- ONE read-typed fragment — `select(p => sql<string>\`…\`.withReadType('text'))`.
+
+For any other value, type the read yourself: `.asExpression<string>().withReadType('text')` or
+`.mapWith(…)` (section 9) — or, for a column of an aliased scope, `AliasedScope.scalar()`.
+
 ### 6. Scalar Comparisons
 
 Compare fields with subquery results:
@@ -298,6 +309,129 @@ For the first, a navigation collection is the way out when the model has the rel
 over the same table as the outer row — `exists(p.user!.posts!.where(p2 => gt(p2.views, p.views)))`,
 a tree's `n.children` — names its own table apart from the outer row and is not refused (see
 [Collections Reached Through Navigations](./querying.md#collections-reached-through-navigations)).
+
+Without such a relation, name the inner side yourself with an **aliased scope** — `db.<table>.as(alias)`
+renders its table under the alias you give it, so neither shape can collide (see
+[Aliased Subquery Scopes](./aliased-scopes.md)):
+
+```typescript
+db.posts.where(p => db.posts.as('rival')
+  .where(r => and(eq(r.userId, p.userId), gt(r.views, p.views)))
+  .exists());
+// EXISTS (SELECT 1 FROM "posts" AS "rival" WHERE ("rival"."user_id" = "posts"."user_id" AND "rival"."views" > "posts"."views"))
+```
+
+### Navigations read by a projected subquery
+
+A subquery **projected** by a query reads the enclosing row's navigations the way a WHERE `exists(...)` does:
+the enclosing query joins them.
+
+```typescript
+db.posts.select(p => ({
+  title: p.title,
+  nextOlder: db.users.where(u => gt(u.age, p.user!.age)).orderBy(u => u.age).limit(1).select(u => u.username).asSubquery('scalar'),
+}));
+// SELECT "posts"."title" as "title", (SELECT "users"."username" FROM "users" WHERE "users"."age" > "user"."age" ORDER BY "users"."age" ASC LIMIT 1) as "nextOlder"
+// FROM "posts"
+// INNER JOIN "users" AS "user" ON "posts"."user_id" = "user"."id"
+```
+
+(Before 1.0.9 the join was missing — `missing FROM-clause entry for table "user"`.) This holds at any depth of
+the projection, through several navigation levels, and in a UNION leg — and in a **collection's item**
+(`u.posts.select(p => ({ author: db.users.where(v => eq(v.id, p.userId))…asSubquery('scalar') }))`, every
+collection strategy): the subquery renders in parentheses and the collection joins the item's navigations it
+reads. (Before 1.0.9 a subquery in a collection's item was bound as a parameter: the item read back the
+serialized Subquery object.)
+
+When the subquery reads a navigation PATH that ends in the same relation name as another path the query reads
+itself — a loan's own `ln.book` and its `ln.edition.book` — each path is its own join, and the query's own
+paths (its projection, WHERE, ORDER BY, the path a collection hangs off) keep the aliases they render under
+without the subquery: the subquery's path is the one that takes the path alias (`<parent>__<relation>`, e.g.
+`"lib_loans__book"` for a first hop, `"edition__book"` below one). So a raw `sql` fragment naming `"book"` reads
+the same join as it did before, and the subquery reads its own path:
+
+```typescript
+db.libLoans.select(ln => ({
+  printed: ln.edition!.book!.name,                                                           // "book"
+  own: db.libBooks.where(b => eq(b.id, ln.book!.id)).select(b => b.name).asSubquery('scalar'),  // "lib_loans__book"
+  raw: sql<string>`"book"."name"`,                                                            // the edition's book
+}));
+```
+
+(Before 1.0.9 such a subquery read the query's join of that name — here the edition's book — without an error.)
+
+### What `exists()` / `notExists()` accept
+
+A subquery (`.select(...).asSubquery()`) or a collection navigation (`u.posts.where(...)`). A
+query builder or a table (`db.posts.where(...)`, `db.posts`) is a query of its own and is refused
+before anything runs — it used to START that query, then fail with
+`this.resolved.getFieldRefs is not a function`:
+
+```typescript
+exists(db.posts.where(p => eq(p.userId, u.id)))                                    // throws
+exists(db.posts.where(p => eq(p.userId, u.id)).select(() => ({ one: literal(1) })).asSubquery())  // ✓
+exists(u.posts!.where(p => gt(p.views, 1000)))                                     // ✓
+```
+
+`exists(...)` and `notExists(...)` are fragments: `.as('flag')` / `.mapWith(...)` project them as
+columns (before 1.0.9 `.as()` rendered an empty expression).
+
+### 8. Array Membership: `eqAnySubquery` / `neAllSubquery`
+
+`(<field> = ANY (ARRAY(<subquery>)))` — membership in a one-column subquery computed as ONE array
+(an uncorrelated subquery is an InitPlan whose array can drive an index condition), not as the
+`IN (SELECT …)` semi-join `inSubquery` renders. Parenthesized like every helper, so it stays one
+operand when it is compared or combined (`eq(flag, eqAnySubquery(…))`):
+
+```typescript
+const activeGenres = db.genres.where(g => eq(g.active, true)).select(g => g.id).asSubquery('array');
+
+db.books.where(b => eqAnySubquery(b.genreId, activeGenres))
+// ("books"."genre_id" = ANY (ARRAY(SELECT "genres"."id" FROM "genres" WHERE "genres"."active" = $1)))
+
+db.books.where(b => neAllSubquery(b.genreId, activeGenres))
+// ("books"."genre_id" <> ALL (ARRAY(SELECT …)))
+```
+
+A NULL field gives NULL; an empty result gives FALSE for `eqAnySubquery` (every row, a NULL field
+included) and TRUE for `neAllSubquery`. Only the subquery's own parameters are bound; the field's
+references and the subquery's correlation references are reported, so the navigations they read
+are joined.
+
+### 9. A Scalar Subquery as an Expression: `asExpression()`
+
+A projected `Subquery` is a value, but not a fragment: it cannot be an operand of `coalesce`, CASE,
+arithmetic or a fragment method. `.asExpression()` turns a SCALAR subquery into one —
+`(<subquery sql>)` with its parameters in the enclosing statement's sequence and its correlation
+references reported:
+
+```typescript
+const cityOf = (o: any) => db.addresses.where(a => eq(a.id, o.addressId)).select(a => a.city)
+  .asSubquery('scalar').asExpression<string>();
+
+db.orders.select(o => ({ city: coalesce(cityOf(o), 'n/a') }))
+db.orders.where(o => isNull(cityOf(o)))
+db.orders.where(o => eq(o.id, id)).update(o => ({ shipCity: cityOf(o) }))   // SET "ship_city" = (SELECT …)
+```
+
+It carries no mapper: projected, it reads like a raw `sql` fragment (a numeric-looking string
+becomes a number, NULL reads `undefined` at the top level). Chain `.withReadType('text')` or
+`.mapWith(...)` to type the read. An `'array'` / `'table'` subquery is refused.
+
+### 10. A Subquery as a Comparison Operand
+
+A scalar subquery can stand on either side of `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `like`,
+`isNull`, `isNotNull`, `between`, `inArray`, …: it renders `(<subquery sql>)` with its parameters
+in textual order, and its correlation references are joined like any other operand's:
+
+```typescript
+db.users.where(u => isNull(db.posts.where(p => eq(p.userId, u.id)).select(p => p.id).asSubquery('scalar')))
+db.users.where(u => eq(u.id, db.posts.where(p => eq(p.id, 1)).select(p => p.userId).asSubquery('scalar')))
+```
+
+(Before 1.0.9 `isNull(subquery)` rendered `"[object Object]" IS NULL`, and `eq(column, subquery)`
+bound the Subquery object as a parameter. A collection `count()` compared the same way —
+`gt(u.posts!.count(), 1)` — now renders its correlated count too.)
 
 ## Type Safety
 

@@ -289,7 +289,7 @@ describe('grouped queries', () => {
           .toList();
 
         expect(rows).toEqual([{ cat: fx.ids.hardback }]);
-        expect(statement()).toMatch(/HAVING \(SUM\("__arg\d+"\) > \$\d+ AND MAX\("__arg\d+"\) < \$\d+\)/);
+        expect(statement()).toMatch(/HAVING \(SUM\("q1"\."__arg\d+"\) > \$\d+ AND MAX\("q1"\."__arg\d+"\) < \$\d+\)/);
       });
 
       test('a condition on the expression key reads the subquery column', async () => {
@@ -301,7 +301,7 @@ describe('grouped queries', () => {
           .toList();
 
         expect(rows.map(r => r.cat)).toEqual([fx.ids.hardback, fx.ids.paperback].sort((a, b) => a - b));
-        expect(statement()).toContain('HAVING "initial" = $');
+        expect(statement()).toContain('HAVING "q1"."initial" = $');
       });
     });
 

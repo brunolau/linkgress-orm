@@ -53,7 +53,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE __elem->>'kind' = $1)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->>'kind') = $1)`
     );
     expect(ctx.params).toEqual(['fiction']);
   });
@@ -65,7 +65,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE __elem->'meta'->>'ref' IS NOT NULL)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->'meta'->>'ref') IS NOT NULL)`
     );
     expect(ctx.params).toEqual([]);
   });
@@ -80,7 +80,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->>'kind' = $1 AND __elem->'meta'->>'ref' IS NOT NULL))`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE ((__elem->>'kind') = $1 AND (__elem->'meta'->>'ref') IS NOT NULL))`
     );
     expect(ctx.params).toEqual(['fiction']);
   });
@@ -95,7 +95,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->>'kind' = $1 OR __elem->>'kind' = $2))`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE ((__elem->>'kind') = $1 OR (__elem->>'kind') = $2))`
     );
     expect(ctx.params).toEqual(['fiction', 'poetry']);
   });
@@ -107,7 +107,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE __elem->'meta'->>'code' LIKE $1)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->'meta'->>'code') LIKE $1)`
     );
     expect(ctx.params).toEqual(['ref_%']);
   });
@@ -119,7 +119,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE __elem->>'kind' != $1)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->>'kind') != $1)`
     );
     expect(ctx.params).toEqual(['archived']);
   });
@@ -131,7 +131,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE __elem->'meta'->>'code' IS NULL)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(shelfTags)}) AS __elem WHERE (__elem->'meta'->>'code') IS NULL)`
     );
   });
 
@@ -146,7 +146,7 @@ describe('jsonbArraySome', () => {
     const ctx = makeContext();
     const sql = condition.buildSql(ctx);
     expect(sql).toBe(
-      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(`"tag_data"`)}) AS __elem WHERE __elem->>'active' = $1)`
+      `EXISTS (SELECT 1 FROM jsonb_array_elements(${elements(`"tag_data"`)}) AS __elem WHERE (__elem->>'active') = $1)`
     );
   });
 

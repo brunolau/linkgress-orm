@@ -182,7 +182,7 @@ describe('inArrayOpt bucket ladder', () => {
       const ctx = makeContext();
       const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-      expect(inArrayOpt(ref('integer'), nine).buildSql(ctx)).toBe('"w"."widget_id" = ANY($1::integer[])');
+      expect(inArrayOpt(ref('integer'), nine).buildSql(ctx)).toBe('("w"."widget_id" = ANY($1::integer[]))');
       expect(ctx.params).toEqual(['{1,2,3,4,5,6,7,8,9}']);
     });
 
@@ -224,7 +224,7 @@ describe('inArrayOpt bucket ladder', () => {
       LinkgressConfig.configure({ inArrayOptThreshold: 4, inArrayPadBuckets: [1, 4, 8] });
 
       expect(inArrayOpt(ref('integer'), [1, 2, 3]).buildSql(makeContext())).toBe(`"w"."widget_id" IN (${placeholders(4)})`);
-      expect(inArrayOpt(ref('integer'), [1, 2, 3, 4, 5]).buildSql(makeContext())).toBe('"w"."widget_id" = ANY($1::integer[])');
+      expect(inArrayOpt(ref('integer'), [1, 2, 3, 4, 5]).buildSql(makeContext())).toBe('("w"."widget_id" = ANY($1::integer[]))');
     });
 
     test('padding preserves duplicates already present in the list', () => {

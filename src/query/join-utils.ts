@@ -199,6 +199,10 @@ export interface NavigationPathNode {
  * - the SHALLOWEST path to a relation name (then the one seen first) owns the plain name, so a query
  *   without a collision renders exactly the SQL it rendered before, and a raw `sql` fragment naming
  *   `"book"` keeps resolving to that path;
+ * - a path reached ONLY by the refs of a projected subquery ({@link addSecondaryRef}) owns the plain
+ *   name only when no path of the build's own refs ends in it: every alias the query's own paths
+ *   render under — which raw `sql` may name — is the one they had before such subqueries were
+ *   planned at all, while the subquery reads its own path (under a path alias when needed);
  * - every other path to the same name renders as `<parentAlias>__<relation>`
  *   (`edition__book`, `edition__book__category`);
  * - a hop named like the anchor table itself never owns its name either: under that name it would
@@ -220,6 +224,8 @@ export class NavigationAliasPlan {
    * most, and pay for this list and nothing else.
    */
   private readonly recorded: Array<object | readonly string[]> = [];
+  /** Refs recorded through {@link addSecondaryRef}: resolved after every entry of `recorded`. */
+  private readonly secondary: object[] = [];
   private changesSql = false;
   private deepest = 0;
   // Built by seal(), for a plan that can change the SQL
@@ -248,6 +254,19 @@ export class NavigationAliasPlan {
 
   /** Records the path `ref` navigates, when it is a reference navigation of this build's own. */
   addRef(ref: unknown): void {
+    this.record(ref, this.recorded);
+  }
+
+  /**
+   * Records the path a PROJECTED subquery reads through `ref` (one of its outer refs): planned and
+   * joined like any other, but with the lowest precedence for the plain alias — after every path of
+   * {@link addRef} / {@link addPath}, whatever the call order and the depths (see the class comment).
+   */
+  addSecondaryRef(ref: unknown): void {
+    this.record(ref, this.secondary);
+  }
+
+  private record(ref: unknown, into: object[]): void {
     if (ref === null || typeof ref !== 'object' || !('__dbColumnName' in ref)) {
       return;
     }
@@ -259,7 +278,7 @@ export class NavigationAliasPlan {
       return;
     }
 
-    this.recorded.push(fieldRef);
+    into.push(fieldRef);
 
     const relationName = renamedNavigationRefs.get(fieldRef) ?? fieldRef.__tableAlias;
 
@@ -286,7 +305,8 @@ export class NavigationAliasPlan {
    * class comment), else the plan itself.
    *
    * Throws when a path alias would exceed PostgreSQL's 63-byte identifier limit (a truncated alias can
-   * collide with another one) or would equal an alias another hop already renders under.
+   * collide with another one; a hop only a projected subquery reads takes a short alias instead, see
+   * {@link secondaryPathAlias}) or would equal an alias another hop already renders under.
    */
   seal(): NavigationAliasPlan | undefined {
     if (!this.changesSql) {
@@ -298,21 +318,52 @@ export class NavigationAliasPlan {
     this.nodesByRef = new Map();
     this.owners = new Map();
 
+    // The hops the build's own refs and paths traverse; a hop only a projected subquery's refs reach
+    // comes after all of them (the secondary refs resolve last, so their first-appearance ranks do too)
+    const primary = new Set<NavigationPathNode>();
+    // Every hop of `names` that exists (nodeForNames stops at a hop that is not a reference relation)
+    const markPrimary = (names: readonly string[]): void => {
+      let key = '';
+
+      for (let i = 0; i < names.length; i++) {
+        key = i === 0 ? names[i] : `${key}.${names[i]}`;
+        const node = this.nodesByKey.get(key);
+
+        if (node === undefined) {
+          return;
+        }
+
+        primary.add(node);
+      }
+    };
+
     for (const entry of this.recorded) {
-      if (Array.isArray(entry)) {
-        this.nodeForNames(entry);
+      const names = Array.isArray(entry) ? entry as readonly string[] : this.pathOf(entry);
+
+      if (names === undefined) {
         continue;
       }
 
-      const names = this.pathOf(entry);
-      const node = names === undefined ? undefined : this.nodeForNames(names);
+      const node = this.nodeForNames(names);
+      markPrimary(names);
 
-      if (node !== undefined) {
+      if (node !== undefined && !Array.isArray(entry)) {
         this.nodesByRef.set(entry, node);
       }
     }
 
-    const nodes = [...this.nodesByKey.values()].sort((a, b) => a.depth - b.depth || a.rank - b.rank);
+    for (const ref of this.secondary) {
+      const names = this.pathOf(ref);
+      const node = names === undefined ? undefined : this.nodeForNames(names);
+
+      if (node !== undefined) {
+        this.nodesByRef.set(ref, node);
+      }
+    }
+
+    // A parent always sorts before its children: the hops above a primary hop are primary too
+    const secondaryOnly = (node: NavigationPathNode): number => (primary.has(node) ? 0 : 1);
+    const nodes = [...this.nodesByKey.values()].sort((a, b) => secondaryOnly(a) - secondaryOnly(b) || a.depth - b.depth || a.rank - b.rank);
     let renamed = false;
 
     for (const node of nodes) {
@@ -324,7 +375,7 @@ export class NavigationAliasPlan {
     // Depth order: a parent's alias is final before its children's path aliases are derived from it
     for (const node of nodes) {
       if (this.owners.get(node.relationName) !== node) {
-        node.alias = this.pathAlias(node);
+        node.alias = primary.has(node) ? this.pathAlias(node) : this.secondaryPathAlias(node);
         renamed = true;
       }
 
@@ -516,6 +567,35 @@ export class NavigationAliasPlan {
     }
 
     return parent;
+  }
+
+  /**
+   * The alias of a hop only a projected subquery reads (see {@link addSecondaryRef}): its path alias
+   * — or, past PostgreSQL's 63-byte identifier limit (a hop one step below the anchor renders
+   * `<anchor table>__<relation>`), `<relation>__<n>`, the first one no hop renders under yet (the
+   * secondary hops are named last). Refusing it would fail a query whose own paths render fine: the
+   * subquery's path is the one that lost the plain name.
+   */
+  private secondaryPathAlias(node: NavigationPathNode): string {
+    const alias = `${this.parentAliasOf(node)}__${node.relationName}`;
+
+    if (identifierBytes(alias) <= 63) {
+      return alias;
+    }
+
+    for (let n = 2; ; n++) {
+      const candidate = `${node.relationName}__${n}`;
+
+      if (identifierBytes(candidate) > 63) {
+        // A relation name itself near the limit: refused as any other path alias
+        return this.pathAlias(node);
+      }
+
+      // Not an alias a hop renders under already, nor a relation name a later hop owns
+      if (!this.nodesByAlias.has(candidate) && !this.owners.has(candidate)) {
+        return candidate;
+      }
+    }
   }
 
   /** `<parentAlias>__<relation>`, refused past PostgreSQL's 63-byte identifier limit. */

@@ -994,6 +994,14 @@ class NacLongDatabase extends DbContext {
     return this.table(NacLongLoan);
   }
 
+  get nacLongEditions(): DbEntityTable<NacLongEdition> {
+    return this.table(NacLongEdition);
+  }
+
+  get nacLongBooks(): DbEntityTable<NacLongBook> {
+    return this.table(NacLongBook);
+  }
+
   protected override setupModel(model: DbModelConfig): void {
     model.entity(NacLongBook, entity => {
       entity.toTable('nac_long_books');
@@ -1054,6 +1062,36 @@ describe('navigation alias collision — refusals', () => {
         expect(error.message).toContain('the path "bookThatThisRelationNameMakesDeliberatelyLong"');
         expect(error.message).toContain('63-byte');
         expect(error.message).toContain('separate query');
+      },
+    );
+  });
+
+  test('NOT refused: the query reads the long two-hop path, a projected subquery the one-hop path of that name', async () => {
+    await withCapturedSql(
+      (client, options) => new NacLongDatabase(client, options),
+      'lateral',
+      cleanupLongSchema,
+      async (db, captured) => {
+        const [dune, emma] = await db.nacLongBooks.insertBulk([{ name: 'Dune' }, { name: 'Emma' }]).returning();
+        const [edition] = await db.nacLongEditions.insertBulk([{ bookId: emma.id }]).returning();
+        const [loan] = await db.nacLongLoans.insertBulk([{ editionId: edition.id, bookId: dune.id }]).returning();
+        captured.length = 0;
+
+        // The query's own path is the only one it reads: it keeps the plain alias, as without the subquery.
+        // The subquery's path used to take it (the shallower one), and the query's path then needed the
+        // 86-byte alias "editionThatThisRelationNameMakesLongToo__bookThatThisRelationNameMakesDeliberatelyLong"
+        const rows = await db.nacLongLoans
+          .select(ln => ({
+            id: ln.id,
+            printed: ln.editionThatThisRelationNameMakesLongToo!.bookThatThisRelationNameMakesDeliberatelyLong!.name,
+            own: db.nacLongBooks.where(b => eq(b.id, ln.bookThatThisRelationNameMakesDeliberatelyLong!.id)).select(b => b.name).asSubquery('scalar'),
+          }))
+          .toList();
+
+        expect(rows).toEqual([{ id: loan.id, printed: 'Emma', own: 'Dune' }]);
+        const statement = lastStatement(captured);
+        expect(statement).toContain('AS "bookThatThisRelationNameMakesDeliberatelyLong" ON "editionThatThisRelationNameMakesLongToo"."book_id" = "bookThatThisRelationNameMakesDeliberatelyLong"."id"');
+        expect(statement).toContain('AS "nac_long_loans__bookThatThisRelationNameMakesDeliberatelyLong" ON "nac_long_loans"."book_id"');
       },
     );
   });

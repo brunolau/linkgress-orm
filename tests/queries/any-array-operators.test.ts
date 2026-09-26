@@ -96,7 +96,7 @@ describe('ANY/ALL array operators', () => {
       const ctx = makeContext();
 
       expect(eqAny(ref('integer'), [4, 8, 15]).buildSql(ctx))
-        .toBe('"oi"."product_price_id" = ANY($1::integer[])');
+        .toBe('("oi"."product_price_id" = ANY($1::integer[]))');
       expect(ctx.params).toEqual(['{4,8,15}']);
     });
 
@@ -104,7 +104,7 @@ describe('ANY/ALL array operators', () => {
       const ctx = makeContext();
 
       expect(neAll(ref('integer'), [4, 8, 15]).buildSql(ctx))
-        .toBe('"oi"."product_price_id" <> ALL($1::integer[])');
+        .toBe('("oi"."product_price_id" <> ALL($1::integer[]))');
       expect(ctx.params).toEqual(['{4,8,15}']);
     });
 
@@ -146,9 +146,9 @@ describe('ANY/ALL array operators', () => {
       // CTE columns and post-select shapes have no __sqlType. Postgres still
       // infers the array type from the ANY context, so bare is correct there.
       expect(eqAny(ref(undefined), [1]).buildSql(makeContext()))
-        .toBe('"oi"."product_price_id" = ANY($1)');
+        .toBe('("oi"."product_price_id" = ANY($1))');
       expect(neAll(ref(undefined), [1]).buildSql(makeContext()))
-        .toBe('"oi"."product_price_id" <> ALL($1)');
+        .toBe('("oi"."product_price_id" <> ALL($1))');
     });
 
     test('the untyped "array" column type stays uncast', () => {
@@ -168,7 +168,7 @@ describe('ANY/ALL array operators', () => {
         { hour: 17, minute: 0 },
       ]);
 
-      expect(fragment.buildSql(ctx)).toBe('"oi"."product_price_id" = ANY($1::smallint[])');
+      expect(fragment.buildSql(ctx)).toBe('("oi"."product_price_id" = ANY($1::smallint[]))');
       expect(ctx.params).toEqual(['{570,1020}']);
     });
 
@@ -177,12 +177,12 @@ describe('ANY/ALL array operators', () => {
       // semantics match inArray/notInArray while the statement text stays stable.
       const anyCtx = makeContext();
       expect(eqAny(ref('integer'), []).buildSql(anyCtx))
-        .toBe('"oi"."product_price_id" = ANY($1::integer[])');
+        .toBe('("oi"."product_price_id" = ANY($1::integer[]))');
       expect(anyCtx.params).toEqual(['{}']);
 
       const allCtx = makeContext();
       expect(neAll(ref('integer'), []).buildSql(allCtx))
-        .toBe('"oi"."product_price_id" <> ALL($1::integer[])');
+        .toBe('("oi"."product_price_id" <> ALL($1::integer[]))');
       expect(allCtx.params).toEqual(['{}']);
     });
 
