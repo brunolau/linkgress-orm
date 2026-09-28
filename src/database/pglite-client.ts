@@ -1,4 +1,5 @@
-import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions } from './database-client.interface';
+import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, TransactionEndedError } from './database-client.interface';
+import { withArrayTypes } from './typed-text';
 import type { PGliteClientOptions } from './types';
 
 // Resolved lazily so '@electric-sql/pglite' stays an optional dependency
@@ -195,7 +196,9 @@ const heldSessions: HeldSessionTracker | undefined = (() => {
 
 /**
  * A lease on PGlite's single session, handed out by `PGliteClient.connect()`. Its queries
- * run directly on the session; every other caller waits until `release()`.
+ * run directly on the session; every other caller waits until `release()`. Released, the
+ * lease refuses its queries with a {@link ConnectionReleasedError} — they would run on the
+ * session outside the lock, under whoever holds it next.
  */
 class PGlitePooledConnection implements PooledConnection {
   private released = false;
@@ -203,6 +206,10 @@ class PGlitePooledConnection implements PooledConnection {
   constructor(private pglite: PGliteInstance, private handBack: () => void) {}
 
   async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    if (this.released) {
+      throw new ConnectionReleasedError(sql);
+    }
+
     return toQueryResult<T>(await this.pglite.query(sql, params));
   }
 
@@ -242,6 +249,8 @@ export class PGliteClient extends DatabaseClient {
   private pglite: PGliteInstance;
   private ownsInstance: boolean;
   private readonly session: SessionLock;
+  /** The types of the `parsers` the application gave this client (undefined for an instance passed in). */
+  private readonly applicationParserOids?: number[];
 
   /**
    * Create a PGliteClient
@@ -273,6 +282,8 @@ export class PGliteClient extends DatabaseClient {
     } else {
       this.pglite = createPGlite(config);
       this.ownsInstance = true;
+      const parsers = typeof config === 'object' && config !== null ? (config as PGliteClientOptions).parsers : undefined;
+      this.applicationParserOids = Object.keys(parsers ?? {}).map(Number).filter(Number.isInteger);
     }
 
     this.session = sessionLockFor(this.pglite);
@@ -305,15 +316,29 @@ export class PGliteClient extends DatabaseClient {
   /**
    * Execute a callback within a transaction.
    * Uses PGlite's transaction(): BEGIN, then COMMIT — or ROLLBACK when the callback throws.
+   *
+   * The query function is valid until the callback settles; a statement sent through it later is refused with
+   * a {@link TransactionEndedError} (PGlite's own "Transaction is closed" never reaches the caller).
    */
   async transaction<T>(callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     this.assertSessionAvailable();
 
     return await this.session.run(() =>
       this.pglite.transaction(async (tx: any) => {
-        const queryFn = async (sql: string, params?: any[]): Promise<QueryResult> => toQueryResult(await tx.query(sql, params));
+        let open = true;
+        const queryFn = async (sql: string, params?: any[]): Promise<QueryResult> => {
+          if (!open) {
+            throw new TransactionEndedError(sql);
+          }
 
-        return await this.holdingSession(() => callback(queryFn));
+          return toQueryResult(await tx.query(sql, params));
+        };
+
+        try {
+          return await this.holdingSession(() => callback(queryFn));
+        } finally {
+          open = false;
+        }
       })
     );
   }
@@ -390,10 +415,65 @@ export class PGliteClient extends DatabaseClient {
   }
 
   /**
+   * The value PGlite delivers for a column of the type `oid` holding `text`: through the parser the
+   * instance holds for that type — PGlite's defaults, this client's, the application's `parsers` — or the
+   * text itself.
+   */
+  parseTypedText(oid: number, text: string): unknown {
+    const parse = this.pglite?.parsers?.[oid];
+
+    return typeof parse === 'function' ? parse(text, oid) : text;
+  }
+
+  /**
+   * The types the application's `parsers` parse, with the arrays of those: the parsers given to this
+   * client — or, for an instance passed in, the builtin types whose parser is neither PGlite's default
+   * nor this client's.
+   */
+  customParsedTypeOids(): readonly number[] {
+    const parsers = this.pglite?.parsers;
+    let oids: number[];
+
+    if (this.applicationParserOids !== undefined) {
+      oids = this.applicationParserOids;
+    } else if (parsers && typeof parsers === 'object') {
+      const defaults = pgliteDefaultParsers();
+      oids = defaults
+        ? CUSTOMIZABLE_SCALAR_TYPE_OIDS.filter((oid) => parsers[oid] !== undefined && parsers[oid] !== defaults[oid] && parsers[oid] !== DEFAULT_PARSERS[oid])
+        : [];
+    } else {
+      oids = [];
+    }
+
+    return withArrayTypes(oids);
+  }
+
+  /**
    * Get access to the underlying PGlite instance for advanced use cases
    * (extension namespaces, live queries, dumpDataDir(), ...)
    */
   getPGlite(): PGliteInstance {
     return this.pglite;
   }
+}
+
+/** The builtin scalar types an application may parse with a parser of its own, besides those a QueryBatch sends as text anyway. */
+const CUSTOMIZABLE_SCALAR_TYPE_OIDS = [16, 21, 23, 26, 700, 701, 114, 3802, 25, 1043, 1042, 18, 19, 142, 2950, 650, 869, 829];
+
+let pgliteParsers: Record<number, unknown> | null | undefined;
+
+/** PGlite's own default result parsers, as its module exports them — null where it cannot be loaded. */
+function pgliteDefaultParsers(): Record<number, unknown> | null {
+  if (pgliteParsers === undefined) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const pgliteModule = require('@electric-sql/pglite');
+      const types = pgliteModule?.types ?? pgliteModule?.default?.types;
+      pgliteParsers = types?.parsers ?? null;
+    } catch {
+      pgliteParsers = null;
+    }
+  }
+
+  return pgliteParsers ?? null;
 }

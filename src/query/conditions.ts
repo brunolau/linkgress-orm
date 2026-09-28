@@ -155,6 +155,42 @@ export type UnwrapSelection<T> = T extends SqlFragment<infer V>
               : T;
 
 /**
+ * What the collection subqueries enclosing a build expose to the collections nested in it (see
+ * CollectionQueryBuilder.buildSql). A nested collection correlates to the row that MINTED it — the
+ * item of an enclosing collection, the item of one of its selectMany() hops, a reference row reached
+ * from either — under the alias that row renders under; a table-name-keyed lookup bound it to any
+ * row of that table in scope, the outer row's own collection included. @internal
+ */
+export interface EnclosingCollectionScope {
+  /** An enclosing collection's chain (see CollectionQueryBuilder.chainId) → the alias its items render under. */
+  readonly items: ReadonlyMap<string | number, string>;
+  /** A row of an enclosing flattening's hop — its item, or a reference row reached from it — → the hop's alias. */
+  readonly hopRows: ReadonlyMap<object, string>;
+  /** Every alias an enclosing collection subquery renders (its own, its hops', their navigations'): never taken again. */
+  readonly aliases: ReadonlySet<string>;
+  /**
+   * The bare names rows OUTSIDE the enclosing collection subqueries are read by — a correlated
+   * subquery's parent row that is none of theirs, read by its table's name (the root query's row):
+   * a collection subquery nested here never renders its table under one. Under that name it
+   * shadowed the outer row for a collection of that row nested deeper, which then correlated to it.
+   */
+  readonly outerNames: ReadonlySet<string>;
+  /**
+   * Set while the projection of the collection a selectMany() selector returned is built (see
+   * CollectionQueryBuilder.selectMany): the relation of the flattened items and their chain, the
+   * relation of the collection nested in that projection whose own projection or filter is being built
+   * (`nested`, none at the top level), and the chains of the rows a collection there may be minted by —
+   * the items of the collection being built, and of the correlated subqueries within it.
+   */
+  readonly projection?: {
+    readonly relation: string;
+    readonly flattenedChain: string | number;
+    readonly nested?: string;
+    readonly chains: ReadonlySet<string | number>;
+  };
+}
+
+/**
  * Context for building SQL with parameter tracking
  */
 export interface SqlBuildContext {
@@ -197,6 +233,12 @@ export interface SqlBuildContext {
    * under its own name inside the lateral.
    */
   lateralTableAliasMap?: Map<string, string>;
+  /**
+   * What the collection subqueries enclosing the one being built expose to it (see
+   * EnclosingCollectionScope): a nested collection correlates to the ROW that minted it, and never
+   * takes an alias one of them renders. @internal
+   */
+  collectionScope?: EnclosingCollectionScope;
   /**
    * Renders a column or an expression operand some other way than its own SQL — `undefined` for a
    * value it leaves alone. A grouped query's HAVING sets it: an aggregate ref (`g.count()`,
@@ -2751,13 +2793,16 @@ export class ConditionBuilder {
    *   nested subquery that reads one of them (see
    *   `CteRootQueryBuilder.asSubquery`) emits a bare reference instead of
    *   re-declaring the CTE and re-binding its parameters.
+   * @param collectionScope What the enclosing collection subqueries expose to the collections the
+   *   condition holds (see EnclosingCollectionScope).
    */
   build(
     condition: Condition,
     startParam: number = 1,
     placeholders?: Map<string, number>,
     hoistedCteNames?: Set<string>,
-    lateralTableAliasMap?: Map<string, string>
+    lateralTableAliasMap?: Map<string, string>,
+    collectionScope?: EnclosingCollectionScope
   ): { sql: string; params: any[]; placeholders?: Map<string, number>; paramCounter: number } {
     const context: SqlBuildContext = {
       paramCounter: startParam,
@@ -2767,6 +2812,9 @@ export class ConditionBuilder {
     };
     if (lateralTableAliasMap !== undefined) {
       context.lateralTableAliasMap = lateralTableAliasMap;
+    }
+    if (collectionScope !== undefined) {
+      context.collectionScope = collectionScope;
     }
 
     const sql = condition.buildSql(context);

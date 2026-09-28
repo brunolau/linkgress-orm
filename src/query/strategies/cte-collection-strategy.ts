@@ -81,7 +81,10 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     rewrittenWhereClause: string | undefined,
     parentFilter?: string,
   ): string {
-    const literalPreds = buildLiteralOnlyPredicates(targetTable, config.foreignKeys, config.matches);
+    // The constant key parts are columns of the table holding the foreign key: the collection's own,
+    // or — flattened by selectMany() — its first hop (they used to be read from the flattened table:
+    // `column "<flattened table>"."<column>" does not exist`, or another column of that name)
+    const literalPreds = buildLiteralOnlyPredicates(config.foreignKeyTableAlias ?? targetTable, config.foreignKeys, config.matches);
     const parts: string[] = [];
     if (parentFilter) {
       parts.push(parentFilter);

@@ -94,6 +94,10 @@ export class MigrationScaffold {
         // changed-signature recreate replaces the old index in place.
         return this.buildIndexUpSql(op);
 
+      case 'repair_index':
+        // Drops the index only where the schema manager would repair it, so the file leaves a healthy one alone elsewhere.
+        return this.buildIndexRepairUpSql(op);
+
       case 'drop_index': {
         const qualifiedIndex = op.schema
           ? `"${op.schema}"."${op.indexName}"`
@@ -224,6 +228,10 @@ export class MigrationScaffold {
           : `-- Cannot auto-generate: recreate previous definition of index "${op.indexName}"`);
         return down;
       }
+
+      case 'repair_index':
+        // The database held the index INVALID before: there is no earlier state worth restoring.
+        return [`-- Nothing to revert: INVALID index "${op.indexName}" was rebuilt from the model`];
 
       case 'drop_index':
         return [`-- Cannot auto-generate: recreate index "${op.indexName}"`];
@@ -488,7 +496,57 @@ export class MigrationScaffold {
       ? `"${op.schema}"."${op.indexName}"`
       : `"${op.indexName}"`;
 
-    const spec = {
+    return [
+      buildDropIndexStatement(qualifiedIndex, { concurrent: op.concurrent, ifExists: true }),
+      buildCreateIndexStatement(this.indexSpecOf(op), qualifiedTable, { concurrent: op.concurrent }),
+    ];
+  }
+
+  /**
+   * Build the UP SQL for a repair_index operation: drop the index only where the
+   * schema manager would repair it, then create it IF NOT EXISTS. A migration file
+   * runs on every database, and the INVALID index is a state of the one it was
+   * scaffolded from: where the index is INVALID the file rebuilds it, where it is
+   * missing it creates it, and a healthy one is left alone — a plain DROP + CREATE
+   * would rebuild it everywhere. The drop's guard is the schema manager's: a plain
+   * (not partitioned) INVALID index, not a unique one that is still ready, none a
+   * constraint requires, no index build running on its table.
+   *
+   * MigrationRunner runs a file in one transaction, so neither statement is ever
+   * CONCURRENTLY (not even for a `.concurrent()` index): the DO block's DROP holds
+   * the table's ACCESS EXCLUSIVE lock — reads and writes wait — until the file
+   * commits, through the whole build. A build that fails (a unique index still
+   * over duplicate rows) fails the file, which rolls the drop back.
+   */
+  private buildIndexRepairUpSql(
+    op: Extract<MigrationOperation, { type: 'repair_index' }>
+  ): string[] {
+    const qualifiedTable = op.schema
+      ? `"${op.schema}"."${op.tableName}"`
+      : `"${op.tableName}"`;
+    const qualifiedIndex = op.schema
+      ? `"${op.schema}"."${op.indexName}"`
+      : `"${op.indexName}"`;
+    const indexLiteral = qualifiedIndex.replace(/'/g, "''");
+    const buildOnTable = 'SELECT 1 FROM pg_stat_progress_create_index p'
+      + ' WHERE p.datid = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())'
+      + ' AND (p.index_relid = x.indexrelid OR p.relid = x.indrelid'
+      + ' OR (p.relid IS NULL AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = p.pid AND l.locktype = \'relation\' AND l.database = p.datid AND l.relation = x.indrelid)))';
+    const repairable = 'SELECT 1 FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid'
+      + ` WHERE x.indexrelid = to_regclass('${indexLiteral}') AND NOT x.indisvalid AND c.relkind = 'i'`
+      + ' AND NOT (x.indisunique AND x.indisready)'
+      + ' AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = x.indexrelid)'
+      + ` AND NOT EXISTS (${buildOnTable})`;
+
+    return [
+      `DO $lkg$ BEGIN IF EXISTS (${repairable}) THEN DROP INDEX ${qualifiedIndex}; END IF; END $lkg$`,
+      buildCreateIndexStatement(this.indexSpecOf(op), qualifiedTable, { concurrent: false, ifNotExists: true }),
+    ];
+  }
+
+  /** The index an index operation creates, as the shared SQL builders take it. */
+  private indexSpecOf(op: Extract<MigrationOperation, { type: 'create_index' | 'recreate_index' | 'repair_index' }>) {
+    return {
       name: op.indexName,
       columns: op.columns,
       isUnique: op.isUnique,
@@ -499,11 +557,6 @@ export class MigrationScaffold {
       nullsNotDistinct: op.nullsNotDistinct,
       include: op.include,
     };
-
-    return [
-      buildDropIndexStatement(qualifiedIndex, { concurrent: op.concurrent, ifExists: true }),
-      buildCreateIndexStatement(spec, qualifiedTable, { concurrent: op.concurrent }),
-    ];
   }
 
   /**

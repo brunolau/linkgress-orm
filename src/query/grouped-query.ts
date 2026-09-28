@@ -24,6 +24,9 @@ import { formatJoinValue, NavigationAliasPlan } from './join-utils';
 import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
 import { lateralSetJoinsSql, lateralSetRefs } from './set-returning';
 import type { LateralSetJoin } from './set-returning';
+import { flatRowBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, isCustomReadMapper } from './future-query';
+import type { BatchFieldDelivery, FutureBatchMeta } from './future-query';
+import { needsClientParse } from '../database/typed-text';
 
 /**
  * Query context for tracking CTEs and parameters
@@ -260,6 +263,26 @@ function describeGroupedValue(value: unknown): string {
 }
 
 /**
+ * How a value of the declared SQL type `sqlType` travels through a QueryBatch: as its text when the
+ * client has to parse it (see needsClientParse) — a grouped query delivers every value as the client does
+ * standalone; `undefined` (as it is) for a type JSON carries as the drivers deliver it.
+ */
+function declaredDelivery(sqlType: unknown, customOids: readonly number[]): BatchFieldDelivery | undefined {
+  return needsClientParse(sqlType, customOids) ? RUNTIME_DELIVERY : undefined;
+}
+
+/** A value sent as its text when its runtime type needs it (see FutureBatchMeta.runtimeTypedColumns). */
+const RUNTIME_DELIVERY: BatchFieldDelivery = Object.freeze({ kind: 'runtime' });
+
+/**
+ * The count of the rows a grouped statement reads — its groups, or a grouped join's rows — as
+ * `futureCount()` asks for it (the statement built without ORDER BY / LIMIT / OFFSET).
+ */
+function countStatementOf(sql: string): string {
+  return `SELECT COUNT(*) as count FROM (${sql}) AS "grouped_count"`;
+}
+
+/**
  * What one build of a grouped select evaluates once and every clause reads: the grouped row, its key,
  * the projection, the HAVING condition over the same group, and each aggregate's argument.
  */
@@ -374,7 +397,9 @@ export class GroupedQueryBuilder<TOriginalRow, TGroupingKey> {
       [...this.havingSelectors],
       this.limitValue,
       this.offsetValue,
-      this.orderByFields,
+      // Each select orders on its own: its orderBy() used to push into ONE list every select of this
+      // grouping shared — a sibling not projecting the key failed naming it, one projecting it took its order
+      [...this.orderByFields],
       this.executor,
       this.manualJoins,
       this.joinCounter,
@@ -536,16 +561,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * Execute query and return results
    */
   async toList(): Promise<ResolveFieldRefs<TSelection>[]> {
-    const context: QueryContext = {
-      ctes: new Map(),
-      cteCounter: 0,
-      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
-      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
-      paramCounter: 1,
-      allParams: [],
-    };
-
-    const { sql, params } = this.buildQuery(context);
+    const { sql, params } = this.buildQuery(this.newQueryContext());
 
     // Execute using executor if available, otherwise use client directly
     const result = this.executor
@@ -556,12 +572,22 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     return this.transformResults(result.rows);
   }
 
+  /** The context one statement of this query is built in — by toList() and by the futures alike. */
+  private newQueryContext(): QueryContext {
+    return {
+      ctes: new Map(),
+      cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      jsonArrayProjection: !this.client.supportsBinaryArrayResults(),
+      paramCounter: 1,
+      allParams: [],
+    };
+  }
+
   /**
    * Transform database results - convert aggregate values and apply mappers
    */
-  private transformResults(rows: any[]): any[] {
-    const readers = this.buildFieldReaders();
-
+  private transformResults(rows: any[], readers: Map<string, (value: any) => any> = this.buildFieldReaders()): any[] {
     return rows.map(row => {
       const transformed: any = {};
 
@@ -592,42 +618,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const mockOriginalSelection = this.originalSelector(mockRow);
 
     // Build column metadata cache from schema for mapper lookup
-    const columnMetadataCache: Record<string, { hasMapper: boolean; mapper?: any }> = {};
-    for (const [key, mockValue] of Object.entries(mockResult as object)) {
-      // Check if mockValue has getMapper (SqlFragment or aliased field with mapper)
-      if (typeof mockValue === 'object' && mockValue !== null && typeof (mockValue as any).getMapper === 'function') {
-        const mapper = (mockValue as any).getMapper();
-        if (mapper) {
-          columnMetadataCache[key] = { hasMapper: true, mapper };
-        }
-      }
-      // Check if this is a FieldRef from schema column
-      else if (typeof mockValue === 'object' && mockValue !== null && '__fieldName' in mockValue) {
-        const fieldName = (mockValue as any).__fieldName as string;
-        // Look up in schema
-        const column = this.schema.columns[fieldName];
-        if (column) {
-          const config = column.build();
-          if (config.mapper) {
-            columnMetadataCache[key] = { hasMapper: true, mapper: config.mapper };
-          }
-        }
-        // Also check original selection for mapper (for aliased fields like p.key.distinctDay)
-        else if (mockOriginalSelection && fieldName in mockOriginalSelection) {
-          const origValue = mockOriginalSelection[fieldName];
-          if (typeof origValue === 'object' && origValue !== null && '__fieldName' in origValue) {
-            const origFieldName = (origValue as any).__fieldName as string;
-            const origColumn = this.schema.columns[origFieldName];
-            if (origColumn) {
-              const config = origColumn.build();
-              if (config.mapper) {
-                columnMetadataCache[key] = { hasMapper: true, mapper: config.mapper };
-              }
-            }
-          }
-        }
-      }
-    }
+    const columnMetadataCache = this.projectionMappers(mockResult as object);
 
     const readers = new Map<string, (value: any) => any>();
 
@@ -673,6 +664,50 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   }
 
   /**
+   * The mapper each field of the projection reads through, by key: an expression's own (`getMapper`);
+   * a column's — a grouping key, also renamed (the `p.key.distinctDay` of `{ distinctDay: p.day }`) —
+   * is its SOURCE column's (see {@link columnReadMapperOf}). Read by {@link buildFieldReaders}, by the
+   * batch deliveries (which revive a mapper's input as the mapper expects it) and, per column, by
+   * {@link getSelectionMetadata}.
+   */
+  private projectionMappers(mockResult: object): Record<string, { hasMapper: boolean; mapper?: any }> {
+    const columnMetadataCache: Record<string, { hasMapper: boolean; mapper?: any }> = {};
+
+    for (const [key, mockValue] of Object.entries(mockResult)) {
+      // Check if mockValue has getMapper (SqlFragment or aliased field with mapper)
+      if (typeof mockValue === 'object' && mockValue !== null && typeof (mockValue as any).getMapper === 'function') {
+        const mapper = (mockValue as any).getMapper();
+        if (mapper) {
+          columnMetadataCache[key] = { hasMapper: true, mapper };
+        }
+      }
+      // A column
+      else if (typeof mockValue === 'object' && mockValue !== null && '__fieldName' in mockValue) {
+        const mapper = this.columnReadMapperOf(mockValue);
+        if (mapper) {
+          columnMetadataCache[key] = { hasMapper: true, mapper };
+        }
+      }
+    }
+
+    return columnMetadataCache;
+  }
+
+  /**
+   * The custom mapper a column of the grouped row reads through — its SOURCE column's: a navigation's
+   * and a set's column carry theirs, a column of the grouped table or of a manual join has its table's
+   * (see {@link columnTypeOf}). `undefined` when that column has none. It used to be looked up by the
+   * column's NAME on the grouped table: a navigation's or a joined table's column named like a mapped
+   * column of the grouped table read through THAT column's mapper, and a mapped navigation column the
+   * grouped table has no column of read through none.
+   */
+  private columnReadMapperOf(ref: object): any | undefined {
+    const { mapper } = this.columnTypeOf(ref);
+
+    return isCustomReadMapper(mapper) ? mapper : undefined;
+  }
+
+  /**
    * The MIN / MAX of a value, read the way the value itself reads: through its column's mapper, as a
    * number for a numeric column, as the driver delivers it for any other column (text, dates,
    * timestamps, uuid, …). Every MIN / MAX used to go through Number(): a text extreme came back NaN
@@ -701,7 +736,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * What the MIN / MAX `aggregate` is an extreme of: the mapper and SQL type of its column (or the
    * mapper of its `sql` expression), as far as they are known.
    */
-  private extremeTypeOf(aggregate: AggregateFieldRef, originalSelection: any): { mapper?: any; sqlType?: string } {
+  private extremeTypeOf(aggregate: AggregateFieldRef, originalSelection: any): { mapper?: any; sqlType?: string; scale?: number } {
     let source: any;
     try {
       source = aggregate.__aggregateSelector?.(originalSelection);
@@ -709,39 +744,49 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       source = undefined;
     }
 
-    let mapper: any;
-    let sqlType: string | undefined;
-
     if (source && typeof source === 'object') {
       if (typeof source.getMapper === 'function') {
-        mapper = source.getMapper();
-      } else if ('__fieldName' in source) {
-        // A navigation's column carries its mapper and type; one of the grouped table or of a
-        // manual join is looked up in that table's schema
-        mapper = source.__mapper;
-        sqlType = source.__sqlType;
+        return { mapper: source.getMapper() };
+      }
 
-        const alias: string | undefined = source.__tableAlias;
-        const tableSchema = (source.__sourceTable ? this.schemaRegistry?.get(source.__sourceTable) : undefined)
-          ?? (alias === undefined || alias === this.schema.name ? this.schema : undefined)
-          ?? this.manualJoins.find(join => join.alias === alias)?.schema
-          ?? this.schemaRegistry?.get(alias!);
-        const column = tableSchema?.columns[source.__fieldName];
-
-        if (column) {
-          const config = column.build();
-          mapper = mapper ?? config.mapper;
-          sqlType = sqlType ?? config.type;
-        }
+      if ('__fieldName' in source) {
+        return this.columnTypeOf(source);
       }
     }
 
-    return { mapper, sqlType };
+    return {};
+  }
+
+  /**
+   * The mapper, declared SQL type and scale of the column `ref` reads, as far as they are known. A
+   * navigation's column, a manual join's and a set's carry their mapper and type; the scale (and a
+   * ref that carries neither) is looked up in the schema of the table the column belongs to.
+   */
+  private columnTypeOf(ref: any): { mapper?: any; sqlType?: string; scale?: number } {
+    let mapper = ref.__mapper;
+    let sqlType: string | undefined = ref.__sqlType;
+    let scale: number | undefined;
+
+    const alias: string | undefined = ref.__tableAlias;
+    const tableSchema = (ref.__sourceTable ? this.schemaRegistry?.get(ref.__sourceTable) : undefined)
+      ?? (alias === undefined || alias === this.schema.name ? this.schema : undefined)
+      ?? this.manualJoins.find(join => join.alias === alias)?.schema
+      ?? this.schemaRegistry?.get(alias!);
+    const column = tableSchema?.columns[ref.__fieldName];
+
+    if (column) {
+      const config = column.build();
+      mapper = mapper ?? config.mapper;
+      sqlType = sqlType ?? config.type;
+      scale = config.scale;
+    }
+
+    return { mapper, sqlType, scale };
   }
 
   /**
    * Get selection metadata for mapper preservation in CTEs
-   * Enhances the selection result with mapper info from original schema columns
+   * Enhances the selection result with the mapper each column reads through — its source column's
    * @internal
    */
   getSelectionMetadata(): Record<string, any> {
@@ -766,41 +811,16 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         continue;
       }
 
-      // Check if it's a FieldRef
+      // A column hands its readers its SOURCE column's mapper (see columnReadMapperOf)
       if (typeof value === 'object' && value !== null && '__fieldName' in value) {
-        const fieldName = (value as any).__fieldName as string;
+        const mapper = this.columnReadMapperOf(value);
 
-        // First check if schema has mapper for this field
-        const column = this.schema.columns[fieldName];
-        if (column) {
-          const config = column.build();
-          if (config.mapper) {
-            // Add mapper info to the metadata
-            enhancedMetadata[key] = {
-              ...value,
-              getMapper: () => config.mapper,
-            };
-            continue;
-          }
-        }
-
-        // Check original selection for mapper (for aliased fields like p.key.distinctDay)
-        if (mockOriginalSelection && fieldName in mockOriginalSelection) {
-          const origValue = mockOriginalSelection[fieldName];
-          if (typeof origValue === 'object' && origValue !== null && '__fieldName' in origValue) {
-            const origFieldName = (origValue as any).__fieldName as string;
-            const origColumn = this.schema.columns[origFieldName];
-            if (origColumn) {
-              const config = origColumn.build();
-              if (config.mapper) {
-                enhancedMetadata[key] = {
-                  ...value,
-                  getMapper: () => config.mapper,
-                };
-                continue;
-              }
-            }
-          }
+        if (mapper) {
+          enhancedMetadata[key] = {
+            ...value,
+            getMapper: () => mapper,
+          };
+          continue;
         }
       }
 
@@ -835,6 +855,152 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       throw new Error('No results found');
     }
     return result;
+  }
+
+  /**
+   * Create a future query of this grouped query's rows — the statement and the reads `toList()` would
+   * run, fixed now and executed later: by `execute()`, by `FutureQueryRunner.runAsync()`, or as a
+   * member of a `QueryBatch` (`batch.addList(grouped, 'id')`), which reads it in the batch's one round
+   * trip exactly as `toList()` reads it.
+   *
+   * @example
+   * const perTeam = db.tasks
+   *   .select(t => ({ teamId: t.teamId, points: t.points }))
+   *   .groupBy(r => ({ teamId: r.teamId }))
+   *   .select(g => ({ teamId: g.key.teamId, tasks: g.count(), points: g.sum(r => r.points) }));
+   *
+   * const batch = new QueryBatch();
+   * const perTeamKey = batch.addList(perTeam, 'perTeam');
+   * const teamsKey = batch.addCount(perTeam, 'teams');
+   * await batch.executeBatch();
+   * batch.getList(perTeamKey); // { teamId: number; tasks: number; points: number }[]
+   */
+  future(): FutureQuery<ResolveFieldRefs<TSelection>> {
+    const { sql, params } = this.buildQuery(this.newQueryContext());
+    const readers = this.buildFieldReaders();
+
+    const future = new FutureQuery<ResolveFieldRefs<TSelection>>(
+      sql,
+      params,
+      rows => this.transformResults(rows, readers),
+      this.client,
+      this.executor
+    );
+    future._batchMeta = this.buildBatchMeta();
+
+    return future;
+  }
+
+  /**
+   * Create a future query of this grouped query's first row, or null — `firstOrDefault()` fixed now
+   * and executed later (`QueryBatch.addFirstOrDefault()`, `FutureQueryRunner.runAsync()`). LIMIT 1 is
+   * applied to the future only: the builder keeps its own paging.
+   */
+  futureFirstOrDefault(): FutureSingleQuery<ResolveFieldRefs<TSelection>> {
+    const originalLimit = this.limitValue;
+    this.limitValue = 1;
+
+    let built: { sql: string; params: any[] };
+    try {
+      built = this.buildQuery(this.newQueryContext());
+    } finally {
+      this.limitValue = originalLimit;
+    }
+
+    const readers = this.buildFieldReaders();
+    const future = new FutureSingleQuery<ResolveFieldRefs<TSelection>>(
+      built.sql,
+      built.params,
+      rows => this.transformResults(rows, readers),
+      this.client,
+      this.executor
+    );
+    future._batchMeta = this.buildBatchMeta();
+
+    return future;
+  }
+
+  /**
+   * Create a future query of the number of groups this query reads — the groups its HAVING keeps; its
+   * ORDER BY, LIMIT and OFFSET aside, as a plain select's `futureCount()` counts its rows past its
+   * paging (`QueryBatch.addCount()`, `FutureQueryRunner.runAsync()`).
+   */
+  futureCount(): FutureCountQuery {
+    const { orderByFields, limitValue, offsetValue } = this;
+    this.orderByFields = [];
+    this.limitValue = undefined;
+    this.offsetValue = undefined;
+
+    let built: { sql: string; params: any[] };
+    try {
+      built = this.buildQuery(this.newQueryContext());
+    } finally {
+      this.orderByFields = orderByFields;
+      this.limitValue = limitValue;
+      this.offsetValue = offsetValue;
+    }
+
+    const future = new FutureCountQuery(countStatementOf(built.sql), built.params, this.client, this.executor);
+    future._batchMeta = { hasNestedPaths: false };
+
+    return future;
+  }
+
+  /** How this query's rows travel through a QueryBatch: each field as {@link buildJsonDeliveries} says. */
+  private buildBatchMeta(): FutureBatchMeta {
+    return flatRowBatchMeta(this.buildJsonDeliveries());
+  }
+
+  /**
+   * How each field of this grouped projection travels through a QueryBatch json envelope, in
+   * projection order — so that the batch hands the reads ({@link buildFieldReaders}) exactly the value the
+   * client delivers standalone. A column — a grouping key, a MIN / MAX of one — of a type JSON carries as
+   * the drivers deliver it (integer, text, …) travels as it is, one of any other type (an int8, a numeric,
+   * a date / timestamp, bytea, …) as its text too, which the client parses; so does an expression — an
+   * expression key, an aggregate fragment, an `sql` over aggregates, a MIN / MAX of an expression — whose
+   * runtime type needs it. COUNT (an integer), SUM / AVG (double precision) and constants (read back as
+   * themselves) travel as they are: `undefined`. Shared with a join of this query, whose rows carry these
+   * fields as they are.
+   * @internal
+   */
+  buildJsonDeliveries(): Array<[string, BatchFieldDelivery | undefined]> {
+    const mockResult = this.resultSelector(this.createMockGroupedItem()) as object;
+    const mockOriginalSelection = this.originalSelector(this.createMockRow());
+    const customOids = this.client.customParsedTypeOids();
+
+    return Object.entries(mockResult).map(([key, value]): [string, BatchFieldDelivery | undefined] => [
+      key,
+      this.jsonDeliveryOf(value, mockOriginalSelection, customOids),
+    ]);
+  }
+
+  /** The batch delivery of one projected value — see {@link buildJsonDeliveries}. */
+  private jsonDeliveryOf(value: unknown, originalSelection: any, customOids: readonly number[]): BatchFieldDelivery | undefined {
+    // A constant reads back as itself, whatever the batch delivers for it
+    if (value === null || typeof value !== 'object' || value instanceof Date) {
+      return undefined;
+    }
+
+    if (isAggregateRef(value)) {
+      // COUNT renders as an integer, SUM / AVG as a double precision: JSON carries them as the driver does
+      if (value.__aggregateType !== 'MIN' && value.__aggregateType !== 'MAX') {
+        return undefined;
+      }
+
+      // An extreme is a value of its argument's type — the column's declared one, else the runtime one
+      const { sqlType } = this.extremeTypeOf(value, originalSelection);
+
+      return sqlType !== undefined ? declaredDelivery(sqlType, customOids) : RUNTIME_DELIVERY;
+    }
+
+    if (isFieldRefValue(value)) {
+      const { sqlType } = this.columnTypeOf(value);
+
+      return sqlType !== undefined ? declaredDelivery(sqlType, customOids) : RUNTIME_DELIVERY;
+    }
+
+    // An expression: its type is PostgreSQL's to tell
+    return RUNTIME_DELIVERY;
   }
 
   /**
@@ -979,7 +1145,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       this.executor,
       isCteJoin ? cte as any : undefined,
       // The grouped fields read back as this grouped query reads them
-      this.buildFieldReaders()
+      this.buildFieldReaders(),
+      // ... and travel through a QueryBatch as they do in it (worked out only when a future asks)
+      () => new Map(this.buildJsonDeliveries())
     );
   }
 
@@ -2098,6 +2266,11 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
   private cte?: DbCte<TRight>;
   /** How the grouped query's own fields read back (see GroupedSelectQueryBuilder.buildFieldReaders), by field name. */
   private leftReaders: Map<string, (value: any) => any>;
+  /**
+   * How the grouped query's own fields travel through a QueryBatch (see
+   * GroupedSelectQueryBuilder.buildJsonDeliveries), by field name — asked for by the futures only.
+   */
+  private leftDeliveries?: () => ReadonlyMap<string, BatchFieldDelivery | undefined>;
   private limitValue?: number;
   private offsetValue?: number;
   private orderByFields: Array<{ field: string; direction: OrderDirection; aliased?: boolean }> = [];
@@ -2124,7 +2297,8 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     createRightMock: () => TRight,
     executor?: QueryExecutor,
     cte?: DbCte<TRight>,
-    leftReaders?: Map<string, (value: any) => any>
+    leftReaders?: Map<string, (value: any) => any>,
+    leftDeliveries?: () => ReadonlyMap<string, BatchFieldDelivery | undefined>
   ) {
     this.schema = schema;
     this.client = client;
@@ -2140,6 +2314,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     this.executor = executor;
     this.cte = cte;
     this.leftReaders = leftReaders ?? new Map();
+    this.leftDeliveries = leftDeliveries;
   }
 
   /**
@@ -2202,21 +2377,24 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
    * Execute query and return results
    */
   async toList(): Promise<ResolveFieldRefs<TSelection>[]> {
-    const context: QueryContext = {
-      ctes: new Map(),
-      cteCounter: 0,
-      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
-      paramCounter: 1,
-      allParams: [],
-    };
-
-    const { sql, params } = this.buildQuery(context);
+    const { sql, params } = this.buildQuery(this.newQueryContext());
 
     const result = this.executor
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
     return this.transformRows(result.rows);
+  }
+
+  /** The context one statement of this query is built in — by toList() and by the futures alike. */
+  private newQueryContext(): QueryContext {
+    return {
+      ctes: new Map(),
+      cteCounter: 0,
+      useJsonArrayAggregation: !this.client.supportsBinaryArrayResults(),
+      paramCounter: 1,
+      allParams: [],
+    };
   }
 
   /**
@@ -2307,6 +2485,119 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       throw new Error('No results found');
     }
     return result;
+  }
+
+  /**
+   * Create a future query of this grouped join's rows — the statement and the reads `toList()` would
+   * run, fixed now and executed later: by `execute()`, by `FutureQueryRunner.runAsync()`, or as a
+   * member of a `QueryBatch`, which reads it in the batch's one round trip exactly as `toList()` does.
+   */
+  future(): FutureQuery<ResolveFieldRefs<TSelection>> {
+    const { sql, params } = this.buildQuery(this.newQueryContext());
+
+    const future = new FutureQuery<ResolveFieldRefs<TSelection>>(sql, params, rows => this.transformRows(rows), this.client, this.executor);
+    future._batchMeta = this.buildBatchMeta();
+
+    return future;
+  }
+
+  /**
+   * Create a future query of this grouped join's first row, or null — `firstOrDefault()` fixed now and
+   * executed later. LIMIT 1 is applied to the future only: the builder keeps its own paging.
+   */
+  futureFirstOrDefault(): FutureSingleQuery<ResolveFieldRefs<TSelection>> {
+    const originalLimit = this.limitValue;
+    this.limitValue = 1;
+
+    let built: { sql: string; params: any[] };
+    try {
+      built = this.buildQuery(this.newQueryContext());
+    } finally {
+      this.limitValue = originalLimit;
+    }
+
+    const future = new FutureSingleQuery<ResolveFieldRefs<TSelection>>(built.sql, built.params, rows => this.transformRows(rows), this.client, this.executor);
+    future._batchMeta = this.buildBatchMeta();
+
+    return future;
+  }
+
+  /**
+   * Create a future query of the number of rows this grouped join reads — its ORDER BY, LIMIT and
+   * OFFSET aside, as a plain select's `futureCount()` counts its rows past its paging.
+   */
+  futureCount(): FutureCountQuery {
+    const { orderByFields, limitValue, offsetValue } = this;
+    this.orderByFields = [];
+    this.limitValue = undefined;
+    this.offsetValue = undefined;
+
+    let built: { sql: string; params: any[] };
+    try {
+      built = this.buildQuery(this.newQueryContext());
+    } finally {
+      this.orderByFields = orderByFields;
+      this.limitValue = limitValue;
+      this.offsetValue = offsetValue;
+    }
+
+    const future = new FutureCountQuery(countStatementOf(built.sql), built.params, this.client, this.executor);
+    future._batchMeta = { hasNestedPaths: false };
+
+    return future;
+  }
+
+  /**
+   * How this join's rows travel through a QueryBatch, field by field (see
+   * GroupedSelectQueryBuilder.buildJsonDeliveries): a field of the grouped query as it travels there;
+   * a column of the joined side by its declared type when the side declares one (a CTE's or a
+   * subquery's column), else — an expression, a literal the side projected — by its runtime type;
+   * an expression of the projection by its runtime type; a literal and a withAggregation list as they
+   * are. The reads take the row's fields by name, so the row's key order does not matter here.
+   */
+  private buildBatchMeta(): FutureBatchMeta {
+    const mockResult = this.resultSelector(this.createLeftMock(), this.createRightMock()) as Record<string, unknown>;
+    const leftDeliveries = this.leftDeliveries?.();
+    const fields: Array<[string, BatchFieldDelivery | undefined]> = [];
+
+    for (const [key, value] of Object.entries(mockResult)) {
+      const kind = joinedProjectionKind(value, key);
+
+      if (kind === 'skip') {
+        // Not in the SELECT (see buildQuery)
+        continue;
+      }
+
+      if (kind === 'literal') {
+        // Read back as itself
+        fields.push([key, undefined]);
+        continue;
+      }
+
+      if (kind === 'expression') {
+        fields.push([key, RUNTIME_DELIVERY]);
+        continue;
+      }
+
+      const ref = value as any;
+
+      if (ref.__isAggregationArray) {
+        // A withAggregation CTE's JSON list: the driver parses it as the batch does
+        fields.push([key, undefined]);
+        continue;
+      }
+
+      if (ref.__tableAlias === this.leftAlias && leftDeliveries?.has(ref.__fieldName)) {
+        fields.push([key, leftDeliveries.get(ref.__fieldName)]);
+        continue;
+      }
+
+      const declared = ref.__cteKind === 'column' && typeof ref.__sqlType === 'string';
+
+      fields.push([key, declared ? declaredDelivery(ref.__sqlType, this.client.customParsedTypeOids()) : RUNTIME_DELIVERY]);
+    }
+
+    return flatRowBatchMeta(fields);
   }
 
   /**

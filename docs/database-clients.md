@@ -41,6 +41,25 @@ interface PooledConnection {
 }
 ```
 
+A connection from `connect()` is valid until `release()`. Released, its session is back in the pool — which may
+already have handed it to another caller, in the middle of that caller's transaction — so every statement issued
+afterwards throws a `ConnectionReleasedError` (its `sql` is the refused text; it was never sent) instead of running
+there. A statement issued before `release()` completes. A second `release()` never reaches the driver's pool (which
+may have handed the session to another caller — a stale release used to free THAT caller's lease on node-postgres
+and postgres.js): `PgClient`'s throws node-postgres's own `Release called on client which has already been released
+to the pool.`; `PostgresClient`'s, `BunClient`'s and `PGliteClient`'s do nothing. Acquire a new connection with
+`connect()`:
+
+```typescript
+const connection = await client.connect();
+try {
+  await connection.query('CREATE TEMP TABLE import_batch (id int)');   // one session for these statements
+  await connection.query('INSERT INTO import_batch VALUES (1), (2)');
+} finally {
+  connection.release();                                               // from here on connection.query() throws
+}
+```
+
 ## Supported Clients
 
 ### 1. PgClient (node-postgres)
@@ -148,9 +167,12 @@ const db = new DbContext(client, schema);
 - **One session.** PGlite runs a single session, one statement at a time. `connect()` leases that
   session until `release()` — a pool of one, shared by every `PGliteClient` over the same instance —
   and other queries wait meanwhile, so never await a query on the outer context while holding a
-  connection. Inside `db.transaction()` use the transactional context: a query on the outer context
-  (or a second transaction) from the callback could never run, so it throws at once instead of
-  hanging. Session state (temp tables, `SET`) is shared by everything using the instance.
+  connection. Released, the lease refuses its queries (`ConnectionReleasedError`): they would run on
+  the session outside the lease, under whoever holds it next. Inside `db.transaction()` use the transactional context — its tables and its model
+  sequences (`tx.<sequence>.nextValue()`) run in the transaction: a query on the outer context (or a
+  second transaction, or `tx.runtimeSequence(…)`, which is bound to the outer client) from the callback
+  could never run, so it throws at once instead of hanging. Session state (temp tables, `SET`) is
+  shared by everything using the instance.
 - **No statement timeouts.** PGlite cannot cancel a running statement: `.withTimeout()` and
   `statement_timeout` are not enforced.
 - **Values.** An instance the client creates follows `pg` wherever `pg` and `postgres` agree:
@@ -254,6 +276,14 @@ collections aggregate with `json_agg` so no native array reaches the driver) and
 `losesNumericZeroScale()` (true: the driver reads a scaled numeric zero as `"0"`, and the query
 builders restore the scale of columns declared with one).
 
+A `QueryBatch` reads its values through two more: `parseTypedText(oid, text, read?)` — the value the
+client delivers for a result column of the type `oid` whose wire text is `text` (`read.parameterized`:
+whether the statement binds parameters, for a driver that decodes those otherwise) — and
+`customParsedTypeOids()` — the types the client parses with parsers of the application's own, which a
+batch then sends as their text. The defaults follow node-postgres's default parsing and name no type; the
+built-in clients answer through their driver's own parsers (Bun's decoding reproduced). See
+[QueryBatch](./guides/querying.md#what-a-batched-query-reads).
+
 ## Usage with DbContext
 
 ### Basic Operations
@@ -288,6 +318,10 @@ await db.transaction(async (ctx) => {
   // Both inserts are committed together
 });
 ```
+
+`ctx` — and everything obtained from it — is valid only until the callback settles; so is the query function
+every client's `transaction(query => …)` hands its callback. A statement sent through either afterwards throws a
+`TransactionEndedError` instead of running on the connection the transaction gave back to the pool.
 
 ### Schema Management
 

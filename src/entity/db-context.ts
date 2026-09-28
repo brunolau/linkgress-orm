@@ -2568,7 +2568,14 @@ export class DataContext<TSchema extends ContextSchema = any> {
   /**
    * Execute in transaction
    * Creates a scoped transactional context to avoid race conditions with concurrent transactions.
-   * Each transaction gets its own isolated context instance with fresh table accessors.
+   * Each transaction gets its own isolated context instance with fresh table accessors and — on a
+   * `DbContext` — its own instances of the model's sequences, bound to the transaction's client (a draw
+   * runs inside the transaction). `runtimeSequence()` stays bound to the root client.
+   *
+   * That context and everything obtained from it (tables, sequences, query builders, futures, batch legs,
+   * prepared queries, its schema manager, its client) are valid only until the callback settles: afterwards
+   * each statement they send is refused with a {@link TransactionEndedError} — it would run on the pooled
+   * connection the transaction released, which may belong to another transaction by then.
    */
   async transaction<TResult>(
     fn: (ctx: this) => Promise<TResult>,
@@ -2578,26 +2585,33 @@ export class DataContext<TSchema extends ContextSchema = any> {
       // Create a transactional client that routes all queries through the transaction
       const txClient = new TransactionalClient(queryFn, this.client);
 
-      // Raise the per-statement timeout for the WHOLE transaction up-front. `SET LOCAL`
-      // is transaction-scoped (auto-resets at COMMIT/ROLLBACK) and applies to every
-      // subsequent statement — including bulk inserts/upserts that don't expose a
-      // per-query `.withTimeout()`. Clamp to a safe non-negative integer (it is
-      // inlined into the SQL); `0` disables the timeout for the transaction.
-      if (options?.timeoutMs !== undefined) {
-        const ms = Math.max(0, Math.floor(Number(options.timeoutMs) || 0));
-        await txClient.query(`SET LOCAL statement_timeout = ${ms}`);
+      try {
+        // Raise the per-statement timeout for the WHOLE transaction up-front. `SET LOCAL`
+        // is transaction-scoped (auto-resets at COMMIT/ROLLBACK) and applies to every
+        // subsequent statement — including bulk inserts/upserts that don't expose a
+        // per-query `.withTimeout()`. Clamp to a safe non-negative integer (it is
+        // inlined into the SQL); `0` disables the timeout for the transaction.
+        if (options?.timeoutMs !== undefined) {
+          const ms = Math.max(0, Math.floor(Number(options.timeoutMs) || 0));
+          await txClient.query(`SET LOCAL statement_timeout = ${ms}`);
+        }
+
+        // Within the transaction, raise the slow-query "expected" threshold so a
+        // deliberately long unit of work doesn't trip the global threshold. Defaults
+        // to the transaction timeout when not given explicitly.
+        const expectedMs = options?.expectedExecutionMs ?? options?.timeoutMs;
+        const optionsOverride = expectedMs !== undefined ? { longRunningQueryThreshold: expectedMs } : undefined;
+
+        // Create an isolated transactional context instead of mutating this.client
+        const txContext = this.createTransactionalContext(txClient, optionsOverride);
+
+        return await fn(txContext);
+      } finally {
+        // The transaction ends with its callback (COMMIT or ROLLBACK follows) and gives its connection back to
+        // the pool: every object of txContext kept beyond this point would otherwise run its statements on that
+        // released connection — outside any transaction, or inside another one that holds it by then. Refuse them.
+        txClient.markEnded();
       }
-
-      // Within the transaction, raise the slow-query "expected" threshold so a
-      // deliberately long unit of work doesn't trip the global threshold. Defaults
-      // to the transaction timeout when not given explicitly.
-      const expectedMs = options?.expectedExecutionMs ?? options?.timeoutMs;
-      const optionsOverride = expectedMs !== undefined ? { longRunningQueryThreshold: expectedMs } : undefined;
-
-      // Create an isolated transactional context instead of mutating this.client
-      const txContext = this.createTransactionalContext(txClient, optionsOverride);
-
-      return await fn(txContext);
     });
   }
 
@@ -2605,6 +2619,12 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * Creates a scoped copy of this context with a different client.
    * Used internally for transaction isolation to prevent race conditions
    * when multiple transactions run concurrently.
+   *
+   * Everything that reaches the database through a client is created afresh on `txClient` (table
+   * accessors, entity tables, the executor, model-sequence instances); configuration is shared (the
+   * schema registry, the model, the sequence registry) or copied (the query options, with the
+   * transaction's override merged in); `rootClient` stays the root's, for the statements that must
+   * outlive the transaction (`runtimeSequence()`).
    */
   protected createTransactionalContext(txClient: DatabaseClient, queryOptionsOverride?: Partial<QueryOptions>): this {
     // Create new instance preserving the prototype chain (including subclass methods/getters)
@@ -2653,15 +2673,26 @@ export class DataContext<TSchema extends ContextSchema = any> {
     if ('modelConfig' in this) {
       (txContext as any).modelConfig = (this as any).modelConfig;
     }
+    // model.useSearchNormalize(): the transaction's getSchemaManager() creates the search_normalize support like the
+    // root's (it read `undefined` — and skipped it — before this was copied)
+    if ('searchNormalizeRequired' in this) {
+      (txContext as any).searchNormalizeRequired = (this as any).searchNormalizeRequired;
+    }
     // Fresh entityTables so DbEntityTable instances are created with txContext reference
     if ('entityTables' in this) {
       (txContext as any).entityTables = new Map();
     }
+    // The sequence registry is configuration (the schema manager reads it): shared.
     if ('sequenceRegistry' in this) {
       (txContext as any).sequenceRegistry = (this as any).sequenceRegistry;
     }
+    // The DbSequence instances are NOT: `sequence(config)` on the transaction's context binds the ones it creates
+    // to the transaction's client, so a model sequence's draw runs inside the transaction. The root's map used to
+    // be shared here: `trx.<sequence>` returned the root's instance, whose nextval ran on a second pool connection
+    // outside the transaction, and a sequence first reached inside a transaction was cached for the root, bound to
+    // that transaction's client. (`runtimeSequence()` binds to `rootClient` on purpose and caches nothing.)
     if ('sequenceInstances' in this) {
-      (txContext as any).sequenceInstances = (this as any).sequenceInstances;
+      (txContext as any).sequenceInstances = new Map();
     }
 
     return txContext;
@@ -8172,7 +8203,20 @@ export abstract class DatabaseContext extends DataContext {
   }
 
   /**
-   * Get a sequence instance for interacting with the database
+   * Get a sequence instance for interacting with the database — a model sequence, registered for the schema
+   * manager (which creates it) and cached per context.
+   *
+   * On a transaction's context (`db.transaction(trx => trx.<sequence>…)`) the instance is the TRANSACTION's
+   * own, bound to its client: `nextValue()` / `currentValue()` / `resync()` run inside the transaction — no
+   * second pool connection, the draw sets that session's `currval()` / `lastval()`, the transaction's
+   * `search_path` resolves an unqualified name, a READ ONLY transaction refuses the draw, and a failed draw
+   * aborts the transaction like any failed statement of it. A drawn value stays consumed when the transaction
+   * rolls back (sequences are not transactional). Its `nextValueCreatingIfMissing()` probes without aborting the
+   * transaction and CREATEs a missing sequence on the ROOT client before drawing in the transaction (see
+   * `DbSequence.nextValueCreatingIfMissing`). The root context keeps its own instance, bound to its own
+   * client; the registry is shared. The transaction's instance belongs to the transaction, like its table
+   * accessors: use `db.<sequence>`, not a kept `trx.<sequence>`, once it has ended. Contrast
+   * {@link runtimeSequence}, bound to the ROOT client even there.
    * @param config - Sequence configuration
    * @returns DbSequence instance with nextValue() and resync() methods
    */
@@ -8184,10 +8228,11 @@ export abstract class DatabaseContext extends DataContext {
       this.sequenceRegistry.set(key, config);
     }
 
-    // Return cached instance or create new one
+    // Return cached instance or create new one — on a transaction's context bound to the transaction's client, with
+    // the root client beside it for nextValueCreatingIfMissing()'s CREATE (a rollback must not undo it)
     let instance = this.sequenceInstances.get(key);
     if (!instance) {
-      instance = new DbSequence(this.client, config);
+      instance = new DbSequence(this.client, config, this.rootClient);
       this.sequenceInstances.set(key, instance);
     }
     return instance;
@@ -8195,8 +8240,8 @@ export abstract class DatabaseContext extends DataContext {
 
   /**
    * A sequence named at RUN time — one per tenant and year, say — that no model declares: draw from it
-   * with {@link DbSequence.nextValueCreatingIfMissing}, which creates it (`CREATE SEQUENCE IF NOT EXISTS`
-   * with these options) on first use.
+   * with {@link DbSequence.nextValueCreatingIfMissing} (or `nextValueCreatingIfMissingBigInt()`, exact beyond
+   * 2^53), which creates it (`CREATE SEQUENCE IF NOT EXISTS` with these options) on first use.
    *
    * - Not registered: the schema manager never creates, compares or drops it, and nothing is cached
    *   (the names are unbounded).
@@ -8206,7 +8251,9 @@ export abstract class DatabaseContext extends DataContext {
    *   transaction's context each call therefore needs a SECOND pool connection (concurrent transactions
    *   that each wait for one can exhaust the pool — `pg.Pool` waits forever by default), and PGlite, which
    *   has one session, refuses the call outright: prefer calling it on the root context, outside
-   *   `transaction()`.
+   *   `transaction()`. A MODEL sequence (`this.sequence(config)` behind a getter) behaves the other way
+   *   round: on a transaction's context it is bound to the transaction's client and draws inside the
+   *   transaction.
    * - Its statements go to the client directly — unlogged, like `DbSequence.nextValue()`.
    * - The name is an identifier, never SQL: quoted (a `"` doubled, a NUL refused), schema-qualified when
    *   `schema` is set, else resolved through the search path. The options are inlined in the DDL: each

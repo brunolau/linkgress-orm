@@ -9,14 +9,14 @@ import { SessionHost } from '../session';
 import { UndoLog } from '../storage/mvcc';
 import { analyzeStatementAsSubquery } from '../analyze/select';
 import { quoteIdentifier } from '../analyze/typeutil';
-import { Catalog, NS_PG_CATALOG, PgType, ProcDef, TypeOid } from '../catalog/catalog';
+import { Catalog, NS_PG_CATALOG, PgType, ProcDef, Relation, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { EvalCtx, StatementState } from '../exec/runtime';
 import { runDoBlock } from '../plpgsql/functions';
 import type { FieldInfo, Session } from '../session';
 import { displaySettingValue, settingDef } from '../settings';
 import { executeAlterTable, renameRelation } from './alter-table';
-import { arrayTypeName, buildSequenceInfo, chooseRelationName, createRowType, createSequenceRelation, indexColumnName, indexNameAddition, newColumn } from './common';
+import { arrayTypeName, buildSequenceInfo, chooseRelationName, createRowType, createSequenceRelation, indexColumnName, indexNameAddition, newColumn, partitionsOf, preventInTransactionBlock } from './common';
 import { createIndexRelation, createTable, lookupTable, resolveCreationNamespace } from './create-table';
 import { executeDrop, executeTruncate } from './drop';
 import { createExtension } from './extensions';
@@ -52,7 +52,7 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
       }
       return parentSt ? createTableAs(session, stmt, parentSt.params, parentSt.paramTypes) : createTableAs(session, stmt, params, boundTypes ?? []);
     case 'CreateIndexStmt':
-      return { command: createIndex(session, stmt) };
+      return { command: createIndex(session, stmt, parentSt) };
     case 'CreateSequenceStmt':
       return { command: createSequence(session, stmt) };
     case 'AlterSequenceStmt':
@@ -60,7 +60,7 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
     case 'AlterTableStmt':
       return { command: executeAlterTable(session, stmt) };
     case 'DropStmt':
-      return { command: executeDrop(session, stmt) };
+      return { command: executeDrop(session, stmt, parentSt) };
     case 'TruncateStmt':
       return { command: executeTruncate(session, stmt) };
     case 'CreateSchemaStmt':
@@ -183,14 +183,46 @@ export function executeUtility(session: Session, stmt: A.Statement, text: string
 // CREATE INDEX
 // ---------------------------------------------------------------------------
 
-function createIndex(session: Session, stmt: A.CreateIndexStmt): string {
-  if (stmt.concurrently && session.txn?.explicit) {
-    throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'CREATE INDEX CONCURRENTLY cannot run inside a transaction block');
+/**
+ * CREATE INDEX CONCURRENTLY commits the new index — not yet valid — before it builds it, so a build that fails (a
+ * unique index over duplicate keys, an index expression or predicate that raises for a row) leaves the index behind
+ * INVALID: `indisvalid` and `indisready` false, never used for reads, not maintained on writes, and skipped by every
+ * later CREATE INDEX … IF NOT EXISTS until it is dropped. The statement's own transaction still aborts; the index is
+ * put into the database's catalog once it has. A statement that failed before the index existed (an unknown column,
+ * a missing operator class) leaves nothing, as in PostgreSQL.
+ */
+function keepFailedConcurrentBuild(session: Session, cat: Catalog, table: Relation, name: string): void {
+  const index = cat.findRelationInNamespace(table.nspOid, name);
+  if (!index?.index || index.index.tableOid !== table.oid) {
+    return;
+  }
+  const invalid: Relation = { ...index, index: { ...index.index, valid: false, ready: false } };
+  const abortedVersion = cat.version;
+  session.txn!.onAbort.push(() => {
+    const db = session.db;
+    // preventInTransactionBlock guarantees a committed table; re-checked, as the name must still be free
+    if (!db.catalog.getRelation(table.oid) || db.catalog.findRelationInNamespace(table.nspOid, name)) {
+      return;
+    }
+    const committed = db.catalog.clone();
+    // past every version the aborted catalog reached: analyses cached by version number stay unambiguous
+    committed.version = Math.max(committed.version, abortedVersion);
+    committed.putRelation(invalid);
+    db.catalog = committed;
+  });
+}
+
+function createIndex(session: Session, stmt: A.CreateIndexStmt, parentSt: StatementState | null): string {
+  if (stmt.concurrently) {
+    preventInTransactionBlock(session, parentSt, 'CREATE INDEX CONCURRENTLY');
   }
   const cat = session.ddlCatalog();
   const rel = lookupTable(session, stmt.relation);
   if (rel.kind !== 'r' && rel.kind !== 'p' && rel.kind !== 'm') {
     throw new PgError(SqlState.WRONG_OBJECT_TYPE, `cannot create index on relation "${rel.name}"`, { detail: `This operation is not supported for ${rel.kind === 'v' ? 'views' : 'this relation kind'}.` });
+  }
+  if (stmt.concurrently && rel.kind === 'p') {
+    throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `cannot create index on partitioned table "${rel.name}" concurrently`);
   }
   const method = stmt.method.toLowerCase();
   if (!['btree', 'hash', 'gin', 'gist', 'brin', 'spgist'].includes(method)) {
@@ -215,21 +247,34 @@ function createIndex(session: Session, stmt: A.CreateIndexStmt): string {
     name = chooseRelationName(cat, rel.name, indexNameAddition(colnames), stmt.unique ? 'key' : 'idx', rel.nspOid, false);
   }
   const ctx = new DdlContext(session, cat);
-  createIndexRelation(
-    session,
-    cat,
-    rel,
-    name,
-    stmt.params,
-    stmt.include,
-    stmt.where ? { raw: stmt.where, text: stmt.whereText ?? '' } : null,
-    method,
-    stmt.unique,
-    false,
-    stmt.nullsNotDistinct,
-    stmt.withOptions,
-    ctx
-  );
+  let index: Relation;
+  try {
+    index = createIndexRelation(
+      session,
+      cat,
+      rel,
+      name,
+      stmt.params,
+      stmt.include,
+      stmt.where ? { raw: stmt.where, text: stmt.whereText ?? '' } : null,
+      method,
+      stmt.unique,
+      false,
+      stmt.nullsNotDistinct,
+      stmt.withOptions,
+      ctx
+    );
+  } catch (e) {
+    if (stmt.concurrently) {
+      keepFailedConcurrentBuild(session, cat, rel, name);
+    }
+    throw e;
+  }
+  if (stmt.only && rel.kind === 'p' && partitionsOf(cat, rel).length > 0) {
+    // ON ONLY a partitioned table with partitions: INVALID (and ready) until an index of every partition is attached
+    // with ALTER INDEX … ATTACH PARTITION — the first step of PostgreSQL's online procedure
+    cat.putRelation({ ...index, index: { ...index.index!, valid: false } });
+  }
   return 'CREATE INDEX';
 }
 
@@ -1131,6 +1176,10 @@ function alterDatabaseSet(session: Session, stmt: A.AlterDatabaseSetStmt): strin
 function discard(session: Session, tag: string): void {
   if (tag === 'DISCARD ALL' || tag === 'DISCARD PLANS') {
     session.preparedStatements.clear();
+  }
+  if (tag === 'DISCARD ALL' || tag === 'DISCARD SEQUENCES') {
+    // every currval() and the lastval() of the session, as PostgreSQL's ResetSequenceCaches()
+    session.discardSequences();
   }
   if (tag === 'DISCARD ALL') {
     session.resetAllSettings();

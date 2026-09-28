@@ -1,9 +1,49 @@
 import * as A from '../ast';
 import { Catalog, Column, Constraint, IndexElemDef, NS_PG_CATALOG, PgType, Relation, SequenceInfo, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
+import type { StatementState } from '../exec/runtime';
 import type { Session } from '../session';
 
 export const NAMEDATALEN = 64;
+
+/**
+ * PreventInTransactionBlock: `what` runs only as a top-level statement of its own — not inside a transaction block
+ * (an explicit one, or the implicit one of a multi-statement query string) and not from a function or DO block.
+ */
+export function preventInTransactionBlock(session: Session, parentSt: StatementState | null, what: string): void {
+  if (session.inTransactionBlock()) {
+    throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, `${what} cannot run inside a transaction block`);
+  }
+  if (parentSt) {
+    throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, `${what} cannot be executed from a function`);
+  }
+}
+
+/** A partitioned table's partitions (not the indexes attached to one of its indexes). */
+export function partitionsOf(cat: Catalog, table: Relation): Relation[] {
+  return cat.childrenOf(table.oid).filter((r) => r.parentOid === table.oid && !r.index);
+}
+
+/**
+ * validatePartitionedIndex: a partitioned index turns valid once every partition of its table has an attached valid
+ * index (ALTER INDEX … ATTACH PARTITION); one attached itself may then complete its own parent.
+ */
+export function validatePartitionedIndex(cat: Catalog, index: Relation): void {
+  const current = cat.getRelation(index.oid);
+  if (!current?.index || current.index.valid) {
+    return;
+  }
+  const table = cat.getRelation(current.index.tableOid);
+  const attached = cat.childrenOf(current.oid).filter((c) => c.index);
+  if (!table || !partitionsOf(cat, table).every((p) => attached.some((c) => c.index!.tableOid === p.oid && c.index!.valid))) {
+    return;
+  }
+  cat.putRelation({ ...current, index: { ...current.index, valid: true } });
+  const parent = current.parentOid ? cat.getRelation(current.parentOid) : undefined;
+  if (parent?.kind === 'I') {
+    validatePartitionedIndex(cat, parent);
+  }
+}
 
 function byteLen(s: string): number {
   return Buffer.byteLength(s, 'utf8');

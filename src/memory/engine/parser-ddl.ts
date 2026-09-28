@@ -1580,7 +1580,8 @@ export class SqlParser extends Parser {
     }
     if (this.acceptKws('ATTACH', 'PARTITION')) {
       const partition = this.parseRangeVar();
-      return { kind: 'ATTACH_PARTITION', partition, bound: this.parsePartitionBound() };
+      // ALTER INDEX … ATTACH PARTITION names an index, without a bound; ALTER TABLE requires one
+      return { kind: 'ATTACH_PARTITION', partition, bound: this.atKw('FOR', 'DEFAULT') ? this.parsePartitionBound() : null };
     }
     if (this.acceptKws('DETACH', 'PARTITION')) {
       const partition = this.parseRangeVar();

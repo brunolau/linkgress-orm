@@ -7,6 +7,7 @@ import { EnumTypeRegistry } from '../types/enum-builder';
 import { CollationRegistry, CollationDefinition } from '../types/collation-builder';
 import { SequenceConfig, qualifiedSequenceName, renderCreateSequenceStatement } from '../schema/sequence-builder';
 import { RawSql } from '../query/conditions';
+import { sqlStateOf } from '../database/sql-state';
 import {
   buildCreateIndexStatement,
   buildDropIndexStatement,
@@ -42,6 +43,41 @@ interface DbIndexInfo {
   column_names: string[];
   /** Canonical `pg_get_indexdef(oid, 0, true)` output, for signature comparison. */
   canonical_def: string;
+  /**
+   * `pg_index.indisvalid`. False for an index a failed or cancelled `CREATE INDEX CONCURRENTLY` left
+   * behind — PostgreSQL never uses it for reads — and for one still being built.
+   */
+  is_valid: boolean;
+  /** `pg_index.indisready`: writes maintain the index — a unique one rejects duplicates, valid or not. */
+  is_ready: boolean;
+  is_unique: boolean;
+  /** A partitioned index (relkind `I`): INVALID until every partition has an attached valid index. */
+  is_partitioned: boolean;
+  /** The constraint that requires the index (`pg_constraint.conindid`) and its table — PostgreSQL will not drop it. */
+  required_by: { constraint: string; table: string } | null;
+  /** INVALID only: an index build is running on the index's table (`pg_stat_progress_create_index`, `pg_locks`). */
+  build_in_progress: boolean;
+}
+
+/** A row of `pg_stat_progress_create_index` for this database, with the tables its backend holds locks on. */
+interface DbIndexBuild {
+  relid: string | null;
+  index_relid: string | null;
+  locked_relations: string[];
+}
+
+/** An index to build, as the schema manager's create paths take it. */
+interface IndexSpec {
+  name: string;
+  columns: string[];
+  isUnique?: boolean;
+  using?: IndexMethod;
+  operatorClass?: string;
+  concurrent?: boolean;
+  expressions?: string[];
+  where?: string;
+  nullsNotDistinct?: boolean;
+  include?: string[];
 }
 
 /**
@@ -72,6 +108,8 @@ export type MigrationOperation =
   | { type: 'alter_column'; tableName: string; schema?: string; columnName: string; from: DbColumnInfo; to: ColumnConfig }
   | { type: 'create_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[] }
   | { type: 'recreate_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[]; reason?: string; previousDef?: string }
+  /** A model index present only INVALID (`previousDef`, e.g. left by a failed CREATE INDEX CONCURRENTLY): dropped and created again from the model. */
+  | { type: 'repair_index'; tableName: string; schema?: string; indexName: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[]; previousDef?: string }
   | { type: 'drop_index'; tableName: string; schema?: string; indexName: string }
   | { type: 'create_statistics'; tableName: string; schema?: string; statisticsName: string; expressions: string[]; kinds?: Array<'ndistinct' | 'dependencies' | 'mcv'> }
   | { type: 'create_check_constraint'; tableName: string; schema?: string; constraintName: string; expression: string }
@@ -80,6 +118,84 @@ export type MigrationOperation =
   | { type: 'drop_foreign_key'; tableName: string; schema?: string; constraintName: string }
   | { type: 'create_view'; viewName: string; schema?: string; definition: string }
   | { type: 'drop_view'; viewName: string; schema?: string };
+
+type IndexOperation = Extract<MigrationOperation, { type: 'create_index' | 'recreate_index' | 'repair_index' }>;
+type RepairIndexOperation = Extract<MigrationOperation, { type: 'repair_index' }>;
+
+/** One INVALID index `migrate()` could not repair, as an {@link IndexRepairError} lists it. */
+export interface IndexRepairFailure {
+  /** The model index that could not be repaired. */
+  readonly indexName: string;
+  /** Its table, as the model names it. */
+  readonly tableName: string;
+  /** The table's schema, when the model names one. */
+  readonly schema?: string;
+  /** The SQLSTATE of the database error that stopped the repair, if one did. */
+  readonly code?: string;
+  /** The error that stopped the repair, if one did. */
+  readonly cause?: unknown;
+  /** What went wrong: the database's message, DETAIL and HINT — or a failure no database error reported. */
+  readonly reason: string;
+}
+
+/**
+ * Thrown by `migrate()` when the repair of one or more INVALID indexes failed: a rebuild raised an error — a unique
+ * index still over duplicate rows, an index expression that fails for a row, a lock or statement timeout, a model
+ * index PostgreSQL cannot build — or left the index INVALID or missing. Repairs run last, after every other operation
+ * of the migration, each on its own; the error is thrown once they have all run — after the post-migration hook — and
+ * names every index that failed: the rest of the migration is done. A rebuild is never retried: fix the cause and run
+ * the migration again.
+ */
+export class IndexRepairError extends Error {
+  /** Every index that could not be repaired, in the order the repairs ran. */
+  readonly failures: readonly IndexRepairFailure[];
+  /** The first failure's index. */
+  readonly indexName: string;
+  /** The first failure's table, as the model names it. */
+  readonly tableName: string;
+  /** The first failure's schema, when the model names one. */
+  readonly schema?: string;
+  /** The first failure's SQLSTATE, if a database error stopped it. */
+  readonly code?: string;
+  /** The first failure's error, if one stopped it. */
+  readonly cause?: unknown;
+
+  constructor(failures: readonly IndexRepairFailure[]) {
+    const on = (f: IndexRepairFailure) => `"${f.indexName}" on ${f.schema ? `"${f.schema}"."${f.tableName}"` : `"${f.tableName}"`}`;
+    const sentence = (text: string) => `${text}${/[.!?]$/.test(text) ? '' : '.'}`;
+    super(failures.length === 1
+      ? `Could not repair INVALID index ${on(failures[0])}: ${sentence(failures[0].reason)} Fix the cause and run the migration again.`
+      : `Could not repair ${failures.length} INVALID indexes: ${sentence(failures.map(f => `${on(f)}: ${f.reason.replace(/\.$/, '')}`).join('; '))} Fix the causes and run the migration again.`);
+    this.name = 'IndexRepairError';
+    this.failures = failures;
+    this.indexName = failures[0].indexName;
+    this.tableName = failures[0].tableName;
+    this.schema = failures[0].schema;
+    this.code = failures[0].code;
+    this.cause = failures[0].cause;
+    // Restore prototype chain so `instanceof` works when targeting ES5
+    Object.setPrototypeOf(this, IndexRepairError.prototype);
+  }
+
+  /**
+   * A failed repair: `cause` the error that stopped it, or `reason` a failure no database error reported.
+   * @internal
+   */
+  static failure(indexName: string, tableName: string, schema: string | undefined, cause: unknown, reason?: string): IndexRepairFailure {
+    return { indexName, tableName, schema, code: sqlStateOf(cause), cause, reason: reason ?? IndexRepairError.describe(cause) };
+  }
+
+  /** The database's message, with its DETAIL (the duplicated key of a unique index) and HINT when it has them. */
+  private static describe(cause: unknown): string {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const extra = (field: 'detail' | 'hint') => {
+      const value = (cause as Record<string, unknown> | null)?.[field];
+      return typeof value === 'string' && value ? [value] : [];
+    };
+
+    return [message, ...extra('detail'), ...extra('hint')].join(' — ');
+  }
+}
 
 /**
  * Database schema manager - handles schema creation, deletion, and automatic migrations
@@ -1112,21 +1228,17 @@ $$`;
         for (const modelIndex of modelIndexes) {
           const dbIndex = existingIndexes.find(d => d.index_name === modelIndex.name);
           if (!dbIndex) {
-            operations.push({
-              type: 'create_index',
-              tableName,
-              schema: schema.schema,
-              indexName: modelIndex.name,
-              columns: modelIndex.columns,
-              isUnique: modelIndex.isUnique,
-              using: modelIndex.using,
-              operatorClass: modelIndex.operatorClass,
-              concurrent: modelIndex.concurrent,
-              expressions: modelIndex.expressions,
-              where: modelIndex.where,
-              nullsNotDistinct: modelIndex.nullsNotDistinct,
-              include: modelIndex.include,
-            });
+            operations.push({ type: 'create_index', ...this.indexOperationFields(tableName, schema.schema, modelIndex) });
+          } else if (!dbIndex.is_valid) {
+            // An INVALID index is MISSING — PostgreSQL never reads it, and CREATE INDEX … IF NOT EXISTS skips it —
+            // so it is rebuilt from the model whatever recreateChangedIndexes says (a changed definition comes
+            // with the rebuild), unless it must be left alone (leaveInvalidIndexAlone).
+            const warning = await this.leaveInvalidIndexAlone(dbIndex, tableName, schema.schema);
+            if (warning) {
+              this.logger(warning, 'warn');
+            } else {
+              operations.push({ type: 'repair_index', ...this.indexOperationFields(tableName, schema.schema, modelIndex), previousDef: dbIndex.canonical_def });
+            }
           } else if (this.recreateChangedIndexes) {
             const comparison = compareIndexDefinition(dbIndex.canonical_def, modelIndex);
             // `needsConfirmation`: equal only because a model CAST(…) was folded away — an added or moved cast
@@ -1153,18 +1265,7 @@ $$`;
           for (const cand of confirmed) {
             operations.push({
               type: 'recreate_index',
-              tableName,
-              schema: schema.schema,
-              indexName: cand.modelIndex.name,
-              columns: cand.modelIndex.columns,
-              isUnique: cand.modelIndex.isUnique,
-              using: cand.modelIndex.using,
-              operatorClass: cand.modelIndex.operatorClass,
-              concurrent: cand.modelIndex.concurrent,
-              expressions: cand.modelIndex.expressions,
-              where: cand.modelIndex.where,
-              nullsNotDistinct: cand.modelIndex.nullsNotDistinct,
-              include: cand.modelIndex.include,
+              ...this.indexOperationFields(tableName, schema.schema, cand.modelIndex),
               reason: cand.reason,
               previousDef: cand.dbDef,
             });
@@ -1343,6 +1444,7 @@ $$`;
       // Phase 1: Schema, enum, table creation (without FKs), column additions
       // Phase 2: Foreign key constraints
       // Phase 3: Indexes and other operations
+      // Phase 4: Repairs of INVALID indexes
       const phase1Ops: MigrationOperation[] = [];
       const phase2Ops: MigrationOperation[] = [];
       const phase3Ops: MigrationOperation[] = [];
@@ -1350,6 +1452,9 @@ $$`;
       // views are created LAST, over the tables the phases shaped.
       const viewDropOps: MigrationOperation[] = [];
       const viewCreateOps: MigrationOperation[] = [];
+      // Repairs run after everything else, each on its own: one that fails (a unique index
+      // still over duplicate rows) leaves the rest of the migration done, not half done.
+      const repairOps: RepairIndexOperation[] = [];
 
       // Track which tables are being created so we can add their FKs later
       const tablesToCreate = new Set<string>();
@@ -1357,6 +1462,8 @@ $$`;
       for (const op of operations) {
         if (op.type === 'drop_view') {
           viewDropOps.push(op);
+        } else if (op.type === 'repair_index') {
+          repairOps.push(op);
         } else if (op.type === 'create_view') {
           viewCreateOps.push(op);
         } else if (op.type === 'create_schema' || op.type === 'create_collation' || op.type === 'create_enum' || op.type === 'add_enum_value' || op.type === 'create_sequence') {
@@ -1414,21 +1521,7 @@ $$`;
           // Add indexes for newly created tables to phase 3
           const indexes = schema.indexes || [];
           for (const index of indexes) {
-            phase3Ops.push({
-              type: 'create_index',
-              tableName,
-			  schema: schema.schema,
-              indexName: index.name,
-              columns: index.columns,
-              isUnique: index.isUnique,
-              using: index.using,
-              operatorClass: index.operatorClass,
-              concurrent: index.concurrent,
-              expressions: index.expressions,
-              where: index.where,
-              nullsNotDistinct: index.nullsNotDistinct,
-              include: index.include,
-            });
+            phase3Ops.push({ type: 'create_index', ...this.indexOperationFields(tableName, schema.schema, index) });
           }
 
           // Add CHECK constraints for newly created tables to phase 3
@@ -1444,12 +1537,12 @@ $$`;
         }
       }
 
-      const totalOps = viewDropOps.length + phase1Ops.length + phase2Ops.length + phase3Ops.length + viewCreateOps.length;
+      const totalOps = viewDropOps.length + phase1Ops.length + phase2Ops.length + phase3Ops.length + viewCreateOps.length + repairOps.length;
       this.logger(`📋 Found ${totalOps} operations to perform:\n`);
 
-      // Show all operations
+      // Show all operations, in the order they run
       let opNum = 1;
-      for (const op of [...viewDropOps, ...phase1Ops, ...phase2Ops, ...phase3Ops, ...viewCreateOps]) {
+      for (const op of [...viewDropOps, ...phase1Ops, ...phase2Ops, ...phase3Ops, ...viewCreateOps, ...repairOps]) {
         this.logger(`${opNum++}. ${this.describeOperation(op)}`);
       }
       this.logger('');
@@ -1493,7 +1586,21 @@ $$`;
         }
       }
 
-      this.logger('\n✓ Migration completed successfully\n');
+      // Phase 4: repairs, each on its own — their failures are thrown together, at the very end
+      const repairFailures: IndexRepairFailure[] = [];
+      if (repairOps.length > 0) {
+        this.logger('🩹 Phase 4: Repairing INVALID indexes...\n');
+        for (const operation of repairOps) {
+          const failure = await this.executeRepairIndex(operation);
+          if (failure) {
+            repairFailures.push(failure);
+          }
+        }
+      }
+
+      this.logger(repairFailures.length === 0
+        ? '\n✓ Migration completed successfully\n'
+        : `\n⚠ Migration completed, except the repair of ${repairFailures.length} INVALID index${repairFailures.length === 1 ? '' : 'es'}\n`);
 
       // Execute post-migration hook if provided
       if (this.postMigrationHook) {
@@ -1504,6 +1611,10 @@ $$`;
         if (this.logQueries) {
           this.logger('✓ Post-migration scripts completed\n');
         }
+      }
+
+      if (repairFailures.length > 0) {
+        throw new IndexRepairError(repairFailures);
       }
     } finally {
       this.closeReadlineInterface();
@@ -1567,23 +1678,21 @@ $$`;
         break;
 
       case 'create_index':
-        await this.executeCreateIndex(operation.tableName, {
-          name: operation.indexName,
-          columns: operation.columns,
-          isUnique: operation.isUnique,
-          using: operation.using,
-          operatorClass: operation.operatorClass,
-          concurrent: operation.concurrent,
-          expressions: operation.expressions,
-          where: operation.where,
-          nullsNotDistinct: operation.nullsNotDistinct,
-          include: operation.include,
-        }, operation.schema);
+        await this.executeCreateIndex(operation.tableName, DbSchemaManager.indexSpecOf(operation), operation.schema);
         break;
 
       case 'recreate_index':
         await this.executeRecreateIndex(operation);
         break;
+
+      case 'repair_index': {
+        // migrate() runs repairs in a phase of their own; alone, a failure is thrown at once
+        const failure = await this.executeRepairIndex(operation);
+        if (failure) {
+          throw new IndexRepairError([failure]);
+        }
+        break;
+      }
 
       case 'drop_index':
         if (await this.confirm(`Drop index "${operation.indexName}"?`)) {
@@ -1810,7 +1919,8 @@ $$`;
   /** Access methods whose indexes can store INCLUDE (non-key) columns. */
   private static readonly INCLUDE_INDEX_METHODS: ReadonlySet<string> = new Set(['btree', 'gist', 'spgist']);
 
-  private async executeCreateIndex(tableName: string, index: { name: string; columns: string[]; isUnique?: boolean; using?: IndexMethod; operatorClass?: string; concurrent?: boolean; expressions?: string[]; where?: string; nullsNotDistinct?: boolean; include?: string[] }, schema?: string): Promise<void> {
+  /** Refuse a model index PostgreSQL cannot build — before anything is created, or dropped to make way for it. */
+  private static validateIndexSpec(index: IndexSpec): void {
     if (index.include && index.include.length > 0 && index.using && !DbSchemaManager.INCLUDE_INDEX_METHODS.has(index.using)) {
       throw new Error(`Index "${index.name}" cannot use INCLUDE with USING ${index.using}: PostgreSQL stores INCLUDE columns only in ${[...DbSchemaManager.INCLUDE_INDEX_METHODS].join(', ')} indexes. Drop .include() or pick one of those methods.`);
     }
@@ -1823,6 +1933,10 @@ $$`;
     if (index.isUnique && index.using === 'gin') {
       throw new Error(`Index "${index.name}" cannot be both UNIQUE and a GIN index. GIN does not support unique constraints — drop .isUnique() or remove the GIN option (e.g. \`ixNormalized(col, { gin: true })\`).`);
     }
+  }
+
+  private async executeCreateIndex(tableName: string, index: IndexSpec, schema?: string): Promise<void> {
+    DbSchemaManager.validateIndexSpec(index);
 
     const uniqueStr = index.isUnique ? 'UNIQUE ' : '';
     const useConcurrent = index.concurrent || this.concurrentIndexes;
@@ -1840,32 +1954,202 @@ $$`;
   }
 
   /**
-   * Recreate an index whose definition changed while its name stayed the same:
-   * drop the existing index, then create it from the model definition.
-   *
-   * The drop and create both use `CONCURRENTLY` when the index opted into it
-   * (`.concurrent()` or the schema manager's `concurrentIndexes` option), making
-   * the change non-blocking; otherwise it is a plain (briefly locking) recreate.
-   * Either way this must run outside a transaction when concurrent.
+   * Recreate an index whose definition changed while its name stayed the same (`recreate_index`): drop the existing
+   * one, then create it from the model. Both use `CONCURRENTLY` when the index opted into it (`.concurrent()` or the
+   * schema manager's `concurrentIndexes` option), making the change non-blocking — outside a transaction; otherwise
+   * it is a plain (briefly locking) recreate. The model index is validated first, so an invalid one never costs the
+   * existing index.
    */
   private async executeRecreateIndex(operation: Extract<MigrationOperation, { type: 'recreate_index' }>): Promise<void> {
+    const spec = DbSchemaManager.indexSpecOf(operation);
+    DbSchemaManager.validateIndexSpec(spec);
     const useConcurrent = operation.concurrent || this.concurrentIndexes;
-    const qualifiedIndexName = operation.schema
-      ? `"${operation.schema}"."${operation.indexName}"`
-      : `"${operation.indexName}"`;
 
     this.logger(`  Recreating index "${operation.indexName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}...\n`);
     if (!useConcurrent) {
       this.logger(`    (blocking recreate — enable concurrentIndexes or .concurrent() for non-blocking)\n`, 'warn');
     }
 
-    await this.client.query(buildDropIndexStatement(qualifiedIndexName, {
+    await this.client.query(buildDropIndexStatement(this.qualifiedIndexName(operation.indexName, operation.schema), {
       concurrent: useConcurrent,
       ifExists: true,
     }));
+    // Reuse executeCreateIndex for concurrent + IF NOT EXISTS.
+    await this.executeCreateIndex(operation.tableName, spec, operation.schema);
+  }
 
-    // Reuse executeCreateIndex for validation + concurrent + IF NOT EXISTS.
-    await this.executeCreateIndex(operation.tableName, {
+  /**
+   * Repair an INVALID index — what a failed or cancelled CREATE INDEX CONCURRENTLY leaves behind, never used for reads
+   * and skipped by every CREATE INDEX … IF NOT EXISTS — by building it again from the model. Returns the failure, or
+   * null when the index was repaired or left alone; migrate() throws the failures together, after everything else.
+   *
+   * The model index is validated first. Then the repair reads the index again, as time may have passed since the plan:
+   * one that is no longer INVALID (rebuilt or validated meanwhile), or that must now be left alone (an index build
+   * running on its table, …: leaveInvalidIndexAlone), is left alone with a warning; one dropped meanwhile is created.
+   *
+   * - `.concurrent()` (or `concurrentIndexes`): `DROP INDEX CONCURRENTLY … IF EXISTS`, then `CREATE INDEX
+   *   CONCURRENTLY … IF NOT EXISTS` — neither blocks writes. A build that fails leaves an INVALID index of its own
+   *   under the name, which the next migration repairs again (or leaves alone, if it failed while validating a unique
+   *   index: see leaveInvalidIndexAlone).
+   * - otherwise the model's index is built first, under a temporary name (`<name>_lkgnew`), and swapped in only once
+   *   built — DROP of the INVALID index and RENAME, in one transaction. The build blocks writes, as any CREATE INDEX;
+   *   one that fails leaves nothing, so the INVALID index is as it was, and the next migration fails the same way.
+   *
+   * A rebuild that leaves the index INVALID or missing is a failure too. A repair is never retried.
+   */
+  private async executeRepairIndex(operation: RepairIndexOperation): Promise<IndexRepairFailure | null> {
+    const spec = DbSchemaManager.indexSpecOf(operation);
+    const table = this.getQualifiedTableName(operation.tableName, operation.schema);
+    const failure = (cause: unknown, reason?: string) => IndexRepairError.failure(operation.indexName, operation.tableName, operation.schema, cause, reason);
+    try {
+      DbSchemaManager.validateIndexSpec(spec);
+
+      const current = (await this.getExistingIndexes(operation.tableName, operation.schema)).find(index => index.index_name === operation.indexName);
+      if (current?.is_valid) {
+        this.logger(`  ⊘ Index "${operation.indexName}" on ${table} is no longer INVALID (rebuilt or validated since the migration was planned): left alone.\n`, 'warn');
+        return null;
+      }
+      const warning = current ? await this.leaveInvalidIndexAlone(current, operation.tableName, operation.schema) : null;
+      if (warning) {
+        this.logger(warning, 'warn');
+        return null;
+      }
+
+      this.logger(`  Repairing INVALID index "${operation.indexName}" on ${table}...\n`);
+      const useConcurrent = operation.concurrent || this.concurrentIndexes;
+      if (!useConcurrent) {
+        this.logger(`    (blocking repair — enable concurrentIndexes or .concurrent() for non-blocking)\n`, 'warn');
+      }
+      if (useConcurrent) {
+        await this.client.query(buildDropIndexStatement(this.qualifiedIndexName(operation.indexName, operation.schema), { concurrent: true, ifExists: true }));
+        await this.executeCreateIndex(operation.tableName, spec, operation.schema);
+      } else if (current) {
+        await this.rebuildBeside(operation, spec);
+      } else {
+        // dropped since the plan: create it
+        await this.executeCreateIndex(operation.tableName, spec, operation.schema);
+      }
+
+      const rebuilt = (await this.getExistingIndexes(operation.tableName, operation.schema)).find(index => index.index_name === operation.indexName);
+      return rebuilt?.is_valid ? null : failure(undefined, `the index is ${rebuilt ? 'still INVALID' : 'missing'} after the rebuild`);
+    } catch (error) {
+      return failure(error);
+    }
+  }
+
+  /**
+   * The blocking repair: build the model's index beside the INVALID one under a temporary name, then — only once it is
+   * built — drop the INVALID index and give the new one its name, in one transaction. A failed build leaves nothing
+   * behind (a blocking CREATE INDEX is one statement); if the swap fails, the new index is dropped again.
+   */
+  private async rebuildBeside(operation: RepairIndexOperation, spec: IndexSpec): Promise<void> {
+    const temporary = DbSchemaManager.repairBuildName(operation.indexName);
+    const qualifiedTable = this.getQualifiedTableName(operation.tableName, operation.schema);
+    const qualifiedTemporary = this.qualifiedIndexName(temporary, operation.schema);
+    this.logger(`  Building ${spec.isUnique ? 'UNIQUE ' : ''}index "${temporary}" on ${qualifiedTable}, to replace "${operation.indexName}"...`);
+    await this.client.query(buildCreateIndexStatement({ ...spec, name: temporary }, qualifiedTable, { concurrent: false, ifNotExists: false }));
+    try {
+      await this.client.transaction(async query => {
+        await query(buildDropIndexStatement(this.qualifiedIndexName(operation.indexName, operation.schema), { concurrent: false, ifExists: true }));
+        await query(`ALTER INDEX ${qualifiedTemporary} RENAME TO "${operation.indexName}"`);
+      });
+    } catch (error) {
+      try {
+        await this.client.query(buildDropIndexStatement(qualifiedTemporary, { concurrent: false, ifExists: true }));
+      } catch {
+        // the swap's error is the one to report
+      }
+      throw error;
+    }
+    this.logger(`  ✓ ${spec.isUnique ? 'UNIQUE ' : ''}Index "${operation.indexName}" rebuilt\n`);
+  }
+
+  /**
+   * The name a blocking repair builds under: `<name>_lkgnew`, the name shortened by whole characters so that it fits
+   * PostgreSQL's 63 bytes.
+   */
+  private static repairBuildName(indexName: string): string {
+    const suffix = '_lkgnew';
+    const encoder = new TextEncoder();
+    const characters = Array.from(indexName);
+    while (encoder.encode(characters.join('') + suffix).length > 63) {
+      characters.pop();
+    }
+
+    return characters.join('') + suffix;
+  }
+
+  /**
+   * Why an INVALID model index is left alone rather than repaired — the warning to log — or null to repair it:
+   * - an index build is running on its table (the index's own concurrent build, a REINDEX CONCURRENTLY of it, or any
+   *   other build, also one another role runs): dropping would wait behind the build and lock the table out, or
+   *   deadlock with it;
+   * - it is a partitioned index: INVALID by design until every partition has an attached valid index — PostgreSQL's
+   *   online procedure (CREATE INDEX … ON ONLY, then each partition's index, attached one by one);
+   * - a constraint requires it: PostgreSQL refuses to drop it;
+   * - it is unique and still ready: it keeps rejecting duplicates, which dropping it to rebuild would stop.
+   */
+  private async leaveInvalidIndexAlone(index: DbIndexInfo, tableName: string, schema?: string): Promise<string | null> {
+    const table = this.getQualifiedTableName(tableName, schema);
+    const qualifiedIndex = this.qualifiedIndexName(index.index_name, schema);
+    if (index.build_in_progress) {
+      return `  ⊘ INVALID index "${index.index_name}" on ${table} left alone: an index is being built on ${table} (pg_stat_progress_create_index) — run the migration again once that build has finished.\n`;
+    }
+    if (index.is_partitioned) {
+      const missing = await this.partitionsWithoutAttachedValidIndex(tableName, schema, index.index_name);
+      return `  ⊘ INVALID partitioned index "${index.index_name}" on ${table} left alone: the migration never rebuilds a partitioned index — it turns valid once every partition has an attached valid index (partitions without one: ${missing.length > 0 ? missing.map(name => `"${name}"`).join(', ') : 'none'}); create those CONCURRENTLY and attach them with ALTER INDEX ${qualifiedIndex} ATTACH PARTITION.\n`;
+    }
+    if (index.required_by) {
+      return `  ⊘ INVALID index "${index.index_name}" on ${table} left alone: constraint "${index.required_by.constraint}" on "${index.required_by.table}" requires it, so it cannot be dropped — rebuild it in place with REINDEX INDEX CONCURRENTLY ${qualifiedIndex}.\n`;
+    }
+    if (index.is_unique && index.is_ready) {
+      return `  ⊘ INVALID unique index "${index.index_name}" on ${table} left alone: it is still ready (indisready), so it keeps rejecting duplicates, and dropping it to rebuild would stop that — rebuild it in place with REINDEX INDEX CONCURRENTLY ${qualifiedIndex} (remove duplicate rows first if that fails).\n`;
+    }
+
+    return null;
+  }
+
+  /** The partitions of a partitioned table without a valid index attached to its partitioned index `indexName`. */
+  private async partitionsWithoutAttachedValidIndex(tableName: string, schema: string | undefined, indexName: string): Promise<string[]> {
+    const result = await this.client.query(`
+      SELECT c.relname
+        FROM pg_inherits pt
+        JOIN pg_class c ON c.oid = pt.inhrelid
+       WHERE pt.inhparent = to_regclass($1)
+         AND NOT EXISTS (
+           SELECT 1 FROM pg_inherits pi JOIN pg_index x ON x.indexrelid = pi.inhrelid
+            WHERE pi.inhparent = to_regclass($2) AND x.indrelid = c.oid AND x.indisvalid)
+       ORDER BY c.relname
+    `, [this.getQualifiedTableName(tableName, schema), this.qualifiedIndexName(indexName, schema)]);
+
+    return result.rows.map(row => row.relname);
+  }
+
+  private qualifiedIndexName(indexName: string, schema?: string): string {
+    return schema ? `"${schema}"."${indexName}"` : `"${indexName}"`;
+  }
+
+  /** A model index as the fields of the operation that creates, recreates or repairs it. */
+  private indexOperationFields(tableName: string, schema: string | undefined, index: IndexDefinition) {
+    return {
+      tableName,
+      schema,
+      indexName: index.name,
+      columns: index.columns,
+      isUnique: index.isUnique,
+      using: index.using,
+      operatorClass: index.operatorClass,
+      concurrent: index.concurrent,
+      expressions: index.expressions,
+      where: index.where,
+      nullsNotDistinct: index.nullsNotDistinct,
+      include: index.include,
+    };
+  }
+
+  /** The index an index operation builds, as `executeCreateIndex` takes it. */
+  private static indexSpecOf(operation: IndexOperation) {
+    return {
       name: operation.indexName,
       columns: operation.columns,
       isUnique: operation.isUnique,
@@ -1876,7 +2160,7 @@ $$`;
       where: operation.where,
       nullsNotDistinct: operation.nullsNotDistinct,
       include: operation.include,
-    }, operation.schema);
+    };
   }
 
   /**
@@ -2084,16 +2368,33 @@ $$`;
     // `pg_get_indexdef(oid, 0, true)` yields the canonical, pretty-printed
     // CREATE INDEX statement (no CONCURRENTLY / IF NOT EXISTS, redundant parens
     // stripped), which the signature comparison parses to detect changes.
+    // `indisvalid` is false for an index a failed or cancelled CREATE INDEX
+    // CONCURRENTLY left behind, and for one still being built. The column names
+    // come as JSON, which every driver decodes to an array (pg returns a native
+    // name[] as its literal text).
     const result = await this.client.query(`
       SELECT
         i.relname as index_name,
         pg_get_indexdef(i.oid, 0, true) as canonical_def,
-        ARRAY(
-          SELECT a.attname
+        (
+          SELECT COALESCE(json_agg(a.attname ORDER BY k.ord), '[]'::json)
           FROM unnest(ix.indkey) WITH ORDINALITY k(attnum, ord)
           JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
-          ORDER BY k.ord
-        ) as column_names
+        ) as column_names,
+        ix.indisvalid as is_valid,
+        ix.indisready as is_ready,
+        ix.indisunique as is_unique,
+        i.relkind as relkind,
+        (
+          SELECT json_build_object('constraint', con.conname, 'table', ct.relname)
+          FROM pg_constraint con
+          JOIN pg_class ct ON ct.oid = con.conrelid
+          WHERE con.conindid = ix.indexrelid
+          ORDER BY con.contype = 'f', con.conname
+          LIMIT 1
+        ) as required_by,
+        ix.indexrelid::text as index_oid,
+        t.oid::text as table_oid
       FROM pg_index ix
       JOIN pg_class t ON t.oid = ix.indrelid
       JOIN pg_class i ON i.oid = ix.indexrelid
@@ -2104,10 +2405,51 @@ $$`;
         AND NOT ix.indisprimary
     `, [schemaName || 'public', tableName]);
 
+    // only an explicit false is INVALID: an index is never rebuilt on a flag that could not be read
+    const invalid = (row: { is_valid: unknown }) => row.is_valid === false;
+    const builds = result.rows.some(invalid) ? await this.readIndexBuilds() : [];
+
     return result.rows.map(row => ({
       index_name: row.index_name,
       column_names: row.column_names,
       canonical_def: row.canonical_def,
+      is_valid: !invalid(row),
+      is_ready: row.is_ready !== false,
+      is_unique: row.is_unique === true,
+      is_partitioned: row.relkind === 'I',
+      required_by: row.required_by ?? null,
+      // a build of this index, or any build on its table — also one whose progress hides the table (another role's),
+      // found through the locks its backend holds on the table
+      build_in_progress: invalid(row) && builds.some(build =>
+        build.index_relid === row.index_oid
+        || build.relid === row.table_oid
+        || (build.relid === null && build.locked_relations.includes(row.table_oid))),
+    }));
+  }
+
+  /**
+   * The index builds running in this database: `pg_stat_progress_create_index`, with the tables each build's backend
+   * holds locks on (`pg_locks`). A role sees `relid` / `index_relid` only for builds run by roles it belongs to (or
+   * with pg_read_all_stats); the locks show every build's table to every role.
+   */
+  private async readIndexBuilds(): Promise<DbIndexBuild[]> {
+    const result = await this.client.query(`
+      SELECT
+        p.relid::text as relid,
+        p.index_relid::text as index_relid,
+        COALESCE((
+          SELECT json_agg(l.relation::text)
+          FROM pg_locks l
+          WHERE l.pid = p.pid AND l.locktype = 'relation' AND l.database = p.datid
+        ), '[]'::json) as locked_relations
+      FROM pg_stat_progress_create_index p
+      WHERE p.datid = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+    `);
+
+    return result.rows.map(row => ({
+      relid: row.relid ?? null,
+      index_relid: row.index_relid ?? null,
+      locked_relations: row.locked_relations ?? [],
     }));
   }
 
@@ -2193,12 +2535,15 @@ $$`;
    * Get all foreign key constraints for a table
    */
   private async getExistingForeignKeys(tableName: string, schemaName?: string): Promise<DbForeignKeyInfo[]> {
+    // The column lists come as JSON, which every driver decodes to an array: an
+    // array_agg of information_schema's identifiers is a name[], which the pg
+    // driver hands back as its literal text ('{book_id}').
     const result = await this.client.query(`
       SELECT
         tc.constraint_name,
-        array_agg(kcu.column_name ORDER BY kcu.ordinal_position) as column_names,
+        json_agg(kcu.column_name ORDER BY kcu.ordinal_position) as column_names,
         ccu.table_name AS referenced_table,
-        array_agg(ccu.column_name ORDER BY kcu.ordinal_position) as referenced_column_names,
+        json_agg(ccu.column_name ORDER BY kcu.ordinal_position) as referenced_column_names,
         rc.delete_rule as on_delete,
         rc.update_rule as on_update
       FROM information_schema.table_constraints AS tc
@@ -2465,6 +2810,10 @@ $$`;
         return `Create ${uniquePrefix}index${concurrentDesc} "${operation.indexName}" on "${operation.tableName}"${usingDesc} (${idxCols})${includeDesc}${whereDesc}`;
       case 'recreate_index':
         return `Recreate index "${operation.indexName}" on "${operation.tableName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}`;
+      case 'repair_index':
+        return operation.concurrent || this.concurrentIndexes
+          ? `Repair INVALID index "${operation.indexName}" on "${operation.tableName}" (drop + create CONCURRENTLY from the model)`
+          : `Repair INVALID index "${operation.indexName}" on "${operation.tableName}" (build from the model as "${DbSchemaManager.repairBuildName(operation.indexName)}", then swap it in)`;
       case 'drop_index':
         return `Drop index "${operation.indexName}" (DESTRUCTIVE)`;
       case 'create_statistics': {

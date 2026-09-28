@@ -83,6 +83,15 @@ const NUMBER_RESULT_MAPPER = {
   fromDriver: (value: unknown) => (value == null ? value : Number(value)),
 };
 
+/**
+ * Whether `mapper` is the numeric-result mapper of the helpers (`agg.count()` / `sum()` / `avg()`,
+ * `round()`, `extract()`, a numeric `literal()`, …): it reads the driver's text and a JSON number alike,
+ * so such a value travels through a QueryBatch as it is. @internal
+ */
+export function isNumberResultMapper(mapper: unknown): boolean {
+  return mapper === NUMBER_RESULT_MAPPER;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') {
     return false;

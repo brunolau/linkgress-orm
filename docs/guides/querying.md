@@ -761,6 +761,37 @@ const top = await db.posts
 
 An `sql` expression written inside `orderBy()` is refused — project it and order by that field.
 
+### In a QueryBatch
+
+A grouped query — and a grouped query joined to a CTE or a subquery — has the future API of a plain
+select: `future()`, `futureFirstOrDefault()` and `futureCount()`. So it joins a `QueryBatch` and is read
+in the batch's one round trip, next to everything else:
+
+```typescript
+const perDay = db.posts
+  .select(p => ({ day: dateTrunc('day', p.createdAt), views: p.views }))
+  .groupBy(r => ({ day: r.day }))
+  .select(g => ({ day: g.key.day, posts: g.count(), views: g.sum(r => r.views) }))
+  .orderBy(r => r.day);
+
+const batch = new QueryBatch();
+const pageKey = batch.addList(perDay.limit(10), 'perDay');  // { day: Date; posts: number; views: number }[]
+const daysKey = batch.addCount(perDay, 'days');             // the number of groups
+const userKey = batch.addFirstOrDefault(db.users.where(u => eq(u.id, id)).select(u => u), 'user');
+await batch.executeBatch();
+```
+
+A batched grouped query reads exactly what its `toList()` / `firstOrDefault()` reads through the same
+client — the same values of the same JS types, in the same key order: an int8 / numeric key as the driver
+delivers it (its exact text, by default), a date or timestamp key (a column, or an expression such as
+`dateTrunc()` / `castAsDate()`) as the client's parser makes it (a Date, by default; its text under a
+pass-through parser), bytea as a Buffer, a mapped column through its mapper. The batch sends each such value
+as its text with its type, which the client parses as its driver parses the type, so an untyped `sql`
+expression reads as it does standalone too (see [QueryBatch](#querybatch-several-reads-in-one-round-trip),
+with its known limitations).
+`futureCount()` counts the groups the HAVING keeps, past the query's ORDER BY / LIMIT / OFFSET — as a plain
+select's `futureCount()` counts its rows past its paging.
+
 ## JOINs
 
 ### Inner Join
@@ -805,6 +836,27 @@ const data = await db.posts
     authorName: user.username,
     categoryName: category.name
   }))
+  .toList();
+```
+
+### How a Joined Table's Columns Read
+
+A column of a manually joined table (`leftJoin` / `innerJoin` of a table — also of the queried table itself,
+also joined twice, also inside a CTE) reads as a column of ITS table, exactly as the same column read through a
+navigation: through its own mapper (`hasCustomMapper()`), as its own SQL type (a text of digits stays text, a
+date / timestamp is what the client's parser makes of one — through a `QueryBatch` too). A condition on it
+binds its value through that mapper. A plain comparison or an ORDER BY on it renders as before; a helper that
+types its SQL by a column's declared type (the `eqAny()` / `neAll()` array cast, the `flag*` mask casts,
+`agg.arrayAgg()` / `unnest()` element types) renders for it as for a column of the queried table.
+
+```typescript
+const jobs = await db.jobs
+  .leftJoin(db.machines, (job, machine) => eq(job.machineId, machine.id), (job, machine) => ({
+    title: job.title,
+    serviceInterval: machine.service,   // the machine column's mapper — { hours: 1, minutes: 30 }
+    installedAt: machine.installedAt,   // a Date
+  }))
+  .where(r => gt(r.serviceInterval, { hours: 1, minutes: 0 }))  // bound through that mapper: 60
   .toList();
 ```
 
@@ -1416,6 +1468,104 @@ const postsWithTotal = await db.posts
   }))
   .toList();
 ```
+
+## QueryBatch: Several Reads in One Round Trip
+
+`QueryBatch` runs independent reads — lists, first rows, counts — as ONE statement (a `UNION ALL` of JSON
+envelopes, each query planned on its own), so a screen that needs five reads pays one round trip:
+
+```typescript
+import { QueryBatch } from 'linkgress-orm';
+
+const batch = new QueryBatch();
+const postsKey = batch.addList(db.posts.where(p => eq(p.userId, id)).select(p => ({ id: p.id, title: p.title })), 'posts');
+const userKey = batch.addFirstOrDefault(db.users.where(u => eq(u.id, id)).select(u => u), 'user');
+const perDayKey = batch.addList(postsPerDay, 'perDay');               // a grouped query
+const commentsKey = batch.addCount(db.comments.where(c => eq(c.userId, id)), 'comments');
+await batch.executeBatch();
+
+batch.getList(postsKey);       // { id: number; title: string }[]
+batch.getItem(userKey);        // the user, or null
+batch.getCount(commentsKey);   // number
+```
+
+A select (`future()` / `futureFirstOrDefault()` / `futureCount()`), a union (`future()`), a grouped query and
+a grouped join (see [GROUP BY › In a QueryBatch](#in-a-querybatch)) join a batch. Every query of one batch
+runs on one context — one client, or one transaction; a query with a `withTimeout()` of its own runs on its
+own executor and is refused. A batch is executed once.
+
+### What a batched query reads
+
+What the same query reads on its own THROUGH THIS CLIENT: the same values of the same JS types, as its
+driver delivers them under the client's configuration — the driver's defaults, or parsers of the
+application's own (a postgres.js `types` entry, a node-postgres pool's `types` or `pg.types.setTypeParser()`,
+PGlite `parsers`). The rows travel as JSON, which carries an integer, a text, a boolean or a `json` document
+as the drivers deliver it, but not a date, an int8 or bytea. So the batch sends each value it cannot carry
+that way as its PostgreSQL TEXT — as the wire protocol sends it, its type's output — alongside the row, with
+its type once for the query, and the client parses that text exactly as its driver parses a column of the
+type (`DatabaseClient.parseTypedText()`: postgres.js, node-postgres and PGlite through their own parsers;
+Bun, which exposes none, by reproducing its decoding — `bigint: true` included, and through its binary
+protocol for a query that binds parameters, as Bun reads one). A client that reads timestamps as their text
+(a pass-through parser) reads a batched timestamp as that text; one that reads an int8 as a `BigInt` reads a
+batched int8 as a `BigInt`.
+
+The values sent as their text are those of the types JSON cannot carry as the drivers deliver them — `date`,
+`time`, `timetz`, `timestamp`, `timestamptz`, `interval`, `int8`, `numeric`, `money`, `bytea`, `point`,
+`circle` and their arrays — of a user-defined type (an enum, a composite, an extension's type; a domain as
+the type it is over, so a domain over integer keeps its JSON number), and of every type the client parses
+with a parser of its own. Which values those are:
+
+- a value only PostgreSQL knows the type of — an expression (`dateTrunc()`, `castAsDate()`, `castAsBigInt()`,
+  `coalesce()`, `atTimeZone()`, `lower()`, `agg.arrayAgg()`, a raw `sql`), a mapped expression (`mapWith()`:
+  its mapper gets what the client delivers), an `agg.min` / `agg.max`, a scalar subquery, a collection's
+  MIN / MAX, a CTE's expression column, a UNION column whose legs declare different types (a date in one, a
+  timestamp in another) — by its runtime type (`pg_typeof`), tested row by row;
+- a read-typed expression (`withReadType()`) — also as the one value of a scalar subquery or a CTE's column —
+  and a column of a CTE, a table subquery, a set (`crossJoinLateral`) or a manually joined table, by the type
+  it declares;
+- a column of a parameterised or aliased declared type (`bigserial`, `numeric(12,2)`, `timestamp(3)`,
+  `timestamp with time zone`), through its mapper when it has one;
+- a declared `bigint` / `numeric` / `decimal` column: always as its text (a JSON number would lose its
+  precision), which the client parses — the driver's exact text, unless the client parses the type itself.
+
+A plain select's declared `timestamp`, `timestamptz`, `date` or `bytea` column (of the query's table or a
+navigation) is restored from its JSON form as 1.0.10 restored it: a Date by the DEFAULT drivers' rules, bytea
+as a Buffer, and for a custom mapper the driver's text form — whatever the client's parsers (see the known
+limitations).
+
+A query with no value to send as its text — columns of the types JSON carries, those declared date /
+timestamp / bytea columns, counts, sums, conditions, numeric results (`agg.count()` / `sum()` / `avg()`,
+`round()`, a numeric `literal()`), `withReadType()` expressions of a type JSON carries (text, integer,
+boolean, json, …), a UNION whose legs agree — is sent exactly as in 1.0.10, byte for byte. A query with one
+sends its rows as such a query does (`row_to_json`: a `json` value untouched — a `\u0000`, a lone surrogate
+— and every object's keys, a collection's items' included, in their order), the texts of the values that need
+one alongside each row, and each such value's type once, over its query wrapped as
+`(SELECT * FROM (…) OFFSET 0)` so that PostgreSQL evaluates the query once per row as on its own. (A query
+with declared int8 / numeric columns is one of these now: 1.0.10 merged their texts into a `jsonb` row; the
+values are the same.)
+
+That costs, per query, a header of about 50 bytes plus about 10 per value sent as text, and one catalog
+lookup per such value; per row, a type test per runtime-typed value, and the texts that are needed. Measured
+on PostgreSQL 18: a correlated scalar subquery per row (400 rows over 20 000) runs once per row, 244 ms, as on
+its own (235 ms; without the `OFFSET 0` wrapper PostgreSQL would evaluate it at every reference, 1 184 ms);
+50 000 rows with one `lower()` take 27 ms where 1.0.10's envelope took 20 ms (ordered: 30 ms and 28 ms).
+
+### Known limitations of the JSON transport
+
+- A plain select's **declared `timestamp` / `timestamptz` / `date` / `bytea` column** is restored by the
+  default drivers' rules, as in 1.0.10 (see above): a client with parsers of its own for these types — a text
+  pass-through, say — reads such a column otherwise on its own. A custom mapper of such a column
+  (`hasCustomMapper()`) gets the driver's TEXT form in a batch (`'2024-03-01 06:00:00'`), the convention of
+  apps that configure timestamp pass-through; a client whose driver parses timestamps into Dates hands that
+  mapper a Date when the query runs on its own. Read through an expression (``sql`${column}` ``), such a
+  column is parsed as the client parses it.
+- A **collection's list** — `toList()`, `toNumberList()`, a `withAggregation()` list — travels as the JSON the
+  query builds for it; where the query itself reads a list as a native array (`toNumberList()` on a client
+  that decodes arrays), a date or timestamp element arrives as its ISO text and an int8 / numeric element as
+  a JSON number.
+- A **`withReadType()`** travels as the type it declares: declare the type the expression HAS. A value declared
+  as a type JSON carries (text, integer, …) that is not of that type arrives as its JSON form.
+- A **domain** over a domain is read by the type the outer domain is over (one level).
 
 ## Prepared Statements
 

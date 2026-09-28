@@ -226,7 +226,13 @@ export interface IndexInfo {
   predicate?: StoredExpr;
   method: string;
   nullsNotDistinct: boolean;
+  /** pg_index.indisvalid: false while reads must not use the index (a failed CREATE INDEX CONCURRENTLY, UPDATE pg_index) */
   valid: boolean;
+  /**
+   * pg_index.indisready: false while writes do not maintain the index — a unique one then enforces nothing (a failed
+   * CREATE INDEX CONCURRENTLY, UPDATE pg_index SET indisready). Absent: ready.
+   */
+  ready?: boolean;
   constraintOid: number;
 }
 

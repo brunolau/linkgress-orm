@@ -42,11 +42,16 @@ into 6 worker databases (`<DB_NAME>_<host>_<pid>_w1..w6`) and runs 6 files at a 
 database. Every database it created is dropped when the run ends — passed, failed, failed during setup,
 stopped with Ctrl+C, or crashed — and a run that was killed outright leaves them for the next PostgreSQL
 run on the same machine to drop (`<host>` is a hash of the host name, so runs on other machines sharing
-the server are left alone). `--pg-jobs N` changes the count; `--pg-jobs 1` runs the files one after
-another on `DB_NAME` itself. The server user needs `CREATEDB`. A memory run builds the schema once into a snapshot every file's database is restored
+the server are left alone). `--pg-jobs N` changes the count, and a run of fewer files clones fewer — a
+one-file run gets ONE private database; only an explicit `--pg-jobs 1` runs the files one after another
+on `DB_NAME` itself (rebuilding its schema and dropping it at the end — never use it on a server others
+share). The server user needs `CREATEDB`. A memory run builds the schema once into a snapshot every file's database is restored
 from, and runs files in parallel. A PGlite run (`--driver pglite`) does the same with a PGlite
 data-directory dump (every file boots its own PGlite); the server is then only needed by the files that
-construct `PgClient` / `PostgresClient` themselves, and the run only warns when it is unreachable.
+construct `PgClient` / `PostgresClient` themselves — they get private worker databases like a PostgreSQL
+run's, one per parallel slot, or, when those cannot be created (no `CREATEDB`, say), `DB_NAME` with the test
+schema created there and dropped at the end, as before — and the run only warns when it is unreachable. (Memory
+and parity runs still run `tests/memory/sql-parity.test.ts` against `DB_NAME`, inside transactions it rolls back.)
 `@electric-sql/pglite` (like `postgres`) is a devDependency, so `npm install` is all a PGlite run needs.
 A few files skip, under PGlite only, what one in-process session cannot do: hold a lock against a second
 session (advisory locks, a live `FOR UPDATE NOWAIT`), cancel a running statement (the end-to-end timeout

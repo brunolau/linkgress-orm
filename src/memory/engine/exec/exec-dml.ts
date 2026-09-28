@@ -1,6 +1,6 @@
-import { Column, Constraint, Relation, StoredExpr, TypeOid } from '../catalog/catalog';
+import { Catalog, Column, Constraint, Relation, StoredExpr, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
-import { Query, RelationRTE, TExpr } from '../analyze/nodes';
+import { CatalogRTE, Query, RelationRTE, TExpr } from '../analyze/nodes';
 import { Heap, Snapshot, Tuple, UndoLog, WaitForTransaction } from '../storage/mvcc';
 import { lockTuple } from '../storage/store';
 import { outputValue } from '../types/io';
@@ -33,6 +33,8 @@ export interface DmlHost extends ExecutorHost {
   deferConstraintCheck(con: Constraint, run: (dml: DmlExecutor) => void): void;
   /** a tuple version was written to the heap (`inserted`: a new version), for autovacuum */
   noteHeapWrite(heap: Heap, inserted: boolean): void;
+  /** the transaction's writable catalog (taking the database's DDL lock), for an UPDATE of pg_index's state flags */
+  ddlCatalog(): Catalog;
 }
 
 interface UniqueIndexInfo {
@@ -108,7 +110,8 @@ export class DmlExecutor {
     const uniques: UniqueIndexInfo[] = [];
     for (const ix of catalog.indexesOf(rel.oid)) {
       const info = ix.index!;
-      if (!info.unique || !info.valid) {
+      // a unique index is enforced while writes maintain it (indisready) — INVALID or not
+      if (!info.unique || info.ready === false) {
         continue;
       }
       const parts: { phys: number; type: number; ev?: Evaluator; plan?: QueryPlan }[] = info.keys.map((k) => {
@@ -996,9 +999,13 @@ export class DmlExecutor {
   // -------------------------------------------------------------------------
 
   executeUpdate(q: Query, base: EvalCtx): { rows: unknown[][]; rowCount: number } {
+    const target = q.rtable[q.resultRelation];
+    if (target.kind === 'catalog') {
+      return this.executeCatalogUpdate(q, base, target);
+    }
     const plan = this.executor.planFor(q, base.parent && base.parent.inst ? (base.parent.inst as { plan: QueryPlan }).plan : null);
     const rt = q.resultRelation;
-    const rte = q.rtable[rt] as RelationRTE;
+    const rte = target as RelationRTE;
     const info = this.tableInfo(rte.relOid);
     const nrt = plan.nrt;
     this.st.updateTargetColumns = new Set(q.updateSet!.map((s) => info.live[s.attIndex].name));
@@ -1086,6 +1093,61 @@ export class DmlExecutor {
       this.fireAfterRowTriggers(updates.map((u) => ({ rel: u.rel, newData: u.newData, oldData: u.oldData })), 'UPDATE', transition);
     });
     this.statementTriggers(info.rel, ['UPDATE'], 'AFTER', transition);
+    return { rows: returning, rowCount };
+  }
+
+  /**
+   * UPDATE of a catalog. Only the index state flags of pg_index get here — the analyzer refuses every other catalog
+   * write (WRITABLE_CATALOG_COLUMNS): each pg_index row the statement selects is written once, onto the index it
+   * describes, in the transaction's catalog, so a ROLLBACK restores the flags. The flags are NOT NULL, as in
+   * PostgreSQL.
+   */
+  private executeCatalogUpdate(q: Query, base: EvalCtx, rte: CatalogRTE): { rows: unknown[][]; rowCount: number } {
+    const plan = this.executor.planFor(q, base.parent && base.parent.inst ? (base.parent.inst as { plan: QueryPlan }).plan : null);
+    const rt = q.resultRelation;
+    const rel = this.st.catalog.getRelation(rte.relOid)!;
+    const live = rel.columns.filter((c) => !c.isDropped);
+    const at = (name: string) => live.findIndex((c) => c.name === name);
+    const [oidAt, validAt, readyAt] = [at('indexrelid'), at('indisvalid'), at('indisready')];
+    // the DDL lock first: waiting for another transaction's DDL retries the statement before anything is written
+    const cat = this.host.ddlCatalog();
+    const rows = this.executor.executeFromWhere(plan, base);
+    const setEvs = q.updateSet!.map((s) => ({ col: live[s.attIndex], at: s.attIndex, ev: s.expr.k === 'default' ? null : plan.ev(s.expr) }));
+    const retEvs = q.returningList.map((te) => plan.ev(te.expr));
+    const returning: unknown[][] = [];
+    const written = new Set<unknown>();
+    let rowCount = 0;
+    for (const row of rows) {
+      const oldData = row[rt] as unknown[];
+      const oid = oldData[oidAt];
+      if (written.has(oid)) {
+        continue;
+      }
+      written.add(oid);
+      const ctx = this.executor.rowCtx(row, base);
+      const newData = oldData.slice();
+      for (const s of setEvs) {
+        // a catalog column has no default
+        const v = s.ev ? s.ev(ctx) : null;
+        if ((v === null || v === undefined) && s.col.notNull) {
+          throw new PgError(SqlState.NOT_NULL_VIOLATION, `null value in column "${s.col.name}" of relation "${rel.name}" violates not-null constraint`);
+        }
+        newData[s.at] = v;
+      }
+      const index = cat.getRelation(oid as number);
+      if (!index?.index) {
+        continue;
+      }
+      cat.putRelation({ ...index, index: { ...index.index, valid: newData[validAt] === true, ready: newData[readyAt] === true } });
+      rowCount++;
+      if (retEvs.length > 0) {
+        const r2 = row.slice();
+        r2[rt] = newData;
+        setReturningOldNew(q, r2, oldData, newData);
+        const c2 = this.executor.rowCtx(r2, base);
+        returning.push(retEvs.map((ev) => ev(c2)));
+      }
+    }
     return { rows: returning, rowCount };
   }
 

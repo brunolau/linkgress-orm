@@ -563,6 +563,7 @@ export type {
 // Migration tools
 export {
   DbSchemaManager,
+  IndexRepairError,
 } from './migration/db-schema-manager';
 
 export {
@@ -596,6 +597,7 @@ export {
 } from './migration/migration-scaffold';
 
 export type {
+  IndexRepairFailure,
   MigrationOperation,
 } from './migration/db-schema-manager';
 
@@ -603,6 +605,8 @@ export type {
 export {
   DatabaseClient,
   QueryTimeoutError,
+  TransactionEndedError,
+  ConnectionReleasedError,
 } from './database/database-client.interface';
 
 export type {
@@ -612,6 +616,7 @@ export type {
 
 export type {
   QueryExecutionOptions,
+  TypedTextRead,
 } from './database/database-client.interface';
 
 export {

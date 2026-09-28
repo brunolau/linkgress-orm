@@ -1,6 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
+import type { EnclosingCollectionScope } from './conditions';
 import { pgTypeOfValue, selectorProjectingConditions } from './sql-functions';
-import { holdsAggregateFragment, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
+import { holdsAggregateFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
@@ -15,12 +16,13 @@ import { DbCte, isCte, projectedValueRef } from './cte-builder';
 import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
-import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta } from './future-query';
+import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta, canonicalJsonColumnType, isCustomReadMapper, jsonColumnDelivery } from './future-query';
+import { needsClientParse } from '../database/typed-text';
 import type { ColumnConfig } from '../schema/column-builder';
 import { createColumnRow } from '../entity/column-row';
 import { MockRowCache } from './mock-row-cache';
 import { NavigationPathCache } from './navigation-path-cache';
-import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, NavigationAliasPlan, quoteTableReference } from './join-utils';
+import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, buildLiteralOnlyPredicates, NavigationAliasPlan, quoteTableReference } from './join-utils';
 import type { NavigationPathNode } from './join-utils';
 import {
   assertStatementLevelCtes, attachReturningSelection, cteDeclarationAt, declareStatementCtes, isStatementCte, NestedDataModifyingCteError, stampChainId,
@@ -446,14 +448,16 @@ const buildOrderByExpressionSql = (
   expression: Condition,
   context: { paramCounter: number; allParams: any[]; placeholders?: Map<string, number>; hoistedCteNames?: Set<string> },
   lateralTableAliasMap?: Map<string, string>,
-  localParams?: any[]
+  localParams?: any[],
+  collectionScope?: EnclosingCollectionScope
 ): string => {
   const { sql, params, placeholders, paramCounter } = new ConditionBuilder().build(
     expression,
     context.paramCounter,
     context.placeholders,
     context.hoistedCteNames,
-    lateralTableAliasMap
+    lateralTableAliasMap,
+    collectionScope
   );
   context.paramCounter = paramCounter;
   context.allParams.push(...params);
@@ -567,6 +571,14 @@ const addExplicitJoinPath = (
  * correlate to the alias, and its reference navigations hang off it under explicit aliases whose
  * refs carry their join path (see explicitNavigationAlias). The schema registry is what gives a
  * navigation's target its own relations, so a chain (`orderTask.task.level.createdBy`) can go on.
+ *
+ * Its columns carry what a navigation's do (see ReferenceQueryBuilder.buildMockRowDescriptors): the
+ * table they belong to (`__sourceTable`), their mapper and their SQL type — so they read, and bind
+ * condition values, as columns of THEIR table. They used to carry none of it, and every read looked the
+ * column up by its NAME on the query's own table: one named like a mapped column of that table read
+ * through THAT column's mapper, a mapped one of its own read through none (and a condition bound its
+ * value unconverted), a text one of digits read as a number, and a QueryBatch revived one by the type
+ * of that table's column of its name — or, when the table had none, not at all.
  */
 export const createJoinedTableMockRow = (
   schema: TableSchema,
@@ -577,12 +589,16 @@ export const createJoinedTableMockRow = (
 
   // Performance: Use pre-computed column name map if available
   const columnNameMap = getColumnNameMapForSchema(schema);
+  const columnMeta = getSchemaColumnMeta(schema);
+  const sourceTable = schema.name;
 
   // Performance: Lazy-cache FieldRef objects
   const fieldRefCache: Record<string, any> = {};
 
   // Add columns as FieldRef objects with table alias
   for (const [colName, dbColumnName] of columnNameMap) {
+    const meta = columnMeta.get(colName);
+
     Object.defineProperty(mock, colName, {
       get() {
         let cached = fieldRefCache[colName];
@@ -591,6 +607,10 @@ export const createJoinedTableMockRow = (
             __fieldName: colName,
             __dbColumnName: dbColumnName,
             __tableAlias: alias,
+            __sourceTable: sourceTable,  // The joined table — the read's (and the batch's) type authority
+            __mapper: meta?.mapper,  // Its mapper: fromDriver on read, toDriver in conditions
+            __sqlType: meta?.type,  // Its SQL type, as a navigation's column carries it
+            __manualJoin: true,  // A QueryBatch sends it as the client parses it (see batchTransportOf)
           };
         }
         return cached;
@@ -784,6 +804,8 @@ export interface QueryContext {
    * Example: { "posts": "lateral_0_posts" }
    */
   lateralTableAliasMap?: Map<string, string>;
+  /** What the collection subqueries enclosing this build expose to it (see EnclosingCollectionScope). */
+  collectionScope?: EnclosingCollectionScope;
   /**
    * True when the driver cannot decode native ARRAY result columns
    * (BunClient) — array-producing aggregations must use json_agg.
@@ -3229,23 +3251,30 @@ export class SelectQueryBuilder<TSelection> {
   }
 
   /**
-   * Build a value reviver for rows delivered as JSON (QueryBatch json_agg
-   * envelope). JSON serialization bypasses the driver's type parsers:
-   * timestamps and dates arrive as ISO strings, numerics as JSON numbers.
-   * The reviver restores driver-equivalent values BEFORE the normal transform
-   * pipeline runs, driven by the DECLARED column types of the selected fields —
-   * never by value shape, so string columns are never misinterpreted.
-   * Returns undefined when no selected column needs revival.
+   * How this query's rows travel through a QueryBatch json_agg envelope (see FutureBatchMeta): which
+   * values the batch sends as their text alongside the row (always, or when their runtime type needs it)
+   * for the client to parse as its driver does, and which declared columns it revives from their JSON
+   * form as it always did. Returns metadata without a reviver when no column needs revival.
    * @internal
    */
-  private buildBatchMeta(selection: any, hasNestedPaths: boolean): FutureBatchMeta {
+  private buildBatchMeta(selection: any, hasNestedPaths: boolean, forcedRuntime?: ReadonlySet<string>): FutureBatchMeta {
     const revivals: Array<{ key: string; revive: (value: any) => any }> = [];
     const textColumns: string[] = [];
-    // A selector returning one column: its row key is the column's name (see transformResults)
-    const revivalSelection = isScalarSelection(selection) && '__dbColumnName' in selection
-      ? { [(selection as FieldRef).__dbColumnName]: selection }
+    const runtimeTyped: string[] = [];
+    const scalar = isScalarSelection(selection);
+    // A selector returning one column: its row key is the column's name (see transformResults). One
+    // returning one expression leaves its column for PostgreSQL to name: the batch names it
+    const scalarExpression = scalar && !('__dbColumnName' in selection);
+    const revivalSelection = scalar
+      ? { [scalarExpression ? BATCH_SINGLE_EXPRESSION_ALIAS : (selection as FieldRef).__dbColumnName]: selection }
       : selection;
-    this.collectJsonRowRevivals(revivalSelection, undefined, revivals, textColumns);
+    this.collectJsonRowRevivals(revivalSelection, undefined, {
+      revivals,
+      textColumns,
+      runtimeTyped,
+      forcedRuntime,
+      customOids: this.client.customParsedTypeOids(),
+    });
 
     const reviveJsonRow = revivals.length === 0
       ? undefined
@@ -3265,166 +3294,260 @@ export class SelectQueryBuilder<TSelection> {
       hasNestedPaths,
       reviveJsonRow,
       textColumns: textColumns.length > 0 ? textColumns : undefined,
+      runtimeTypedColumns: runtimeTyped.length > 0 ? runtimeTyped : undefined,
+      // The batch addresses the one expression's column by name when it sends its text
+      columnAlias: scalarExpression && (runtimeTyped.length > 0 || textColumns.length > 0) ? BATCH_SINGLE_EXPRESSION_ALIAS : undefined,
     };
   }
 
   /**
-   * Walk a selection — including nested-object projections — collecting revival
-   * entries keyed by the FLAT column alias each leaf is delivered under: top-level
-   * keys as-is, nested leaves under the `__nested__<path>__<leaf>` path-encoded
-   * alias that tryBuildFlatNestedSelect emits (revival runs BEFORE nested
-   * reconstruction, so it must target the flat row shape). Only plain object
-   * literals are recursed into; collections, SqlFragments and subquery builders
-   * are skipped — they are delivered as json under standalone execution too, so
-   * they need no revival.
+   * How one selected value travels through a QueryBatch — see collectJsonRowRevivals:
+   * - `runtime`: sent as its text when its runtime type needs it (see FutureBatchMeta.runtimeTypedColumns)
+   *   — an expression that declares no read type (a helper such as `dateTrunc()` / `castAsDate()` /
+   *   `castAsBigInt()` / `coalesce()` / `lower()`, a raw `sql`, an `agg.min` / `agg.max`), a mapped
+   *   expression (`mapWith()`: its mapper then gets what the client delivers standalone), a scalar
+   *   subquery of such a value, a collection's MIN / MAX; and a value of a DECLARED type the batch cannot
+   *   carry as the drivers deliver it (see needsClientParse) that is new to the batch — a column of a CTE,
+   *   a table subquery, a set or a manually joined table, a read-typed expression (`withReadType`), a
+   *   column of a type other than those below;
+   * - `text`: sent as its text always — a declared int8 / numeric column (`bigint`, `numeric`, `decimal`);
+   * - `declared`: revived from its JSON form as a batch always revived it — a declared `timestamp`,
+   *   `timestamptz`, `date` or `bytea` column of this query's table or a navigation (see jsonColumnDelivery);
+   * - `plain`: a value of a declared type JSON carries as the drivers deliver it (integer, text, …) — as it is;
+   * - `keep`: travels as it always did — a projected condition, a numeric-result helper
+   *   (`agg.count` / `sum` / `avg`, `round()`, a numeric `literal()` — read the same from text and from
+   *   a JSON number), a collection's COUNT / SUM / EXISTS, a collection, a withAggregation list, a
+   *   non-scalar subquery;
+   * - `nested`: a nested object (or a navigation row projected whole), whose values are walked;
+   * - `undefined`: a value the batch knows nothing of (a literal, a column it cannot resolve) — as it is.
+   */
+  private batchTransportOf(value: unknown, customOids: readonly number[]): BatchTransport | 'nested' | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+      return undefined;
+    }
+
+    const ref = value as any;
+    // A value of a declared type new to the batch: its text when the client has to parse it
+    const typed = (sqlType: string): BatchTransport =>
+      (needsClientParse(sqlType, customOids) ? { kind: 'runtime', sqlType } : { kind: 'plain', sqlType });
+
+    if ('__cteKind' in ref || ref.__setColumn === true) {
+      if (ref.__isAggregationArray) {
+        return KEEP_TRANSPORT;
+      }
+
+      const mapper = fromDriverMapper(ref.__mapper) ?? (typeof ref.getMapper === 'function' ? fromDriverMapper(ref.getMapper()) : undefined);
+
+      if (ref.__cteKind === 'expression' && isCustomReadMapper(mapper)) {
+        // A mapped expression: as a mapped expression of this query travels
+        return isNumberResultMapper(mapper) ? KEEP_TRANSPORT : RUNTIME_TRANSPORT;
+      }
+
+      // A column — or an expression column read as a type (withReadType) — typed by what it declares;
+      // anything else only PostgreSQL knows the type of
+      return typeof ref.__sqlType === 'string' ? typed(ref.__sqlType) : RUNTIME_TRANSPORT;
+    }
+
+    if ('__fieldName' in ref) {
+      const config = this.resolveFieldColumnConfig(ref);
+      const sqlType = config?.type;
+
+      if (sqlType === undefined) {
+        return undefined;
+      }
+
+      if (ref.__manualJoin === true) {
+        // A manually joined table's column is new to the batch: as the client parses it
+        return typed(sqlType);
+      }
+
+      // A column of this query's table or a navigation's: as a batch always sent it — a date / timestamp /
+      // bytea revived from its JSON form, an int8 / numeric as its text
+      switch (sqlType) {
+        case 'timestamp':
+        case 'timestamptz':
+        case 'date':
+        case 'bytea':
+          return { kind: 'declared', sqlType, hasMapper: isCustomReadMapper(config!.mapper) };
+        case 'bigint':
+        case 'numeric':
+        case 'decimal':
+          return { kind: 'text', sqlType };
+        default:
+          return typed(sqlType);
+      }
+    }
+
+    if (value instanceof SqlFragment) {
+      const mapper = value.getMapper();
+
+      if (isCustomReadMapper(mapper)) {
+        return isNumberResultMapper(mapper) ? KEEP_TRANSPORT : RUNTIME_TRANSPORT;
+      }
+
+      const readType = value.getReadType();
+
+      if (readType !== undefined) {
+        // Read as a column of the type it declares (withReadType)
+        return typed(readType);
+      }
+
+      const root = projectedValueRoot(value);
+
+      // A condition projected as a value (asBoolean): a boolean, which JSON carries as the driver does
+      return root instanceof WhereConditionBase && !(root instanceof SqlFragment) ? KEEP_TRANSPORT : RUNTIME_TRANSPORT;
+    }
+
+    if (value instanceof Subquery) {
+      if (!value.isScalar()) {
+        return KEEP_TRANSPORT;
+      }
+
+      const read = value.getScalarRead();
+
+      if (isCustomReadMapper(read?.mapper)) {
+        return isNumberResultMapper(read?.mapper) ? KEEP_TRANSPORT : RUNTIME_TRANSPORT;
+      }
+
+      return read?.readType !== undefined ? typed(read.readType) : RUNTIME_TRANSPORT;
+    }
+
+    if (value instanceof CollectionQueryBuilder) {
+      const aggregation = value.isScalarAggregation() ? value.getAggregationType() : undefined;
+
+      return aggregation === 'MIN' || aggregation === 'MAX' ? RUNTIME_TRANSPORT : KEEP_TRANSPORT;
+    }
+
+    // Recurse only into plain object literals — the nested-object projections
+    // tryBuildFlatNestedSelect flattens. Class instances (collections, SqlFragment,
+    // Subquery) and collection-result markers must not be walked. Reference mock rows inherit their
+    // getters from a shared prototype (see createMockTargetRow) yet are walked like plain objects.
+    const proto = Object.getPrototypeOf(value);
+
+    return (proto === Object.prototype || proto === null || isReferenceMockRow(value)) && !('__collectionResult' in value)
+      ? 'nested'
+      : undefined;
+  }
+
+  /**
+   * Walk a selection — including nested-object projections — collecting how each value travels,
+   * keyed by the FLAT column alias it is delivered under: top-level keys as-is, nested leaves under the
+   * `__nested__<path>__<leaf>` path-encoded alias that tryBuildFlatNestedSelect emits (revival runs
+   * BEFORE nested reconstruction, so it must target the flat row shape). A flat alias in `forcedRuntime` —
+   * a UNION column whose legs declare different types — is runtime-typed whatever this selection's value
+   * is (PostgreSQL resolves the union's type).
    * @internal
    */
   private collectJsonRowRevivals(
     selection: any,
     pathPrefix: string | undefined,
-    revivals: Array<{ key: string; revive: (value: any) => any }>,
-    textColumns: string[]
+    into: {
+      revivals: Array<{ key: string; revive: (value: any) => any }>;
+      textColumns: string[];
+      runtimeTyped: string[];
+      forcedRuntime?: ReadonlySet<string>;
+      customOids: readonly number[];
+    }
   ): void {
     for (const key in selection) {
-      const value = selection[key];
+      const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
+      const transport = this.batchTransportOf(selection[key], into.customOids);
 
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      if (transport === 'nested') {
+        this.collectJsonRowRevivals(selection[key], pathPrefix ? flatKey : `__nested__${key}`, into);
         continue;
       }
 
-      if ('__fieldName' in value) {
-        const config = this.resolveFieldColumnConfig(value);
+      if (into.forcedRuntime?.has(flatKey) || transport?.kind === 'runtime') {
+        into.runtimeTyped.push(flatKey);
+      } else if (transport?.kind === 'text') {
+        into.textColumns.push(flatKey);
+      } else if (transport?.kind === 'declared') {
+        const revive = jsonColumnDelivery(transport.sqlType, transport.hasMapper)?.revive;
 
-        if (!config) {
-          continue;
+        if (revive) {
+          into.revivals.push({ key: flatKey, revive });
         }
-
-        const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
-        // A custom fromDriver mapper is the column's type authority: it was
-        // written against the driver's RAW output (apps that configure
-        // timestamp parser passthrough, so their mappers expect the
-        // text-protocol string). For mapper columns, revival reconstructs that
-        // text form — json's ISO 'T' separator back to the driver's space, a
-        // timestamptz's ':00' offset minutes collapsed to the driver's short
-        // form — and never hands the mapper a Date it does not expect.
-        const hasMapper = config.mapper != null;
-
-        if (config.type === 'timestamp') {
-          revivals.push(hasMapper
-            ? { key: flatKey, revive: (v) => (typeof v === 'string' ? v.replace('T', ' ') : v) }
-            : { key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
-        } else if (config.type === 'timestamptz') {
-          revivals.push(hasMapper
-            ? { key: flatKey, revive: (v) => (typeof v === 'string' ? v.replace('T', ' ').replace(/([+-]\d{2}):00$/, '$1') : v) }
-            : { key: flatKey, revive: (v) => (typeof v === 'string' ? new Date(v) : v) });
-        } else if (config.type === 'date') {
-          if (hasMapper) {
-            // json 'YYYY-MM-DD' IS the driver text form — the mapper gets it as-is.
-            continue;
-          }
-
-          revivals.push({
-            key: flatKey,
-            revive: (v) => {
-              if (typeof v !== 'string') {
-                return v;
-              }
-
-              // Mirror the drivers' date parsing: local midnight, not UTC
-              const [year, month, day] = v.split('-').map(Number);
-
-              return new Date(year, month - 1, day);
-            },
-          });
-        } else if (config.type === 'decimal' || config.type === 'numeric' || config.type === 'bigint') {
-          // Values of these types can exceed float53 precision, and JSON.parse
-          // silently collapses arbitrary-precision JSON numerals to floats —
-          // unrecoverable here. The batch therefore casts them ::text
-          // server-side (see the envelope in query-batch.ts); these fallback
-          // revivals only normalize a NUMBER that slipped through (older
-          // metadata without textColumns) and no-op on the cast strings.
-          textColumns.push(flatKey);
-          const scale = config.scale;
-          revivals.push({
-            key: flatKey,
-            revive: (v) => (typeof v === 'number' ? (scale != null && config.type !== 'bigint' ? v.toFixed(scale) : String(v)) : v),
-          });
-        } else if (config.type === 'bytea') {
-          // Driver delivery is a byte buffer; row_to_json emits the '\x…' hex text.
-          revivals.push({
-            key: flatKey,
-            revive: (v) => {
-              if (typeof v !== 'string' || !v.startsWith('\\x')) {
-                return v;
-              }
-
-              const hex = v.slice(2);
-              const bufferCtor = (globalThis as any).Buffer;
-
-              return bufferCtor
-                ? bufferCtor.from(hex, 'hex')
-                : Uint8Array.from(hex.match(/../g)?.map((pair) => parseInt(pair, 16)) ?? []);
-            },
-          });
-        }
-
-        continue;
-      }
-
-      // Recurse only into plain object literals — the nested-object projections
-      // tryBuildFlatNestedSelect flattens. Class instances (collections, SqlFragment,
-      // Subquery) and collection-result markers must not be walked.
-      const proto = Object.getPrototypeOf(value);
-
-      // Reference mock rows inherit their getters from a shared prototype (see
-      // createMockTargetRow) yet must keep being walked exactly like the plain-object mocks
-      // they replaced.
-      if ((proto === Object.prototype || proto === null || isReferenceMockRow(value)) && !('__collectionResult' in value)) {
-        this.collectJsonRowRevivals(
-          value,
-          pathPrefix ? `${pathPrefix}__${key}` : `__nested__${key}`,
-          revivals,
-          textColumns
-        );
       }
     }
   }
 
   /**
-   * Union-leg hook: builds the full batch metadata (reviver + text-cast column
+   * Union-leg hook: builds the full batch metadata (reviver + text-sent column
    * aliases) for a previously consumed union selection so
    * UnionQueryBuilder.future() can attach it. Same mechanics as the standalone
-   * future factories.
+   * future factories. `forcedRuntime`: the flat aliases whose legs declare
+   * different types (see _batchTypeSignatures) — typed by the union's type.
    * @internal
    */
-  _buildUnionBatchMeta(selectionResult: any, hasNestedPaths: boolean): FutureBatchMeta {
-    return this.buildBatchMeta(selectionResult, hasNestedPaths);
+  _buildUnionBatchMeta(selectionResult: any, hasNestedPaths: boolean, forcedRuntime?: ReadonlySet<string>): FutureBatchMeta {
+    return this.buildBatchMeta(selectionResult, hasNestedPaths, forcedRuntime);
   }
 
   /**
-   * Resolve the declared column config for a selected FieldRef: base table
-   * fast path, then schema registry lookup for navigation-sourced fields.
-   * Mirrors the mapper resolution order used by transformResults().
+   * Union-leg hook: what this leg declares for each flat alias of its selection, as a comparable
+   * signature — `declared:<type>` (the type as the batch knows it: `date`, `timestamp`, `bigint`,
+   * `numeric`, …, the type's name for another type it sends as text, or `plain` for a type JSON carries
+   * as the drivers deliver it — integer, text, boolean), `runtime` (only PostgreSQL knows it), `keep` (a
+   * value that travels as it is), `value` (a literal). A UNION column whose legs' signatures differ has
+   * the type PostgreSQL resolves for the union — which no one leg declares: the batch sends it. Legs that
+   * agree leave the union's envelope as it was.
    * @internal
    */
-  private resolveFieldColumnConfig(fieldRef: any): ColumnConfig | undefined {
+  _batchTypeSignatures(selectionResult: any): Map<string, string> {
+    const signatures = new Map<string, string>();
+    const scalar = isScalarSelection(selectionResult);
+    const selection = scalar
+      ? { [!('__dbColumnName' in selectionResult) ? BATCH_SINGLE_EXPRESSION_ALIAS : (selectionResult as FieldRef).__dbColumnName]: selectionResult }
+      : selectionResult;
+    const customOids = this.client.customParsedTypeOids();
+
+    const walk = (values: any, pathPrefix: string | undefined): void => {
+      for (const key in values) {
+        const flatKey = pathPrefix ? `${pathPrefix}__${key}` : key;
+        const transport = this.batchTransportOf(values[key], customOids);
+
+        if (transport === 'nested') {
+          walk(values[key], pathPrefix ? flatKey : `__nested__${key}`);
+        } else if (transport === undefined) {
+          signatures.set(flatKey, 'value');
+        } else if (transport.kind === 'keep') {
+          signatures.set(flatKey, 'keep');
+        } else if (transport.sqlType === undefined) {
+          signatures.set(flatKey, 'runtime');
+        } else {
+          const name = transport.sqlType.replace(/\([^)]*\)/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          signatures.set(flatKey, `declared:${canonicalJsonColumnType(name) ?? (transport.kind === 'plain' ? 'plain' : name)}`);
+        }
+      }
+    };
+
+    walk(selection, undefined);
+
+    return signatures;
+  }
+
+  /**
+   * The declared type and mapper of a selected column, for a QueryBatch. A column of this
+   * query's own table: its schema's column config (as the standalone read takes it). A column of
+   * another table — a navigation's, a manually joined table's, also one of another context — carries its
+   * own type and mapper, which the standalone read takes and which are therefore authoritative here too;
+   * that table's schema, when the registry holds it, only fills in what the column does not carry (the
+   * registry may not hold it, or map the same table otherwise).
+   * @internal
+   */
+  private resolveFieldColumnConfig(fieldRef: any): { type?: string; mapper?: any } | undefined {
     const sourceTable = fieldRef.__sourceTable;
-    const schema =
-      !sourceTable || sourceTable === this.schema.name ? this.schema : this.schemaRegistry?.get(sourceTable);
 
-    if (!schema) {
-      return undefined;
+    if (!sourceTable || sourceTable === this.schema.name) {
+      return columnConfigOf(this.schema, fieldRef.__fieldName);
     }
 
-    const cached = schema.columnMetadataCache?.get(fieldRef.__fieldName);
+    const registered = columnConfigOf(this.schemaRegistry?.get(sourceTable), fieldRef.__fieldName);
+    const type = typeof fieldRef.__sqlType === 'string' ? fieldRef.__sqlType : registered?.type;
+    const mapper = '__mapper' in fieldRef ? fieldRef.__mapper : registered?.mapper;
 
-    if (cached?.config) {
-      return cached.config;
-    }
-
-    const column = schema.columns?.[fieldRef.__fieldName];
-
-    return column && typeof column.build === 'function' ? column.build() : undefined;
+    return type === undefined && mapper === undefined ? undefined : { type, mapper };
   }
 
   /**
@@ -3736,8 +3859,9 @@ export class SelectQueryBuilder<TSelection> {
               collectionData = rawData;
             }
           } else {
-            // For list results, ensure we return an array
-            collectionData = rawData || this.getDefaultValueForCollection(collection.builder);
+            // For list results, ensure we return an array. A scalar aggregate of 0 (or false) is a value, not
+            // a missing one: `||` read a `min()` / `max()` of 0 as null
+            collectionData = rawData ?? this.getDefaultValueForCollection(collection.builder);
           }
 
           // Handle nested paths
@@ -3810,7 +3934,8 @@ export class SelectQueryBuilder<TSelection> {
     if (typeof b.isSingleResult === 'function' && b.isSingleResult()) {
       return false;
     }
-    if ((b.navigationPath?.length ?? 0) > 0 || (b.selectManyJoins?.length ?? 0) > 0 || b.foreignKeyTableAlias) {
+    // A flattened collection (selectMany) reads its items through its hops, and filters them there
+    if ((b.navigationPath?.length ?? 0) > 0 || (b.hops?.length ?? 0) > 0) {
       return false;
     }
 
@@ -7952,8 +8077,9 @@ ${joinClauses.join('\n')}`;
       }
 
       const cached = this.schema.columnMetadataCache?.get(value.__fieldName as string);
-      // A navigation's column reads through ITS mapper, also when the root has a column of the
-      // same name (whose mapper — or lack of one — it used to get)
+      // A navigation's column — and a manually joined table's (see createJoinedTableMockRow) — reads
+      // through ITS mapper, also when the root has a column of the same name (whose mapper — or lack
+      // of one — it used to get)
       const ownTable = value.__sourceTable === undefined || value.__sourceTable === this.schema.name;
       const cachedMapper = ownTable ? (cached?.hasMapper ? cached.mapper : undefined) : value.__mapper;
 
@@ -7970,14 +8096,14 @@ ${joinClauses.join('\n')}`;
           : { key, type: FieldType.FIELD_REF_NO_MAPPER, value };
       }
 
-      // Not in root schema cache — check FieldRef's own mapper (from navigation properties)
+      // Not in root schema cache — check FieldRef's own mapper (a navigation's, a joined table's)
       const fieldMapper = (value as any).__mapper;
 
       if (fieldMapper && typeof fieldMapper.fromDriver === 'function') {
         return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: fieldMapper };
       }
 
-      // A navigation's text column keeps its text: '01234' used to read back as the number 1234
+      // A navigation's (or joined table's) text column keeps its text: '01234' used to read back as the number 1234
       return { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).__sqlType), keepNull: nested };
     }
 
@@ -8626,6 +8752,41 @@ export function isScalarSelection(selection: unknown): selection is FieldRef | W
 
 /** The field an expression a collection selects on its own (`e => sql\`...\``) is projected under. */
 const SCALAR_SELECTION_ALIAS = '__value';
+
+/**
+ * The name a QueryBatch gives the one column of a select whose selector returns one expression
+ * (PostgreSQL names that column itself) when the batch types, casts or revives it — see
+ * `FutureBatchMeta.columnAlias`.
+ */
+const BATCH_SINGLE_EXPRESSION_ALIAS = '__batch_value';
+
+/** How one selected value travels through a QueryBatch — see SelectQueryBuilder.batchTransportOf. */
+type BatchTransport =
+  | { readonly kind: 'runtime'; readonly sqlType?: string }
+  | { readonly kind: 'text'; readonly sqlType: string }
+  | { readonly kind: 'declared'; readonly sqlType: string; readonly hasMapper: boolean }
+  | { readonly kind: 'plain'; readonly sqlType: string }
+  | { readonly kind: 'keep'; readonly sqlType?: undefined };
+
+const KEEP_TRANSPORT: BatchTransport = Object.freeze({ kind: 'keep' });
+const RUNTIME_TRANSPORT: BatchTransport = Object.freeze({ kind: 'runtime' });
+
+/** The config of the column `fieldName` of `schema` (its metadata cache first), if the schema has it. */
+function columnConfigOf(schema: TableSchema | undefined, fieldName: string): ColumnConfig | undefined {
+  if (!schema) {
+    return undefined;
+  }
+
+  const cached = schema.columnMetadataCache?.get(fieldName);
+
+  if (cached?.config) {
+    return cached.config;
+  }
+
+  const column = schema.columns?.[fieldName] as { build?: () => ColumnConfig } | undefined;
+
+  return column && typeof column.build === 'function' ? column.build() : undefined;
+}
 
 /** Unwraps each item of a scalar collection selection (`{ <alias>: value }` → value). */
 export function unwrapScalarItems(items: any[], alias: string): any[] {
@@ -9545,6 +9706,8 @@ export class ReferenceQueryBuilder<TItem = any> {
                   relConfig.foreignKeys,  // Propagate composite FK / literal predicates
                   relConfig.matches
                 );
+                // The row that minted it (see CollectionQueryBuilder.mintedBy)
+                cached.mintedBy = slots;
               }
               return cached;
             },
@@ -9593,6 +9756,185 @@ export class ReferenceQueryBuilder<TItem = any> {
   }
 }
 
+/** An ORDER BY key of a collection, as `orderBy()` records it (see CollectionQueryBuilder.orderByFields). */
+type CollectionOrderKey = { field: string; direction: OrderDirection; table?: string; ref?: FieldRef; fragment?: Condition };
+
+/**
+ * A `limit()` / `offset()` on one LEVEL of a flattened collection — a hop, or the flattened items. The
+ * level's rows are ranked within each row of the level `partition` (`-1`: the collection's parent), in
+ * `orderBy` order (ties: the level's primary key), and the ones ranked in (offset, offset + limit] are
+ * kept. A limit written before `selectMany()` ranks within the parent; one written on the collection
+ * a selector returns ranks within the row it was returned for (see CollectionQueryBuilder.selectMany).
+ */
+interface LevelRank {
+  readonly partition: number;
+  readonly orderBy: readonly CollectionOrderKey[];
+  readonly limit?: number;
+  readonly offset?: number;
+  /** The collection the limit was written on, for messages. */
+  readonly relationName: string;
+}
+
+/** One constraint of a level of a flattened collection — a filter, or a limit — in the order they apply. */
+type LevelConstraint = { readonly where: Condition; readonly rank?: undefined } | { readonly rank: LevelRank; readonly where?: undefined };
+
+/**
+ * One collection a `selectMany()` flattened through — a HOP between the flattened collection's parent
+ * and its items. `l.shelves.where(s => …).selectMany(s => s.books)` has one hop, the shelves; every
+ * further `selectMany()` adds the collection it flattens as the next hop (and a selector returning a
+ * flattened collection brings that collection's hops along). The hop keeps what was written on its
+ * items — filters and limits, in the order they apply — and the mock item its refs were minted from:
+ * a build renders those refs under the hop's alias (see CollectionQueryBuilder.renderHops).
+ */
+interface SelectManyHop {
+  /** The hop's table. */
+  readonly table: string;
+  /** Its schema, when it lives outside the default one. */
+  readonly schema?: string;
+  /** Its table schema: where the navigations of the hop's items are looked up. */
+  readonly tableSchema?: TableSchema;
+  /** The relation the hop's items were reached through; it names the hop's alias. */
+  readonly relationName: string;
+  /**
+   * The keys the next level in — the next hop, or the flattened items — joins on: foreign-key columns
+   * of that level's table, principal-key columns of the last step of `path` (or of the hop itself).
+   */
+  readonly foreignKeys: string[];
+  readonly matches: string[];
+  /**
+   * The reference navigations from the hop's item to the row the next level's relation hangs off
+   * (`s => s.curator.shelves`: the curator); empty when it hangs off the hop's item itself.
+   */
+  readonly path: readonly NavigationJoin[];
+  /** What was written on the hop's items: filters and limits, in the order they apply. */
+  readonly constraints: readonly LevelConstraint[];
+  /** The mock item the hop's refs were minted from. */
+  readonly item?: object;
+}
+
+/** The hops of a flattened collection as ONE build renders them (see CollectionQueryBuilder.renderHops). */
+interface HopRendering {
+  /** Each hop's alias, parent side first. */
+  readonly aliases: readonly string[];
+  /** Per hop: the joins from the next level in to the hop (through its path), in FROM order. */
+  readonly joinsByHop: readonly (readonly NavigationJoin[])[];
+  /** Per hop: the aliases of the steps of its navigation path, from the hop on (none without a path). */
+  readonly pathAliases: readonly (readonly string[])[];
+  /** The navigations of the hops' items, joined after every other join: `hop` is the hop they start at. */
+  readonly navigationJoins: ReadonlyArray<{ readonly hop: number; readonly join: NavigationJoin }>;
+}
+
+/** How one build renders the constraints of a flattened collection's levels (see CollectionQueryBuilder.levelPredicates). */
+interface LevelScope {
+  /** The alias the flattened items render under in this build. */
+  readonly itemAlias: string;
+  /** The joins of the navigations of the items (a filter or an order key of theirs may read through them). */
+  readonly itemNavigationJoins: readonly NavigationJoin[];
+  /**
+   * The row the collection correlates to, as this build renders it — set where the build IS correlated
+   * to it (a correlated subquery, a LATERAL). A ranking is then tied to the row it ranks within and
+   * reads that row's rows alone, through its foreign key; without it (the set-based CTE / temp-table
+   * aggregations) the ranking ranks every parent's rows at once (see CollectionQueryBuilder.rankPredicate).
+   */
+  readonly parentAlias?: string;
+  /** A filter of a level (a hop index, or the hop count for the items) in the build's parameter sequence. */
+  condition(condition: Condition, level: number): string;
+  /** An ORDER BY key in the build's parameter sequence, the items' columns under `itemAlias`. */
+  orderKey(key: CollectionOrderKey): string;
+  /** The joins of the items' navigations that ORDER BY keys read through. */
+  orderKeyNavigationJoins(keys: readonly CollectionOrderKey[]): NavigationJoin[];
+}
+
+/** A join on every key pair of its relation (a constant key part included), its source mapped by `source`. */
+const renderNavigationJoin = (join: NavigationJoin, source: (alias: string) => string): string =>
+  `${join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN'} ${quoteTableReference(join.targetTable, join.targetSchema)} "${join.alias}" ON ${join.foreignKeys
+    .map((fk, index) => `${formatJoinValue(source(join.sourceAlias), fk)} = ${formatJoinValue(join.alias, join.matches[index] || 'id')}`)
+    .join(' AND ')}`;
+
+/**
+ * Stamps a mock row a flattened collection adopts (see CollectionQueryBuilder.selectMany) — and every ref
+ * and reference row minted from it — with `chainId`: the collection a selector returns was built on rows
+ * of a chain of its own, and the flattened collection owns them now.
+ */
+const adoptMockRow = (row: unknown, chainId: number, seen: Set<object> = new Set()): void => {
+  if (row === null || typeof row !== 'object' || seen.has(row)) {
+    return;
+  }
+
+  seen.add(row);
+  const slots = row as MockRowSlots;
+  slots[MOCK_ROW_CHAIN_ID] = chainId;
+
+  const refs = slots[MOCK_ROW_FIELD_REFS];
+  if (refs !== undefined) {
+    for (const key in refs) {
+      if (refs[key] !== null && typeof refs[key] === 'object') {
+        refs[key].__chainId = chainId;
+      }
+    }
+  }
+
+  const navigations = slots[MOCK_ROW_NAV_CACHE];
+  if (navigations !== undefined) {
+    for (const key in navigations) {
+      // A collection of a reference row keeps the chain it was built with
+      if (!(navigations[key] instanceof CollectionQueryBuilder)) {
+        adoptMockRow(navigations[key], chainId, seen);
+      }
+    }
+  }
+};
+
+/**
+ * Maps `row` and every reference row reached from it (never a collection) to `alias`: the rows of a
+ * selectMany() hop, for the collections they mint (see EnclosingCollectionScope.hopRows).
+ */
+const mapRowTree = (row: unknown, alias: string, into: Map<object, string>): void => {
+  if (row === null || typeof row !== 'object' || into.has(row)) {
+    return;
+  }
+
+  into.set(row, alias);
+  const navigations = (row as MockRowSlots)[MOCK_ROW_NAV_CACHE];
+
+  if (navigations !== undefined) {
+    for (const key in navigations) {
+      if (!(navigations[key] instanceof CollectionQueryBuilder)) {
+        mapRowTree(navigations[key], alias, into);
+      }
+    }
+  }
+};
+
+/** A table's primary-key columns, as their database names; empty when it has none (or no schema is known). */
+const primaryKeyColumns = (schema: TableSchema | undefined): string[] => {
+  if (schema === undefined) {
+    return [];
+  }
+
+  const columns: string[] = [];
+
+  for (const [propName, meta] of getSchemaColumnMeta(schema)) {
+    if (meta.primaryKey) {
+      columns.push(meta.name ?? propName);
+    }
+  }
+
+  return columns;
+};
+
+/** An alias's length as PostgreSQL counts it: UTF-8 bytes (it truncates identifiers past 63). */
+const utf8ByteLength = (identifier: string): number => {
+  let bytes = 0;
+
+  for (const char of identifier) {
+    const code = char.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+
+  return bytes;
+};
+
 /**
  * Collection query builder for nested queries
  */
@@ -9613,6 +9955,9 @@ export class CollectionQueryBuilder<TItem = any> {
   private matches: string[];
   private sourceTable: string;
   private selector?: (item: any) => any;
+  // The selector is the projection of the collection a selectMany() selector returned (see selectMany):
+  // a count() / exists() of the flattened items drops it — it cannot change either
+  private innerProjection: boolean = false;
   private whereCond?: Condition;
   private limitValue?: number;
   private offsetValue?: number;
@@ -9621,7 +9966,7 @@ export class CollectionQueryBuilder<TItem = any> {
   // build renders qualified (under its planned alias) and joins like a projected navigation.
   // `fragment` is a key that is an SQL expression (a `sql` fragment, a condition, a nested
   // collection's count / exists), rendered in the collection's parameter sequence; `field` is empty.
-  private orderByFields: Array<{ field: string; direction: OrderDirection; table?: string; ref?: FieldRef; fragment?: Condition }> = [];
+  private orderByFields: CollectionOrderKey[] = [];
   private asName?: string;
   private isMarkedAsList: boolean = false;
   private isDistinct: boolean = false;
@@ -9632,10 +9977,39 @@ export class CollectionQueryBuilder<TItem = any> {
   private schemaRegistry?: Map<string, TableSchema>;
   // Navigation path leading to this collection (for intermediate joins in lateral subqueries)
   private navigationPath: NavigationJoin[];
-  // Navigation joins added by selectMany() - included in both CTE and LATERAL navigation joins
-  private selectManyJoins: NavigationJoin[] = [];
-  // When FK is on a different table than target (from selectMany), the table alias to qualify FK
-  private foreignKeyTableAlias?: string;
+  // The collections selectMany() flattened this one through, parent side first (see SelectManyHop).
+  // Never mutated in place: selectMany() builds new arrays, so derived builders share them safely.
+  private hops: SelectManyHop[] = [];
+  // The relation this collection's items were reached through: the last selectMany()'s inner
+  // relation; `relationName` (kept for the aggregation's naming) when the collection is not flattened
+  private itemRelationName?: string;
+  // What the selectMany() that produced these items wrote on them before this builder's own where():
+  // the filters and limits of the collection its selector returned (see selectMany)
+  private itemConstraints: LevelConstraint[] = [];
+  // The order the flattened items come in before this builder's own orderBy(): the order of the rows
+  // they were flattened through, then the order of the collection the selector returned (see selectMany)
+  private itemBaseOrder: CollectionOrderKey[] = [];
+  // The hops as the build in progress renders them (see withRenderedHops); undefined between builds.
+  // Never copied to derived builders
+  private renderedHops?: HopRendering;
+
+  /**
+   * @internal The mock row whose navigation getter minted this collection — a collection's item, or a
+   * reference row reached from one — when a row did (a root query's rows do not stamp theirs). A
+   * correlated subquery correlates to that row (see enclosingRow), and selectMany() accepts only
+   * a collection of the item it hands its selector (see selectMany).
+   */
+  public mintedBy?: object;
+
+  /**
+   * @internal The chain of the row that minted this collection (see mintedBy), read from the row: a
+   * flattening adopts the rows of the collection its selector returns (see adoptMockRow), and a
+   * collection memoized on one of them used to keep the chain it was minted with — a valid second
+   * flattening through it was refused as a collection "of another row".
+   */
+  get mintedChainId(): number | string | undefined {
+    return this.mintedBy === undefined ? undefined : (this.mintedBy as MockRowSlots)[MOCK_ROW_CHAIN_ID];
+  }
 
   // Performance: Cache the mock item to avoid recreating it
   private _cachedMockItem?: any;
@@ -9735,9 +10109,16 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.orderByFields = [...this.orderByFields];
     newBuilder.asName = this.asName;
     newBuilder.isDistinct = this.isDistinct;
-    newBuilder.selectManyJoins = this.selectManyJoins;
-    newBuilder.foreignKeyTableAlias = this.foreignKeyTableAlias;
+    newBuilder.hops = this.hops;
+    newBuilder.itemRelationName = this.itemRelationName;
+    newBuilder.itemConstraints = this.itemConstraints;
+    newBuilder.itemBaseOrder = this.itemBaseOrder;
+    newBuilder.mintedBy = this.mintedBy;
     newBuilder.chainId = this.chainId;
+    // The item the filter and the order keys were written on is the item the projection reads (as a
+    // snapshot shares it, see captureSnapshot): a selectMany() flattening the projected collection
+    // adopts that one row
+    newBuilder._cachedMockItem = this._cachedMockItem;
     return newBuilder;
   }
 
@@ -9792,8 +10173,12 @@ export class CollectionQueryBuilder<TItem = any> {
     snapshot.isDistinct = this.isDistinct;
     snapshot.aggregationType = this.aggregationType;
     snapshot.flattenResultType = this.flattenResultType;
-    snapshot.selectManyJoins = this.selectManyJoins;
-    snapshot.foreignKeyTableAlias = this.foreignKeyTableAlias;
+    snapshot.hops = this.hops;
+    snapshot.itemRelationName = this.itemRelationName;
+    snapshot.itemConstraints = this.itemConstraints;
+    snapshot.itemBaseOrder = this.itemBaseOrder;
+    snapshot.innerProjection = this.innerProjection;
+    snapshot.mintedBy = this.mintedBy;
     snapshot.chainId = this.chainId;
     snapshot._cachedMockItem = this._cachedMockItem;
 
@@ -9811,6 +10196,11 @@ export class CollectionQueryBuilder<TItem = any> {
   selectDistinct<TSelection>(selector: (item: TItem) => TSelection): CollectionQueryBuilder<TSelection> {
     const newBuilder = this.select(selector);
     newBuilder.isDistinct = true;
+    // A distinct list has no order of its own: the order a flattening's items inherit from the rows
+    // they were flattened through (see itemBaseOrder) is dropped — one distinct value can come from
+    // several of those rows — as LINQ providers drop an ordering under Distinct(). A limit ranked in
+    // that order still picks its rows (see LevelRank)
+    newBuilder.itemBaseOrder = [];
     return newBuilder;
   }
 
@@ -9918,10 +10308,10 @@ export class CollectionQueryBuilder<TItem = any> {
           // Collection navigation
           // Non-enumerable to prevent Object.entries triggering getters (avoids stack overflow)
           descriptors[relName] = {
-            get: () => {
+            get(this: any) {
               // Don't call build() - it returns schema without relations
               const fk = relConfig.foreignKey || relConfig.foreignKeys?.[0] || '';
-              return new CollectionQueryBuilder(
+              const collection = new CollectionQueryBuilder(
                 relName,
                 relConfig.targetTable,
                 fk,
@@ -9933,6 +10323,9 @@ export class CollectionQueryBuilder<TItem = any> {
                 relConfig.foreignKeys,  // Propagate composite FK / literal predicates
                 relConfig.matches
               );
+              // The item that minted it (see mintedBy)
+              collection.mintedBy = this;
+              return collection;
             },
             enumerable: false,
             configurable: true,
@@ -10020,11 +10413,19 @@ export class CollectionQueryBuilder<TItem = any> {
     return this;
   }
 
-  /** The refs of this collection's ORDER BY keys (the columns an expression key reads included). */
+  /**
+   * The refs of this collection's ORDER BY keys (the columns an expression key reads included) — its
+   * own, then the ones a flattening orders its items by before them (see itemBaseOrder).
+   */
   private orderByRefs(): FieldRef[] {
+    return CollectionQueryBuilder.orderKeyRefs(this.itemBaseOrder.length === 0 ? this.orderByFields : [...this.orderByFields, ...this.itemBaseOrder]);
+  }
+
+  /** The refs of ORDER BY keys: a key's column, and the columns an expression key reads. */
+  private static orderKeyRefs(keys: readonly CollectionOrderKey[]): FieldRef[] {
     const refs: FieldRef[] = [];
 
-    for (const entry of this.orderByFields) {
+    for (const entry of keys) {
       if (entry.ref !== undefined) {
         refs.push(entry.ref);
       }
@@ -10035,6 +10436,30 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     return refs;
+  }
+
+  /**
+   * The filter of the collection's items: what the selectMany() that produced them wrote on them (the
+   * filters of the collection its selector returned), and this builder's own where().
+   */
+  private itemWhereCondition(): Condition | undefined {
+    if (this.itemConstraints.length === 0) {
+      return this.whereCond;
+    }
+
+    const conditions: Condition[] = [];
+
+    for (const constraint of this.itemConstraints) {
+      if (constraint.where !== undefined) {
+        conditions.push(constraint.where);
+      }
+    }
+
+    if (this.whereCond) {
+      conditions.push(this.whereCond);
+    }
+
+    return conditions.length === 0 ? undefined : conditions.length === 1 ? conditions[0] : andCondition(...conditions);
   }
 
   /**
@@ -10062,9 +10487,7 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   min<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
     const snapshot = this.captureSnapshot();
-    if (selector && !snapshot.selector) {
-      snapshot.selector = selector as any;
-    }
+    snapshot.aggregateOver(selector);
     snapshot.aggregationType = 'MIN';
     return snapshot as unknown as SqlFragment<number | null>;
   }
@@ -10077,9 +10500,7 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   max<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
     const snapshot = this.captureSnapshot();
-    if (selector && !snapshot.selector) {
-      snapshot.selector = selector as any;
-    }
+    snapshot.aggregateOver(selector);
     snapshot.aggregationType = 'MAX';
     return snapshot as unknown as SqlFragment<number | null>;
   }
@@ -10092,9 +10513,7 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   sum<TSelection>(selector?: (item: TItem) => TSelection): SqlFragment<number | null> {
     const snapshot = this.captureSnapshot();
-    if (selector && !snapshot.selector) {
-      snapshot.selector = selector as any;
-    }
+    snapshot.aggregateOver(selector);
     snapshot.aggregationType = 'SUM';
     return snapshot as unknown as SqlFragment<number | null>;
   }
@@ -10108,7 +10527,40 @@ export class CollectionQueryBuilder<TItem = any> {
   count(): SqlFragment<number> {
     const snapshot = this.captureSnapshot();
     snapshot.aggregationType = 'COUNT';
+    snapshot.dropInnerProjection();
     return snapshot as unknown as SqlFragment<number>;
+  }
+
+  /**
+   * The value `min()` / `max()` / `sum()` aggregate: `selector`'s over the item — over the projection
+   * the flattened items carry (see innerProjection) when they carry one: `selectMany(s => s.books.select(b
+   * => ({ p: b.pages }))).max(x => x.p)` aggregates the pages; the selector used to be dropped, and the
+   * aggregate read the whole projection (`MAX requires an aggregate field`). Without a selector the
+   * aggregate reads the projection itself, as it always did.
+   */
+  private aggregateOver(selector: ((item: any) => any) | undefined): void {
+    if (selector === undefined) {
+      return;
+    }
+
+    if (this.innerProjection && this.selector !== undefined) {
+      const projection = this.selector;
+      this.selector = (item: any) => selector(projection(item));
+      this.innerProjection = false;
+      return;
+    }
+
+    if (!this.selector) {
+      this.selector = selector;
+    }
+  }
+
+  /** A count / an existence of flattened items does not read the projection they carry (see innerProjection). */
+  private dropInnerProjection(): void {
+    if (this.innerProjection) {
+      this.selector = undefined;
+      this.innerProjection = false;
+    }
   }
 
   /**
@@ -10124,6 +10576,7 @@ export class CollectionQueryBuilder<TItem = any> {
   exists(): SqlFragment<boolean> {
     const snapshot = this.captureSnapshot();
     snapshot.aggregationType = 'EXISTS';
+    snapshot.dropInnerProjection();
     return snapshot as unknown as SqlFragment<boolean>;
   }
 
@@ -10131,52 +10584,282 @@ export class CollectionQueryBuilder<TItem = any> {
    * Flatten a nested collection through this collection.
    * Similar to LINQ's SelectMany - projects each item to a collection and flattens.
    *
-   * Example: product.productPrices!.selectMany(pp => pp.capacityGroups!).exists()
-   * SQL: SELECT EXISTS(SELECT 1 FROM capacity_groups JOIN product_prices ON ... WHERE ...)
+   * Example: library.shelves!.where(s => eq(s.archived, false)).selectMany(s => s.books!).count()
+   * SQL: SELECT COUNT(*) FROM books JOIN shelves "shelves__bridge1" ON books.shelf_id = "shelves__bridge1".id
+   *      WHERE "shelves__bridge1".library_id = library.id AND "shelves__bridge1".archived = false
+   *
+   * This collection becomes a HOP of the flattened one (see SelectManyHop), joined from the inner
+   * table on the INNER relation's own keys (its foreign key(s) on the inner table, this table's
+   * principal key(s)) under an alias of its own. A flattened collection flattened again keeps its hops
+   * and adds this one. What was written on each side keeps its meaning (LINQ's):
+   *
+   * - this collection's `where()` filters the hop; its `orderBy()` orders the flattened items (the
+   *   items of an earlier row come first), and its `limit()` / `offset()` keep the first rows of each
+   *   parent — ranked in that order — before they are flattened;
+   * - the collection the selector returns may be filtered, ordered and limited too: its `where()`
+   *   filters the items (it may read the item it was returned for), its `orderBy()` orders the items
+   *   of each row, and its `limit()` / `offset()` keep the first items of each row;
+   * - the selector may return a flattened collection (its hops become hops here) or a collection of a
+   *   navigation of its item (`s => s.curator.shelves`);
+   * - the collection it returns may project its items (`s => s.books.select(b => b.title)`): the
+   *   flattened items are that projection;
+   * - after `select()`, the selector is handed the projection and flattens the collection it holds
+   *   (`l.shelves.select(s => ({ books: s.books })).selectMany(x => x.books)`).
+   *
+   * A limit / offset that ranks rows before they are flattened (see LevelRank) takes a non-negative
+   * integer. Refused, with an error: a `selectDistinct()` or a terminal (`count()`, `toList()`, …)
+   * on either side, a selector returning anything but a collection of its item, and a limit whose
+   * rows cannot be told apart (a table without a primary key, or rows reached through a navigation).
    */
   selectMany<TInner>(selector: (item: TItem) => CollectionQueryBuilder<TInner>): CollectionQueryBuilder<TInner> {
-    const mockItem = this.createMockItem();
-    const innerCollection = selector(mockItem);
-    const innerAny = innerCollection as any;
+    const relation = this.itemRelationName ?? this.relationName;
+    this.assertFlattenable(relation);
 
-    // Build a navigation join from inner target table → this (intermediate) table
-    // e.g., product_price_capacity_groups.product_price_id → product_prices.id — on the INNER
-    // relation's own keys: its foreign key(s) on the inner table, the intermediate's principal key(s)
-    const navJoin: NavigationJoin = {
-      alias: this.targetTable,
-      targetTable: this.targetTable,
-      targetSchema: this.targetTableSchema?.schema,
-      foreignKeys: innerAny.foreignKeys,   // FK on inner table pointing to intermediate
-      matches: innerAny.matches,           // Principal key on intermediate table (`id` by default)
-      isMandatory: true,                   // INNER JOIN for flattening
-      sourceAlias: innerAny.targetTable,   // Source is the inner (target) table
+    const item = this.createMockItem();
+    // After select(), the selector is handed the projection: the collection it returns is one the
+    // projection holds (base handed it the item itself — right only for a field named like the navigation)
+    const projected = this.selector !== undefined;
+    const inner = this.flattenedCollectionOf(selector(projected ? this.selector!(item) : item), relation, projected);
+
+    // The inner collection's rows — and those of its own hops — were minted with a chain of their own;
+    // the flattened collection owns them now (they are its items and its hops)
+    adoptMockRow(inner._cachedMockItem, this.chainId);
+    for (const innerHop of inner.hops) {
+      adoptMockRow(innerHop.item, this.chainId);
+    }
+
+    // This collection's own constraints: what produced its items, its where(), and its limit — the
+    // first rows of each parent, in the order its items come in
+    const index = this.hops.length;
+    const order = [...this.orderByFields, ...this.itemBaseOrder];
+    const constraints: LevelConstraint[] = [...this.itemConstraints];
+    if (this.whereCond) {
+      constraints.push({ where: this.whereCond });
+    }
+    if (this.limitValue !== undefined || this.offsetValue !== undefined) {
+      constraints.push({
+        rank: {
+          partition: -1,
+          orderBy: order,
+          limit: CollectionQueryBuilder.rankBound(this.limitValue, 'LIMIT', `"${relation}", before selectMany()`),
+          offset: CollectionQueryBuilder.rankBound(this.offsetValue, 'OFFSET', `"${relation}", before selectMany()`),
+          relationName: relation,
+        },
+      });
+    }
+
+    const hop: SelectManyHop = {
+      table: this.targetTable,
+      schema: this.targetTableSchema?.schema,
+      tableSchema: this.targetTableSchema,
+      relationName: relation,
+      foreignKeys: inner.foreignKeys,       // FK on the inner table pointing to this one (or to the path's end)
+      matches: inner.matches,               // Principal key of this table (`id` by default)
+      path: inner.navigationPath,
+      constraints,
+      item,
     };
+
+    // The inner collection's levels hang off this hop: a limit of its written per ITS parent ranks per
+    // row of this hop, and one ranked per one of its hops ranks per that hop, now further down
+    const rebase = (constraint: LevelConstraint): LevelConstraint => (constraint.rank === undefined
+      ? constraint
+      : { rank: { ...constraint.rank, partition: constraint.rank.partition < 0 ? index : constraint.rank.partition + index + 1 } });
+    const innerRelation = inner.itemRelationName ?? inner.relationName;
+    const itemConstraints: LevelConstraint[] = inner.itemConstraints.map(rebase);
+    if (inner.whereCond) {
+      itemConstraints.push({ where: inner.whereCond });
+    }
+    if (inner.limitValue !== undefined || inner.offsetValue !== undefined) {
+      itemConstraints.push({
+        rank: {
+          partition: index,
+          orderBy: [...inner.orderByFields, ...inner.itemBaseOrder],
+          limit: CollectionQueryBuilder.rankBound(inner.limitValue, 'LIMIT', `"${innerRelation}", returned by the selector of selectMany()`),
+          offset: CollectionQueryBuilder.rankBound(inner.offsetValue, 'OFFSET', `"${innerRelation}", returned by the selector of selectMany()`),
+          relationName: innerRelation,
+        },
+      });
+    }
 
     // Create new builder targeting the inner table but with outer's FK for parent correlation — and
     // the outer relation's principal key: a relation keyed on another column than `id`
-    // (`withPrincipalKey(c => c.code)`) used to correlate `fk = parent.id`
+    // (`withPrincipalKey(c => c.code)`) used to correlate `fk = parent.id`. The correlation reads
+    // the FIRST hop, which holds that key (see renderHops)
     const newBuilder = new CollectionQueryBuilder<TInner>(
       this.relationName,            // Keep outer relation name for CTE naming
-      innerAny.targetTable,         // Target is the inner collection's table
+      inner.targetTable,            // Target is the inner collection's table
       this.foreignKey,              // FK is the outer collection's FK (e.g., product_id)
       this.sourceTable,             // Source is the outer collection's source (e.g., products)
-      innerAny.targetTableSchema,
+      inner.targetTableSchema,
       this.schemaRegistry,
       this.navigationPath,
       this.foreignKeys,
       this.matches
     );
 
-    // The FK column lives on the intermediate table, not the target table
-    newBuilder.selectManyJoins = [navJoin];
-    newBuilder.foreignKeyTableAlias = this.targetTable;
-
-    // Carry over where condition from outer collection if any. It was built on this
-    // collection's item rows, so the flattened builder keeps this chain's identity.
-    newBuilder.whereCond = this.whereCond;
+    newBuilder.hops = [...this.hops, hop, ...inner.hops.map(innerHop => ({ ...innerHop, constraints: innerHop.constraints.map(rebase) }))];
+    newBuilder.itemRelationName = innerRelation;
+    newBuilder.itemConstraints = itemConstraints;
+    // Each row's items come after those of the rows before it, and in the inner collection's order
+    newBuilder.itemBaseOrder = [...order, ...inner.orderByFields, ...inner.itemBaseOrder];
+    // The inner collection's items are the flattened items: the refs its filter holds are theirs
+    newBuilder._cachedMockItem = inner._cachedMockItem;
+    // A projection of the collection the selector returned projects the flattened items (it may read
+    // the row they were flattened through: its refs render under that hop, see renderHops)
+    if (inner.selector !== undefined) {
+      newBuilder.selector = inner.selector;
+      newBuilder.innerProjection = true;
+    }
+    newBuilder.mintedBy = this.mintedBy;
     newBuilder.chainId = this.chainId;
+    newBuilder.assertRanksIdentifiable();
 
     return newBuilder;
+  }
+
+  /**
+   * Refuses to flatten a distinct projection or a terminal of a collection (see selectMany). A plain
+   * select() is flattened through: the selector is handed the projection.
+   */
+  private assertFlattenable(relation: string): void {
+    if (this.selector !== undefined && this.isDistinct) {
+      throw new Error(
+        `selectMany() on "${relation}" follows selectDistinct(): the rows a distinct projection keeps are not rows of "${relation}" to flatten. `
+        + 'Call selectMany() on the collection itself, then selectDistinct() the flattened items.'
+      );
+    }
+
+    const terminal = this.terminalName();
+
+    if (terminal !== undefined) {
+      throw new Error(`selectMany() on "${relation}" follows ${terminal}, which ends the collection: flatten it before ${terminal}.`);
+    }
+  }
+
+  /** The terminal this builder is the result of — `count()`, `toList()`, … — if it is one. */
+  private terminalName(): string | undefined {
+    if (this.aggregationType !== undefined) {
+      return `${this.aggregationType.toLowerCase()}()`;
+    }
+
+    if (this.flattenResultType !== undefined) {
+      return this.flattenResultType === 'number' ? 'toNumberList()' : 'toStringList()';
+    }
+
+    return this.isMarkedAsList ? 'toList()' : undefined;
+  }
+
+  /**
+   * The collection a selectMany() selector returned, checked: a collection of the item the selector was
+   * handed (`projected`: of the item the projection it was handed was made of) — minted by that item or
+   * by a reference row reached from it — without a distinct projection or a terminal. Anything else used
+   * to be joined as if it were one (a collection of the OUTER row joined its foreign key to this
+   * collection's key).
+   */
+  private flattenedCollectionOf(value: unknown, relation: string, projected: boolean): CollectionQueryBuilder<any> {
+    if (!(value instanceof CollectionQueryBuilder)) {
+      throw new Error(
+        `The selector of selectMany() on "${relation}" must return a collection navigation of the item it is handed (\`s => s.books\`)`
+        + (projected ? ' — here, of the projection select() made of the item (`x => x.books`) —' : ',')
+        + ' and it returned something else: a reference navigation or a value cannot be flattened.'
+      );
+    }
+
+    const terminal = value.terminalName();
+
+    if (terminal !== undefined) {
+      throw new Error(
+        `The selector of selectMany() on "${relation}" returned "${value.relationName}" ending in ${terminal}: selectMany() flattens a collection. `
+        + `Aggregate or list the flattened items instead.`
+      );
+    }
+
+    if (value.selector !== undefined && value.isDistinct) {
+      throw new Error(
+        `The selector of selectMany() on "${relation}" returned "${value.relationName}" with selectDistinct(): its values are distinct per flattened row, `
+        + 'which the flattened items cannot express. Flatten the collection first, then selectDistinct() the flattened items.'
+      );
+    }
+
+    const ofItem = value.navigationPath.length === 0 ? value.sourceTable === this.targetTable : value.navigationPath[0].sourceAlias === this.targetTable;
+
+    if (value.mintedChainId !== this.chainId || !ofItem) {
+      throw new Error(
+        `The selector of selectMany() on "${relation}" returned the collection "${value.relationName}" of another row: it must return a collection `
+        + `of the item it is handed (\`s => s.books\`) or of a navigation of that item (\`s => s.curator.shelves\`). `
+        + `Read "${value.relationName}" of the other row outside selectMany().`
+      );
+    }
+
+    return value;
+  }
+
+  /**
+   * The limit / offset of a ranking (see LevelRank), checked as PostgreSQL checks a LIMIT: a negative
+   * one fails with the text the database gives a LIMIT / OFFSET, and a ranking keeps whole rows only.
+   * Unchecked, a ranking kept nothing for `limit(-1)`, where every LATERAL `LIMIT -1` fails, and one
+   * row for `limit(1.5)`, where `LIMIT 1.5` keeps two.
+   */
+  private static rankBound(value: number | undefined, keyword: 'LIMIT' | 'OFFSET', collection: string): number | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const call = `${keyword.toLowerCase()}(${String(value)}) on ${collection}`;
+
+    if (typeof value === 'number' && value < 0) {
+      throw new Error(`${keyword} must not be negative (${call})`);
+    }
+
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`${keyword} must be an integer (${call}): expected a non-negative integer`);
+    }
+
+    return value;
+  }
+
+  /**
+   * Refuses a limit on a level of this flattened collection whose rows cannot be told apart: a table
+   * without a primary key (the limit keeps rows BY it), or rows reached through a navigation path of a
+   * hop between the level and the rows it is ranked within — through a reference, one row can be
+   * reached from several, and which ones the limit keeps has no single answer.
+   */
+  private assertRanksIdentifiable(): void {
+    const check = (rank: LevelRank, level: number, table: string, tableSchema: TableSchema | undefined): void => {
+      if (primaryKeyColumns(tableSchema).length === 0) {
+        throw new Error(
+          `limit() / offset() on "${rank.relationName}" keeps rows of "${table}", which has no primary key to tell them apart. `
+          + 'Give the table a primary key, or limit the flattened items instead.'
+        );
+      }
+
+      for (let hopIndex = rank.partition + 1; hopIndex < level; hopIndex++) {
+        const path = this.hops[hopIndex].path;
+
+        if (path.length > 0) {
+          throw new Error(
+            `limit() / offset() on "${rank.relationName}" ranks rows reached through the navigation "${path.map(step => step.alias).join('.')}" of `
+            + `"${this.hops[hopIndex].relationName}": one of them can be reached from several rows, so which ones the limit keeps is ambiguous. `
+            + 'Limit the collection the selector returns, or the flattened items, instead.'
+          );
+        }
+      }
+    };
+
+    for (const [hopIndex, hop] of this.hops.entries()) {
+      for (const constraint of hop.constraints) {
+        if (constraint.rank !== undefined) {
+          check(constraint.rank, hopIndex, hop.table, hop.tableSchema);
+        }
+      }
+    }
+
+    for (const constraint of this.itemConstraints) {
+      if (constraint.rank !== undefined) {
+        check(constraint.rank, this.hops.length, this.targetTable, this.targetTableSchema);
+      }
+    }
   }
 
   /**
@@ -10404,13 +11087,63 @@ export class CollectionQueryBuilder<TItem = any> {
    * Our OWN refs stay hidden, as they always were — they are emitted inside this subquery and
    * must not drag joins into the parent. Required for duck-typing compatibility with the
    * Condition interface when used in WHERE clauses.
+   *
+   * The filters of the collections a `selectMany()` flattened this one through (its hops) are
+   * rendered by this subquery too, so their correlations are reported with ours — and so are the order
+   * keys of its rankings (see LevelRank): a ranking ordered through a navigation of the OUTER row needs
+   * that navigation joined out there (`missing FROM-clause entry` in a WHERE otherwise). Our own
+   * ORDER BY is not rendered here — a count or an existence does not depend on it.
    */
   getFieldRefs(): FieldRef[] {
-    if (!this.whereCond) {
-      return [];
+    if (this.hops.length === 0) {
+      return this.whereCond ? this.whereCond.getFieldRefs().filter(ref => isForeignChainRef(ref, this.chainId)) : [];
     }
 
-    return this.whereCond.getFieldRefs().filter(ref => isForeignChainRef(ref, this.chainId));
+    return [...this.whereFieldRefs(), ...CollectionQueryBuilder.orderKeyRefs(this.rankOrderKeys())].filter(ref => isForeignChainRef(ref, this.chainId));
+  }
+
+  /** The refs of every filter this collection renders: its hops' and its items' (see LevelConstraint). */
+  private whereFieldRefs(): FieldRef[] {
+    const refs: FieldRef[] = [];
+    const add = (constraints: readonly LevelConstraint[]): void => {
+      for (const constraint of constraints) {
+        if (constraint.where !== undefined) {
+          refs.push(...constraint.where.getFieldRefs());
+        }
+      }
+    };
+
+    for (const hop of this.hops) {
+      add(hop.constraints);
+    }
+
+    add(this.itemConstraints);
+
+    if (this.whereCond) {
+      refs.push(...this.whereCond.getFieldRefs());
+    }
+
+    return refs;
+  }
+
+  /** The ORDER BY keys of every limit on a level of this flattened collection (see LevelRank). */
+  private rankOrderKeys(): CollectionOrderKey[] {
+    const keys: CollectionOrderKey[] = [];
+    const add = (constraints: readonly LevelConstraint[]): void => {
+      for (const constraint of constraints) {
+        if (constraint.rank !== undefined) {
+          keys.push(...constraint.rank.orderBy);
+        }
+      }
+    };
+
+    for (const hop of this.hops) {
+      add(hop.constraints);
+    }
+
+    add(this.itemConstraints);
+
+    return keys;
   }
 
   /**
@@ -10429,20 +11162,14 @@ export class CollectionQueryBuilder<TItem = any> {
       }
     };
 
-    if (this.whereCond) {
-      for (const ref of this.whereCond.getFieldRefs()) {
-        add(ref);
-      }
+    // Our own filter and those of our hops (see getFieldRefs)
+    for (const ref of this.hops.length === 0 ? (this.whereCond ? this.whereCond.getFieldRefs() : []) : this.whereFieldRefs()) {
+      add(ref);
     }
 
-    for (const entry of this.orderByFields) {
-      add(entry.ref);
-
-      if (entry.fragment !== undefined) {
-        for (const ref of entry.fragment.getFieldRefs()) {
-          add(ref);
-        }
-      }
+    // Our ORDER BY, the order a flattening's items come in, and the orders its limits rank by
+    for (const ref of this.hops.length === 0 ? this.orderByRefs() : [...this.orderByRefs(), ...CollectionQueryBuilder.orderKeyRefs(this.rankOrderKeys())]) {
+      add(ref);
     }
 
     if (this.selector) {
@@ -10461,9 +11188,11 @@ export class CollectionQueryBuilder<TItem = any> {
    * nested in a collection kept the foreign marker (`missing FROM-clause entry for table
    * "__collection_…__"`), and a collection over the table its enclosing collection reads
    * (`m.loans` → `ln.member.loans.where(x => gt(x.id, ln.id))`) rewrote the enclosing row's refs to
-   * its own alias with its own marker — `x.id > x.id`, false for every row.
+   * its own alias with its own marker — `x.id > x.id`, false for every row. An enclosing collection
+   * subquery that renders its items under an alias of its own says so by the items' chain (see
+   * EnclosingCollectionScope.items), which wins over the table name.
    */
-  private withEnclosingRowAliases<T>(aliasMap: Map<string, string> | undefined, build: () => T): T {
+  private withEnclosingRowAliases<T>(aliasMap: Map<string, string> | undefined, scope: EnclosingCollectionScope | undefined, build: () => T): T {
     const renamed: Array<[any, string]> = [];
 
     for (const ref of this.getOuterFieldRefs()) {
@@ -10471,7 +11200,8 @@ export class CollectionQueryBuilder<TItem = any> {
 
       if (typeof alias === 'string' && alias.length > 15 && alias.startsWith('__collection_') && alias.endsWith('__')) {
         const table = alias.slice('__collection_'.length, -2);
-        (ref as any).__tableAlias = aliasMap?.get(table) ?? table;
+        const chain = (ref as any).__chainId;
+        (ref as any).__tableAlias = (chain !== undefined ? scope?.items.get(chain) : undefined) ?? aliasMap?.get(table) ?? table;
         renamed.push([ref, alias]);
       }
     }
@@ -10565,12 +11295,140 @@ export class CollectionQueryBuilder<TItem = any> {
       throw new Error('buildSql() on CollectionQueryBuilder is only supported for EXISTS and COUNT aggregations');
     }
 
-    return this.withEnclosingRowAliases(context.lateralTableAliasMap, () =>
-      this.withNavigationPlan(undefined, () => this.buildSqlBody(context)));
+    // In the projection of the collection a selectMany() selector returned (a `sql` fragment of it)
+    CollectionQueryBuilder.assertOfProjectedRows(this, context.collectionScope);
+
+    const scope = context.collectionScope;
+    const pathAliases = this.pathAliasesIn(scope);
+
+    return this.withEnclosingRowAliases(context.lateralTableAliasMap, scope, () =>
+      this.withRenderedHops(context.lateralTableAliasMap, scope, () =>
+        this.withNavigationPlan(undefined, () => this.buildSqlBody(context, pathAliases), scope, pathAliases)));
   }
 
-  /** The body of {@link buildSql}, run under the navigation plan of this collection's WHERE. */
-  private buildSqlBody(context: SqlBuildContext): string {
+  /**
+   * The aliases the joins of the navigation path this collection hangs off render under in its
+   * correlated subquery: each step's relation name, unless the enclosing scope reads a row by that name
+   * — a row outside every enclosing collection subquery, read by its bare name (see
+   * EnclosingCollectionScope.outerNames), or an alias an enclosing subquery renders — then with a suffix
+   * (`nt_shelf_2`). For a navigation named like its table (`bk.nt_shelf.nt_library.shelves`), the plain
+   * name shadowed the OUTER row of that table, and a collection of that row nested deeper read the
+   * navigation's row instead (1.0.10 failed on it: the subquery's own table took that name too).
+   */
+  private pathAliasesIn(scope: EnclosingCollectionScope | undefined): string[] {
+    const aliases = this.navigationPath.map(step => step.alias);
+    const reserved = (alias: string): boolean => scope !== undefined && (scope.outerNames.has(alias) || scope.aliases.has(alias));
+
+    if (!aliases.some(reserved)) {
+      return aliases;
+    }
+
+    const taken = new Set<string>([...scope!.outerNames, ...scope!.aliases, ...aliases]);
+
+    return aliases.map((alias, index) => {
+      if (!reserved(alias)) {
+        return alias;
+      }
+
+      // Room for a suffix within PostgreSQL's 63-byte identifiers
+      const stem = utf8ByteLength(alias) <= 60 ? alias : `__path${index + 1}`;
+      let renamed = stem;
+
+      for (let suffix = 2; taken.has(renamed); suffix++) {
+        renamed = `${stem}_${suffix}`;
+      }
+
+      taken.add(renamed);
+      return renamed;
+    });
+  }
+
+  /**
+   * The alias of the row this collection hangs off, as the enclosing build renders it: the row that
+   * minted it (see mintedBy), when an enclosing collection subquery renders that row — a row of one of
+   * its selectMany() hops, or its items (see EnclosingCollectionScope) — else `table` under the alias
+   * an enclosing LATERAL gives it, else `table` itself. `table` is the name the collection reads that
+   * row by: its source table, or the source of the first step of its navigation path.
+   *
+   * A table-name lookup alone bound a collection of ANY row of that table to the enclosing subquery's
+   * row: in `t.children.where(c => sql`… ${t.children.count()} > 1`)` the count of the OUTER node's
+   * children counted the children of each child. `outside` says the row is none of theirs (the root
+   * query's row, read by name — see EnclosingCollectionScope.outerNames).
+   */
+  private enclosingRow(table: string, aliasMap: Map<string, string> | undefined, scope: EnclosingCollectionScope | undefined): { alias: string; outside: boolean } {
+    if (scope !== undefined) {
+      const hopAlias = this.mintedBy !== undefined ? scope.hopRows.get(this.mintedBy) : undefined;
+
+      if (hopAlias !== undefined) {
+        return { alias: hopAlias, outside: false };
+      }
+
+      const chain = this.mintedChainId;
+      const itemAlias = chain !== undefined ? scope.items.get(chain) : undefined;
+
+      if (itemAlias !== undefined) {
+        return { alias: itemAlias, outside: false };
+      }
+    }
+
+    return { alias: aliasMap?.get(table) || table, outside: true };
+  }
+
+  /**
+   * What this collection's subquery exposes to the collections nested in it, added to what the
+   * enclosing ones expose (see EnclosingCollectionScope): its items render under `itemAlias`, each row
+   * of its hops — a hop's item, and the reference rows reached from it — under that hop's alias, and
+   * every alias it renders is taken. `outerName`: the bare name it reads a row outside every
+   * enclosing collection subquery by (its parent row, when that is the root query's), which no
+   * subquery nested in it may render its table under.
+   *
+   * Inside the projection of the collection a selectMany() selector returned (see
+   * EnclosingCollectionScope.projection), a collection there may read collections of our items. A
+   * collection aggregated by a strategy (`barrier`: a nested list or aggregate — under the CTE and
+   * temp-table strategies a statement apart from the rows around it) reads those of its OWN items only;
+   * a correlated subquery sees the rows around it, and adds its items to theirs.
+   */
+  private enclosedScope(enclosing: EnclosingCollectionScope | undefined, itemAlias: string, outerName?: string, barrier = false): EnclosingCollectionScope {
+    const items = new Map(enclosing?.items ?? []);
+    const hopRows = new Map(enclosing?.hopRows ?? []);
+    const aliases = new Set(enclosing?.aliases ?? []);
+    const outerNames = new Set(enclosing?.outerNames ?? []);
+    const enclosingProjection = enclosing?.projection;
+    const projection = enclosingProjection === undefined
+      ? undefined
+      : barrier
+        ? { ...enclosingProjection, nested: this.itemRelationName ?? this.relationName, chains: new Set([this.chainId]) }
+        : { ...enclosingProjection, chains: new Set([...enclosingProjection.chains, this.chainId]) };
+
+    if (outerName !== undefined) {
+      outerNames.add(outerName);
+    }
+
+    items.set(this.chainId, itemAlias);
+    if (itemAlias !== this.targetTable) {
+      aliases.add(itemAlias);
+    }
+
+    const rendering = this.renderedHops;
+
+    if (rendering !== undefined) {
+      for (const alias of this.renderedHopAliases()) {
+        aliases.add(alias);
+      }
+
+      for (const [index, hop] of this.hops.entries()) {
+        mapRowTree(hop.item, rendering.aliases[index], hopRows);
+      }
+    }
+
+    return { items, hopRows, aliases, outerNames, projection };
+  }
+
+  /**
+   * The body of {@link buildSql}, run under the navigation plan of this collection's WHERE. `pathAliases`:
+   * the aliases the joins of our navigation path render under (see pathAliasesIn).
+   */
+  private buildSqlBody(context: SqlBuildContext, pathAliases: readonly string[]): string {
     const targetTable = this.targetTable;
     const foreignKey = this.foreignKey;
     const sourceTable = this.sourceTable;
@@ -10581,9 +11439,11 @@ export class CollectionQueryBuilder<TItem = any> {
     // table name — mirrors lateral-collection-strategy's own correlation handling.
     // Only the λ-root is translated: bridge-internal aliases are emitted by this very
     // subquery and must never be remapped, even if they collide with a lateral's
-    // target table name.
-    const aliasMap = (context as { lateralTableAliasMap?: Map<string, string> }).lateralTableAliasMap;
-    const rootAnchor = (alias: string): string => aliasMap?.get(alias) || alias;
+    // target table name. Inside an enclosing collection subquery, the row we hang off is the row that
+    // minted us, under the alias that subquery renders it with (see enclosingRow)
+    const aliasMap = context.lateralTableAliasMap;
+    const enclosing = context.collectionScope;
+    const { alias: anchor, outside } = this.enclosingRow(this.navigationPath.length === 0 ? sourceTable : this.navigationPath[0].sourceAlias, aliasMap, enclosing);
 
     // COUNT names its own table: a count reached through a navigation back to the SAME table
     // (`post.user.posts`) would otherwise shadow the outer row that navigation hangs off — the
@@ -10592,35 +11452,61 @@ export class CollectionQueryBuilder<TItem = any> {
     // subquery reads from the enclosing scope — the row it correlates to (a relation of a table to
     // itself), the row the first hop of its navigation path starts from (`ed.book.editions` from an
     // edition), or an enclosing row its WHERE reads — the same shadowing made those EXISTS true for
-    // every row. A selectMany bridge addresses the raw table name, so it keeps it.
+    // every row. A flattened collection (selectMany) names its table by that same rule, for a
+    // COUNT too: its hops render under aliases of their own (see renderHops), so only such an
+    // enclosing name needs one. Nested in another collection subquery, it never takes a bare name
+    // a row outside them is read by (see EnclosingCollectionScope.outerNames): a collection of that
+    // row nested in it — which correlates to it by that name — bound to ours.
     const readsOuterNamed = (name: string): boolean =>
-      rootAnchor(this.navigationPath.length === 0 ? sourceTable : this.navigationPath[0].sourceAlias) === name
-      || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
-    const ownAlias = this.selectManyJoins.length > 0
-      ? targetTable
+      anchor === name || enclosing?.outerNames.has(name) === true || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
+    const rendering = this.renderedHops;
+    const named = rendering !== undefined
+      ? readsOuterNamed(targetTable) ? `${this.relationName}__${this.aggregationType === 'COUNT' ? 'count' : 'exists'}` : targetTable
       : this.aggregationType === 'COUNT'
         ? `${this.relationName}__count`
         : readsOuterNamed(targetTable) ? `${this.relationName}__exists` : targetTable;
+    // An alias the enclosing scope already exposes — an enclosing LATERAL's, or one an enclosing
+    // collection subquery renders (a collection of the same relation in the filter of another:
+    // `t.children.where(c => exists(c.children))`) — takes a suffix: under the same alias the inner
+    // FROM would shadow the row it correlates to
+    let ownAlias = named;
+    if (named !== targetTable) {
+      const taken = new Set<string>([...(aliasMap?.values() ?? []), ...(enclosing?.aliases ?? []), ...(enclosing?.outerNames ?? [])]);
+
+      for (let suffix = 2; taken.has(ownAlias); suffix++) {
+        ownAlias = `${named}_${suffix}`;
+      }
+    }
     const ownRef = (alias: string): string => (alias === targetTable ? ownAlias : alias);
+    const ownMarker = collectionMarkerPattern(targetTable, false);
+
+    // The row we correlate to, as this subquery renders it: the one we hang off (a row of the enclosing
+    // scope), or the last join of our navigation path — under the alias it renders under here
+    const pathAliasOf = (alias: string): string => {
+      const index = this.navigationPath.findIndex(step => step.alias === alias);
+
+      return index < 0 ? alias : pathAliases[index];
+    };
+    const correlationSource = this.navigationPath.length === 0 ? anchor : pathAliasOf(sourceTable);
 
     // Build JOINs needed inside the EXISTS subquery
     const allJoins: string[] = [];
 
-    // Navigation path joins (for reference navigation like pc.order → orders)
+    // Navigation path joins (for reference navigation like pc.order → orders), under the aliases
+    // pathAliasesIn gives them
     for (const [index, nav] of this.navigationPath.entries()) {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      const src = index === 0 ? rootAnchor(nav.sourceAlias) : nav.sourceAlias;
-      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${src}"."${fk}" = "${nav.alias}"."${pk}"`);
+      const src = index === 0 ? anchor : pathAliasOf(nav.sourceAlias);
+      const alias = pathAliases[index];
+      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${alias}" ON "${src}"."${fk}" = "${alias}"."${pk}"`);
     }
 
-    // SelectMany joins (for selectMany navigation through intermediate tables)
-    for (const nav of this.selectManyJoins) {
-      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
-      const fk = nav.foreignKeys[0];
-      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${nav.sourceAlias}"."${fk}" = "${nav.alias}"."${pk}"`);
+    // The selectMany hops, from our table outwards, each under its own alias and on every key pair
+    // of its relation (a constant key part included)
+    for (const join of this.renderedHopJoins()) {
+      allJoins.push(renderNavigationJoin(join, ownRef));
     }
 
     // Joins required by REFERENCE navigations inside the collection's own
@@ -10629,24 +11515,30 @@ export class CollectionQueryBuilder<TItem = any> {
     // aggregation has no selector, so a where-navigated alias rendered unjoined and
     // the statement failed with `missing FROM-clause entry for table "<alias>"`.
     // Reuses the selector path's machinery: seed aliases + chains from the
-    // condition's FieldRefs, then resolve multi-hop paths against the target schema.
-    for (const nav of this.resolveWhereNavigationJoins(sourceTable)) {
+    // condition's FieldRefs, then resolve multi-hop paths against the target schema. A navigation of
+    // ours that is the inverse of our key IS the row we correlate to — under the alias that row renders
+    // under here (the table's name read another row once the enclosing subquery took an alias)
+    const itemNavigationJoins = this.resolveWhereNavigationJoins(correlationSource);
+    for (const nav of itemNavigationJoins) {
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
       allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${ownRef(nav.sourceAlias)}"."${fk}" = "${nav.alias}"."${pk}"`);
     }
 
-    const navJoinsSQL = allJoins.join('\n');
+    // The navigations the hops' items are read through, joined from the hops
+    for (const { join } of rendering?.navigationJoins ?? []) {
+      allJoins.push(renderNavigationJoin(join, ownRef));
+    }
 
     // Build WHERE clause: correlation + additional conditions
     // Use full composite-FK / literal-predicate form when navigation declared
     // multiple key pairs (e.g. SCD2 `[productId, isCurrent] / [id, true]`).
-    const fkTableAlias = this.foreignKeyTableAlias || ownAlias;
+    // A flattened collection correlates through its first hop, which holds the parent's key.
+    const fkTableAlias = rendering !== undefined ? rendering.aliases[0] : ownAlias;
     // Root-attached collections correlate on the λ-root itself, which a lateral
     // exposes only under its generated alias; nav-derived collections correlate on
-    // the bridge's terminal alias, which this subquery emits itself — never remap it.
-    const correlationSource = this.navigationPath.length === 0 ? rootAnchor(sourceTable) : sourceTable;
+    // the bridge's terminal alias, which this subquery emits itself (see correlationSource)
     let whereSQL: string;
     if (this.foreignKeys && this.foreignKeys.length > 0) {
       const matches = this.matches && this.matches.length > 0 ? this.matches : ['id'];
@@ -10655,37 +11547,528 @@ export class CollectionQueryBuilder<TItem = any> {
       whereSQL = `"${fkTableAlias}"."${foreignKey}" = "${correlationSource}"."id"`;
     }
 
-    if (this.whereCond) {
+    // What our filters see of us: a collection nested in them correlates to the row that minted it —
+    // one of our items, a row of one of our hops (see EnclosingCollectionScope) — never to whatever
+    // renders under its table's name here, and takes none of our aliases; a row outside every
+    // collection subquery we read by name keeps that name for itself
+    const scope = this.enclosedScope(enclosing, ownAlias, outside ? anchor : undefined);
+
+    // A condition rendered in this subquery's parameter sequence
+    const buildCondition = (condition: Condition): string => {
       const condBuilder = new ConditionBuilder();
-      const { sql: condSql, params, placeholders, paramCounter } = condBuilder.build(this.whereCond, context.paramCounter, context.placeholders, context.hoistedCteNames);
+      const { sql: condSql, params, placeholders, paramCounter } = condBuilder.build(
+        condition, context.paramCounter, context.placeholders, context.hoistedCteNames, undefined, scope);
       context.paramCounter = paramCounter;
       context.params.push(...params);
       if (placeholders) {
         context.placeholders = placeholders;
       }
 
+      return condSql;
+    };
+
+    // The hops' filters and limits, and the limits on our items (see levelPredicates): a ranking reads
+    // the rows of the one row it ranks within
+    if (rendering !== undefined) {
+      const levelScope: LevelScope = {
+        itemAlias: ownAlias,
+        itemNavigationJoins,
+        parentAlias: correlationSource,
+        condition: (condition, level) => (level < this.hops.length
+          ? buildCondition(condition)
+          : buildCondition(condition).replace(ownMarker, `"${ownAlias}"`)),
+        orderKey: key => this.orderKeySql(key, buildCondition).replace(ownMarker, `"${ownAlias}"`),
+        orderKeyNavigationJoins: keys => this.resolveRefNavigationJoins(CollectionQueryBuilder.orderKeyRefs(keys), correlationSource),
+      };
+
+      for (const predicate of this.levelPredicates(levelScope)) {
+        whereSQL += ` AND ${predicate}`;
+      }
+    }
+
+    const navJoinsSQL = allJoins.join('\n');
+
+    const itemWhere = this.itemWhereCondition();
+    if (itemWhere) {
+      const condSql = buildCondition(itemWhere);
+
       // Rewrite collection marker aliases to actual table names
-      const markerPattern = collectionMarkerPattern(targetTable, false);
-      const rewrittenCondSql = condSql.replace(markerPattern, `"${ownAlias}"`);
+      const rewrittenCondSql = condSql.replace(ownMarker, `"${ownAlias}"`);
 
       whereSQL += ` AND ${rewrittenCondSql}`;
     }
 
+    // Its own limit / offset: how many items a count sees, and whether one is past the offset — which
+    // items those are, their order cannot change, so none is rendered (nor joined for). They used to be
+    // ignored: `limit(1).count()` counted them all
+    const limited = this.limitValue !== undefined || this.offsetValue !== undefined;
+    const limitSQL = (this.limitValue !== undefined ? `\nLIMIT ${this.limitValue}` : '')
+      + (this.offsetValue !== undefined ? `\nOFFSET ${this.offsetValue}` : '');
+
     const fromTable = quoteTableReference(targetTable, this.targetTableSchema?.schema);
+    const fromItem = ownAlias === targetTable ? fromTable : `${fromTable} "${ownAlias}"`;
 
     if (this.aggregationType === 'COUNT') {
-      const countParts = [ownAlias === targetTable ? `SELECT COUNT(*) FROM ${fromTable}` : `SELECT COUNT(*) FROM ${fromTable} "${ownAlias}"`];
+      const countParts = [limited ? `SELECT COUNT(*) FROM (SELECT 1 FROM ${fromItem}` : `SELECT COUNT(*) FROM ${fromItem}`];
       if (navJoinsSQL) countParts.push(navJoinsSQL);
-      countParts.push(`WHERE ${whereSQL}`);
+      countParts.push(limited ? `WHERE ${whereSQL}${limitSQL}) "${ownAlias}__rows"` : `WHERE ${whereSQL}`);
 
       return countParts.join('\n');
     }
 
-    const parts = [ownAlias === targetTable ? `EXISTS (SELECT 1 FROM ${fromTable}` : `EXISTS (SELECT 1 FROM ${fromTable} "${ownAlias}"`];
+    const parts = [`EXISTS (SELECT 1 FROM ${fromItem}`];
     if (navJoinsSQL) parts.push(navJoinsSQL);
-    parts.push(`WHERE ${whereSQL})`);
+    parts.push(`WHERE ${whereSQL}${limitSQL})`);
 
     return parts.join('\n');
+  }
+
+  /**
+   * One ORDER BY key as SQL over the collection's FROM: an expression key rendered by `renderFragment`
+   * (in the caller's parameter sequence), a column key qualified by its alias (see orderByKeyExpression).
+   */
+  private orderKeySql(key: CollectionOrderKey, renderFragment: (fragment: Condition) => string): string {
+    return key.fragment !== undefined ? `(${renderFragment(key.fragment)})` : this.orderByKeyExpression(key);
+  }
+
+  /**
+   * Runs one build with this collection's selectMany hops rendered (see {@link renderHops}), read by
+   * every step of the build through `renderedHops`. A collection that was not flattened builds as it
+   * always did.
+   */
+  private withRenderedHops<T>(enclosingAliasMap: Map<string, string> | undefined, enclosingScope: EnclosingCollectionScope | undefined, build: () => T): T {
+    if (this.hops.length === 0) {
+      return build();
+    }
+
+    const previous = this.renderedHops;
+    const { rendering, restore } = this.renderHops(enclosingAliasMap, enclosingScope);
+    this.renderedHops = rendering;
+
+    try {
+      return build();
+    } finally {
+      restore();
+      this.renderedHops = previous;
+    }
+  }
+
+  /**
+   * This flattened collection's hops as one build renders them.
+   *
+   * Each hop renders under an alias of its own — `<relation>__bridge<n>`, `n` counted from the parent —
+   * and never under its table's name, which a hop used to take: that name can be the flattened table's
+   * own (a tree, `t.children.selectMany(c => c.children)`: an ambiguous table reference) or the
+   * enclosing row's the subquery correlates to (the correlation then bound to the hop — no
+   * grandchildren anywhere). An alias the enclosing scope exposes (a value of `enclosingAliasMap`, or
+   * any alias an enclosing collection subquery renders — its hops', their navigations', its own: a
+   * flattening nested in a filter of a flattening through the same relations, see
+   * EnclosingCollectionScope.aliases) takes a suffix — under the same alias it shadowed the enclosing
+   * hop, and a filter comparing the two rows compared one row with itself. Every hop joins the next
+   * level in on the keys of the relation that reached that level — through the hop's navigation path, when the selector read the collection off
+   * a navigation of the hop's item: the last hop joins the flattened table, every other hop the hop
+   * after it.
+   *
+   * The refs minted from a hop's item are renamed until `restore()`: its columns to the hop's alias,
+   * its navigations to `<hop alias>__<relation path>` (joined from the hop, see navigationJoins). A
+   * ref of a hop can then render anywhere — in the hop's filter, in a filter of the next level that
+   * reads it (`s => s.books.where(b => eq(b.curatorId, s.curatorId))`), in an order key, inside a
+   * limit's ranking — even over the flattened table itself, which a textual marker rewrite cannot
+   * tell apart from the items.
+   */
+  private renderHops(
+    enclosingAliasMap: Map<string, string> | undefined,
+    enclosingScope: EnclosingCollectionScope | undefined
+  ): { rendering: HopRendering; restore: () => void } {
+    const taken = new Set<string>([...(enclosingAliasMap?.values() ?? []), ...(enclosingScope?.aliases ?? []), ...(enclosingScope?.outerNames ?? [])]);
+    const aliases: string[] = [];
+
+    for (const [index, hop] of this.hops.entries()) {
+      const named = `${hop.relationName}__bridge${index + 1}`;
+      // Room for a suffix within PostgreSQL's 63-byte identifiers (a truncated alias can collide)
+      const stem = utf8ByteLength(named) <= 60 ? named : `__bridge${index + 1}`;
+      let alias = stem;
+
+      for (let suffix = 2; taken.has(alias); suffix++) {
+        alias = `${stem}_${suffix}`;
+      }
+
+      taken.add(alias);
+      aliases.push(alias);
+    }
+
+    // `<hop alias>__<relation path>`, or a short `<hop alias>__nav<n>` past PostgreSQL's 63 bytes
+    const navigationAliases = new Map<string, string>();
+    const navigationAliasOf = (hopIndex: number, names: readonly string[]): string => {
+      const key = `${hopIndex}|${names.join('.')}`;
+      let alias = navigationAliases.get(key);
+
+      if (alias === undefined) {
+        const named = `${aliases[hopIndex]}__${names.join('__')}`;
+        const stem = utf8ByteLength(named) <= 60 ? named : `__bridge${hopIndex + 1}__nav${navigationAliases.size + 1}`;
+        alias = stem;
+
+        for (let suffix = 2; taken.has(alias); suffix++) {
+          alias = `${stem}_${suffix}`;
+        }
+
+        taken.add(alias);
+        navigationAliases.set(key, alias);
+      }
+
+      return alias;
+    };
+
+    const last = this.hops.length - 1;
+    const pathAliases: string[][] = [];
+    const joinsByHop = this.hops.map((hop, index): NavigationJoin[] => {
+      const next = index === last ? this.targetTable : aliases[index + 1];
+
+      if (hop.path.length === 0) {
+        pathAliases.push([]);
+        return [{ alias: aliases[index], targetTable: hop.table, targetSchema: hop.schema, foreignKeys: hop.foreignKeys, matches: hop.matches, isMandatory: true, sourceAlias: next }];
+      }
+
+      // Through the path, from its end back to the hop: each step joined on its own keys, reversed
+      const steps = hop.path.map((_, stepIndex) => navigationAliasOf(index, hop.path.slice(0, stepIndex + 1).map(step => step.alias)));
+      pathAliases.push(steps);
+      const end = hop.path.length - 1;
+      const joins: NavigationJoin[] = [{
+        alias: steps[end], targetTable: hop.path[end].targetTable, targetSchema: hop.path[end].targetSchema,
+        foreignKeys: hop.foreignKeys, matches: hop.matches, isMandatory: true, sourceAlias: next,
+      }];
+
+      for (let stepIndex = end; stepIndex > 0; stepIndex--) {
+        joins.push({
+          alias: steps[stepIndex - 1], targetTable: hop.path[stepIndex - 1].targetTable, targetSchema: hop.path[stepIndex - 1].targetSchema,
+          foreignKeys: hop.path[stepIndex].matches, matches: hop.path[stepIndex].foreignKeys, isMandatory: true, sourceAlias: steps[stepIndex],
+        });
+      }
+
+      joins.push({
+        alias: aliases[index], targetTable: hop.table, targetSchema: hop.schema,
+        foreignKeys: hop.path[0].matches, matches: hop.path[0].foreignKeys, isMandatory: true, sourceAlias: steps[0],
+      });
+
+      return joins;
+    });
+
+    const joined = new Set<string>();
+    for (const joins of joinsByHop) {
+      for (const join of joins) {
+        joined.add(join.alias);
+      }
+    }
+
+    const restores: Array<() => void> = [];
+    const rename = (row: MockRowSlots, alias: string, navigationAliasesOfRow: string[] | undefined): void => {
+      const refs = row[MOCK_ROW_FIELD_REFS];
+
+      if (refs === undefined) {
+        return;
+      }
+
+      for (const key in refs) {
+        const ref = refs[key];
+
+        if (ref === null || typeof ref !== 'object') {
+          continue;
+        }
+
+        const previousAlias = ref.__tableAlias;
+        const previousNavigationAliases = ref.__navigationAliases;
+        ref.__tableAlias = alias;
+        if (navigationAliasesOfRow !== undefined) {
+          ref.__navigationAliases = navigationAliasesOfRow;
+        }
+        restores.push(() => {
+          ref.__tableAlias = previousAlias;
+          if (navigationAliasesOfRow !== undefined) {
+            ref.__navigationAliases = previousNavigationAliases;
+          }
+        });
+      }
+    };
+
+    const navigationJoins: Array<{ hop: number; join: NavigationJoin }> = [];
+    for (const [hopIndex, hop] of this.hops.entries()) {
+      if (hop.item === undefined) {
+        continue;
+      }
+
+      rename(hop.item as MockRowSlots, aliases[hopIndex], undefined);
+
+      // The reference rows reached from the hop's item, depth first: each one's refs, and its join
+      const walk = (row: MockRowSlots, names: string[], schema: TableSchema | undefined, parentAlias: string, ancestors: string[]): void => {
+        const rows = row[MOCK_ROW_NAV_CACHE];
+
+        if (rows === undefined) {
+          return;
+        }
+
+        for (const relationName in rows) {
+          const next = rows[relationName];
+          const relation: any = schema?.relations?.[relationName];
+
+          if (next === null || typeof next !== 'object' || next instanceof CollectionQueryBuilder || !relation || relation.type !== 'one') {
+            continue;
+          }
+
+          const path = [...names, relationName];
+          const alias = navigationAliasOf(hopIndex, path);
+          const targetSchema: TableSchema | undefined = this.schemaRegistry?.get(relation.targetTable) ?? relation.targetTableBuilder?.build();
+
+          if (!joined.has(alias)) {
+            joined.add(alias);
+            navigationJoins.push({
+              hop: hopIndex,
+              join: {
+                alias,
+                targetTable: relation.targetTable,
+                targetSchema: targetSchema?.schema,
+                foreignKeys: relation.foreignKeys || [relation.foreignKey || ''],
+                matches: relation.matches || ['id'],
+                isMandatory: relation.isMandatory ?? false,
+                sourceAlias: parentAlias,
+              },
+            });
+          }
+
+          rename(next, alias, ancestors);
+          walk(next, path, targetSchema, alias, [...ancestors, alias]);
+        }
+      };
+
+      walk(hop.item as MockRowSlots, [], hop.tableSchema ?? this.schemaRegistry?.get(hop.table), aliases[hopIndex], []);
+    }
+
+    return {
+      rendering: { aliases, joinsByHop, pathAliases, navigationJoins },
+      restore: () => {
+        for (let i = restores.length - 1; i >= 0; i--) {
+          restores[i]();
+        }
+      },
+    };
+  }
+
+  /** The joins of the hops being rendered, in FROM order: from the flattened table outwards. */
+  private renderedHopJoins(): NavigationJoin[] {
+    const rendering = this.renderedHops;
+
+    if (rendering === undefined) {
+      return [];
+    }
+
+    const joins: NavigationJoin[] = [];
+
+    for (let i = rendering.joinsByHop.length - 1; i >= 0; i--) {
+      joins.push(...rendering.joinsByHop[i]);
+    }
+
+    return joins;
+  }
+
+  /** Every alias the hops being rendered occupy: the hops', their paths' and their navigations'. */
+  private renderedHopAliases(): string[] {
+    const rendering = this.renderedHops;
+
+    if (rendering === undefined) {
+      return [];
+    }
+
+    const aliases: string[] = [];
+
+    for (const joins of rendering.joinsByHop) {
+      for (const join of joins) {
+        aliases.push(join.alias);
+      }
+    }
+
+    for (const { join } of rendering.navigationJoins) {
+      aliases.push(join.alias);
+    }
+
+    return aliases;
+  }
+
+  /**
+   * The WHERE predicates of this flattened collection's levels, beyond its items' own filter: every
+   * hop's filters and limits, in the order they apply, then the limits on its items (their filters
+   * render with the items' own — see itemWhereCondition). `scope` renders them in the build's
+   * parameter sequence.
+   */
+  private levelPredicates(scope: LevelScope): string[] {
+    const predicates: string[] = [];
+
+    for (const [hopIndex, hop] of this.hops.entries()) {
+      for (const [constraintIndex, constraint] of hop.constraints.entries()) {
+        predicates.push(constraint.where !== undefined
+          ? scope.condition(constraint.where, hopIndex)
+          : this.rankPredicate(hopIndex, constraint.rank!, hop.constraints.slice(0, constraintIndex), scope));
+      }
+    }
+
+    for (const [constraintIndex, constraint] of this.itemConstraints.entries()) {
+      if (constraint.rank !== undefined) {
+        predicates.push(this.rankPredicate(this.hops.length, constraint.rank, this.itemConstraints.slice(0, constraintIndex), scope));
+      }
+    }
+
+    return predicates;
+  }
+
+  /**
+   * A limit on one level of this flattened collection (see LevelRank) as a WHERE predicate: the level's
+   * row is among the rows the limit keeps. The ranking reads the level and the hops between it and the
+   * rows it ranks within, joined under the aliases they render under outside — their filters and limits
+   * apply inside, as they do outside — plus every constraint of the level written before the limit, in
+   * the limit's order, ties broken by the level's primary key.
+   *
+   * Where the build is correlated to the collection's parent row (a correlated subquery, a LATERAL:
+   * `scope.parentAlias`), the ranking is tied to the ONE row it ranks within — the parent (through
+   * the first hop's key to it), or the hop row outside (through the next level's key to it):
+   * `pk IN (SELECT pk … WHERE <its key> = <that row's> … ORDER BY … LIMIT n OFFSET m)`, which an index
+   * on that foreign key reads (once per parent, when the ranking hangs off the parent). It used to
+   * number the rows of every parent with ROW_NUMBER() for each row it was asked about (seconds for a
+   * few hundred parents). The set-based aggregations (CTE, temp table) read every parent at once, and
+   * number every parent's rows once — ROW_NUMBER() per row ranked within — which a per-row LIMIT there
+   * only slows down (4-5x, measured).
+   */
+  private rankPredicate(level: number, rank: LevelRank, before: readonly LevelConstraint[], scope: LevelScope): string {
+    const rendering = this.renderedHops!;
+    const levels = this.hops.length;
+    const levelAlias = (index: number): string => (index === levels ? scope.itemAlias : rendering.aliases[index]);
+    const alias = levelAlias(level);
+    const table = level === levels ? this.targetTable : this.hops[level].table;
+    const tableSchema = level === levels ? this.targetTableSchema : this.hops[level].tableSchema;
+    const schemaName = level === levels ? this.targetTableSchema?.schema : this.hops[level].schema;
+    const primaryKey = primaryKeyColumns(tableSchema);
+    const itemSource = (source: string): string => (source === this.targetTable || source === this.relationName ? scope.itemAlias : source);
+
+    // The level, then every hop between it and the rows it ranks within, from it outwards
+    const from: string[] = [`${quoteTableReference(table, schemaName)} "${alias}"`];
+    for (let hopIndex = level - 1; hopIndex > rank.partition; hopIndex--) {
+      for (const join of rendering.joinsByHop[hopIndex]) {
+        from.push(renderNavigationJoin(join, itemSource));
+      }
+    }
+    for (const { hop, join } of rendering.navigationJoins) {
+      if (hop > rank.partition && hop <= level) {
+        from.push(renderNavigationJoin(join, itemSource));
+      }
+    }
+    if (level === levels) {
+      // The items' navigations: the ones their filters read, and the ones this ranking's order keys read
+      const joined = new Set<string>();
+
+      for (const join of [...scope.itemNavigationJoins, ...scope.orderKeyNavigationJoins(rank.orderBy)]) {
+        if (!joined.has(join.alias)) {
+          joined.add(join.alias);
+          from.push(renderNavigationJoin(join, itemSource));
+        }
+      }
+    }
+
+    // The row ranked within: the parent (the first hop's key to it), or a hop (the next level's key)
+    const [partitionAlias, partitionKeys, partitionMatches] = rank.partition < 0
+      ? [rendering.aliases[0], this.foreignKeys, this.matches]
+      : [levelAlias(rank.partition + 1), this.hops[rank.partition].foreignKeys, this.hops[rank.partition].matches];
+    const parentAlias = scope.parentAlias;
+    const where: string[] = [];
+
+    if (parentAlias === undefined) {
+      where.push(...buildLiteralOnlyPredicates(partitionAlias, partitionKeys, partitionMatches));
+    } else if (rank.partition < 0) {
+      // The rows of the parent the collection correlates to: the collection's own correlation, read by
+      // the first hop rendered in here
+      where.push(this.foreignKeys.length > 0
+        ? buildCollectionCorrelationWhere(rendering.aliases[0], parentAlias, this.foreignKeys, this.matches.length > 0 ? this.matches : ['id'])
+        : `"${rendering.aliases[0]}"."${this.foreignKey}" = "${parentAlias}"."id"`);
+    } else {
+      // The rows of the hop row outside (it is not rendered in here): the join of the next level in to it
+      const join = rendering.joinsByHop[rank.partition][0];
+      where.push(join.foreignKeys
+        .map((fk, index) => `${formatJoinValue(itemSource(join.sourceAlias), fk)} = ${formatJoinValue(join.alias, join.matches[index] || 'id')}`)
+        .join(' AND '));
+    }
+
+    for (let hopIndex = rank.partition + 1; hopIndex < level; hopIndex++) {
+      const constraints = this.hops[hopIndex].constraints;
+
+      for (const [constraintIndex, constraint] of constraints.entries()) {
+        where.push(constraint.where !== undefined
+          ? scope.condition(constraint.where, hopIndex)
+          : this.rankPredicate(hopIndex, constraint.rank!, constraints.slice(0, constraintIndex), scope));
+      }
+    }
+
+    for (const [constraintIndex, constraint] of before.entries()) {
+      where.push(constraint.where !== undefined
+        ? scope.condition(constraint.where, level)
+        : this.rankPredicate(level, constraint.rank!, before.slice(0, constraintIndex), scope));
+    }
+
+    const orderBy = [
+      ...rank.orderBy.map(key => `${scope.orderKey(key)} ${key.direction}`),
+      ...primaryKey.map(column => `"${alias}"."${column}" ASC`),
+    ];
+    const whereSQL = where.length > 0 ? `\nWHERE ${where.join(' AND ')}` : '';
+
+    // The navigation path of a ranked HOP — the one its items reach the next level through — renders
+    // outside as that hop's path, which the ranking does not join: a step an order key or a filter of the
+    // hop reads (`s.curator.name` under `selectMany(s => s.curator.shelves)`) read the step joined outside,
+    // one value for every row ranked, and the limit kept the first rows by primary key. A step read in
+    // here — and the steps before it — joins from the ranked row (LEFT: a row without it is still ranked)
+    if (level < levels) {
+      const steps = rendering.pathAliases[level];
+      const path = this.hops[level].path;
+      const read = [...orderBy, ...where, ...from.slice(1)].join('\n');
+      let deepest = -1;
+
+      steps.forEach((step, index) => {
+        if (read.includes(`"${step}"`)) {
+          deepest = index;
+        }
+      });
+
+      from.splice(1, 0, ...steps.slice(0, deepest + 1).map((step, index) => renderNavigationJoin({
+        alias: step,
+        targetTable: path[index].targetTable,
+        targetSchema: path[index].targetSchema,
+        foreignKeys: path[index].foreignKeys,
+        matches: path[index].matches,
+        isMandatory: false,
+        sourceAlias: index === 0 ? alias : steps[index - 1],
+      }, source => source)));
+    }
+
+    if (parentAlias !== undefined) {
+      // `pk IN (SELECT pk … LIMIT n OFFSET m)`: the key on the left is the level's row outside, the one
+      // in the subquery the row the subquery reads under the same alias (row-valued for a composite key)
+      const columns = primaryKey.map(column => `"${alias}"."${column}"`);
+      const bounds = [
+        ...(rank.limit !== undefined ? [`LIMIT ${rank.limit}`] : []),
+        ...(rank.offset !== undefined ? [`OFFSET ${rank.offset}`] : []),
+      ];
+
+      return `${columns.length === 1 ? columns[0] : `(${columns.join(', ')})`} IN (SELECT ${columns.join(', ')}\n`
+        + `FROM ${from.join('\n')}${whereSQL}\nORDER BY ${orderBy.join(', ')}\n${bounds.join(' ')})`;
+    }
+
+    const keys = primaryKey.map((column, index) => `"${alias}"."${column}" AS "__pk${index}"`).join(', ');
+    const sameRow = primaryKey.map((column, index) => `"__ranked"."__pk${index}" = "${alias}"."${column}"`);
+    const partitionBy = partitionKeys.filter(key => !isLiteralKeyPart(key)).map(key => `"${partitionAlias}"."${key}"`);
+    const rowNumber = `ROW_NUMBER() OVER (${partitionBy.length > 0 ? `PARTITION BY ${partitionBy.join(', ')} ` : ''}ORDER BY ${orderBy.join(', ')})`;
+    const offset = rank.offset ?? 0;
+    const kept = [`"__ranked"."__rn" > ${offset}`];
+    if (rank.limit !== undefined) {
+      kept.push(`"__ranked"."__rn" <= ${offset + rank.limit}`);
+    }
+
+    return `EXISTS (SELECT 1 FROM (SELECT ${keys}, ${rowNumber} AS "__rn"\n`
+      + `FROM ${from.join('\n')}${whereSQL}) "__ranked"\n`
+      + `WHERE ${[...kept, ...sameRow].join(' AND ')})`;
   }
 
   /**
@@ -10694,7 +12077,12 @@ export class CollectionQueryBuilder<TItem = any> {
    * path that lost its plain alias to another path ending in the same relation name render under a
    * path alias until `build` returns. See NavigationAliasPlan.
    */
-  private withNavigationPlan<T>(selectorResult: unknown, build: (plan: NavigationAliasPlan | undefined) => T): T {
+  private withNavigationPlan<T>(
+    selectorResult: unknown,
+    build: (plan: NavigationAliasPlan | undefined) => T,
+    enclosingScope?: EnclosingCollectionScope,
+    pathAliases?: readonly string[]
+  ): T {
     const anchorSchema = this.targetTableSchema ?? this.schemaRegistry?.get(this.targetTable);
 
     if (anchorSchema === undefined) {
@@ -10707,8 +12095,18 @@ export class CollectionQueryBuilder<TItem = any> {
     // our `ln.edition.book.category`: one alias `category`, and the inner join would shadow the
     // outer row — the comparison became the inner row with itself). A navigation of ours by one of
     // those names gets a path alias. The parent's own alias is left to the correlation rules of
-    // resolveRefNavigationJoins (the inverse of our own key IS the parent row).
-    const reserved = new Set([...this.navigationPath, ...this.selectManyJoins].map(step => step.alias));
+    // resolveRefNavigationJoins (the inverse of our own key IS the parent row). Nested in collection
+    // subqueries, so are the names the enclosing scope reads rows by — a row outside all of them read by
+    // its bare name (EnclosingCollectionScope.outerNames), an alias an enclosing subquery renders — and
+    // the aliases our own path renders under (see pathAliasesIn): a navigation named like its table
+    // (`k.nt_shelf`) shadowed the OUTER row of that table.
+    const reserved = new Set(this.navigationPath.map(step => step.alias));
+    for (const alias of this.renderedHopAliases()) {
+      reserved.add(alias);
+    }
+    for (const alias of [...(pathAliases ?? []), ...(enclosingScope?.outerNames ?? []), ...(enclosingScope?.aliases ?? [])]) {
+      reserved.add(alias);
+    }
     for (const ref of this.getOuterFieldRefs()) {
       const alias = (ref as any).__tableAlias;
 
@@ -10720,8 +12118,9 @@ export class CollectionQueryBuilder<TItem = any> {
     const nestedPaths: string[][] = [];
     this.addSelectionToNavigationPlan(selectorResult, plan, nestedPaths);
 
-    if (this.whereCond) {
-      for (const ref of this.whereCond.getFieldRefs()) {
+    const itemWhere = this.itemWhereCondition();
+    if (itemWhere) {
+      for (const ref of itemWhere.getFieldRefs()) {
         plan.addRef(ref);
       }
     }
@@ -10964,11 +12363,13 @@ export class CollectionQueryBuilder<TItem = any> {
    * navigation of ours named the same would shadow it, which cannot be rendered.
    */
   private resolveWhereNavigationJoins(correlationAlias: string): NavigationJoin[] {
-    if (!this.whereCond) {
+    const itemWhere = this.itemWhereCondition();
+
+    if (!itemWhere) {
       return [];
     }
 
-    return this.resolveRefNavigationJoins(this.whereCond.getFieldRefs(), correlationAlias);
+    return this.resolveRefNavigationJoins(itemWhere.getFieldRefs(), correlationAlias);
   }
 
   /**
@@ -10991,7 +12392,7 @@ export class CollectionQueryBuilder<TItem = any> {
 
     const alreadyJoined = new Set<string>([
       ...this.navigationPath.map(nav => nav.alias),
-      ...this.selectManyJoins.map(nav => nav.alias),
+      ...this.renderedHopAliases(),
     ]);
     const whereJoins: NavigationJoin[] = [];
     const whereAliases = new Set<string>();
@@ -11435,8 +12836,83 @@ export class CollectionQueryBuilder<TItem = any> {
     // (rebuilds proxy mocks and any nested CollectionQueryBuilder instances).
     const selectorResult = this.evaluateSelector();
 
-    return this.withEnclosingRowAliases(context.lateralTableAliasMap, () =>
-      this.withNavigationPlan(selectorResult, () => this.buildCTEBody(context, client, parentIds, selectorResult, joinOwnPath === true)));
+    return this.withEnclosingRowAliases(context.lateralTableAliasMap, context.collectionScope, () =>
+      this.withRenderedHops(context.lateralTableAliasMap, context.collectionScope, () =>
+        this.withNavigationPlan(selectorResult, () => this.buildCTEBody(context, client, parentIds, selectorResult, joinOwnPath === true), context.collectionScope)));
+  }
+
+  /**
+   * A collection this one's projection aggregates, checked: at the top level of the projection of the
+   * collection a selectMany() selector returned, a collection of a row the items were flattened
+   * through (a hop's row: `s => s.books.select(b => ({ n: s.visibleBooks.count() }))`) is refused — a
+   * nested aggregation correlates to the item's own row, and bound the hop's collection to another row
+   * (the enclosing query's row of that table: silently wrong) or to none (`invalid reference to
+   * FROM-clause entry`); a `sql` fragment of that projection reads the hop's row (see
+   * EnclosingCollectionScope.hopRows). Every collection in that projection must be one it may read (see
+   * assertOfProjectedRows).
+   */
+  private assertProjectable(field: CollectionQueryBuilder<any>, scope: EnclosingCollectionScope): void {
+    const projection = scope.projection;
+
+    if (field.mintedBy !== undefined && scope.hopRows.has(field.mintedBy) && projection?.nested === undefined) {
+      throw new Error(
+        `The projection of the items of "${projection?.relation ?? this.itemRelationName ?? this.relationName}" flattened by selectMany() `
+        + `reads "${field.relationName}", a collection of a row they were flattened through: it is not aggregated per flattened item. `
+        + `Count it in a sql fragment of this projection instead (sql\`\${<row>.${field.relationName}.count()}\`), which reads that row, `
+        + 'or read it outside selectMany().'
+      );
+    }
+
+    CollectionQueryBuilder.assertOfProjectedRows(field, scope);
+  }
+
+  /**
+   * Refuses, in the projection of the collection a selectMany() selector returned (new in 1.0.11, see
+   * EnclosingCollectionScope.projection), a collection of a row the aggregation there is not correlated
+   * to:
+   *
+   * - of a row outside the flattening — the OUTER row's (`s => s.books.select(b => ({ n: l.crates.count() }))`):
+   *   the CTE and temp-table strategies read it as some other row, or as none;
+   * - inside a collection nested in that projection, of any row but that collection's own items — the
+   *   flattened item's (`b.reviews.select(r => ({ n: b.reviews.count() }))`), a hop's row: under the CTE
+   *   strategy the nested aggregation is a statement apart from them, and counted another row's.
+   *
+   * Each message names a form that works.
+   */
+  private static assertOfProjectedRows(collection: CollectionQueryBuilder<any>, scope: EnclosingCollectionScope | undefined): void {
+    const projection = scope?.projection;
+    const chain = collection.mintedChainId;
+
+    if (projection === undefined || (chain !== undefined && projection.chains.has(chain))) {
+      return;
+    }
+
+    const name = collection.relationName;
+    const place = projection.nested === undefined
+      ? `the items of "${projection.relation}" flattened by selectMany()`
+      : `"${projection.nested}" inside the projection of the items of "${projection.relation}" flattened by selectMany()`;
+    const rule = projection.nested === undefined
+      ? 'it may read collections of the flattened items only'
+      : 'a collection nested there may read collections of its own items only';
+
+    if (collection.mintedBy !== undefined && scope!.hopRows.has(collection.mintedBy)) {
+      throw new Error(
+        `The projection of ${place} reads "${name}", a collection of a row the flattened items were flattened through: ${rule}. `
+        + `Read "${name}" outside selectMany(), next to the flattened list.`
+      );
+    }
+
+    if (chain !== undefined && chain === projection.flattenedChain) {
+      throw new Error(
+        `The projection of ${place} reads "${name}", a collection of the flattened items: ${rule}. `
+        + `Read "${name}" in the projection of the items of "${projection.relation}" itself.`
+      );
+    }
+
+    throw new Error(
+      `The projection of ${place} reads "${name}", a collection of a row outside the flattening: ${rule}. `
+      + `Read "${name}" outside selectMany(), next to the flattened list.`
+    );
   }
 
   /**
@@ -11500,6 +12976,17 @@ export class CollectionQueryBuilder<TItem = any> {
       context.lateralTableAliasMap.set(this.targetTable, innerTableAlias);
     }
 
+    // What our filters and our projection see of us (see EnclosingCollectionScope): our items render
+    // under the lateral's inner alias (else under our table's own name), our hops' rows under their aliases
+    const itemAlias = strategyType === 'lateral' ? `lateral_${reservedCounter}_${this.relationName}` : this.targetTable;
+    const scope = this.enclosedScope(context.collectionScope, itemAlias, undefined, true);
+    // The projection of the collection a selectMany() selector returned (see innerProjection) reads
+    // collections of the flattened items only, and a collection nested in it those of its own items
+    // (see assertOfProjectedRows)
+    const projectionScope: EnclosingCollectionScope = this.innerProjection
+      ? { ...scope, projection: { relation: this.itemRelationName ?? this.relationName, flattenedChain: this.chainId, chains: new Set([this.chainId]) } }
+      : scope;
+
     // Build selected fields configuration (supports nested objects)
     const selectedFieldConfigs: SelectedField[] = [];
     const localParams: any[] = [];
@@ -11543,6 +13030,7 @@ export class CollectionQueryBuilder<TItem = any> {
           lateralTableAliasMap: context.lateralTableAliasMap,
           // A subquery in the item's projection reads the statement's CTEs by name
           hoistedCteNames: context.hoistedCteNames,
+          collectionScope: projectionScope,
         };
         const fragmentSql = field.buildSql(sqlBuildContext);
         context.paramCounter = sqlBuildContext.paramCounter;
@@ -11558,12 +13046,14 @@ export class CollectionQueryBuilder<TItem = any> {
           placeholders: context.placeholders,
           lateralTableAliasMap: context.lateralTableAliasMap,
           hoistedCteNames: context.hoistedCteNames,
+          collectionScope: scope,
         };
         const subquerySql = field.buildSql(subqueryContext);
         context.paramCounter = subqueryContext.paramCounter;
 
         return { alias, expression: `(${subquerySql})` };
       } else if (field instanceof CollectionQueryBuilder) {
+        this.assertProjectable(field, projectionScope);
         // Nested collection query builder, built as a subquery of this one. Inside a temp-table
         // aggregation — a statement of its own, with no WITH list of its enclosing query — it
         // renders as LATERAL, which needs nothing outside the aggregation's own FROM.
@@ -11573,6 +13063,7 @@ export class CollectionQueryBuilder<TItem = any> {
           ...context,
           cteCounter: context.cteCounter,
           collectionStrategy: strategyType === 'cte' ? 'cte' : 'lateral',
+          collectionScope: projectionScope,
         };
         const nestedResult = field.buildCTE(nestedCtx, client, undefined, CollectionQueryBuilder.pathRenamedIn(field, this.navigationPlan, this.targetTable));
         // Sync both counters back - cteCounter for CTE naming, paramCounter for parameter numbering
@@ -11767,14 +13258,17 @@ export class CollectionQueryBuilder<TItem = any> {
     // the lateral's alias: an exists() / count() over a collection of our item correlates to it
     let whereClause: string | undefined;
     let whereParams: any[] | undefined;
-    if (this.whereCond) {
+    // A flattening's items: the filters of the collection its selector returned, then our own
+    const itemWhere = this.itemWhereCondition();
+    if (itemWhere) {
       const condBuilder = new ConditionBuilder();
       const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(
-        this.whereCond,
+        itemWhere,
         context.paramCounter,
         context.placeholders,
         context.hoistedCteNames,
-        strategyType === 'lateral' ? context.lateralTableAliasMap : undefined
+        strategyType === 'lateral' ? context.lateralTableAliasMap : undefined,
+        scope
       );
       whereClause = sql;
       whereParams = params;
@@ -11792,17 +13286,20 @@ export class CollectionQueryBuilder<TItem = any> {
     // projection reuses as an alias bound to that alias; the CTE / temp-table aggregates ordered
     // by names their subquery output does not carry. Each strategy now orders by the expression
     // itself, or by a column of its inner SELECT carrying it.
+    // A flattening's items come in the order of the rows they were flattened through before our own
+    // keys break ties (see itemBaseOrder)
     let orderByClause: string | undefined;
     let orderByFields: CollectionAggregationConfig['orderByFields'];
-    if (this.orderByFields.length > 0) {
-      orderByFields = this.orderByFields.map(({ field, direction, table, fragment }, index) => ({
-        field,
-        direction,
-        table,
+    const orderKeys = this.itemBaseOrder.length === 0 ? this.orderByFields : [...this.orderByFields, ...this.itemBaseOrder];
+    if (orderKeys.length > 0) {
+      orderByFields = orderKeys.map(key => ({
+        field: key.field,
+        direction: key.direction,
+        table: key.table,
         // An expression key renders in our parameter sequence, its own columns under our marker
-        expression: fragment !== undefined
-          ? buildOrderByExpressionSql(fragment, context, strategyType === 'lateral' ? context.lateralTableAliasMap : undefined, localParams)
-          : this.orderByKeyExpression(this.orderByFields[index]),
+        expression: key.fragment !== undefined
+          ? buildOrderByExpressionSql(key.fragment, context, strategyType === 'lateral' ? context.lateralTableAliasMap : undefined, localParams, scope)
+          : this.orderByKeyExpression(key),
       }));
       orderByClause = orderByFields.map(({ expression, direction }) => `${expression} ${direction}`).join(', ');
     }
@@ -11832,13 +13329,14 @@ export class CollectionQueryBuilder<TItem = any> {
             aggregateField = (selectedField as any).__dbColumnName;
           }
         } else if (selectedField instanceof CollectionQueryBuilder) {
+          this.assertProjectable(selectedField, projectionScope);
           // Selector returns a nested collection (e.g., sum(row => other.where(...).count())).
           // We need a *scalar* SQL expression to feed into the aggregate — so force the nested
           // build to emit a correlated subquery (lateral's scalar form) rather than a CTE/temp
           // table that can't be composed inside SUM(...). Outer strategies (CTE, temp table,
           // lateral) then wrap this expression with the aggregate function via
           // config.aggregateExpression.
-          const nestedCtx: QueryContext = { ...context, collectionStrategy: 'lateral' };
+          const nestedCtx: QueryContext = { ...context, collectionStrategy: 'lateral', collectionScope: projectionScope };
           const nestedResult = selectedField.buildCTE(nestedCtx, client, undefined, CollectionQueryBuilder.pathRenamedIn(selectedField, this.navigationPlan, this.targetTable));
           context.cteCounter = nestedCtx.cteCounter;
           context.paramCounter = nestedCtx.paramCounter;
@@ -11854,6 +13352,7 @@ export class CollectionQueryBuilder<TItem = any> {
             placeholders: context.placeholders,
             lateralTableAliasMap: context.lateralTableAliasMap,
             hoistedCteNames: context.hoistedCteNames,
+            collectionScope: projectionScope,
           };
           aggregateExpression = selectedField.buildSql(sqlBuildContext);
           context.paramCounter = sqlBuildContext.paramCounter;
@@ -11919,25 +13418,79 @@ export class CollectionQueryBuilder<TItem = any> {
       }
     }
 
+    // Step 5a: What was written on the collections a selectMany() flattened us through (our hops) —
+    // their filters and limits, each under its hop's alias — and the limits on our items (see
+    // levelPredicates); the navigations of the hops' items join from the hops, after every join of
+    // ours. Their parameters follow ours in the sequence
+    const bridgeJoins = this.renderedHopJoins();
+    const hopNavigationJoins: NavigationJoin[] = this.renderedHops?.navigationJoins.map(entry => entry.join) ?? [];
+    if (this.renderedHops !== undefined) {
+      const enclosingAliasMap = strategyType === 'lateral' ? context.lateralTableAliasMap : undefined;
+      const itemMarker = collectionMarkerPattern(this.targetTable, false);
+      const renderCondition = (condition: Condition): string => {
+        const condBuilder = new ConditionBuilder();
+        const { sql, params, placeholders, paramCounter: newParamCounter } = condBuilder.build(
+          condition,
+          context.paramCounter,
+          context.placeholders,
+          context.hoistedCteNames,
+          enclosingAliasMap,
+          scope
+        );
+        context.paramCounter = newParamCounter;
+        localParams.push(...params);
+        context.allParams.push(...params);
+        whereParams = whereParams === undefined ? params : [...whereParams, ...params];
+        if (placeholders) {
+          context.placeholders = placeholders;
+        }
+
+        return sql;
+      };
+      // Under LATERAL we are correlated to the parent row — as the strategy renders it once our own entry
+      // in the alias map is gone (Step 6) — and a ranking is tied to the row it ranks within; the CTE and
+      // temp-table aggregations rank every parent's rows at once
+      const parentAlias = strategyType !== 'lateral'
+        ? undefined
+        : (this.sourceTable === this.targetTable ? (hadPreviousEntry ? previousTableAlias : undefined) : context.lateralTableAliasMap?.get(this.sourceTable))
+          || this.sourceTable;
+      const levelScope: LevelScope = {
+        itemAlias,
+        itemNavigationJoins: navigationJoins,
+        parentAlias,
+        condition: (condition, level) => (level < this.hops.length
+          ? renderCondition(condition)
+          : renderCondition(condition).replace(itemMarker, `"${itemAlias}"`)),
+        orderKey: key => this.orderKeySql(key, renderCondition).replace(itemMarker, `"${itemAlias}"`),
+        orderKeyNavigationJoins: keys => this.resolveRefNavigationJoins(CollectionQueryBuilder.orderKeyRefs(keys), this.sourceTable),
+      };
+      const predicates = this.levelPredicates(levelScope);
+
+      if (predicates.length > 0) {
+        whereClause = whereClause === undefined ? predicates.join(' AND ') : [...predicates, whereClause].join(' AND ');
+      }
+    }
+
     // Step 5b: Merge navigation path joins (for intermediate tables in navigation chains)
     // These joins are needed when accessing a collection through a chain like:
     // ln.edition.book.category.formats
     // The navigation path contains joins for productPrice, product, category
     // which must be included in the lateral subquery for correlation
-    // Include selectMany joins in both all and selector navigation joins
-    // selectMany joins are structural (from flattening) and needed by both CTE and LATERAL
+    // Include the selectMany hops in both all and selector navigation joins: they are structural
+    // (from flattening) and needed by both CTE and LATERAL — and after our own joins, the
+    // navigations of the hops' filters, which join from the hops
     // (the common case — no navigation path, no selectMany — reuses the detected array instead of
     // spreading it twice; strategies only read these lists)
-    const allNavigationJoins: NavigationJoin[] = this.navigationPath.length === 0 && this.selectManyJoins.length === 0
+    const allNavigationJoins: NavigationJoin[] = this.navigationPath.length === 0 && bridgeJoins.length === 0
       ? navigationJoins
-      : [...this.navigationPath, ...this.selectManyJoins, ...navigationJoins];
+      : [...this.navigationPath, ...bridgeJoins, ...navigationJoins, ...hopNavigationJoins];
     // The correlated form joins the path this collection hangs off as well when the enclosing scope
     // renders the path's last hop under another alias (see buildCTE's `joinOwnPath`)
     const allSelectorJoins: NavigationJoin[] = joinOwnPath && strategyType === 'lateral' && this.navigationPath.length > 0
       ? allNavigationJoins
-      : this.selectManyJoins.length === 0
+      : bridgeJoins.length === 0
         ? navigationJoins
-        : [...this.selectManyJoins, ...navigationJoins];
+        : [...bridgeJoins, ...navigationJoins, ...hopNavigationJoins];
 
     // Step 6: Build CollectionAggregationConfig object
     const config: CollectionAggregationConfig = {
@@ -11950,7 +13503,8 @@ export class CollectionQueryBuilder<TItem = any> {
       // withPrincipalKey: [id, true]`) in the projection WHERE clause.
       foreignKeys: this.foreignKeys,
       matches: this.matches,
-      foreignKeyTableAlias: this.foreignKeyTableAlias,
+      // A flattened collection's parent key is held by its first hop
+      foreignKeyTableAlias: this.renderedHops?.aliases[0],
       sourceTable: this.sourceTable,
       parentIds,  // Pass parent IDs for temp table strategy
       parentKeyType: strategyType === 'temptable' ? this.getParentKeyType() : undefined,

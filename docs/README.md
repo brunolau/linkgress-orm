@@ -52,12 +52,13 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Nested collections
   - Aggregations (count, sum, min, max)
   - GROUP BY and HAVING
-  - JOINs (inner, left, multiple)
+  - JOINs (inner, left, multiple); [how a joined table's columns read](./guides/querying.md#how-a-joined-tables-columns-read) — its own mapper and type, as through a navigation
   - Subqueries
   - CTEs (Common Table Expressions)
   - Magic SQL strings with custom formatters
   - Built-in operators: coalesce, JSONB extraction, flag/bitmask operations
   - Advanced patterns and type safety
+  - [QueryBatch](./guides/querying.md#querybatch-several-reads-in-one-round-trip): several reads (grouped ones too) in one round trip, and the known limitations of its JSON transport
 
 - **[SQL Expression Helpers](./guides/sql-expressions.md)** - Built-in spellings of common SQL expressions
   - Casts (`cast`, `castAsInt`, `castAsString`, … and `.cast*()` on every fragment)

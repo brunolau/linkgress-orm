@@ -362,7 +362,7 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
         indisclustered: false,
         indisvalid: ix.valid,
         indcheckxmin: false,
-        indisready: true,
+        indisready: ix.ready !== false,
         indislive: true,
         indisreplident: false,
         indkey: [...ix.keys.map((k) => k.attnum), ...ix.include],
@@ -622,6 +622,8 @@ const GENERATORS: Record<string, (session: Session, cat: Catalog) => Row[]> = {
   ],
   'pg_catalog.pg_operator': (_s, cat) => [...cat.builtin.operators.values(), ...cat.operators.values()].map((o) => ({ oid: o.oid, oprname: o.name, oprnamespace: o.nspOid, oprowner: 10, oprkind: o.kind, oprcanmerge: false, oprcanhash: false, oprleft: o.left, oprright: o.right, oprresult: o.result, oprcom: o.commutator, oprnegate: o.negator, oprcode: o.codeOid, oprrest: 0, oprjoin: 0 })),
   'pg_catalog.pg_cast': (_s, cat) => [...cat.builtin.casts.values()].map((c, i) => ({ oid: 10000 + i, castsource: c.source, casttarget: c.target, castfunc: c.funcOid, castcontext: c.context, castmethod: c.method })),
+  // an index is built within its statement, which no other session interleaves with: none is ever seen in progress
+  'pg_catalog.pg_stat_progress_create_index': () => [],
   'pg_catalog.pg_depend': () => [],
   'pg_catalog.pg_shdepend': () => [],
   'pg_catalog.pg_rewrite': () => [],

@@ -168,7 +168,12 @@ export class Session implements ExecSession, AnalyzerEnv {
   private settings = new Map<string, string>();
   txn: TxnState | null = null;
   private tempNsOid = 0;
-  private lastSeqValue: bigint | null = null;
+  /**
+   * The sequence the session's last nextval() drew from — PostgreSQL's `last_used_seq`: lastval() reads that
+   * sequence's currval, looked up when it is called. setval() never sets it.
+   */
+  private lastUsedSeqOid: number | null = null;
+  /** currval() per sequence OID: set by nextval() and by setval(…, true), forgotten by DISCARD SEQUENCES / ALL. */
   readonly currvals = new Map<number, bigint>();
   readonly typeOps: TypeOps;
   readonly collations: Collations;
@@ -558,6 +563,10 @@ export class Session implements ExecSession, AnalyzerEnv {
             return true;
           }
         }
+        if (needsWrite && rte && rte.kind === 'catalog') {
+          // an UPDATE of pg_index's state flags: a catalog is never temporary
+          return true;
+        }
       }
       return q.cteList.some((c) => c.isModifying && writesRegular(c.query));
     };
@@ -842,7 +851,7 @@ export class Session implements ExecSession, AnalyzerEnv {
     st.lastValue = next;
     st.isCalled = true;
     this.currvals.set(seqOid, next);
-    this.lastSeqValue = next;
+    this.lastUsedSeqOid = seqOid;
     return next;
   }
 
@@ -868,17 +877,33 @@ export class Session implements ExecSession, AnalyzerEnv {
     s.state.isCalled = isCalled;
     s.state.logCnt = 0;
     if (isCalled) {
+      // moves currval() — and lastval() when this is the last-used sequence — but, as in PostgreSQL, never makes
+      // the sequence the last-used one
       this.currvals.set(seqOid, value);
-      this.lastSeqValue = value;
     }
     return value;
   }
 
+  /**
+   * The currval of the sequence the session's last nextval() drew from. As PostgreSQL's `lastval()`, it looks that
+   * sequence up NOW: once it is gone — dropped, also by DROP TABLE of its owner or a CASCADE, or by this session's
+   * own uncommitted DROP (a ROLLBACK brings it back) — there is no lastval, even when a sequence drawn from earlier
+   * still exists.
+   */
   lastval(): bigint {
-    if (this.lastSeqValue === null) {
+    const oid = this.lastUsedSeqOid;
+    const rel = oid === null ? undefined : this.catalog().getRelation(oid);
+    const value = oid === null ? undefined : this.currvals.get(oid);
+    if (!rel || rel.kind !== 'S' || value === undefined) {
       throw new PgError(SqlState.OBJECT_NOT_IN_PREREQUISITE_STATE, 'lastval is not yet defined in this session');
     }
-    return this.lastSeqValue;
+    return value;
+  }
+
+  /** DISCARD SEQUENCES (and DISCARD ALL): the session forgets every currval() and its lastval(). */
+  discardSequences(): void {
+    this.currvals.clear();
+    this.lastUsedSeqOid = null;
   }
 
   // -------------------------------------------------------------------------
@@ -1685,6 +1710,14 @@ export class Session implements ExecSession, AnalyzerEnv {
     return !this.txn?.explicit && !this.inImplicitBlock;
   }
 
+  /**
+   * IsTransactionBlock(): inside an explicit transaction block, or the implicit one a multi-statement
+   * query string runs in — where PreventInTransactionBlock refuses CREATE / DROP INDEX CONCURRENTLY.
+   */
+  inTransactionBlock(): boolean {
+    return !!this.txn?.explicit || this.inImplicitBlock;
+  }
+
   /** COMMIT / ROLLBACK [AND CHAIN] inside a procedure: finish the transaction and start the next one. */
   procedureTransactionEnd(commit: boolean, chain: boolean, st: StatementState): void {
     const txn = this.txn!;
@@ -2163,6 +2196,10 @@ export class SessionHost {
 
   catalogRows(relOid: number, st: StatementState): unknown[][] {
     return catalogRelationRows(this.session, relOid, st);
+  }
+
+  ddlCatalog(): Catalog {
+    return this.session.ddlCatalog();
   }
 
   executeModify(q: Query, ctx: EvalCtx, executor: Executor): { rows: unknown[][]; rowCount: number } {

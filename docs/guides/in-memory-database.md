@@ -208,3 +208,41 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
   refused (PostgreSQL raises `0A000` / `2BP01`). The schema manager does not rely on either: it drops
   and re-creates every model-managed view (`model.view()`) whenever a migration changes columns, so
   both engines behave the same.
+- Index builds evaluate each index expression and predicate over the table's own rows (not an
+  INHERITS child's, as in PostgreSQL), and a `CREATE INDEX CONCURRENTLY` whose build fails — a
+  unique index over duplicate keys, an expression or predicate raising for a row — leaves the index
+  behind INVALID (`indisvalid` and `indisready` false: unused for reads, not maintained, skipped by
+  `CREATE INDEX … IF NOT EXISTS`), as PostgreSQL does; without CONCURRENTLY a failed build leaves
+  nothing. An expression the engine cannot evaluate — a function it does not implement, such as
+  `to_tsvector` — is not evaluated over the rows of a non-unique index, which builds as it always
+  did; a unique index's build still computes its keys, so over existing rows it fails with the
+  engine's `0A000`.
+  `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are refused where PostgreSQL refuses
+  them: in a transaction block or a multi-statement query string, from a function or `DO` block
+  (`25001`, before any name is looked up); a partitioned table or index, and for the drop several
+  names or `CASCADE` (`0A000`). `TRUNCATE` makes a non-unique INVALID index valid and ready again
+  (PostgreSQL rebuilds the table's indexes); a unique one keeps its flags.
+- A partitioned index is one index over the whole table: `CREATE INDEX` on a partitioned table
+  creates no index on each partition, as PostgreSQL does. `CREATE INDEX … ON ONLY` a partitioned
+  table with partitions creates it INVALID (but ready), and `ALTER INDEX … ATTACH PARTITION` attaches
+  an index of one of the partitions (`55000` for an index of another table, `42P17` when the
+  definitions differ); the partitioned index turns valid once every partition has an attached valid
+  index — PostgreSQL's online procedure. An attached index cannot be dropped on its own (`2BP01`,
+  with PostgreSQL's hint); dropping the partitioned index drops the attached ones.
+- The catalogs are generated from the engine's own structures, not stored in tables, so catalog DML
+  is refused with `42501` (`permission denied for table …`) — with one exception, the write a
+  PostgreSQL superuser uses to stage an INVALID index: `UPDATE pg_index SET indisvalid = …,
+  indisready = …` (either flag or both, any `WHERE` / `FROM` / `RETURNING`, also in a data-modifying
+  `WITH`) changes the state of the index each selected row describes. `indisvalid = false` stops
+  reads using it; `indisready = false` stops writes maintaining it, so a unique index no longer
+  rejects duplicates. The write is transactional, refused in a read-only transaction (`25006`), a
+  NULL flag violates the column's NOT NULL (`23502`), and like DDL it holds the database's DDL lock
+  until the transaction ends. A `SET` of any other column — even one `pg_index` does not have,
+  where PostgreSQL reports `42703` — stays `42501`.
+- An index builds within its statement, so `pg_stat_progress_create_index` is always empty (and
+  `pg_locks` shows no relation locks), and a build reads only the rows its snapshot sees —
+  PostgreSQL's blocking build also visits the row versions older transactions in the same database
+  can still see. `REINDEX`, `VACUUM` and `CLUSTER` are accepted and do nothing, so an INVALID index
+  stays INVALID through them. In PostgreSQL plain `VACUUM` leaves it INVALID too, while `REINDEX`
+  rebuilds it valid, and `VACUUM FULL` and `CLUSTER` rebuild a non-unique one valid (a unique one
+  stays INVALID, as after `TRUNCATE`).

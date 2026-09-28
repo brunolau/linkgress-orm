@@ -156,6 +156,9 @@ The automatic migrator can detect and handle the following changes:
 **Index Level:**
 - Create indexes
 - Drop indexes
+- Repair INVALID indexes — what a failed `CREATE INDEX CONCURRENTLY` leaves behind — by rebuilding them
+  from the model, last, after every other operation; their failures come as one `IndexRepairError` (see
+  [Schema configuration → An INVALID Index](./schema-configuration.md#an-invalid-index-a-failed-create-index-concurrently))
 
 **Constraint Level:**
 - Create foreign keys
@@ -701,6 +704,18 @@ The `DbSchemaManager` analyzes and generates the following migration operations:
   type: 'drop_index',
   tableName: 'users',
   indexName: 'ix_users_old_field'
+}
+// A model index present only INVALID (a failed CREATE INDEX CONCURRENTLY): built again from the model, last —
+// dropped and created CONCURRENTLY for a .concurrent() index or with concurrentIndexes, otherwise built beside
+// it under a temporary name and swapped in. A scaffolded file drops it only where the schema manager would
+// repair it, then CREATE INDEX … IF NOT EXISTS (never CONCURRENTLY: the file runs in one transaction).
+{
+  type: 'repair_index',
+  tableName: 'users',
+  indexName: 'uq_users_email',
+  columns: ['email'],
+  isUnique: true,
+  previousDef: 'CREATE UNIQUE INDEX uq_users_email ON users USING btree (email)'
 }
 ```
 

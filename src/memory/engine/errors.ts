@@ -199,6 +199,11 @@ export function notSupported(what: string): PgError {
   return new PgError(SqlState.FEATURE_NOT_SUPPORTED, `in-memory engine: ${what} is not supported`);
 }
 
+/** A limitation of the engine ("in-memory engine: … is not implemented / supported"), not an error PostgreSQL raises. */
+export function isEngineLimitation(e: unknown): boolean {
+  return e instanceof PgError && e.code === SqlState.FEATURE_NOT_SUPPORTED && e.message.startsWith('in-memory engine: ');
+}
+
 export function internalError(message: string): PgError {
   return new PgError(SqlState.INTERNAL_ERROR, message);
 }

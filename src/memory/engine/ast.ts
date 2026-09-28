@@ -654,7 +654,8 @@ export type AlterTableCmd =
   | { kind: 'SET_SCHEMA'; schema: string }
   | { kind: 'SET_OPTIONS'; options: DefElem[] }
   | { kind: 'RESET_OPTIONS'; options: DefElem[] }
-  | { kind: 'ATTACH_PARTITION'; partition: RangeVar; bound: PartitionBound }
+  /** `bound`: null for ALTER INDEX … ATTACH PARTITION (an index is attached without one) */
+  | { kind: 'ATTACH_PARTITION'; partition: RangeVar; bound: PartitionBound | null }
   | { kind: 'DETACH_PARTITION'; partition: RangeVar; concurrently: boolean; finalize: boolean }
   | { kind: 'OWNER_TO'; owner: string }
   | { kind: 'SET_LOGGED'; logged: boolean }

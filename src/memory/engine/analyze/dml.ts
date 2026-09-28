@@ -33,10 +33,29 @@ function liveColumns(rel: Relation): Column[] {
   return rel.columns.filter((c) => !c.isDropped);
 }
 
-function openTarget(an: Analyzer, rv: A.RangeVar, verb: string): Relation {
+/**
+ * The catalog columns an UPDATE may write. PostgreSQL lets a superuser change any catalog row; the engine's catalogs
+ * are generated from its own structures, so it writes exactly one kind: the index state flags of pg_index, mapped
+ * onto the index the row describes (DmlExecutor.executeCatalogUpdate). Every other catalog write is refused.
+ */
+const WRITABLE_CATALOG_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  'pg_catalog.pg_index': ['indisvalid', 'indisready'],
+};
+
+/** The columns an UPDATE's SET clause assigns, as written. */
+function assignedColumns(items: A.SetClauseItem[]): string[] {
+  return items.flatMap((item) => (item.kind === 'single' ? [item.target.name!] : item.targets.map((t) => t.name!)));
+}
+
+/** `assigned`: the columns an UPDATE writes — only an UPDATE of writable catalog columns opens a catalog. */
+function openTarget(an: Analyzer, rv: A.RangeVar, verb: string, assigned?: string[]): Relation {
   const rel = atPosition(rv.loc, () => lookupRelation(an, rv)!);
   if (rel.isBuiltinCatalog) {
-    throw new PgError(SqlState.INSUFFICIENT_PRIVILEGE, `permission denied for table ${rel.name}`);
+    const writable = assigned && WRITABLE_CATALOG_COLUMNS[`${an.catalog.namespaceName(rel.nspOid)}.${rel.name}`];
+    if (!writable || !assigned.every((name) => writable.includes(name))) {
+      throw new PgError(SqlState.INSUFFICIENT_PRIVILEGE, `permission denied for table ${rel.name}`);
+    }
+    return rel;
   }
   if (rel.kind === 'v' && verb !== 'merge into') {
     // an automatically updatable view: rewritten onto its base relation once analyzed (view-rewrite.ts)
@@ -932,7 +951,7 @@ function transformUpdate(an: Analyzer, stmt: A.UpdateStmt, pstate: ParseState): 
   if (stmt.with) {
     transformWithClause(an, pstate, stmt.with);
   }
-  const rel = openTarget(an, stmt.relation, 'update');
+  const rel = openTarget(an, stmt.relation, 'update', assignedColumns(stmt.targetList));
   const resultRt = addTargetRte(an, pstate, rel, stmt.relation, stmt.relation.inh);
   q.resultRelation = resultRt;
   q.fromlist.push({ k: 'ref', rtIndex: resultRt });

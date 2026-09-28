@@ -1,5 +1,6 @@
-import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, QueryTimeoutError } from './database-client.interface';
+import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, QueryTimeoutError, TransactionEndedError } from './database-client.interface';
 import type { PostgresOptions } from './types';
+import { withArrayTypes } from './typed-text';
 
 // Use dynamic import to make postgres optional
 type Sql = any;
@@ -185,15 +186,30 @@ async function runTxStatement(
  * guarantee exists.
  */
 class PostgresPooledConnection implements PooledConnection {
+  /** Released, the reserved connection is back in the pool: later statements are refused. */
+  private released = false;
+
   constructor(private sql: Sql, private reserved: boolean, private defaultStatementTimeout?: number) {}
 
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    if (this.released) {
+      throw new ConnectionReleasedError(sql);
+    }
+
     // postgres library doesn't have explicit binary protocol toggle
     // It automatically uses the most efficient protocol based on data types.
     return await runStatement(this.sql, sql, params, options?.timeoutMs, this.defaultStatementTimeout, options?.prepare) as QueryResult<T>;
   }
 
   release(): void {
+    // a second release() must not reach postgres.js: on a connection reserved again by another caller it would
+    // cancel THAT caller's reservation (`c.reserved = null`)
+    if (this.released) {
+      return;
+    }
+
+    this.released = true;
+
     if (this.reserved && typeof (this.sql as any).release === 'function') {
       (this.sql as any).release();
     }
@@ -385,6 +401,11 @@ export class PostgresClient extends DatabaseClient {
 
   /**
    * Begin a transaction using postgres library's built-in transaction support
+   *
+   * NOT guarded like {@link transaction}: the callback gets postgres.js's own transaction handle, and a statement
+   * sent through it after the callback has settled is not refused with a {@link TransactionEndedError} — it runs on
+   * the connection the transaction handed back, inside another caller's transaction if one holds that connection by
+   * then. Do not keep the handle past the callback.
    * @deprecated Use transaction() method instead for cross-driver compatibility
    */
   async begin<T>(callback: (sql: Sql) => Promise<T>): Promise<T> {
@@ -394,16 +415,28 @@ export class PostgresClient extends DatabaseClient {
   /**
    * Execute a callback within a transaction.
    * Uses postgres library's built-in sql.begin() for proper transaction handling.
+   *
+   * The query function is valid until the callback settles; a statement sent through it later is refused with
+   * a {@link TransactionEndedError}.
    */
   async transaction<T>(callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     return await this.sql.begin(async (sql: Sql) => {
+      let open = true;
       const queryFn = async (sqlStr: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult> => {
+        if (!open) {
+          throw new TransactionEndedError(sqlStr);
+        }
+
         // Honor a per-statement `.withTimeout()` override inside the transaction.
         // `runTxStatement` scopes `SET LOCAL statement_timeout` to this statement.
         return await runTxStatement(sql, sqlStr, params, options?.timeoutMs, this.defaultStatementTimeout, options?.prepare);
       };
 
-      return await callback(queryFn);
+      try {
+        return await callback(queryFn);
+      } finally {
+        open = false;
+      }
     });
   }
 
@@ -413,6 +446,53 @@ export class PostgresClient extends DatabaseClient {
    */
   supportsBinaryProtocol(): boolean {
     return false; // No explicit control, but uses binary internally
+  }
+
+  /**
+   * The value postgres.js delivers for a column of the type `oid` holding `text`: through the parser its
+   * `options.parsers` holds for that type — the driver's defaults with the application's `types` over
+   * them, array parsers included once a connection has read the array types — or the text itself. An
+   * array parser gets the text after its opening brace, as postgres.js hands it a column's.
+   */
+  parseTypedText(oid: number, text: string): unknown {
+    const parse = (this.sql as any)?.options?.parsers?.[oid];
+
+    if (typeof parse !== 'function') {
+      return text;
+    }
+
+    return parse.array === true ? parse(text.slice(1)) : parse(text);
+  }
+
+  /**
+   * The types the application's postgres.js `types` parse (each type's `from` OIDs), with their arrays —
+   * a builtin's array type before any connection has read the array types, any other's once one has.
+   */
+  customParsedTypeOids(): readonly number[] {
+    const types = (this.sql as any)?.options?.types;
+
+    if (!types || typeof types !== 'object') {
+      return [];
+    }
+
+    const oids = new Set<number>();
+
+    for (const type of Object.values(types) as Array<{ from?: unknown; parse?: unknown }>) {
+      if (type && typeof type.parse === 'function' && type.from !== undefined && type.from !== null) {
+        for (const oid of ([] as unknown[]).concat(type.from)) {
+          if (typeof oid === 'number') {
+            oids.add(oid);
+            const array = (this.sql as any)?.options?.shared?.typeArrayMap?.[oid];
+
+            if (typeof array === 'number') {
+              oids.add(array);
+            }
+          }
+        }
+      }
+    }
+
+    return withArrayTypes([...oids]);
   }
 
   /**

@@ -574,8 +574,8 @@ describe('1. every expression builder renders a self-delimited expression', () =
     ['isSubquery DbCte DbCteBuilder isCte', 'subquery / CTE plumbing'],
     ['DbEntity EntityMetadataStore DbColumn isDbColumn EntityConfigBuilder EntityPropertyBuilder EntityNavigationBuilder HasManyNavigationBuilder HasOneNavigationBuilder DbModelConfig ViewConfigBuilder DbContext DbEntityTable EntityInsertBuilder TypeAliases', 'model / context'],
     ['CustomTypeBuilder customType jsonType array enumType point vector interval createCustomType identityMapper applyToDriver applyFromDriver applyFromDriverArray', 'custom type / mapper'],
-    ['DbSequence SequenceBuilder sequence DbSchemaManager EnumMigrator MigrationRunner MigrationJournal MigrationLoader MigrationScaffold', 'sequences / migrations'],
-    ['DatabaseClient QueryTimeoutError PostgresClient PgClient BunClient PGliteClient createInMemoryDatabase restoreInMemoryDatabase startInMemoryDatabaseThread', 'database client'],
+    ['DbSequence SequenceBuilder sequence DbSchemaManager IndexRepairError EnumMigrator MigrationRunner MigrationJournal MigrationLoader MigrationScaffold', 'sequences / migrations'],
+    ['DatabaseClient QueryTimeoutError TransactionEndedError ConnectionReleasedError PostgresClient PgClient BunClient PGliteClient createInMemoryDatabase restoreInMemoryDatabase startInMemoryDatabaseThread', 'database client'],
   ];
   for (const [names, why] of NOT_EXPRESSIONS) {
     for (const name of names.split(' ')) {

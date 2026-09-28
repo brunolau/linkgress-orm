@@ -112,11 +112,13 @@ describe('runtime sequences', () => {
       expect(await sequenceExists('rt_seq_schema')).toBe(true);
     });
 
-    test('bounds above 2^53 are valid bigint options: the sequence is created and draws', async () => {
+    test('bounds above 2^53 are valid bigint options: the sequence is created and draws — exactly, as bigints', async () => {
       const wide = db.runtimeSequence({ name: 'rt_seq_wide', startWith: 1e16, minValue: 1e16, maxValue: 2 ** 60, incrementBy: 2n });
 
-      expect(await wide.nextValueCreatingIfMissing()).toBe(1e16);
-      expect(await wide.nextValueCreatingIfMissing()).toBe(1e16 + 2);
+      expect(await wide.nextValueCreatingIfMissingBigInt()).toBe(10000000000000000n);
+      expect(await wide.nextValueCreatingIfMissingBigInt()).toBe(10000000000000002n);
+      // beyond Number.MAX_SAFE_INTEGER the number variant refuses (a RangeError) rather than risk a rounded value
+      await expectToReject(wide.nextValueCreatingIfMissing(), 'nextValueCreatingIfMissing() drew 10000000000000004');
     });
 
     test.skipIf(!concurrentSessions)('bound to the ROOT client: a CREATE made from a transaction survives its rollback', async () => {

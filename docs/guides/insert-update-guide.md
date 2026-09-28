@@ -759,6 +759,33 @@ await db.transaction(async (tx) => {
 });
 ```
 
+### The transaction's objects end with it
+
+`tx` and everything obtained from it — table accessors, model sequences, query builders, futures,
+`QueryBatch` / `MutationBatch` legs, prepared queries, `tx.getSchemaManager()`, `tx.getClient()` — run their
+statements on the transaction's connection, and are valid only until the callback settles. Used afterwards,
+each statement is refused with a `TransactionEndedError` (its `sql` is the refused text) before it reaches the
+database: by then the connection is back in the pool, and may belong to ANOTHER transaction.
+
+```typescript
+const kept = await db.transaction(async tx => tx);   // returning tx (or anything built from it) is the mistake
+await kept.posts.count();                            // TransactionEndedError: this transaction has already ended …
+
+// keep results, not transaction-scoped objects; outside the callback, use db (or a new transaction)
+const count = await db.transaction(async tx => tx.posts.count());
+```
+
+The query function a driver's own `client.transaction(query => …)` hands its callback is refused the same way
+once the callback has settled. Before 1.0.11 such statements ran silently — on `pg` on the released pooled
+connection, outside any transaction or inside whichever transaction held it by then. (The deprecated
+`PostgresClient.begin()` is the exception: the postgres.js handle it hands its callback is not guarded — use
+`transaction()`.)
+
+`FutureQueryRunner.runAsync()`, like `QueryBatch`, takes the futures of ONE context: a batch that mixes `tx`'s
+futures with `db`'s (or with a kept, ended transaction's) is refused before anything runs — on postgres.js, Bun
+and PGlite such a batch without parameters used to run every future on the first one's client, `tx`'s outside the
+transaction.
+
 ### Advisory Locks
 
 Transaction-scoped advisory locks serialize concurrent units of work on a key that is not a

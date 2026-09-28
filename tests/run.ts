@@ -11,8 +11,8 @@
  *   --driver <name>    the DatabaseClient the suite uses: pg (default), postgres, bun or pglite (LINKGRESS_TEST_DRIVER)
  *   -t, --test-name-pattern <regex>   only run tests whose full name matches
  *   -j, --jobs <n>     parallel files in memory and PGlite runs (default: half the CPU cores)
- *   --pg-jobs <n>      parallel files against PostgreSQL, each on a database of its own (default 6); 1 runs
- *                      the files one after another on DB_NAME itself
+ *   --pg-jobs <n>      parallel files against PostgreSQL, each on a database of its own (default 6); only an
+ *                      explicit 1 runs the files one after another on DB_NAME itself
  *   --timeout <ms>     per-test timeout (default 30000)
  *   --json <file>      write the per-test outcomes of the run(s)
  *   --coverage         collect coverage (lcov) for every file, merged into coverage/lcov.info
@@ -23,9 +23,11 @@
  *
  * PostgreSQL runs use the server in DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD (`.env` supported;
  * the name must contain "test"). With --pg-jobs N > 1 (the default) the runner builds a template database
- * (the extensions the suite uses plus the test schema), clones it into N worker databases
- * (`<DB_NAME>_<host>_<pid>_w<k>`, CREATE DATABASE … TEMPLATE), runs N files at a time — each file's process
- * gets its worker's database as DB_NAME — and drops every database it created when the run ends: normally,
+ * (the extensions the suite uses plus the test schema), clones it into min(N, files) worker databases
+ * (`<DB_NAME>_<host>_<pid>_w<k>`, CREATE DATABASE … TEMPLATE) — ONE for a one-file run: the files never run on
+ * DB_NAME, the database the CREATE / DROP DATABASE statements connect to (tests/utils/run-plan.ts) — runs that many files at a
+ * time — each file's process gets its worker's database as DB_NAME — and drops every database it created when
+ * the run ends: normally,
  * on a failure, or on Ctrl+C / SIGTERM (DROP DATABASE … WITH (FORCE)). Databases of a runner that could
  * not clean up (killed hard) are dropped by the next PostgreSQL run on the same machine (`<host>` is a
  * short hash of the host name): the process that created them no longer exists. Runs on other machines
@@ -41,13 +43,18 @@
  * (LINKGRESS_SQL_PARITY_REQUIRE_PG=1). PGlite runs
  * (`--driver pglite`) dump the schema from one PGlite once; every file boots its own instance from that
  * dump (tests/utils/pglite-server.ts), so they run in parallel — the server is then only needed by files
- * that construct PgClient / PostgresClient themselves, and a run without one only warns.
+ * that construct PgClient / PostgresClient themselves, which get private worker databases like a PostgreSQL
+ * run's (one per parallel slot; DB_NAME itself with an explicit --pg-jobs 1, or — the test schema created there
+ * and dropped at the end, as before — when the private databases cannot be created), and a run without one only
+ * warns. DB_NAME also stays the database the runner connects to for CREATE / DROP DATABASE, and memory / parity
+ * runs run tests/memory/sql-parity.test.ts against it, in transactions it rolls back.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { availableParallelism, hostname, tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { databasePlan } from './utils/run-plan';
 
 type Mode = 'pg' | 'memory' | 'pglite';
 type Status = 'passed' | 'failed' | 'skipped';
@@ -458,6 +465,14 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
     console.log(options.prefix ? message.split('\n').map((line) => (line ? options.prefix + line : line)).join('\n') : message);
   };
   const env: Record<string, string> = { ...baseEnv };
+  // private worker databases unless an explicit --pg-jobs 1 (tests/utils/run-plan.ts): a one-file run included
+  const plan = databasePlan(mode, { pgJobs, parallelJobs, fileCount: files.length });
+  const jobs = plan.jobs;
+  // every parallel slot runs its files on a database of its own
+  let workerDatabases: string[] = [];
+  // a PGlite run whose private databases could not be created uses DB_NAME, as before (plan.sharedDatabaseFallback)
+  let fellBackToSharedDatabase = false;
+  const setupStarted = Date.now();
   if (mode === 'memory') {
     env.LINKGRESS_TEST_DB = 'memory';
     if (thread) {
@@ -473,34 +488,50 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
     log('Building the PGlite schema snapshot...');
     runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['pglite-snapshot', snapshot], env);
     env.LINKGRESS_TEST_PGLITE_SNAPSHOT = snapshot;
-    // only the files that construct PgClient / PostgresClient themselves need the server
-    log('Creating the test schema in PostgreSQL (optional on PGlite)...');
-    if (!runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env, true)) {
-      log('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
+    // only the files that construct PgClient / PostgresClient themselves need the server — optional on PGlite
+    if (plan.usesSharedDatabase) {
+      log('Creating the test schema in PostgreSQL (optional on PGlite)...');
+      if (!runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env, true)) {
+        log('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
+      }
+    } else {
+      try {
+        await dropStaleWorkerDatabases();
+        workerDatabases = await createWorkerDatabases(plan.workerDatabases, env, log);
+      } catch (e) {
+        await dropWorkerDatabases().catch(() => undefined);
+        // no private databases (no CREATEDB, a DB_NAME too long for their names, …): the old behaviour, on DB_NAME
+        fellBackToSharedDatabase = plan.sharedDatabaseFallback;
+        log(`Could not create private worker databases (${describeRunError(e)}): the files that construct PgClient / PostgresClient use ${BASE_DB} itself, as before.`);
+        log('Creating the test schema in PostgreSQL (optional on PGlite)...');
+        if (!runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env, true)) {
+          log('PostgreSQL unreachable: files that construct PgClient / PostgresClient directly will fail.');
+        }
+      }
     }
-  }
-
-  const jobs = mode === 'pg' ? Math.min(pgJobs, files.length) : parallelJobs;
-  // --pg-jobs > 1: every worker runs its files on a database of its own
-  let workerDatabases: string[] = [];
-  const setupStarted = Date.now();
-  if (mode === 'pg') {
+  } else {
     delete env.LINKGRESS_TEST_DB;
     await dropStaleWorkerDatabases();
-    if (jobs > 1) {
+    if (plan.workerDatabases > 0) {
       try {
-        workerDatabases = await createWorkerDatabases(jobs, env, log);
+        workerDatabases = await createWorkerDatabases(plan.workerDatabases, env, log);
       } catch (e) {
         await dropWorkerDatabases();
         throw e;
       }
     } else {
-      log('Creating the test schema in PostgreSQL...');
+      log(`Creating the test schema in PostgreSQL (${BASE_DB} itself: --pg-jobs 1)...`);
       runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['create'], env);
     }
   }
   const runStarted = Date.now();
-  log(`Running ${files.length} test file(s) ${mode === 'pg' ? `against PostgreSQL${jobs > 1 ? ` (${jobs} in parallel, one database each; setup ${((runStarted - setupStarted) / 1000).toFixed(1)}s)` : ''}` : `${mode === 'memory' ? 'in memory' : 'on PGlite'} (${jobs} in parallel)`}`);
+  const setup = `setup ${((runStarted - setupStarted) / 1000).toFixed(1)}s`;
+  const where = mode === 'pg'
+    ? `against PostgreSQL (${workerDatabases.length > 0 ? `${jobs} in parallel, one private database each` : `serially, on ${BASE_DB} itself`}; ${setup})`
+    : mode === 'memory'
+      ? `in memory (${jobs} in parallel)`
+      : `on PGlite (${jobs} in parallel${workerDatabases.length > 0 ? `; files that reach the server: ${workerDatabases.length} private database(s), ${setup}` : ''})`;
+  log(`Running ${files.length} test file(s) ${where}`);
   const outcomes: FileOutcome[] = new Array(files.length);
   const indices = files.map((_, i) => i);
   const waitsForServer = (i: number) => mode === 'memory' && !!options.serverFree && SERVER_BOUND_IN_MEMORY.has(rel(files[i]));
@@ -533,7 +564,7 @@ const runAll = async (mode: Mode, options: RunOptions = {}): Promise<RunResult> 
   } finally {
     if (workerDatabases.length > 0) {
       await dropWorkerDatabases();
-    } else if (mode !== 'memory') {
+    } else if (plan.usesSharedDatabase || fellBackToSharedDatabase) {
       runSetupScript(path.join(TESTS_DIR, 'global-schema.ts'), ['drop'], env, mode === 'pglite');
     }
   }

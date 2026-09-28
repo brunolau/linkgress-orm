@@ -4,7 +4,7 @@ import { addRelationRte } from '../analyze/from';
 import { emptyQuery } from '../analyze/nodes';
 import { ParseState } from '../analyze/parse-state';
 import { Catalog, Column, Constraint, IndexElemDef, IndexInfo, NS_PG_CATALOG, Relation, StoredExpr, TypeOid } from '../catalog/catalog';
-import { PgError, SqlState } from '../errors';
+import { isEngineLimitation, PgError, SqlState } from '../errors';
 import { parseExpression } from '../parser-ddl';
 import type { Session } from '../session';
 import { outputValue } from '../types/io';
@@ -24,6 +24,7 @@ import {
 } from './common';
 import { DdlContext } from './stmt-context';
 import { atPosition } from '../analyze/location';
+import type { Evaluator } from '../exec/runtime';
 
 const SERIAL_TYPES: Record<string, number> = {
   serial: TypeOid.int4,
@@ -538,12 +539,60 @@ export function createIndexRelation(
   cat.putRelation(index);
   if (unique) {
     validateUniqueIndex(session, cat, rel, index, ctx);
+  } else {
+    evaluateIndexOverRows(rel, index, ctx);
   }
   return index;
 }
 
+/**
+ * Build a non-unique index over the table's rows as PostgreSQL does: its predicate, then — for every row the
+ * predicate admits — each key expression, so an expression or predicate that raises for a row (a division by zero, a
+ * failing cast) fails the build. Plain column keys evaluate nothing. A unique index is built by validateUniqueIndex,
+ * whose key reads evaluate the same way while it looks for duplicate keys. Only the table's own rows are read: an
+ * INHERITS child's rows are not in the index. A partitioned table's rows live in its partitions, whose column layout
+ * may differ from the parent's the expressions are analyzed against: not evaluated. Nor is an expression the engine
+ * cannot evaluate (a function it does not implement): that is a limitation of the engine, not an error of the rows,
+ * so the index is built without it, as the engine always built non-unique indexes.
+ */
+function evaluateIndexOverRows(rel: Relation, index: Relation, ctx: DdlContext): void {
+  const info = index.index!;
+  const expressions = info.keys.filter((k) => k.attnum === 0 && k.expr).map((k) => k.expr!);
+  if ((!info.predicate && expressions.length === 0) || rel.kind === 'p') {
+    return;
+  }
+  const tuples = ctx.visibleTuples(rel, false);
+  if (tuples.length === 0) {
+    return;
+  }
+  ctx.st.scratch.clear();
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { EvalCtx } = require('../exec/runtime');
+  const compile = (stored: StoredExpr, kind: 'index' | 'predicate'): Evaluator => {
+    const { q, expr } = ctx.host.analyzeRelationExpr(rel, stored, kind);
+    return ctx.executor.planFor(q, null).ev(expr);
+  };
+  try {
+    const predicate = info.predicate ? compile(info.predicate, 'predicate') : null;
+    const keys = expressions.map((e) => compile(e, 'index'));
+    for (const { tuple } of tuples) {
+      if (predicate && predicate(new EvalCtx([tuple.data, tuple], null, ctx.st)) !== true) {
+        continue;
+      }
+      for (const key of keys) {
+        key(new EvalCtx([tuple.data, tuple], null, ctx.st));
+      }
+    }
+  } catch (e) {
+    if (!isEngineLimitation(e)) {
+      throw e;
+    }
+  }
+}
+
 function validateUniqueIndex(session: Session, cat: Catalog, rel: Relation, index: Relation, ctx: DdlContext): void {
-  const tuples = ctx.visibleTuples(rel);
+  // the table's own rows: an INHERITS child's rows are not in the index
+  const tuples = ctx.visibleTuples(rel, false);
   if (tuples.length === 0) {
     return;
   }

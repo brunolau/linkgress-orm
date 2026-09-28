@@ -29,7 +29,9 @@ export interface UnionLegBuilder {
   /** @internal */
   _applyUnionPostProcessing?(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): any[];
   /** @internal */
-  _buildUnionBatchMeta?(selectionResult: any, hasNestedPaths: boolean): import('./future-query').FutureBatchMeta;
+  _buildUnionBatchMeta?(selectionResult: any, hasNestedPaths: boolean, forcedRuntime?: ReadonlySet<string>): import('./future-query').FutureBatchMeta;
+  /** What the leg declares for each flat alias of its selection — see SelectQueryBuilder._batchTypeSignatures. @internal */
+  _batchTypeSignatures?(selectionResult: any): Map<string, string>;
   /**
    * CTEs this leg carries from `.with(...)`. The union hoists them to statement
    * level so every leg can reference them; see `UnionQueryBuilder.buildSql`.
@@ -54,6 +56,29 @@ interface UnionComponent {
   unionType?: UnionType;
   /** Owner reference so post-fetch processing can call back into the builder. */
   ownerBuilder?: UnionLegBuilder;
+}
+
+/**
+ * The flat aliases (the first leg's) of a union's columns whose legs declare different types — compared
+ * position by position, as PostgreSQL matches a union's columns (see
+ * SelectQueryBuilder._batchTypeSignatures). `undefined` when every leg agrees, or when a leg cannot tell
+ * (the first leg's metadata then stands for all, as it always did).
+ */
+function unionTypeConflicts(legs: ReadonlyArray<{ owner: UnionLegBuilder; selectionResult: any } | undefined>): ReadonlySet<string> | undefined {
+  if (legs.length < 2 || legs.some(leg => leg === undefined || typeof leg.owner._batchTypeSignatures !== 'function')) {
+    return undefined;
+  }
+
+  const [first, ...others] = legs.map(leg => [...leg!.owner._batchTypeSignatures!(leg!.selectionResult)]);
+  const conflicts = new Set<string>();
+
+  first.forEach(([key, signature], position) => {
+    if (others.some(other => other[position]?.[1] !== signature)) {
+      conflicts.add(key);
+    }
+  });
+
+  return conflicts.size > 0 ? conflicts : undefined;
 }
 
 /**
@@ -330,12 +355,16 @@ export class UnionQueryBuilder<TSelection> {
    * both post-processing (nested reconstruction, collection mappers) and JSON
    * revival — correct because UNION semantics force every leg to project the
    * identical column shape, so the shape-driven mapping applies to all rows.
+   * A column whose legs declare different types (a date in one, a timestamp in
+   * another) has the type PostgreSQL resolves for the union, which the first
+   * leg does not declare: the batch sends that column's runtime type.
    */
   future(): FutureQuery<TSelection> {
     const { sql, params } = this.buildSql();
 
     let firstLegMeta: { nestedPaths: Set<string>; selectionResult: any } | undefined;
     let firstLegOwner: UnionLegBuilder | undefined;
+    const legs: Array<{ owner: UnionLegBuilder; selectionResult: any } | undefined> = [];
     for (let i = 0; i < this.components.length; i++) {
       const c = this.components[i];
       if (c.ownerBuilder?._consumeUnionMetadata) {
@@ -344,9 +373,13 @@ export class UnionQueryBuilder<TSelection> {
           firstLegMeta = meta;
           firstLegOwner = c.ownerBuilder;
         }
-        // Non-first legs: just drain to avoid stale state on the builder.
+        legs.push(meta ? { owner: c.ownerBuilder, selectionResult: meta.selectionResult } : undefined);
+      } else {
+        legs.push(undefined);
       }
     }
+
+    const forcedRuntime = unionTypeConflicts(legs);
 
     const transformFn = (rows: any[]): TSelection[] => {
       if (firstLegOwner?._applyUnionPostProcessing && firstLegMeta) {
@@ -358,7 +391,7 @@ export class UnionQueryBuilder<TSelection> {
 
     const future = new FutureQuery<TSelection>(sql, params, transformFn, this.client, this.executor);
     future._batchMeta = firstLegMeta && firstLegOwner?._buildUnionBatchMeta
-      ? firstLegOwner._buildUnionBatchMeta(firstLegMeta.selectionResult, firstLegMeta.nestedPaths.size > 0)
+      ? firstLegOwner._buildUnionBatchMeta(firstLegMeta.selectionResult, firstLegMeta.nestedPaths.size > 0, forcedRuntime)
       : { hasNestedPaths: (firstLegMeta?.nestedPaths.size ?? 0) > 0 };
 
     return future;

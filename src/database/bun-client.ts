@@ -1,5 +1,16 @@
-import { DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions } from './database-client.interface';
+import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, TransactionEndedError } from './database-client.interface';
+import type { TypedTextRead } from './database-client.interface';
 import type { BunSqlOptions } from './types';
+import { parseBuiltInTypedText } from './typed-text';
+
+/**
+ * Bun's own decoding of a TEXT result: a date at UTC midnight, a timestamp without a zone as a UTC wall
+ * time, a date or a timestamp before Christ as an invalid Date.
+ */
+const BUN_TEXT_PARSING = { dateAsUtc: true, timestampAsUtc: true, bcDateInvalid: true, bcTimestampInvalid: true } as const;
+
+/** Bun's decoding of a BINARY result: as of a text one, but a timestamp before Christ read as that time. */
+const BUN_BINARY_PARSING = { ...BUN_TEXT_PARSING, bcTimestampInvalid: false } as const;
 
 // Resolved lazily so the module can be imported under Node
 type BunSql = any;
@@ -171,11 +182,20 @@ function normalizeParams(params: any[] | undefined, textMode: boolean): any[] {
 
 /**
  * Wrapper for the reserved connection from Bun SQL
+ *
+ * Released, the reserved connection is back in the pool: later statements are refused with a
+ * {@link ConnectionReleasedError}.
  */
 class BunPooledConnection implements PooledConnection {
+  private released = false;
+
   constructor(private reserved: any, private textMode: boolean, private datesAsStrings: boolean) {}
 
   async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    if (this.released) {
+      throw new ConnectionReleasedError(sql);
+    }
+
     // Bun result sets are real arrays — pass through without copying.
     const result = await this.reserved.unsafe(sql, normalizeParams(params, this.textMode));
 
@@ -194,6 +214,12 @@ class BunPooledConnection implements PooledConnection {
   }
 
   release(): void {
+    // a second release() never reaches Bun.SQL (the reserved connection may belong to another caller by now)
+    if (this.released) {
+      return;
+    }
+
+    this.released = true;
     this.reserved.release();
   }
 }
@@ -313,10 +339,18 @@ export class BunClient extends DatabaseClient {
   /**
    * Execute a callback within a transaction.
    * Uses Bun SQL's built-in sql.begin() for proper transaction handling.
+   *
+   * The query function is valid until the callback settles; a statement sent through it later is refused with
+   * a {@link TransactionEndedError}.
    */
   async transaction<T>(callback: (query: (sql: string, params?: any[]) => Promise<QueryResult>) => Promise<T>): Promise<T> {
     return await this.sql.begin(async (tx: BunSql) => {
+      let open = true;
       const queryFn = async (sqlStr: string, params?: any[]): Promise<QueryResult> => {
+        if (!open) {
+          throw new TransactionEndedError(sqlStr);
+        }
+
         const result = await tx.unsafe(sqlStr, normalizeParams(params, this.usesTextResults));
 
         if (!this.usesTextResults) {
@@ -333,7 +367,11 @@ export class BunClient extends DatabaseClient {
         };
       };
 
-      return await callback(queryFn);
+      try {
+        return await callback(queryFn);
+      } finally {
+        open = false;
+      }
     });
   }
 
@@ -446,6 +484,38 @@ export class BunClient extends DatabaseClient {
    */
   losesNumericZeroScale(): boolean {
     return !this.usesTextResults;
+  }
+
+  /**
+   * The value Bun's SQL client delivers for a column of the type `oid` holding `text` — reproduced, as
+   * Bun exposes no parsers: a boolean, an int2 / int4 / oid and a float as a number, a json document
+   * parsed, an int8 as its text (a BigInt with Bun's `bigint: true`), a date at UTC midnight, a timestamp
+   * without a zone as a UTC wall time, a timestamptz as its instant, ±infinity as ±Infinity, bytea as a
+   * Buffer, an array of these element by element, every other type as its text; a date before Christ as
+   * an invalid Date. Bun decodes the results of a PARAMETERISED statement (`read.parameterized`) through
+   * the binary protocol unless the client runs with `prepare: false`: a numeric zero then loses its scale
+   * (see losesNumericZeroScale) and a timestamp before Christ reads as that time, where the text decoding
+   * makes it an invalid Date. With `datesAsStrings`, a date / timestamp as the PostgreSQL text the client
+   * makes of it.
+   */
+  parseTypedText(oid: number, text: string, read?: TypedTextRead): unknown {
+    const binary = !this.usesTextResults && read?.parameterized === true;
+
+    if (oid === 1700 && binary && /^-?0\.0+$/.test(text)) {
+      return '0';
+    }
+
+    const parsing = binary ? BUN_BINARY_PARSING : BUN_TEXT_PARSING;
+    const value = parseBuiltInTypedText(oid, text, this.sql?.options?.bigint === true ? { ...parsing, int8AsBigInt: true } : parsing);
+
+    if (this.datesAsStrings && value instanceof Date) {
+      const row = { value };
+      convertDatesToPgText([row]);
+
+      return row.value;
+    }
+
+    return value;
   }
 
   /**

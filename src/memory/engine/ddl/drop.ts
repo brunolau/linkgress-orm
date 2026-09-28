@@ -2,8 +2,9 @@ import * as A from '../ast';
 import { lookupRelation } from '../analyze/from';
 import { Catalog, Relation, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
+import type { StatementState } from '../exec/runtime';
 import type { Session } from '../session';
-import { relationKindName } from './common';
+import { preventInTransactionBlock, relationKindName } from './common';
 
 interface DropCtx {
   session: Session;
@@ -72,6 +73,18 @@ export function dropRelation(ctx: DropCtx, rel: Relation, requested: boolean): v
         hint: `You can drop constraint ${con.name} on table ${table.name} instead.`,
       });
     }
+    // an index attached to a partitioned index (ALTER INDEX … ATTACH PARTITION) goes with it, never alone
+    const partitioned = rel.parentOid ? cat.getRelation(rel.parentOid) : undefined;
+    if (partitioned?.kind === 'I' && requested) {
+      throw new PgError(SqlState.DEPENDENT_OBJECTS_STILL_EXIST, `cannot drop index ${rel.name} because index ${partitioned.name} requires it`, {
+        hint: `You can drop index ${partitioned.name} instead.`,
+      });
+    }
+    if (rel.kind === 'I') {
+      for (const attached of cat.childrenOf(rel.oid)) {
+        dropRelation(ctx, attached, false);
+      }
+    }
   }
 
   // owned objects
@@ -132,7 +145,17 @@ export function dropRelationNow(session: Session, relOid: number): void {
   }
 }
 
-export function executeDrop(session: Session, stmt: A.DropStmt): string {
+export function executeDrop(session: Session, stmt: A.DropStmt, parentSt: StatementState | null): string {
+  if (stmt.concurrently) {
+    // ExecDropStmt, then RemoveRelations: refused before any name is looked up
+    preventInTransactionBlock(session, parentSt, 'DROP INDEX CONCURRENTLY');
+    if (stmt.objects.length !== 1) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'DROP INDEX CONCURRENTLY does not support dropping multiple objects');
+    }
+    if (stmt.cascade) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'DROP INDEX CONCURRENTLY does not support CASCADE');
+    }
+  }
   const cat = session.ddlCatalog();
   const ctx: DropCtx = { session, cat, cascade: stmt.cascade, notices: [], dropped: new Set() };
   const tag = 'DROP ' + stmt.objectType;
@@ -144,9 +167,6 @@ export function executeDrop(session: Session, stmt: A.DropStmt): string {
     case 'INDEX':
     case 'SEQUENCE':
     case 'FOREIGN TABLE': {
-      if (stmt.concurrently && session.txn!.explicit) {
-        throw new PgError(SqlState.ACTIVE_SQL_TRANSACTION, 'DROP INDEX CONCURRENTLY cannot run inside a transaction block');
-      }
       const rels: Relation[] = [];
       for (const obj of stmt.objects) {
         const rv = { schema: obj.names.length > 1 ? obj.names[obj.names.length - 2] : undefined, name: obj.names[obj.names.length - 1] };
@@ -175,6 +195,10 @@ export function executeDrop(session: Session, stmt: A.DropStmt): string {
         }
         if (rel.isBuiltinCatalog) {
           throw new PgError(SqlState.INSUFFICIENT_PRIVILEGE, `permission denied: "${rel.name}" is a system catalog`);
+        }
+        // a temporary index is dropped without CONCURRENTLY, so only a permanent partitioned one is refused
+        if (stmt.concurrently && rel.kind === 'I' && rel.persistence !== 't') {
+          throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, `cannot drop partitioned index "${rv.name}" concurrently`);
         }
         rels.push(rel);
       }
@@ -439,6 +463,15 @@ export function executeTruncate(session: Session, stmt: A.TruncateStmt): string 
       txn.droppedStorage.push(current.storageId);
     }
     cat.putRelation({ ...current, storageId: heap.storageId });
+    // TRUNCATE rebuilds the table's indexes over no rows (reindex_relation), without re-checking constraints: an
+    // INVALID or not-ready one — what a failed CREATE INDEX CONCURRENTLY left, or an UPDATE of pg_index — is valid
+    // and ready again unless it is unique (or an exclusion index), as reindex_index marks valid only an index whose
+    // uniqueness check it did not skip
+    for (const ix of [...cat.indexesOf(rel.oid)]) {
+      if (ix.index && (!ix.index.valid || ix.index.ready === false) && !ix.index.unique && !ix.index.exclusion) {
+        cat.putRelation({ ...ix, index: { ...ix.index, valid: true, ready: true } });
+      }
+    }
     if (stmt.restartIdentity) {
       for (const s of cat.relations.values()) {
         if (s.kind === 'S' && s.sequence?.ownedBy?.relOid === rel.oid) {

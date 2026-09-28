@@ -698,6 +698,126 @@ Notes:
 - The recreate has a brief window with no index while it rebuilds; prefer the
   `concurrent` form on large production tables.
 
+### An INVALID Index (a failed `CREATE INDEX CONCURRENTLY`)
+
+`CREATE INDEX CONCURRENTLY` commits the new index before it builds it. When the
+build fails — a unique index over duplicate rows, an index expression or
+predicate that raises for a row, a lock or statement timeout, a cancel — the
+index is left behind **INVALID** (`pg_index.indisvalid = false`): PostgreSQL
+never uses it for reads, and `CREATE INDEX … IF NOT EXISTS` skips it because
+the name exists. (A failed `REINDEX CONCURRENTLY` leaves its INVALID copy under
+another name, `<name>_ccnew`: the model does not declare it, so it is left alone.)
+
+`migrate()` treats such an index as **missing** and builds it again from the
+model. `analyze()` lists the repair as its own operation:
+
+```typescript
+const operations = await db.getSchemaManager().analyze();
+// → [{ type: 'repair_index', indexName: 'uq_books_isbn', previousDef: 'CREATE UNIQUE INDEX uq_books_isbn …', … }]
+
+await db.getSchemaManager({ concurrentIndexes: true }).migrate();
+// → Repair INVALID index "uq_books_isbn" on "books" (drop + create CONCURRENTLY from the model)
+```
+
+How it rebuilds, and what a failed repair leaves:
+
+- **Concurrent** (the index is `.concurrent()`, or the manager runs with
+  `concurrentIndexes: true`): `DROP INDEX CONCURRENTLY IF EXISTS`, then
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS` — neither blocks writes. A build
+  that fails leaves an INVALID index of its own under the name — not ready when
+  the build itself failed, so the next migration repairs it again and fails the
+  same way until the cause is fixed; ready when it failed while validating a
+  unique index, so the next migration leaves it alone (see below).
+- **Blocking** (neither): the model's index is built first, beside the INVALID
+  one, under a temporary name (`<name>_lkgnew`, shortened to fit 63 bytes), and
+  swapped in only once built — `DROP INDEX` of the INVALID one and `ALTER INDEX
+  … RENAME` in one transaction. The build blocks writes to the table, as any
+  `CREATE INDEX` does (a warning says so); the swap takes an ACCESS EXCLUSIVE
+  lock briefly. A build that fails leaves nothing, so the INVALID index is as it
+  was and the next migration fails the same way.
+- Repairs run **last**, after every other operation of the migration (views
+  re-created included), each on its own. Their failures are collected and
+  thrown as **one** `IndexRepairError` naming each index and its cause — after
+  the post-migration hook (`onMigrationComplete`) has run: the rest of the
+  migration is done. A rebuild is never retried: remove the cause and run the
+  migration again — while it persists, every migration ends with the same
+  `IndexRepairError`, never a raw database error.
+- The repair runs whatever `recreateChangedIndexes` says — an INVALID index is
+  missing, not changed — and builds the model's current definition. The model
+  index is validated before anything is built or dropped: one PostgreSQL cannot
+  build (say `INCLUDE` on a GIN index) fails the repair and leaves the INVALID
+  index as it was.
+
+Some INVALID indexes are **left alone**, with a warning naming the index and
+what to do — at planning and again right before the repair runs, as time may
+have passed since the plan:
+
+- one whose table has an **index build running** — its own
+  `CREATE INDEX CONCURRENTLY`, a `REINDEX INDEX CONCURRENTLY` of it (building
+  `<name>_ccnew`), or any other build on the table.
+  `pg_stat_progress_create_index` shows the table of a build the migrating role
+  may watch (a build run by a role it belongs to, or any build with
+  `pg_read_all_stats`); for any other build it shows no table, and the locks the
+  build's backend holds on the table (`pg_locks`, readable by every role) show
+  it instead. Dropping the index then would queue behind the build and lock the
+  table out — or deadlock with it. Run the migration again once the build has
+  finished.
+- a **partitioned** index: INVALID by design until every partition has an
+  attached valid index — PostgreSQL's online procedure is `CREATE INDEX … ON
+  ONLY`, then each partition's index `CONCURRENTLY`, attached one by one with
+  `ALTER INDEX … ATTACH PARTITION`. The warning names the partitions still
+  without one.
+- one a **constraint requires** (`pg_constraint.conindid`): PostgreSQL refuses
+  to drop it. Rebuild it in place with `REINDEX INDEX CONCURRENTLY`.
+- a **unique** one that is still **ready** (`indisready`) — a concurrent build
+  that failed while validating, or was cancelled while waiting for older
+  snapshots: it still rejects duplicates, which dropping it to rebuild would
+  stop. Rebuild it in place with `REINDEX INDEX CONCURRENTLY` (remove duplicate
+  rows first if that fails).
+- one that is **no longer INVALID** when the repair runs (rebuilt by hand,
+  validated); one **dropped** meanwhile is simply created.
+- An INVALID index the model does not declare is left alone, like every index
+  the model does not declare.
+
+```typescript
+import { IndexRepairError } from 'linkgress-orm';
+
+try {
+  await db.getSchemaManager({ concurrentIndexes: true }).migrate();
+} catch (error) {
+  if (error instanceof IndexRepairError) {
+    // Could not repair INVALID index "uq_books_isbn" on "books": could not create unique
+    // index "uq_books_isbn" — Key (isbn)=(978-0) is duplicated. Fix the cause and run the migration again.
+    for (const failure of error.failures) {
+      console.log(failure.indexName, failure.code, failure.reason);  // uq_books_isbn 23505 could not create …
+    }
+  }
+  throw error;
+}
+```
+
+- The error's `failures` lists every index that could not be repaired
+  (`indexName`, `tableName`, `schema`, `code` — the SQLSTATE — `cause` — the
+  database error — and `reason`, its message with DETAIL and HINT); `indexName`,
+  `code` and `cause` on the error itself are the first failure's. A blocking
+  repair's build error names the temporary index (`… "uq_books_isbn_lkgnew"`).
+- Prefer the concurrent form for expression and partial indexes: a
+  **blocking** `CREATE INDEX` also indexes the row versions an older
+  transaction in the same database can still see, so a row you just fixed with
+  an `UPDATE` can fail the rebuild again until those transactions end. A
+  concurrent build reads only the live rows.
+- `ensureCreated()` creates missing indexes by name (`IF NOT EXISTS`) and does
+  not repair one: run `migrate()`.
+- A scaffolded migration (`MigrationScaffold`) drops the index in a `DO` block
+  only where the schema manager would repair it (INVALID, not partitioned, not
+  required by a constraint, not a unique one still ready, no index build on its
+  table), then runs `CREATE INDEX … IF NOT EXISTS` — never `CONCURRENTLY`, as
+  `MigrationRunner` runs each file in one transaction. So the drop's ACCESS
+  EXCLUSIVE lock on the table — reads and writes wait — is held until the file
+  commits, through the whole build; a build that fails fails the file, which
+  rolls the drop back. Where the index is missing the file creates it, and a
+  healthy one is left alone.
+
 ## Collations
 
 Define custom PostgreSQL collations for locale-aware or case/accent-insensitive text handling.
@@ -1005,6 +1125,32 @@ console.log(config.name, config.startWith, config.incrementBy);
 const name = db.customerCodeSeq.getQualifiedName();  // "public"."customer_code_seq"
 ```
 
+`nextValue()`, `currentValue()` and `nextValueCreatingIfMissing()` return a JS number, which is exact only
+within ±(2^53 − 1) (`Number.MAX_SAFE_INTEGER`). Beyond it they throw a `RangeError` — never a rounded number; a
+drawn value is consumed all the same. The bigint variants return every int8 value exactly, and `resync()` takes a
+bigint too — a number it takes only within ±(2^53 − 1), and anything else (2^53 and beyond, a fraction, NaN) throws a
+`RangeError` before any SQL instead of setting a rounded value:
+
+```typescript
+// catalogNoSeq: a model sequence declared like those above, drawing beyond 2^53
+const next = await db.catalogNoSeq.nextValueBigInt();      // 9007199254740993n — nextValue() would throw
+const current = await db.catalogNoSeq.currentValueBigInt();
+await db.catalogNoSeq.resync(9223372036854775000n);
+// runtime sequences: nextValueCreatingIfMissingBigInt()
+```
+
+Inside a transaction, draw through the context the callback receives — the draw then runs in the transaction
+(see [Sequences inside `transaction()`](#sequences-inside-transaction)):
+
+```typescript
+// with a model sequence declared like those above:
+//   get harvestNoSeq(): DbSequence { return this.sequence(sequence('harvest_no_seq').build()); }
+await db.transaction(async tx => {
+  const harvestNo = await tx.harvestNoSeq.nextValue();         // on the transaction's connection
+  await tx.query(`SELECT currval('harvest_no_seq') AS value`); // the same session: the value just drawn
+});
+```
+
 ### Sequence Builder Options
 
 ```typescript
@@ -1025,7 +1171,7 @@ sequence('my_sequence')
 
 A sequence whose name is computed at run time — one per tenant and year, say — is declared by no model.
 `db.runtimeSequence(config)` gives a `DbSequence` for it, and `nextValueCreatingIfMissing()` creates it
-on first use:
+on first use (`nextValueCreatingIfMissingBigInt()` returns the value as an exact bigint):
 
 ```typescript
 const number = await db
@@ -1045,7 +1191,8 @@ const number = await db
 - Not registered: the schema manager never creates, compares or drops a runtime sequence.
 - Bound to the context's ROOT client, also when called on a transaction's context: a CREATE made inside a
   caller's transaction would be undone by its rollback (restarting the numbering), and a failed first
-  `nextval` would abort the transaction. A drawn value is consumed whatever the caller does next.
+  `nextval` would abort the transaction. A drawn value is consumed whatever the caller does next. A model
+  sequence binds the other way round — see [Sequences inside `transaction()`](#sequences-inside-transaction).
 - …which has two consequences when you call it on a transaction's context (`tx.runtimeSequence(…)`):
   - **A second pool connection per call.** The transaction holds one connection and the sequence needs
     another from the same pool. When as many transactions as the pool has connections each wait for
@@ -1061,6 +1208,31 @@ const number = await db
   (-2^63 … 2^63-1): a number — also above 2^53 — or a JS `bigint`; a fraction, NaN, ±Infinity or a
   value outside that range throws before any SQL. The same rule applies to the sequences the schema
   manager creates, which share the options renderer.
+
+### Sequences inside `transaction()`
+
+The two kinds of sequence bind in opposite ways on the context `db.transaction()` hands you:
+
+| On `tx` inside `db.transaction(async tx => …)` | Model sequence (`tx.harvestNoSeq`, declared with `this.sequence()`) | Runtime sequence (`tx.runtimeSequence(…)`) |
+|---|---|---|
+| Bound to | the transaction's client — `tx` gets its own instance | the context's ROOT client |
+| Statements run | inside the transaction, on its connection | on a second pool connection, outside the transaction |
+| `currval()` / `lastval()` in the transaction | the value just drawn | not set by the draw |
+| The transaction's session state (`SET LOCAL search_path`, …) | applies (an unqualified name resolves through it) | does not apply |
+| In a `READ ONLY` transaction | the draw is refused (25006), like any write | draws |
+| A failed draw (an exhausted sequence, …) | aborts the transaction, like any failed statement | leaves the transaction untouched |
+| Connections needed | none beyond the transaction's | one more per call — can exhaust the pool |
+| PGlite (one session) | works | refused at once |
+| Rollback of the transaction | the drawn value stays consumed | the drawn value stays consumed; a CREATE survives |
+| `nextValueCreatingIfMissing()`, sequence missing | probed in the transaction (`to_regclass`, never aborts it), CREATEd on the ROOT client (a second connection; survives a rollback; PGlite refuses it), then drawn in the transaction | the ladder above, on the root client |
+
+Sequences are not transactional: a value drawn in a transaction that rolls back is never handed out again,
+and `resync()` (`setval`) is not undone by the rollback. The root context `db` keeps its own model-sequence
+instances, bound to the root client; the sequence registry the schema manager reads is shared. `tx`'s instance
+belongs to the transaction, like `tx`'s table accessors: kept past the callback, its statements are refused with a
+`TransactionEndedError` (see "The transaction's objects end with it" in the insert/update guide). Use
+`db.<sequence>` outside the transaction. Before 1.0.11 a model sequence reached through `tx` was the root's
+instance and ran on a second connection like a runtime one.
 
 ## Default Values
 

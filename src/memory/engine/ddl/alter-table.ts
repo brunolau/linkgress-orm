@@ -4,12 +4,12 @@ import { transformExpr } from '../analyze/expr';
 import { addRelationRte } from '../analyze/from';
 import { emptyQuery } from '../analyze/nodes';
 import { ParseState } from '../analyze/parse-state';
-import { Catalog, Column, Relation, TypeOid } from '../catalog/catalog';
+import { Catalog, Column, IndexInfo, Relation, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { EvalCtx } from '../exec/runtime';
 import { parseExpression } from '../parser-ddl';
 import type { Session } from '../session';
-import { buildSequenceInfo, chooseConstraintName, chooseRelationName, createSequenceRelation, newColumn, newConstraint } from './common';
+import { buildSequenceInfo, chooseConstraintName, chooseRelationName, createSequenceRelation, newColumn, newConstraint, validatePartitionedIndex } from './common';
 import { addCheckConstraint, addForeignKey, addIndexConstraint, lookupTable } from './create-table';
 import { dropRelation } from './drop';
 import { DdlContext } from './stmt-context';
@@ -407,6 +407,13 @@ export function executeAlterTable(session: Session, stmt: A.AlterTableStmt): str
       case 'ENABLE_TRIGGER':
         break;
       case 'ATTACH_PARTITION': {
+        if (stmt.objectType === 'INDEX') {
+          attachPartitionIndex(session, cat, rel, cmd.partition);
+          break;
+        }
+        if (!cmd.bound) {
+          throw new PgError(SqlState.SYNTAX_ERROR, 'syntax error at end of input');
+        }
         const part = lookupTable(session, cmd.partition);
         cat.putRelation({ ...part, parentOid: relOid, partitionBound: cmd.bound });
         break;
@@ -426,6 +433,66 @@ export function executeAlterTable(session: Session, stmt: A.AlterTableStmt): str
     }
   }
   return tag;
+}
+
+/**
+ * ALTER INDEX … ATTACH PARTITION (ATExecAttachPartitionIdx): the index of one of the partitions becomes a partition of
+ * the partitioned index — the step of PostgreSQL's online procedure after each partition's index is built. Once every
+ * partition has an attached valid index, the partitioned index is valid. Attaching it again changes nothing.
+ */
+function attachPartitionIndex(session: Session, cat: Catalog, parent: Relation, rv: A.RangeVar): void {
+  if (parent.kind !== 'I') {
+    throw new PgError(SqlState.WRONG_OBJECT_TYPE, `ALTER action ATTACH PARTITION cannot be performed on relation "${parent.name}"`, {
+      detail: 'This operation is not supported for indexes.',
+    });
+  }
+  const child = lookupRelation(session.makeAnalyzer(), rv, true);
+  if (!child?.index) {
+    throw new PgError(SqlState.UNDEFINED_OBJECT, `index "${rv.name}" does not exist`);
+  }
+  if (child.parentOid === parent.oid) {
+    return;
+  }
+  const table = current(cat, parent.index!.tableOid);
+  const childTable = current(cat, child.index.tableOid);
+  const cannot = `cannot attach index "${child.name}" as a partition of index "${parent.name}"`;
+  if (child.parentOid) {
+    throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, cannot, { detail: `Index "${child.name}" is already attached to another index.` });
+  }
+  if (childTable.parentOid !== table.oid) {
+    throw new PgError(SqlState.OBJECT_NOT_IN_PREREQUISITE_STATE, cannot, { detail: `Index "${child.name}" is not an index on any partition of table "${table.name}".` });
+  }
+  if (!sameIndexDefinition(table, parent.index!, childTable, child.index)) {
+    throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, cannot, { detail: 'The index definitions do not match.' });
+  }
+  if (cat.childrenOf(parent.oid).some((c) => c.index?.tableOid === childTable.oid)) {
+    throw new PgError(SqlState.INVALID_OBJECT_DEFINITION, cannot, { detail: `Another index is already attached for partition "${childTable.name}".` });
+  }
+  cat.putRelation({ ...child, parentOid: parent.oid });
+  validatePartitionedIndex(cat, parent);
+}
+
+/**
+ * CompareIndexInfo, as far as the engine keeps an index: method, uniqueness, keys (a column by name — a partition's
+ * columns may be numbered differently — or an expression by its text), their operator classes, collations and
+ * ordering, INCLUDE columns and the predicate.
+ */
+function sameIndexDefinition(parentTable: Relation, parent: IndexInfo, childTable: Relation, child: IndexInfo): boolean {
+  const columnName = (rel: Relation, attnum: number) => rel.columns[attnum - 1]?.name;
+  const text = (e?: { text: string }) => (e?.text ?? '').replace(/\s+/g, ' ').trim();
+  if (parent.method !== child.method || parent.unique !== child.unique || parent.nullsNotDistinct !== child.nullsNotDistinct || parent.exclusion !== child.exclusion) {
+    return false;
+  }
+  if (parent.keys.length !== child.keys.length || parent.include.length !== child.include.length) {
+    return false;
+  }
+  const keysMatch = parent.keys.every((k, i) => {
+    const c = child.keys[i];
+    const sameKey = k.attnum > 0 ? c.attnum > 0 && columnName(parentTable, k.attnum) === columnName(childTable, c.attnum) : c.attnum === 0 && text(k.expr) === text(c.expr);
+    return sameKey && k.opclassOid === c.opclassOid && k.collation === c.collation && k.desc === c.desc && k.nullsFirst === c.nullsFirst;
+  });
+  const includeMatches = parent.include.every((a, i) => columnName(parentTable, a) === columnName(childTable, child.include[i]));
+  return keysMatch && includeMatches && text(parent.predicate) === text(child.predicate);
 }
 
 function exprMentions(text: string, name: string): boolean {

@@ -27,10 +27,11 @@ export class DdlContext {
   }
 
   /** Visible tuples of a relation (including its partitions). */
-  visibleTuples(rel: Relation): { rel: Relation; tuple: Tuple }[] {
+  /** `inh`: with the rows of INHERITS children (a partitioned table's partitions hold its rows either way). */
+  visibleTuples(rel: Relation, inh = true): { rel: Relation; tuple: Tuple }[] {
     const out: { rel: Relation; tuple: Tuple }[] = [];
     const vis = this.session.db.store.vis;
-    for (const part of this.host.relationHeaps(rel, true, this.st)) {
+    for (const part of this.host.relationHeaps(rel, inh, this.st)) {
       for (const t of part.heap.tuples) {
         if (vis.visible(t, this.st.snapshot)) {
           out.push({ rel: part.rel, tuple: t });

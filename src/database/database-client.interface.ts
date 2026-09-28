@@ -1,9 +1,25 @@
+import { parseBuiltInTypedText } from './typed-text';
+
 /**
  * Database-agnostic query result interface
  */
 export interface QueryResult<T = any> {
   rows: T[];
   rowCount: number | null;
+}
+
+/**
+ * How a statement would have read a value standalone — what a driver may decode a result column by
+ * (see DatabaseClient.parseTypedText).
+ */
+export interface TypedTextRead {
+  /**
+   * Whether the statement binds parameters. A driver may decode the results of a parameterised
+   * statement otherwise than those of a statement without any: Bun's SQL client decodes them through
+   * the binary protocol (unless `prepare: false`), which drops a numeric zero's scale and reads a
+   * timestamp before Christ that its text decoding cannot.
+   */
+  readonly parameterized?: boolean;
 }
 
 /**
@@ -77,8 +93,63 @@ export class QueryTimeoutError extends Error {
 }
 
 /**
+ * A statement sent through a transaction after that transaction ended — committed, rolled back or failed.
+ *
+ * Everything obtained from the context `db.transaction()` hands its callback — table accessors, model
+ * sequences, query builders, futures, `QueryBatch` / `MutationBatch` legs, prepared queries, its schema
+ * manager, its client — and the query function a driver's `transaction()` hands its callback, run their
+ * statements on the transaction's connection. Once the transaction has ended that connection is back in the
+ * pool and may belong to ANOTHER transaction, so such a statement is refused before it reaches the database.
+ * Use the root context (or a new transaction) instead.
+ */
+export class TransactionEndedError extends Error {
+  /** The SQL text of the refused statement (never sent). */
+  readonly sql: string;
+
+  constructor(sql: string) {
+    super(
+      'this transaction has already ended — objects obtained from its context (tables, sequences, queries, ' +
+      'batches, its schema manager, its client) are only valid inside transaction(); use the root context ' +
+      'or a new transaction instead. The statement was not run.'
+    );
+    this.name = 'TransactionEndedError';
+    this.sql = sql;
+    // Restore prototype chain so `instanceof` works when targeting ES5
+    Object.setPrototypeOf(this, TransactionEndedError.prototype);
+  }
+}
+
+/**
+ * A statement sent through a {@link PooledConnection} after its `release()`.
+ *
+ * Released, the connection's session is back in the pool, which may already have handed it to another caller —
+ * in the middle of that caller's transaction, say (PGlite: its one session, outside the session lock). So such a
+ * statement is refused before it reaches the database. Acquire a new connection with `connect()`.
+ */
+export class ConnectionReleasedError extends Error {
+  /** The SQL text of the refused statement (never sent). */
+  readonly sql: string;
+
+  constructor(sql: string) {
+    super(
+      'this connection has already been released — a statement on it would run on a pooled connection that may ' +
+      'belong to another caller by now; acquire a new one with connect(). The statement was not run.'
+    );
+    this.name = 'ConnectionReleasedError';
+    this.sql = sql;
+    // Restore prototype chain so `instanceof` works when targeting ES5
+    Object.setPrototypeOf(this, ConnectionReleasedError.prototype);
+  }
+}
+
+/**
  * Database-agnostic pooled client/connection interface
  * Represents a single connection from the pool for transactions
+ *
+ * Valid until `release()`: a statement issued after it is refused with a {@link ConnectionReleasedError} (one
+ * issued before completes). A second `release()` never reaches the driver's pool — which may have handed the
+ * session to another caller by then: `PgClient`'s throws node-postgres's own error, `PostgresClient`'s,
+ * `BunClient`'s and `PGliteClient`'s do nothing.
  */
 export interface PooledConnection {
   query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>>;
@@ -166,13 +237,49 @@ export abstract class DatabaseClient {
   losesNumericZeroScale(): boolean {
     return false;
   }
+
+  /**
+   * The value this client delivers, standalone, for a result column of the type `oid` whose PostgreSQL
+   * TEXT form is `text` — through the parser its driver is configured with (the driver's defaults, or
+   * the application's own). A QueryBatch sends a value its JSON envelope cannot carry as the driver
+   * delivers it (a timestamp, an int8, a value of a type with a parser of the application's) as its
+   * text and turns it back with this, so a batched value is exactly the one the same query reads on
+   * its own through this client.
+   *
+   * `read` says how the statement would have read it (whether it binds parameters), for a driver that
+   * decodes a result column by that.
+   *
+   * Default: node-postgres's default parsing — a date and a timestamp without a zone as a local Date,
+   * a timestamptz as its instant, ±infinity as ±Infinity, bytea as a Buffer, an array of them element by
+   * element; every other type as its text. A client of another driver overrides it.
+   */
+  parseTypedText(oid: number, text: string, _read?: TypedTextRead): unknown {
+    return parseBuiltInTypedText(oid, text, NODE_POSTGRES_PARSING);
+  }
+
+  /**
+   * The types (OIDs) this client's driver parses with a parser the application configured, beyond the
+   * driver's defaults: a QueryBatch sends every value of these types as its text, so that parser gets
+   * it (see parseTypedText). Default: none.
+   */
+  customParsedTypeOids(): readonly number[] {
+    return [];
+  }
 }
+
+/** node-postgres's defaults: a date at local midnight, a timestamp without a zone as a local time. */
+const NODE_POSTGRES_PARSING = { dateAsUtc: false, timestampAsUtc: false } as const;
 
 /**
  * A wrapper client that routes queries through a transactional connection.
  * Used internally to ensure all operations within a transaction use the same connection.
+ *
+ * Once the transaction has ended ({@link markEnded}) every statement is refused with a
+ * {@link TransactionEndedError}: the connection behind the query function is back in the pool.
  */
 export class TransactionalClient extends DatabaseClient {
+  private ended = false;
+
   constructor(
     private queryFn: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>,
     private parentClient: DatabaseClient
@@ -180,16 +287,33 @@ export class TransactionalClient extends DatabaseClient {
     super();
   }
 
+  /**
+   * The client of a transaction — also after it ended, when its statements are refused (a context kept past its
+   * transaction keeps reporting where it came from, and its statements fail with {@link TransactionEndedError}).
+   */
   isInTransaction(): boolean {
     return true;
   }
 
   async query<T = any>(sql: string, params?: any[], options?: QueryExecutionOptions): Promise<QueryResult<T>> {
+    if (this.ended) {
+      throw new TransactionEndedError(sql);
+    }
+
     // Forward the per-query options (notably `.withTimeout()`'s `timeoutMs`) to the
     // transaction's query fn. Earlier versions dropped these, so a per-query timeout
     // silently no-op'd inside `db.transaction()`; the driver now honors it via a
     // statement-scoped `SET LOCAL statement_timeout`.
     return await this.queryFn(sql, params, options) as QueryResult<T>;
+  }
+
+  /**
+   * The transaction ended — its callback settled; COMMIT or ROLLBACK follows. From now on every statement is
+   * refused with a {@link TransactionEndedError} instead of running on the released pooled connection.
+   * @internal
+   */
+  markEnded(): void {
+    this.ended = true;
   }
 
   async connect(): Promise<PooledConnection> {
@@ -206,6 +330,11 @@ export class TransactionalClient extends DatabaseClient {
   }
 
   async transaction<T>(_callback: (query: (sql: string, params?: any[], options?: QueryExecutionOptions) => Promise<QueryResult>) => Promise<T>): Promise<T> {
+    // an ENDED transaction's context: the real cause — the statement it would begin with is refused
+    if (this.ended) {
+      throw new TransactionEndedError('BEGIN');
+    }
+
     // Nested transactions not supported - could implement savepoints in the future
     throw new Error('Nested transactions are not supported');
   }
@@ -224,5 +353,13 @@ export class TransactionalClient extends DatabaseClient {
 
   losesNumericZeroScale(): boolean {
     return this.parentClient.losesNumericZeroScale();
+  }
+
+  parseTypedText(oid: number, text: string, read?: TypedTextRead): unknown {
+    return this.parentClient.parseTypedText(oid, text, read);
+  }
+
+  customParsedTypeOids(): readonly number[] {
+    return this.parentClient.customParsedTypeOids();
   }
 }
