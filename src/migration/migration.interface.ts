@@ -91,6 +91,21 @@ export interface MigrationConfig {
    * Level indicates the type of log message ('info', 'error', 'debug').
    */
   logger?: (message: string, level?: LogLevel) => void;
+
+  /**
+   * Free-form label stored in every journal row this runner records as
+   * applied (normal path, baselined rows, and runOnBaseline-executed rows) —
+   * typically the release/image tag (e.g. `2026.09.25-88a9dc5`). Lets a
+   * later rollback know which release applied which migration, so it can
+   * pick the files and the build that contains them.
+   *
+   * linkgress never reads this from the environment — the caller passes it.
+   * Unset means the row's `applied_by` is NULL, same as rows written before
+   * this option existed.
+   *
+   * @default undefined (NULL)
+   */
+  appliedBy?: string;
 }
 
 /**
@@ -110,6 +125,12 @@ export interface MigrationJournalEntry {
    * runOnBaseline migrations executed during a baseline.
    */
   baselined: boolean;
+  /**
+   * The `MigrationConfig.appliedBy` label of the runner that recorded this
+   * row, or NULL when that runner had none set (including every row written
+   * before this column existed).
+   */
+  applied_by: string | null;
 }
 
 /**

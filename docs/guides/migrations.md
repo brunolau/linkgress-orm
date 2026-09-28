@@ -837,6 +837,7 @@ const runner = new MigrationRunner(db, {
   journalSchema: 'public',          // default
   verbose: true,                    // log progress
   logger: console.log,              // custom logger
+  appliedBy: '2026.09.25-88a9dc5',  // optional — see "Journal Table" below
 });
 
 // Run all pending migrations
@@ -989,6 +990,12 @@ console.log(`Reverted: ${result3.applied.join(', ')}`);
 - The `down()` method runs migrations in reverse order (most recent first)
 - Each rollback runs in a transaction for safety
 - Some operations cannot be auto-generated for `down()` (marked with comments in scaffolded files)
+- If a migration's FILE is missing (e.g. rolling back from a build that no longer ships it), `down()`
+  does NOT delete the journal row or otherwise pretend the migration was reverted: nothing was
+  actually undone, so it reports that migration under `result.failed` and stops there — exactly like
+  a `down()` that threw. Any older migrations in the same batch stay untouched and pending revert.
+  Either run `down()` from a build that contains the file, or, if you already reverted its effects by
+  hand, remove its journal row yourself with `MigrationJournal.recordReverted()`.
 
 ### NPM Scripts for Manual Migrations
 
@@ -1095,11 +1102,14 @@ CREATE TABLE "__migrations" (
   id SERIAL PRIMARY KEY,
   filename VARCHAR(255) NOT NULL UNIQUE,
   applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  baselined BOOLEAN NOT NULL DEFAULT FALSE
+  baselined BOOLEAN NOT NULL DEFAULT FALSE,
+  applied_by TEXT
 );
 ```
 
 `baselined` is true for rows recorded by the fresh-database baseline shortcut without being executed (their effects came from the model-built schema); it is false for migrations whose `up()` really ran — including `runOnBaseline` migrations executed during a baseline. Read it via `MigrationJournal.getApplied()` or `MigrationRunner.status()`. Journals created before the column existed are upgraded automatically (idempotent `ADD COLUMN IF NOT EXISTS`; pre-existing rows keep the default false).
+
+`applied_by` is a free-form label — set it with `MigrationConfig.appliedBy` — stored on every row the runner records as applied (normal path, baselined rows, and `runOnBaseline`-executed rows). Use it for the release/image tag that ran the migration (e.g. `2026.09.25-88a9dc5`), so a rollback several releases later can pick the files and the build that contains them. linkgress never reads it from the environment; it is whatever the caller passes. It is `NULL` when `appliedBy` is not configured — the same as every row written before this column existed. Journals created before the column existed are upgraded automatically the same way as `baselined` (idempotent `ADD COLUMN IF NOT EXISTS`; pre-existing rows keep `NULL`).
 
 The table is created automatically when you first run migrations. You can customize the table name and schema:
 
