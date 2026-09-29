@@ -157,6 +157,20 @@ entity.property(e => e.publishTime)
 - Pre-cached in `TableSchema.columnMetadataCache` (`Map<string, { hasMapper, mapper? }>`)
 - Also attached directly on FieldRefs as `__mapper` (set by `ReferenceQueryBuilder.createMockTargetRow()`)
 
+### Shared (immutable) values
+A mapper declared `immutable: true` (`createCustomType`, `customType`, `TypeMapper.immutable`) has its
+`fromDriver` called once per distinct primitive driver value of a column within ONE result set
+(`src/query/shared-values.ts`). Every read path that applies `fromDriver` reads through
+`forResultSet(mapper, count)`, made once per result set and column (a RETURNING's collection: once per
+shape entry, i.e. per key) — never on a plan that serves several result sets (a future's, a prepared
+query's, a join's grouped readers, a RETURNING plan): those keep the declared mapper and make it per
+result set (`readerThrough` / `readersForResultSet`, `shapeForResultSet`). `count` = the values the
+reader reads (`rows.length`; a collection's items via `valuesAt`, computed only when asked): it sizes
+the probe window (`probeWindow`) and skips the memo under 2 values (an `agg.arrayAgg` list's elements are
+not rows and get no count: `readerThrough(…, false)`). A mapper without the flag comes back
+from `forResultSet` as it is; the factories of derived mappers / plan readers live in a module
+`WeakMap`, never on the objects.
+
 ### Result Mapping Pipeline (`transformResults()` in query-builder.ts)
 1. **Pre-analysis phase**: `compileFieldRead()` compiles each projected value into a `FieldRead` (FieldType FIELD_REF_MAPPER, FIELD_REF_NO_MAPPER, SQL_FRAGMENT_MAPPER, SIMPLE, LITERAL, NESTED, collections, CTE_AGGREGATION)
 2. **Per-row phase**: `readField()` applies it — `mapper.fromDriver()`, a literal as itself, a NESTED read value by value

@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   isTextParsedType, JSON_TEXT_TYPE_OIDS, needsClientParse, parseBuiltInTypedText, parsePgArrayText, TEXT_TRANSPORT_TYPE_OIDS, textOfJsonForm, withArrayTypes,
 } from '../../src/database/typed-text';
-import { applyBatchOverrides, canonicalJsonColumnType, flatRowBatchMeta, jsonColumnDelivery } from '../../src/query/future-query';
+import { applyBatchOverrides, canonicalJsonColumnType, flatRowBatchMeta, jsonColumnDelivery, reviveJsonRows } from '../../src/query/future-query';
+import { ParsedValueMemo } from '../../src/query/parsed-value-memo';
 
 /** A date column's value as node-postgres reads it: local midnight of that day. */
 const localDay = (text: string): Date => {
@@ -62,9 +63,9 @@ describe('the QueryBatch transport of a row', () => {
       { day: null, n: 3, weight: 9007199254740992, label: 'fog' },
     ];
 
-    // In the envelope's order: the text columns, then the runtime-typed ones — NULL where a value needs no
-    // text (label's type needs none); the empty text of a NULL value
-    const merged = applyBatchOverrides(rows, [['12', '2024-03-04', null], ['9007199254740993', '', null]], meta, [20, 1082, 25], client, TEXT_TYPES, { parameterized: true });
+    // In the envelope's order — the text columns, then the runtime-typed ones — each value's texts, one per row;
+    // NULL for a value whose type needs none (label's); the empty text of a NULL value
+    const merged = applyBatchOverrides(rows, [['12', '9007199254740993'], ['2024-03-04', ''], null], meta, [20, 1082, 25], client, TEXT_TYPES, { parameterized: true });
 
     expect(merged).toEqual([
       { day: '1082:2024-03-04', n: 2, weight: '20:12', label: 'calm' },
@@ -74,14 +75,14 @@ describe('the QueryBatch transport of a row', () => {
     expect(client.calls).toEqual([[20, '12', true], [1082, '2024-03-04', true], [20, '9007199254740993', true]]);
   });
 
-  test('no texts (no value of the branch needed one), a row without texts, a branch of no rows (NULL types): the rows as they came', () => {
+  test('no texts (no value of the branch needed one), a value without texts, a branch of no rows (NULL types): the rows as they came', () => {
     const meta = { runtimeTypedColumns: ['day'] };
     const client = recordingClient();
 
     // An int8 and a numeric: their JSON form gives no text back — nothing to parse without the server's
     expect(applyBatchOverrides([{ big: 12, exact: 1.5 }], undefined, { runtimeTypedColumns: ['big', 'exact'] }, [20, 1700], client, TEXT_TYPES))
       .toEqual([{ big: 12, exact: 1.5 }]);
-    expect(applyBatchOverrides([{ day: '2024-03-04' }], [null], meta, [1082], client, TEXT_TYPES)).toEqual([{ day: '2024-03-04' }]);
+    expect(applyBatchOverrides([{ big: 12 }], [null], { runtimeTypedColumns: ['big'] }, [20], client, TEXT_TYPES)).toEqual([{ big: 12 }]);
     expect(applyBatchOverrides([], [], meta, [null], client, TEXT_TYPES)).toEqual([]);
     expect(applyBatchOverrides([], undefined, meta, [null], client, TEXT_TYPES)).toEqual([]);
     // Over no rows `min(pg_typeof(…))` is NULL: a text (there is none) would stay as it is
@@ -103,7 +104,7 @@ describe('the QueryBatch transport of a row', () => {
     const client = recordingClient();
 
     // No texts at all (no value of the branch needed the server's), and texts whose values the server sent none of
-    for (const texts of [undefined, [new Array(columns.length).fill(null)]]) {
+    for (const texts of [undefined, new Array(columns.length).fill(null)]) {
       client.calls.length = 0;
       const [row] = applyBatchOverrides([{ ...json, id: 7 }], texts, meta, oids, client, TEXT_TYPES, { parameterized: true });
 
@@ -117,7 +118,7 @@ describe('the QueryBatch transport of a row', () => {
     }
 
     // Under a DateStyle other than ISO the server sends a date's / timestamp's text: that text, not the JSON form's
-    const sent = applyBatchOverrides([{ day: '2024-03-04', at: '2024-03-01T06:00:00', n: 1 }], [['03/04/2024', '03/01/2024 06:00:00']],
+    const sent = applyBatchOverrides([{ day: '2024-03-04', at: '2024-03-01T06:00:00', n: 1 }], [['03/04/2024'], ['03/01/2024 06:00:00']],
       { runtimeTypedColumns: ['day', 'at'] }, [1082, 1114], client, TEXT_TYPES);
     expect(sent).toEqual([{ day: '1082:03/04/2024', at: '1114:03/01/2024 06:00:00', n: 1 }]);
 
@@ -134,7 +135,7 @@ describe('the QueryBatch transport of a row', () => {
     // Its json parser made the first row's timestamp a Date already: the server sent its text, which wins
     const revived = new Date(Date.UTC(2024, 2, 1, 6));
     const rows = [{ at: revived, day: '2024-03-01' }, { at: '2024-03-02T07:00:00', day: '2024-03-02' }];
-    const merged = applyBatchOverrides(rows, [['2024-03-01 06:00:00', '2024-03-01'], [null, null]], meta, [1114, 1082], client, TEXT_TYPES, undefined, false);
+    const merged = applyBatchOverrides(rows, [['2024-03-01 06:00:00', null], ['2024-03-01', null]], meta, [1114, 1082], client, TEXT_TYPES, undefined, false);
 
     expect(merged).toEqual([{ at: '1114:2024-03-01 06:00:00', day: '1082:2024-03-01' }, { at: '2024-03-02T07:00:00', day: '2024-03-02' }]);
     // No texts at all: the rows as they came
@@ -143,7 +144,7 @@ describe('the QueryBatch transport of a row', () => {
     expect(client.calls).toEqual([[1114, '2024-03-01 06:00:00', undefined], [1082, '2024-03-01', undefined]]);
   });
 
-  test('a value repeated on consecutive rows is parsed for every row — each row gets a value of its own', () => {
+  test('a value repeated on consecutive rows is parsed for every row when its parser makes an object — each row gets a value of its own', () => {
     const parsed: string[] = [];
     const client = {
       parseTypedText: (oid: number, text: string): unknown => {
@@ -160,6 +161,155 @@ describe('the QueryBatch transport of a row', () => {
     expect(merged[0].day).not.toBe(merged[1].day);
   });
 
+  test('a text repeated in a result set is parsed once: a string / number reused, a plain Date copied for every row', () => {
+    const parsed: string[] = [];
+    const client = {
+      parseTypedText: (oid: number, text: string): unknown => {
+        parsed.push(`${oid}:${text}`);
+
+        return oid === 1114 ? new Date(text.replace(' ', 'T')) : oid === 1700 ? `${text}0` : Number(text);
+      },
+    };
+    const days = ['2024-03-01T00:00:00', '2024-03-02T00:00:00', '2024-03-01T00:00:00', '2024-03-01T00:00:00'];
+    const rows = days.map((day, i) => ({ day, price: 0, n: 0, i }));
+    const texts = [['1.5', '2.5', '1.5', '1.5'], ['7', '7', '7', '8']];
+    const merged = applyBatchOverrides(rows, [...texts, null], { textColumns: ['price', 'n'], runtimeTypedColumns: ['day'] }, [1700, 20, 1114], client, new Set([...TEXT_TYPES]));
+
+    // Each distinct text once, whether the server sent it or it was rebuilt from the JSON form
+    expect(parsed).toEqual(['1700:1.5', '20:7', '1114:2024-03-01 00:00:00', '1700:2.5', '1114:2024-03-02 00:00:00', '20:8']);
+    expect(merged.map(row => [row.price, row.n])).toEqual([['1.50', 7], ['2.50', 7], ['1.50', 7], ['1.50', 8]]);
+    // Every row a Date of its own, of the same time; changing one leaves the others as they were
+    expect(merged.map(row => (row.day as Date).getTime())).toEqual(days.map(day => new Date(day).getTime()));
+    expect(new Set(merged.map(row => row.day)).size).toBe(4);
+    (merged[0].day as Date).setFullYear(1999);
+    (merged[2].day as Date).setTime(0);
+    expect((merged[3].day as Date).getTime()).toBe(new Date(days[3]).getTime());
+
+    // A new result set parses its texts again
+    applyBatchOverrides([{ day: days[0] }], undefined, { runtimeTypedColumns: ['day'] }, [1114], client, TEXT_TYPES);
+    expect(parsed.at(-1)).toBe('1114:2024-03-01 00:00:00');
+    expect(parsed).toHaveLength(7);
+  });
+
+  test('a parsed value reused only where that cannot be told: an invalid Date copied, a Buffer / Date subclass / frozen Date / Date with a property of its own parsed every time', () => {
+    class Stamp extends Date {}
+    const values: Record<string, () => unknown> = {
+      invalid: () => new Date(NaN),
+      buffer: () => Buffer.from('ab'),
+      subclass: () => new Stamp(0),
+      frozen: () => Object.freeze(new Date(0)),
+      tagged: () => Object.assign(new Date(0), { zone: 'UTC' }),
+      symbol: () => Symbol.for('x'),
+      nothing: () => undefined,
+    };
+
+    for (const [kind, make] of Object.entries(values)) {
+      let calls = 0;
+      const memo = new ParsedValueMemo(() => {
+        calls++;
+
+        return make();
+      });
+      const read = [memo.read('t'), memo.read('t'), memo.read('t')];
+
+      if (kind === 'invalid') {
+        expect(read.every(value => value instanceof Date && Number.isNaN(value.getTime()))).toBe(true);
+        expect(new Set(read).size).toBe(3);
+        expect(calls).toBe(1);
+      } else if (kind === 'nothing') {
+        expect(read).toEqual([undefined, undefined, undefined]);
+        expect(calls).toBe(1);
+      } else {
+        expect({ kind, calls }).toEqual({ kind, calls: 3 });
+      }
+    }
+  });
+
+  test('a value that looks like a Date but is none — a Proxy of one, an object made from Date.prototype — is parsed every time, as it is, without asking the Proxy anything', () => {
+    let traps = 0;
+    const counting = {
+      getPrototypeOf: (target: Date) => {
+        traps++;
+
+        return Reflect.getPrototypeOf(target);
+      },
+      isExtensible: (target: Date) => {
+        traps++;
+
+        return Reflect.isExtensible(target);
+      },
+      ownKeys: (target: Date) => {
+        traps++;
+
+        return Reflect.ownKeys(target);
+      },
+    };
+    const values: Record<string, () => object> = {
+      proxy: () => new Proxy(new Date(0), counting),
+      made: () => Object.create(Date.prototype),
+    };
+
+    for (const [kind, make] of Object.entries(values)) {
+      const made: object[] = [];
+      const memo = new ParsedValueMemo(() => {
+        const value = make();
+        made.push(value);
+
+        return value;
+      });
+      const read = [memo.read('t'), memo.read('t'), memo.read('t')];
+
+      // What the parser made, row by row — never a copy, never shared
+      expect({ kind, calls: made.length, same: read.every((value, i) => value === made[i]) }).toEqual({ kind, calls: 3, same: true });
+    }
+    expect(traps).toBe(0);
+  });
+
+  test('a text the client\'s json parser made into something else (a number) is parsed as it is, row by row: -0 stays -0', () => {
+    // A client that parses json itself reads the envelope's texts through its own parser: here one making numbers
+    const texts = [[0, -0, 0, -0] as unknown as string[]];
+    const rows = texts[0].map(() => ({ f: 1.5 }));
+    let calls = 0;
+    const client = {
+      parseTypedText: (_oid: number, text: string): unknown => {
+        calls++;
+
+        return text;
+      },
+    };
+    const merged = applyBatchOverrides(rows, texts, { textColumns: ['f'] }, [701], client, new Set([...TEXT_TYPES, 701]), undefined, false);
+
+    expect(merged.map(row => Object.is(row.f, -0))).toEqual([false, true, false, true]);
+    expect(calls).toBe(4);
+  });
+
+  test('the memo of a column whose texts rarely repeat stops (every text parsed, as without it), and holds at most MAX_TEXTS texts', () => {
+    let calls = 0;
+    const counting = () => new ParsedValueMemo((text) => {
+      calls++;
+
+      return text.length;
+    });
+
+    // All distinct: past GIVE_UP_AFTER texts with fewer than a quarter repeats, a repeat is parsed again
+    const distinct = counting();
+    for (let i = 0; i < ParsedValueMemo.GIVE_UP_AFTER; i++) {
+      distinct.read(`t${i}`);
+    }
+    calls = 0;
+    expect(distinct.read('t0')).toBe(2);
+    expect(calls).toBe(1);
+
+    // Every text read twice (half of them repeats): the memo holds MAX_TEXTS texts; a text past them is parsed each time
+    const full = counting();
+    calls = 0;
+    for (let i = 0; i < ParsedValueMemo.MAX_TEXTS + 10; i++) {
+      full.read(`t${i}`);
+      full.read(`t${i}`);
+    }
+    expect(calls).toBe(ParsedValueMemo.MAX_TEXTS + 2 * 10);
+  });
+
   test('a client\'s parser for one type is resolved once per branch, then called per value — exactly as parseTypedText would be', () => {
     const resolved: Array<[number, boolean | undefined]> = [];
     const client = {
@@ -172,7 +322,7 @@ describe('the QueryBatch transport of a row', () => {
     };
     const rows = [{ at: '2024-03-01T06:00:00', big: 1 }, { at: '2024-03-02T07:00:00', big: 2 }, { at: null, big: 3 }];
 
-    expect(applyBatchOverrides(rows, [[null, '1'], [null, '2'], [null, '3']], { runtimeTypedColumns: ['at', 'big'] }, [1114, 20], client, TEXT_TYPES, { parameterized: false }))
+    expect(applyBatchOverrides(rows, [null, ['1', '2', '3']], { runtimeTypedColumns: ['at', 'big'] }, [1114, 20], client, TEXT_TYPES, { parameterized: false }))
       .toEqual([{ at: '1114~2024-03-01 06:00:00', big: '20~1' }, { at: '1114~2024-03-02 07:00:00', big: '20~2' }, { at: null, big: '20~3' }]);
     expect(resolved).toEqual([[1114, false], [20, false]]);
     expect(client.calls).toEqual([]);
@@ -205,7 +355,7 @@ describe('the QueryBatch transport of a row', () => {
     // A domain over int4 and one over boolean (their base types sent), an enum and a composite (their own
     // OIDs), and an int4 the client parses with a parser of its own (23 among its text types)
     const row = { score: 7, flag: true, mood: 'calm', point: { x: 1, y: null }, rank: 3 };
-    const texts = [['7', 't', 'calm', '(1,)', '3']];
+    const texts = [['7'], ['t'], ['calm'], ['(1,)'], ['3']];
 
     expect(applyBatchOverrides([{ ...row }], texts, meta, [23, 16, 16500, 16501, 23], client, TEXT_TYPES)[0])
       .toEqual({ score: 7, flag: true, mood: '16500:calm', point: '16501:(1,)', rank: 3 });
@@ -236,6 +386,29 @@ describe('the QueryBatch transport of a row', () => {
     expect(jsonColumnDelivery('date', true)).toBeUndefined();
     // Every other type has no JSON revival: an int8 / numeric travels as its text
     expect(['bigint', 'numeric', 'integer', 'text', undefined].map(type => jsonColumnDelivery(type, false))).toEqual(new Array(5).fill(undefined));
+  });
+
+  test('a declared column\'s JSON form repeated in a result set is revived once; every row gets a Date of its own, NULL stays NULL', () => {
+    const revived: string[] = [];
+    const timestamp = jsonColumnDelivery('timestamp', false)!.revive;
+    const rows = ['2024-03-01T09:15:00', '2024-03-01T09:15:00', null, '2024-03-02T10:00:00', '2024-03-01T09:15:00'].map((at, n) => ({ n, at }));
+    const merged = reviveJsonRows(rows, [{
+      key: 'at',
+      revive: (value: string) => {
+        revived.push(value);
+
+        return timestamp(value);
+      },
+    }]);
+
+    expect(revived).toEqual(['2024-03-01T09:15:00', '2024-03-02T10:00:00']);
+    expect(merged.map(row => (row.at === null ? null : (row.at as Date).getTime())))
+      .toEqual([localTime('2024-03-01 09:15:00'), localTime('2024-03-01 09:15:00'), null, localTime('2024-03-02 10:00:00'), localTime('2024-03-01 09:15:00')]
+        .map(date => (date === null ? null : date.getTime())));
+    expect(new Set(merged.map(row => row.at)).size).toBe(5);
+    (merged[0].at as Date).setTime(0);
+    expect((merged[4].at as Date).getTime()).toBe(localTime('2024-03-01 09:15:00').getTime());
+    expect(merged.map(row => Object.keys(row))).toEqual(new Array(5).fill(['n', 'at']));
   });
 });
 

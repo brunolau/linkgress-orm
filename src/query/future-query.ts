@@ -2,6 +2,7 @@ import type { DatabaseClient, QueryResult, TypedTextRead } from '../database/dat
 import { isTextParsedType, JSON_TEXT_TYPE_OIDS, textOfJsonForm } from '../database/typed-text';
 import type { QueryExecutor } from '../entity/db-context';
 import { DRIVER_VALUE_MAPPER } from './conditions';
+import { ParsedValueMemo } from './parsed-value-memo';
 
 /**
  * Metadata attached by the query builder so QueryBatch can safely embed the
@@ -19,11 +20,11 @@ export interface FutureBatchMeta {
   /** Selection produces nested-path rows (nested object selections) — reconstructed by the shared transform. */
   hasNestedPaths: boolean;
   /**
-   * Restores the values a batch has always restored from their JSON form, as it always did: a plain
-   * select's declared date / timestamp / timestamptz / bytea column (for a custom mapper, in its text
+   * The values a batch has always restored from their JSON form, as it always did (see reviveJsonRows): a
+   * plain select's declared date / timestamp / timestamptz / bytea column (for a custom mapper, in its text
    * form — see {@link jsonColumnDelivery}). Undefined when there is none.
    */
-  reviveJsonRow?: (row: any) => any;
+  jsonRevivals?: ReadonlyArray<JsonRevival>;
   /**
    * Flat aliases whose values the batch always sends as their TEXT — a declared int8 / numeric column,
    * whose value a JSON number would lose (JSON.parse collapses it to a float) — parsed back by the client
@@ -59,31 +60,36 @@ export type BatchTypeOids = ReadonlyArray<number | null>;
 /** What a batch parses the texts it sends with: the client the batch runs on. */
 type TypedTextParser = Pick<DatabaseClient, 'parseTypedText'> & Partial<Pick<DatabaseClient, 'typedTextParser'>>;
 
-/** How a batch reads one text-sent value of a branch: under `key`, parsed by `parse`, from its JSON form too (`fromJson`). */
+/**
+ * How a batch reads one text-sent value of a branch: under `key`, from the texts the server sent (`texts`,
+ * parsed through `fromText`) or from its JSON form (`fromJson`: the text rebuilt from it, parsed) — each
+ * text parsed once for the result set (see ParsedValueMemo).
+ */
 interface BatchValueRead {
-  readonly index: number;
   readonly key: string;
+  /** The value's parser (the memos' too): what a text that is no string — a json-parsing client's — goes through. */
   readonly parse: (text: string) => unknown;
-  /** The value's text from its JSON form, for a type whose text the server does not send (see JSON_TEXT_TYPE_OIDS). */
-  readonly fromJson?: (json: string) => string;
-  /** The JSON form last rebuilt, and its text: a column often repeats one value on consecutive rows (a day, a status' timestamp) */
-  lastJson?: string;
-  lastText?: string;
+  /** The texts the server sent of the value, one per row, in row order — none for a type that needs none. */
+  readonly texts?: ReadonlyArray<string | null>;
+  readonly fromText?: ParsedValueMemo;
+  /** For a type whose text the server does not send (see JSON_TEXT_TYPE_OIDS). */
+  readonly fromJson?: ParsedValueMemo;
 }
 
 /**
- * The rows of a QueryBatch branch with the TEXTS of their values parsed in — `texts`: one array per row, in
- * row order, of one text (or NULL) per text-sent value (the branch's text columns, then its runtime-typed
- * ones), or `undefined` when none of the branch's values needed the server to send one; `typeOids`: the
- * (base) type of each. A value whose (base) type the client parses from its text (see isTextParsedType —
- * `textTypeOids`) becomes what `client` delivers for that type standalone (DatabaseClient.parseTypedText),
- * read as the branch's own statement reads it (`read`: whether it binds parameters) — from the text the
- * server sent, or, for a type whose JSON form gives its text back (JSON_TEXT_TYPE_OIDS, which the server
- * sends no text for — under a `DateStyle` other than ISO, only for a type of those whose JSON form ignores
- * it), from the text rebuilt from that form (textOfJsonForm). Any other value stays as the JSON row carries
- * it: NULL (the text of NULL is empty), and a value of a domain over a type JSON carries as the drivers
- * deliver it. Each row keeps its key order. `rebuildsFromJson` false (a client that parses json itself, see
- * JSON_TYPE_OID — the server then sent every text): no text is rebuilt, only those sent are parsed.
+ * The rows of a QueryBatch branch with the TEXTS of their values parsed in — `texts`: per text-sent value
+ * (the branch's text columns, then its runtime-typed ones), the array of its texts, one per row in row order,
+ * or NULL when its type needed none (`texts` itself `undefined` when none of the branch's values did);
+ * `typeOids`: the (base) type of each. A value whose (base) type the client parses from its text (see
+ * isTextParsedType — `textTypeOids`) becomes what `client` delivers for that type standalone
+ * (DatabaseClient.parseTypedText), read as the branch's own statement reads it (`read`: whether it binds
+ * parameters) — from the text the server sent, or, for a type whose JSON form gives its text back
+ * (JSON_TEXT_TYPE_OIDS, which the server sends no text for — under a `DateStyle` other than ISO, only for a
+ * type of those whose JSON form ignores it), from the text rebuilt from that form (textOfJsonForm). Any other
+ * value stays as the JSON row carries it: NULL (the text of NULL is empty), and a value of a domain over a
+ * type JSON carries as the drivers deliver it. Each row keeps its key order. `rebuildsFromJson` false (a
+ * client that parses json itself, see JSON_TYPE_OID — the server then sent every text): no text is rebuilt,
+ * only those sent are parsed.
  * @internal
  */
 export function applyBatchOverrides(
@@ -103,7 +109,6 @@ export function applyBatchOverrides(
 
   const keys = [...(meta.textColumns ?? []), ...(meta.runtimeTypedColumns ?? [])];
   const reads: BatchValueRead[] = [];
-  let fromJson = false;
 
   for (let i = 0; i < keys.length; i++) {
     const oid = typeOids?.[i];
@@ -112,33 +117,29 @@ export function applyBatchOverrides(
       continue;
     }
 
+    const valueTexts = Array.isArray(texts?.[i]) ? texts![i]! : undefined;
     const rebuilds = rebuildsFromJson && JSON_TEXT_TYPE_OIDS.has(oid);
 
     // Neither a text sent nor one to rebuild: the value stays as it is, and needs no parser
-    if (!texts && !rebuilds) {
+    if (!valueTexts && !rebuilds) {
       continue;
     }
 
-    fromJson ||= rebuilds;
+    const parse = client.typedTextParser ? client.typedTextParser(oid, read) : (text: string) => client.parseTypedText(oid, text, read);
     reads.push({
-      index: i,
       key: keys[i],
-      parse: client.typedTextParser ? client.typedTextParser(oid, read) : (text) => client.parseTypedText(oid, text, read),
-      fromJson: rebuilds ? (json) => textOfJsonForm(oid, json) : undefined,
+      parse,
+      texts: valueTexts,
+      fromText: valueTexts ? new ParsedValueMemo(parse) : undefined,
+      fromJson: rebuilds ? new ParsedValueMemo(parse, (json) => textOfJsonForm(oid, json)) : undefined,
     });
   }
 
-  if (reads.length === 0 || (!texts && !fromJson)) {
+  if (reads.length === 0) {
     return rows;
   }
 
   for (let rowIx = 0; rowIx < rows.length; rowIx++) {
-    const rowTexts = texts?.[rowIx];
-
-    if (texts && !rowTexts) {
-      continue;
-    }
-
     const row = rows[rowIx];
 
     for (let r = 0; r < reads.length; r++) {
@@ -149,18 +150,14 @@ export function applyBatchOverrides(
         continue;
       }
 
-      const text = rowTexts?.[valueRead.index];
+      const text = valueRead.texts?.[rowIx];
 
       if (text !== null && text !== undefined) {
-        row[valueRead.key] = valueRead.parse(text);
+        // Only a text is a memo key: a client that parses json itself may have made one something else (a
+        // number: -0 and 0 would share an entry), which its parser gets as it is, row by row
+        row[valueRead.key] = typeof text === 'string' ? valueRead.fromText!.read(text) : valueRead.parse(text);
       } else if (valueRead.fromJson && typeof value === 'string') {
-        // Parsed per row (every row gets a value of its own); the text only rebuilt for a new JSON form
-        if (value !== valueRead.lastJson) {
-          valueRead.lastJson = value;
-          valueRead.lastText = valueRead.fromJson(value);
-        }
-
-        row[valueRead.key] = valueRead.parse(valueRead.lastText!);
+        row[valueRead.key] = valueRead.fromJson.read(value);
       }
     }
   }
@@ -177,6 +174,37 @@ export function applyBatchOverrides(
 export interface JsonColumnDelivery {
   /** Restores the value from its JSON form (never called for NULL). */
   readonly revive: (value: any) => any;
+}
+
+/** A declared column restored from its JSON form (see jsonColumnDelivery): its row key, and how. @internal */
+export interface JsonRevival {
+  readonly key: string;
+  readonly revive: (value: any) => any;
+}
+
+/**
+ * The rows of a QueryBatch branch with their declared columns restored from their JSON form (`revivals`, see
+ * jsonColumnDelivery) — each JSON form once for the result set (see ParsedValueMemo), every row a value of
+ * its own. NULL stays NULL. The rows are restored in place.
+ * @internal
+ */
+export function reviveJsonRows(rows: Array<Record<string, any>>, revivals: ReadonlyArray<JsonRevival>): Array<Record<string, any>> {
+  const memos = revivals.map(({ revive }) => new ParsedValueMemo(revive));
+
+  for (let rowIx = 0; rowIx < rows.length; rowIx++) {
+    const row = rows[rowIx];
+
+    for (let i = 0; i < revivals.length; i++) {
+      const { key, revive } = revivals[i];
+      const value = row[key];
+
+      if (value !== null && value !== undefined) {
+        row[key] = typeof value === 'string' ? memos[i].read(value) : revive(value);
+      }
+    }
+  }
+
+  return rows;
 }
 
 /**

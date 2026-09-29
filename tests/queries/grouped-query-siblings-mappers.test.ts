@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import {
   createCustomType,
+  customType,
   DatabaseClient,
   DbColumn,
   DbContext,
@@ -394,6 +395,60 @@ describe('grouped selects: siblings of one groupBy(), and the mapper a key reads
       }
       expect(expected.navigation).toEqual([{ machineRuntime: 480, jobs: 2 }, { machineRuntime: 600, jobs: 3 }]);
       expect(expected.mappedNavigation).toEqual([{ service: span(0, 45), jobs: 2 }, { service: span(1, 30), jobs: 3 }]);
+    });
+  });
+
+  /**
+   * The builder form of a custom type (`customType()`: `getType()` holds its `fromDriver`) on an expression of a
+   * grouped select. A plain select reads through it; the grouped select kept the builder itself as the field's
+   * mapper — no `fromDriver` there — and handed the value back as the driver delivered it (a count as '45').
+   */
+  describe('an expression read through the builder form of a custom type (customType)', () => {
+    const spanBuilder = customType<Span, number>({
+      dataType: 'integer',
+      toDriver: value => value.hours * 60 + value.minutes,
+      fromDriver: value => ({ hours: Math.floor(Number(value) / 60), minutes: Number(value) % 60 }),
+    });
+
+    /** Per machine: 15 minutes a job, as an expression of the grouped select read through the builder. */
+    const loadPerMachine = () => db.jobs
+      .select(j => ({ machineId: j.machineId, priority: j.priority }))
+      .groupBy(r => ({ machineId: r.machineId }))
+      .select(g => ({ machineId: g.key.machineId, load: sql<number>`count(*) * 15`.mapWith<Span>(spanBuilder) }))
+      .orderBy(r => r.machineId);
+
+    test('a grouped select\'s expression reads through it — it came back as the driver\'s value', async () => {
+      expect(await loadPerMachine().toList()).toEqual([
+        { machineId: lathe, load: span(0, 45) },
+        { machineId: press, load: span(0, 30) },
+      ]);
+    });
+
+    test('a MIN / MAX of an expression read through it reads through it too', async () => {
+      const rows = await db.jobs
+        .select(j => ({ machineId: j.machineId, effort: sql<number>`${j.priority} * 30`.mapWith<Span>(spanBuilder) }))
+        .groupBy(r => ({ machineId: r.machineId }))
+        .select(g => ({ machineId: g.key.machineId, most: g.max(r => r.effort), least: g.min(r => r.effort) }))
+        .orderBy(r => r.machineId)
+        .toList();
+
+      // lathe: priorities 1, 2, 1 · press: 3, 2
+      expect(rows).toEqual([
+        { machineId: lathe, most: span(1, 0), least: span(0, 30) },
+        { machineId: press, most: span(1, 30), least: span(1, 0) },
+      ]);
+    });
+
+    test('the same through a QueryBatch', async () => {
+      const batch = new QueryBatch();
+      const key = batch.addList(loadPerMachine(), 'load');
+
+      await batch.executeBatch();
+
+      expect(batch.getList(key)).toEqual([
+        { machineId: lathe, load: span(0, 45) },
+        { machineId: press, load: span(0, 30) },
+      ]);
     });
   });
 });

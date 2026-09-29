@@ -1,4 +1,4 @@
-import { applyBatchOverrides, FutureBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery } from './future-query';
+import { applyBatchOverrides, FutureBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, reviveJsonRows } from './future-query';
 import type { BatchTypeOids } from './future-query';
 import { DATE_STYLE_TYPE_OIDS, FIRST_USER_TYPE_OID, JSON_TEXT_TYPE_OIDS, JSON_TYPE_OID, TEXT_TRANSPORT_TYPE_OIDS } from '../database/typed-text';
 
@@ -64,6 +64,9 @@ import { renumberPlaceholders } from './sql-utils';
 /** A column of a branch's row (`(__batch_q."…")`). */
 const branchColumnSql = (column: string): string => `(__batch_q."${column.replace(/"/g, '""')}")`;
 
+/** The built-in types of the text list: base and array types, never a domain (see typesSql). */
+const BUILT_IN_TEXT_TYPE_OIDS: ReadonlySet<number> = new Set(TEXT_TRANSPORT_TYPE_OIDS);
+
 /**
  * Whether the session's `DateStyle` writes a date / timestamp as ISO — the form their JSON takes whatever the
  * style (see DATE_STYLE_TYPE_OIDS). Uncorrelated: PostgreSQL evaluates it once per statement.
@@ -100,20 +103,41 @@ function needsTextSql(column: string, textTypes: string, rebuildsFromJson: boole
 }
 
 /**
- * The (base) type of each text-sent value of a branch, ONCE for the branch — the OID the aggregate found
- * (`__batch_s.t<i>`: the type is the same for every row of a column; NULL over no rows), resolved to the
- * type a domain is over (the drivers read a domain's value by that type): one catalog lookup per value.
- * Only a domain the server sends the text of is resolved — a user-defined one, or one of `textTypes`: a
- * domain the catalog itself defines (OID below 16384, `information_schema.time_stamp` over timestamptz)
- * sends none, and its value keeps its JSON form, as it always did — never rebuilt as the text of the type
- * it is over.
+ * The type of each text-sent value of a branch, ONCE for the branch: `t` — the OIDs the aggregates found
+ * (`__batch_s.t`, see textsAndTypesSql: the type is the same for every row of a column; NULL over no rows) —
+ * and `d` — for each of them that is a domain whose text the server sends, the type it is over
+ * (`{ "<domain>": <type> }`, NULL when there is none: the drivers read a domain's value by that type, see
+ * branchTypes): ONE catalog lookup for the branch. The server sends the text of a user-defined domain and of
+ * one the client parses itself (`domainTextOids`: those of its own types below 16384 no built-in rule covers
+ * — a built-in type of the text list is never a domain); a domain the catalog itself defines (OID below
+ * 16384, `information_schema.time_stamp` over timestamptz) sends none, and its value keeps its JSON form, as
+ * it always did — never rebuilt as the text of the type it is over.
  */
-function typeOidsSql(count: number, textTypes: string): string {
-  const oids = Array.from({ length: count }, (_, i) => '(SELECT (CASE WHEN __batch_t.typtype = \'d\' '
-    + `AND (__batch_t.oid >= ${FIRST_USER_TYPE_OID} OR __batch_t.oid = ANY(${textTypes})) THEN __batch_t.typbasetype `
-    + `ELSE __batch_t.oid END)::bigint FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t${i})`);
+function typesSql(domainTextOids: readonly number[]): string {
+  const clientDomains = domainTextOids.length > 0 ? ` OR __batch_t.oid IN (${domainTextOids.join(', ')})` : '';
 
-  return `to_json(ARRAY[${oids.join(', ')}]::bigint[])`;
+  return '\'t\', to_json(__batch_s.t::bigint[]), '
+    + '\'d\', (SELECT json_object_agg(__batch_t.oid, __batch_t.typbasetype::bigint) FROM pg_catalog.pg_type __batch_t '
+    + `WHERE __batch_t.oid = ANY(__batch_s.t) AND __batch_t.typtype = 'd' AND (__batch_t.oid >= ${FIRST_USER_TYPE_OID}${clientDomains}))`;
+}
+
+/**
+ * The (base) type of each text-sent value of a branch, from its envelope (see typesSql): its type, a domain's
+ * resolved to the type it is over.
+ */
+function branchTypes(payload: { t?: unknown; d?: unknown } | null | undefined): BatchTypeOids {
+  const types: Array<number | null> = Array.isArray(payload?.t) ? payload.t : [];
+  const domains = payload?.d;
+
+  if (!domains || typeof domains !== 'object') {
+    return types;
+  }
+
+  return types.map((oid) => {
+    const base = typeof oid === 'number' ? (domains as Record<string, unknown>)[oid] : undefined;
+
+    return typeof base === 'number' ? base : oid;
+  });
 }
 
 /**
@@ -125,25 +149,21 @@ function typeOidsSql(count: number, textTypes: string): string {
 const outputTextSql = (column: string): string => `concat(${branchColumnSql(column)})`;
 
 /**
- * The texts a branch sends alongside its rows — one array per row, in row order, of one text (or NULL)
- * per text column (always), then per runtime-typed value (when its type needs it) — NULL when no value of
- * the branch needs one (the FILTER, constant per column, then admits no row; it asks for the session's
- * `DateStyle` once per row, not once per value) — and each value's type OID.
+ * The texts a branch sends alongside its rows — `x`: per text-sent value, the JSON array of its text in every
+ * row, in row order (a text column's always, a runtime-typed value's when its type needs it: its FILTER,
+ * constant for a column, admits every row or none — NULL then; NULL over no rows too) — and `t`: each value's
+ * type OID. A value's test runs once per row, in its FILTER. Each travels as ONE array column, whatever the
+ * number of values: a target list holds at most 1 664 entries, and a column per value would halve how many
+ * values a branch can send.
  */
 function textsAndTypesSql(textColumns: readonly string[], typedColumns: readonly string[], textTypes: string, rebuildsFromJson: boolean): string {
   const texts = [
-    ...textColumns.map((column) => outputTextSql(column)),
-    ...typedColumns.map((column) => `CASE WHEN ${needsTextSql(column, textTypes, rebuildsFromJson)} THEN ${outputTextSql(column)} END`),
+    ...textColumns.map((column) => `json_agg(${outputTextSql(column)})`),
+    ...typedColumns.map((column) => `json_agg(${outputTextSql(column)}) FILTER (WHERE ${needsTextSql(column, textTypes, rebuildsFromJson)})`),
   ];
-  const filter = textColumns.length > 0
-    ? ''
-    : rebuildsFromJson
-      ? ` FILTER (WHERE ${typedColumns.map((column) => needsServerTextSql(column, textTypes)).join(' OR ')}`
-        + ` OR (NOT ${ISO_DATE_STYLE_SQL} AND (${typedColumns.map((column) => dateStyledSql(column)).join(' OR ')})))`
-      : ` FILTER (WHERE ${typedColumns.map((column) => needsTextSql(column, textTypes, false)).join(' OR ')})`;
-  const oids = [...textColumns, ...typedColumns].map((column, i) => `min(pg_typeof(${branchColumnSql(column)})::oid) AS t${i}`);
+  const oids = [...textColumns, ...typedColumns].map((column) => `min(pg_typeof(${branchColumnSql(column)})::oid)`);
 
-  return `json_agg(ARRAY[${texts.join(', ')}])${filter} AS x, ${oids.join(', ')}`;
+  return `ARRAY[${texts.join(', ')}] AS x, ARRAY[${oids.join(', ')}] AS t`;
 }
 
 /**
@@ -172,23 +192,24 @@ function textsAndTypesSql(textColumns: readonly string[], typedColumns: readonly
  * money, bytea, point, circle — a date / timestamp / timestamptz only under
  * `DateStyle` ISO): the client rebuilds that text from the row (textOfJsonForm):
  *
- *   SELECT 2 AS __batch_ix, json_build_object('t', to_json(ARRAY[(SELECT … typbasetype … = __batch_s.t0)]::bigint[]),
- *                                             'r', __batch_s.r, 'x', __batch_s.x) AS __batch_items
- *   FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS r,
- *                json_agg(ARRAY[CASE WHEN <its type needs it> THEN concat(…) END]) FILTER (WHERE …) AS x,
- *                min(pg_typeof(…)::oid) AS t0
+ *   SELECT 2 AS __batch_ix, json_build_object('t', to_json(__batch_s.t::bigint[]),
+ *                                             'd', (SELECT json_object_agg(…) FROM pg_catalog.pg_type … domains …),
+ *                                             'r', __batch_s.r, 'x', to_json(__batch_s.x)) AS __batch_items
+ *   FROM (SELECT coalesce(json_agg(__batch_q.*), '[]'::json) AS r,
+ *                ARRAY[json_agg(concat(…)) FILTER (WHERE <its type needs it>), …] AS x,
+ *                ARRAY[min(pg_typeof(…)::oid), …] AS t
  *         FROM (SELECT * FROM (...) __batch_q0 OFFSET 0) __batch_q) __batch_s
  *
- * The rows are `row_to_json`, as in any other branch (a json value untouched, its
- * keys in their order); `x` is NULL when no value of the branch needs its text.
- * The `OFFSET 0` fence evaluates the branch's query once per row, as on its own:
- * without it PostgreSQL would inline the query and evaluate an expression — a
- * correlated subquery — at every reference the envelope makes to it (five for a
- * value that may need its text). Per branch that costs a header of about 50 bytes
- * plus about 10 per text-sent value, and one catalog lookup per text-sent value;
- * per row, a type test per runtime-typed value, and the texts that are needed (one
- * `lower()` over 50 000 rows: about a third longer than a branch without texts).
- * A branch with no value to send as text is the envelope above, byte for byte.
+ * The rows are those of any other branch, aggregated as records (json_agg of a record
+ * is its `row_to_json`: a json value untouched, its keys in their order); `x` holds one
+ * array of texts per text-sent value — NULL for a value whose type needs none. The
+ * `OFFSET 0` fence evaluates the branch's query once per row, as on its own: without
+ * it PostgreSQL would inline the query and evaluate an expression — a correlated
+ * subquery — at every reference the envelope makes to it (its type test, its text,
+ * its type). Per branch that costs a header of about 60 bytes plus about 10 per
+ * text-sent value, and one catalog lookup; per row, one type test per runtime-typed
+ * value, and the texts that are needed. A branch with no value to send as text is
+ * the envelope above, byte for byte.
  *
  * Known limits of the JSON transport: a plain select's DECLARED date / timestamp /
  * timestamptz / bytea column is revived from its JSON form by the default drivers'
@@ -296,6 +317,8 @@ export class QueryBatch {
     const textTypeOids = new Set([...TEXT_TRANSPORT_TYPE_OIDS, ...client.customParsedTypeOids()]);
     const rebuildsFromJson = !textTypeOids.has(JSON_TYPE_OID);
     const textTypes = `'{${[...textTypeOids].filter((oid) => !rebuildsFromJson || !JSON_TEXT_TYPE_OIDS.has(oid)).join(',')}}'::oid[]`;
+    // The types of the text list a domain may be (see typesSql): the client's own below 16384
+    const domainTextOids = [...textTypeOids].filter((oid) => oid < FIRST_USER_TYPE_OID && !BUILT_IN_TEXT_TYPE_OIDS.has(oid));
 
     this.entries.forEach((entry, ix) => {
       const offset = params.length;
@@ -313,9 +336,10 @@ export class QueryBatch {
         // itself gets the name its metadata addresses it by
         const alias = meta?.columnAlias === undefined ? '' : `("${meta.columnAlias.replace(/"/g, '""')}")`;
         typedBranches.add(ix);
+        // `__batch_q.*`: the whole row even when the branch has a column named __batch_q (a bare name would be that column)
         branches.push(
-          `SELECT ${ix} AS __batch_ix, json_build_object('t', ${typeOidsSql(textColumns.length + typedColumns.length, textTypes)}, 'r', __batch_s.r, 'x', __batch_s.x) AS __batch_items `
-          + `FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS r, ${textsAndTypesSql(textColumns, typedColumns, textTypes, rebuildsFromJson)} `
+          `SELECT ${ix} AS __batch_ix, json_build_object(${typesSql(domainTextOids)}, 'r', __batch_s.r, 'x', to_json(__batch_s.x)) AS __batch_items `
+          + `FROM (SELECT coalesce(json_agg(__batch_q.*), '[]'::json) AS r, ${textsAndTypesSql(textColumns, typedColumns, textTypes, rebuildsFromJson)} `
           + `FROM (SELECT * FROM (\n${branchSql}\n) __batch_q0${alias} OFFSET 0) __batch_q) __batch_s`
         );
       }
@@ -328,7 +352,7 @@ export class QueryBatch {
 
     const itemsByIx = new Map<number, any[]>();
     const typesByIx = new Map<number, BatchTypeOids>();
-    const textsByIx = new Map<number, Array<Array<string | null>>>();
+    const textsByIx = new Map<number, Array<Array<string | null> | null>>();
 
     for (const row of result.rows) {
       const raw = row.__batch_items;
@@ -337,7 +361,7 @@ export class QueryBatch {
 
       if (typedBranches.has(ix)) {
         itemsByIx.set(ix, Array.isArray(payload?.r) ? payload.r : []);
-        typesByIx.set(ix, Array.isArray(payload?.t) ? payload.t : []);
+        typesByIx.set(ix, branchTypes(payload));
 
         if (Array.isArray(payload?.x)) {
           textsByIx.set(ix, payload.x);
@@ -359,8 +383,8 @@ export class QueryBatch {
         rows = applyBatchOverrides(rows, textsByIx.get(ix), meta, typesByIx.get(ix), client, textTypeOids, { parameterized: entry.future._params.length > 0 }, rebuildsFromJson);
       }
 
-      if (meta?.reviveJsonRow) {
-        rows = rows.map(meta.reviveJsonRow);
+      if (meta?.jsonRevivals) {
+        rows = reviveJsonRows(rows, meta.jsonRevivals);
       }
 
       if (entry.kind === 'count') {

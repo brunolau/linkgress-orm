@@ -19,6 +19,12 @@ export interface CustomType<TData = any, TDriver = any> {
    * Convert database value to TypeScript value
    */
   fromDriver(value: TDriver): TData;
+
+  /**
+   * The values `fromDriver` returns are never mutated, so rows with the same driver value within one result set
+   * share one — see `CustomTypeDefinition.immutable` (`createCustomType`). Unset: `fromDriver` runs for every value.
+   */
+  readonly immutable?: boolean;
 }
 
 /**
@@ -30,6 +36,8 @@ export class CustomTypeBuilder<TData = any, TDriver = any> {
       dataType: string;
       toDriver: (value: TData) => TDriver;
       fromDriver: (value: TDriver) => TData;
+      /** See `CustomTypeDefinition.immutable` (`createCustomType`) */
+      immutable?: boolean;
     }
   ) {}
 
@@ -37,11 +45,19 @@ export class CustomTypeBuilder<TData = any, TDriver = any> {
    * Gets the custom type definition
    */
   getType(): CustomType<TData, TDriver> {
-    return {
-      dataType: this.config.dataType,
-      toDriver: this.config.toDriver,
-      fromDriver: this.config.fromDriver,
-    };
+    // A type without the flag keeps the shape it always had
+    return this.config.immutable === true
+      ? {
+        dataType: this.config.dataType,
+        toDriver: this.config.toDriver,
+        fromDriver: this.config.fromDriver,
+        immutable: true,
+      }
+      : {
+        dataType: this.config.dataType,
+        toDriver: this.config.toDriver,
+        fromDriver: this.config.fromDriver,
+      };
   }
 
   /**
@@ -53,12 +69,14 @@ export class CustomTypeBuilder<TData = any, TDriver = any> {
 }
 
 /**
- * Creates a custom type
+ * Creates a custom type. `immutable: true` declares that the values `fromDriver` returns are never mutated, so rows
+ * with the same driver value within one result set share one (see `CustomTypeDefinition.immutable`).
  */
 export function customType<TData = any, TDriver = any>(config: {
   dataType: string;
   toDriver: (value: TData) => TDriver;
   fromDriver: (value: TDriver) => TData;
+  immutable?: boolean;
 }): CustomTypeBuilder<TData, TDriver> {
   return new CustomTypeBuilder(config);
 }

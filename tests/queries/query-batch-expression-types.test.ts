@@ -298,7 +298,7 @@ interface Batchable extends Listable {
  * the types whose values the server sends as their text for a client without parsers of its own (a date /
  * time / timestamp / interval, money, bytea, point and circle are rebuilt from their JSON form — a date /
  * timestamp / timestamptz only under DateStyle ISO), a column of the branch's row, the per-row test whether
- * its type needs the text (the FILTER asks for the DateStyle once per row), and the header of the branch's types.
+ * its type needs the text (its FILTER asks for the DateStyle once per row), and the header of the branch's types.
  */
 const TEXT_TYPES = '\'{20,1700,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[]';
 const ISO_DATE_STYLE = '(SELECT current_setting(\'DateStyle\') LIKE \'ISO%\')';
@@ -306,22 +306,24 @@ const batchColumn = (name: string): string => `(__batch_q."${name}")`;
 const needsServerText = (name: string): string => `pg_typeof(${batchColumn(name)})::oid = ANY(${TEXT_TYPES}) OR pg_typeof(${batchColumn(name)})::oid >= 16384`;
 const dateStyled = (name: string): string => `pg_typeof(${batchColumn(name)})::oid = ANY('{1082,1114,1184}'::oid[])`;
 const needsText = (name: string): string => `(${needsServerText(name)} OR (NOT ${ISO_DATE_STYLE} AND ${dateStyled(name)}))`;
-const needsTextFilter = (names: string[]): string =>
-  `${names.map(needsServerText).join(' OR ')} OR (NOT ${ISO_DATE_STYLE} AND (${names.map(dateStyled).join(' OR ')}))`;
-const textWhenNeeded = (name: string): string => `CASE WHEN ${needsText(name)} THEN concat(${batchColumn(name)}) END`;
-// A domain resolves to the type it is over when the server sends its text: a user-defined one, or one of the text types
-const typeHeader = (count: number): string => `to_json(ARRAY[${Array.from({ length: count }, (_, i) => '(SELECT (CASE WHEN __batch_t.typtype = \'d\' '
-  + `AND (__batch_t.oid >= 16384 OR __batch_t.oid = ANY(${TEXT_TYPES})) THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint `
-  + `FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t${i})`).join(', ')}]::bigint[])`;
+// A value's texts, one per row: when its type needs them (its FILTER, constant for the value), or always (a text column)
+const textWhenNeeded = (name: string): string => `json_agg(concat(${batchColumn(name)})) FILTER (WHERE ${needsText(name)})`;
+const textAlways = (name: string): string => `json_agg(concat(${batchColumn(name)}))`;
+// Each value's type, and the type each of them that is a domain the server sends the text of is over — a
+// user-defined one, for a client without parsers of its own: one catalog lookup for the branch
+const TYPE_HEADER = '\'t\', to_json(__batch_s.t::bigint[]), '
+  + '\'d\', (SELECT json_object_agg(__batch_t.oid, __batch_t.typbasetype::bigint) FROM pg_catalog.pg_type __batch_t '
+  + 'WHERE __batch_t.oid = ANY(__batch_s.t) AND __batch_t.typtype = \'d\' AND (__batch_t.oid >= 16384))';
 
 /**
- * The fenced envelope of branch `ix` running `sql`: `texts` — the texts it sends of each row (in order), with
- * `filter` when every one is sent only when needed — and the types of `columns`, once.
+ * The fenced envelope of branch `ix` running `sql`: its rows (the whole row, `__batch_q.*`), `texts` — the
+ * aggregate of each value's texts (see textWhenNeeded / textAlways), in ONE array — and the types of `columns`,
+ * once, in another.
  */
-const fencedEnvelope = (ix: number, sql: string, texts: string[], columns: string[], filter: string | undefined): string =>
-  `SELECT ${ix} AS __batch_ix, json_build_object('t', ${typeHeader(columns.length)}, 'r', __batch_s.r, 'x', __batch_s.x) AS __batch_items `
-  + `FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS r, json_agg(ARRAY[${texts.join(', ')}])${filter === undefined ? '' : ` FILTER (WHERE ${filter})`} AS x, `
-  + `${columns.map((name, i) => `min(pg_typeof(${batchColumn(name)})::oid) AS t${i}`).join(', ')} `
+const fencedEnvelope = (ix: number, sql: string, texts: string[], columns: string[]): string =>
+  `SELECT ${ix} AS __batch_ix, json_build_object(${TYPE_HEADER}, 'r', __batch_s.r, 'x', to_json(__batch_s.x)) AS __batch_items `
+  + `FROM (SELECT coalesce(json_agg(__batch_q.*), '[]'::json) AS r, ARRAY[${texts.join(', ')}] AS x, `
+  + `ARRAY[${columns.map(name => `min(pg_typeof(${batchColumn(name)})::oid)`).join(', ')}] AS t `
   + `FROM (SELECT * FROM (\n${sql}\n) __batch_q0 OFFSET 0) __batch_q) __batch_s`;
 
 describe('a plain select\'s untyped values in a QueryBatch', () => {
@@ -730,8 +732,7 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
         0,
         build().future().getSql(),
         [textWhenNeeded('pulses'), textWhenNeeded('pressure')],
-        ['pulses', 'pressure'],
-        needsTextFilter(['pulses', 'pressure'])
+        ['pulses', 'pressure']
       ));
       expect(statement).not.toContain('to_jsonb');
     });
@@ -897,11 +898,18 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       expect(Object.keys(batched[0].when)).toEqual(['zone', 'day', 'big']);
     });
 
-    test('a branch of more than 50 typed values: every value as standalone, also with no rows', async () => {
+    /**
+     * A branch as wide as 1.0.16 took: 1 662 values sent as text and the id — 1 663 columns, one fewer than the
+     * 1 664 entries a PostgreSQL target list holds. The envelope may not hold more than a few entries per branch
+     * of its own (one per value would halve the width; an array constructor, not a function: a function takes
+     * at most 100 arguments). Seen by the lanes whose server enforces the limit — PostgreSQL through every driver,
+     * and PGlite; the in-memory engine enforces neither limit, and reads the branch there as a check of its values.
+     */
+    test('a branch of 1 662 typed values — as wide as 1.0.16 took (a target list holds 1 664 entries, a function 100 arguments): every value as standalone, also with no rows', async () => {
       const wide = (r: any): Record<string, unknown> => {
         const row: Record<string, unknown> = { id: r.id };
 
-        for (let i = 0; i < 60; i++) {
+        for (let i = 0; i < 1662; i++) {
           row[`v${i}`] = i % 2 === 0 ? dateTrunc('day', r.takenAt) : castAsBigInt(sql`${r.pulses} + ${i}`);
         }
 
@@ -910,7 +918,8 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
 
       const rows = await expectBatchedLikeStandalone<any[]>(() => db.readings.select(r => wide(r)).orderBy((r: any) => r.id));
       expect(rows).toHaveLength(4);
-      expect([rows[0].v0, rows[0].v1, rows[0].v59]).toEqual([localTime('2024-03-01 00:00:00'), '9007199254740994', '9007199254741052']);
+      expect(Object.keys(rows[0])).toHaveLength(1663);
+      expect([rows[0].v0, rows[0].v1, rows[0].v1661]).toEqual([localTime('2024-03-01 00:00:00'), '9007199254740994', '9007199254742654']);
 
       const none = await expectBatchedLikeStandalone<any[]>(() => db.readings.where(r => eq(r.note, 'hail')).select(r => wide(r)));
       expect(none).toEqual([]);
@@ -1064,6 +1073,32 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       expect(batch.getList(knownKey)).toEqual(await knownTyped().toList());
     });
 
+    /**
+     * A value named like the envelope's own row alias. A bare `__batch_q` is that column wherever the branch has
+     * one; the fenced envelope reads its rows as `__batch_q.*` — always the whole row — so such a branch reads as
+     * standalone, where 1.0.16 raised `function row_to_json(integer) does not exist` (and 1.0.17's first envelope,
+     * which aggregated `__batch_q`, read every row as `{}`). A branch with no value to send as its text keeps
+     * 1.0.10's envelope byte for byte, and fails on the name as it always did.
+     */
+    test('a value named __batch_q: a branch that sends texts reads its rows whole, as standalone; one that sends none fails as it always did', async () => {
+      const typed = () => db.readings.select(r => ({ __batch_q: r.id, day: dateTrunc('day', r.takenAt) })).orderBy(r => r.__batch_q);
+      const rows = await expectBatchedLikeStandalone<any[]>(typed);
+
+      expect(rows).toHaveLength(4);
+      expect(rows.map(row => Object.keys(row).sort())).toEqual(new Array(4).fill(['__batch_q', 'day']));
+      expect(rows[0].day).toEqual(localTime('2024-03-01 00:00:00'));
+
+      const plain = new QueryBatch();
+      plain.addList(db.readings.select(r => ({ __batch_q: r.id, note: r.note })).orderBy(r => r.__batch_q), 'plain');
+      let failure: unknown;
+      try {
+        await plain.executeBatch();
+      } catch (error) {
+        failure = error;
+      }
+      expect(String((failure as Error | undefined)?.message)).toMatch(/row_to_json/);
+    });
+
     test('a declared int8 / numeric column: its SQL is the fenced envelope now (1.0.10 merged its text into a jsonb row), its value unchanged — the exact text', async () => {
       const build = () => db.readings.select(r => ({ id: r.id, pressure: r.pressure, pulses: r.pulses, details: r.details })).orderBy(r => r.id);
 
@@ -1078,9 +1113,8 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       expect(statement).toBe(fencedEnvelope(
         0,
         build().future().getSql(),
-        [`concat(${batchColumn('pressure')})`, `concat(${batchColumn('pulses')})`],
-        ['pressure', 'pulses'],
-        undefined
+        [textAlways('pressure'), textAlways('pulses')],
+        ['pressure', 'pulses']
       ));
       expect(statement).not.toContain('to_jsonb');
     });
@@ -1100,15 +1134,18 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       const needsServerText = `pg_typeof(${day})::oid = ANY(${textTypes}) OR pg_typeof(${day})::oid >= 16384`;
       const dateStyled = `pg_typeof(${day})::oid = ANY('{1082,1114,1184}'::oid[])`;
       const needsItsText = `(${needsServerText} OR (NOT ${isoDateStyle} AND ${dateStyled}))`;
-      // A domain resolves to the type it is over when the server sends its text (a user-defined one, one of the text types)
+      // Its type once; the type a domain is over when the server sends its text (a user-defined one), in one
+      // catalog lookup for the branch; the rows aggregated as whole records; the value's texts, one per row,
+      // when its type needs them (the test runs once per row, in the FILTER) — the texts in ONE array column,
+      // the types in another, whatever the number of values
       expect(statement).toBe(
-        'SELECT 0 AS __batch_ix, json_build_object(\'t\', to_json(ARRAY[(SELECT (CASE WHEN __batch_t.typtype = \'d\' '
-        + `AND (__batch_t.oid >= 16384 OR __batch_t.oid = ANY(${textTypes})) THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint `
-        + 'FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t0)]::bigint[]), '
-        + '\'r\', __batch_s.r, \'x\', __batch_s.x) AS __batch_items '
-        + 'FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), \'[]\'::json) AS r, '
-        + `json_agg(ARRAY[CASE WHEN ${needsItsText} THEN concat(${day}) END]) FILTER (WHERE ${needsServerText} OR (NOT ${isoDateStyle} AND (${dateStyled}))) AS x, `
-        + `min(pg_typeof(${day})::oid) AS t0 FROM (SELECT * FROM (\n`
+        'SELECT 0 AS __batch_ix, json_build_object(\'t\', to_json(__batch_s.t::bigint[]), '
+        + '\'d\', (SELECT json_object_agg(__batch_t.oid, __batch_t.typbasetype::bigint) FROM pg_catalog.pg_type __batch_t '
+        + 'WHERE __batch_t.oid = ANY(__batch_s.t) AND __batch_t.typtype = \'d\' AND (__batch_t.oid >= 16384)), '
+        + '\'r\', __batch_s.r, \'x\', to_json(__batch_s.x)) AS __batch_items '
+        + 'FROM (SELECT coalesce(json_agg(__batch_q.*), \'[]\'::json) AS r, '
+        + `ARRAY[json_agg(concat(${day})) FILTER (WHERE ${needsItsText})] AS x, `
+        + `ARRAY[min(pg_typeof(${day})::oid)] AS t FROM (SELECT * FROM (\n`
         + `${build().future().getSql()}\n) __batch_q0 OFFSET 0) __batch_q) __batch_s`
       );
       expect(statement).not.toContain('to_jsonb');
@@ -1124,7 +1161,7 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       batch.addList(build(), 'days');
       const statement = await executeInOneRoundTrip(batch);
       expect(statement).toContain(`\n) __batch_q0("__batch_value") OFFSET 0) __batch_q) __batch_s`);
-      expect(statement).toContain(`min(pg_typeof(${batchColumn('__batch_value')})::oid) AS t0`);
+      expect(statement).toContain(`ARRAY[min(pg_typeof(${batchColumn('__batch_value')})::oid)] AS t`);
     });
 
     test('a branch of untyped values with no rows reads [] and null', async () => {

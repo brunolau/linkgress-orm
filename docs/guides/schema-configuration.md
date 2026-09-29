@@ -1356,6 +1356,78 @@ model.entity(Post, entity => {
 });
 ```
 
+### Immutable Values: `immutable: true`
+
+A type whose mapped values are never mutated — Temporal values, primitives, frozen objects — can say so.
+linkgress then calls its `fromDriver` **once per distinct driver value** of a column within one result set, and
+every row with that driver value gets the **same** mapped value. An expensive `fromDriver` (a Temporal parse, a
+date library) runs once per distinct value instead of once per row; bulk reads repeat their dates and moments a lot.
+
+The key is the value the driver hands the mapper, and only a string, a number, a bigint or a boolean is one. This
+works with every driver's defaults — an integer column of days read into a `Temporal.PlainDate`:
+
+```typescript
+import { createCustomType } from 'linkgress-orm';
+
+const EPOCH = Temporal.PlainDate.from('1970-01-01');
+
+// An integer column of days since 1970-01-01
+export const epochDay = createCustomType<{ data: Temporal.PlainDate; driverData: number }>({
+  dataType: () => 'integer',
+  toDriver: value => (value == null ? null : EPOCH.until(value).days),
+  fromDriver: value => (value == null ? null : EPOCH.add({ days: value })),
+  immutable: true,
+});
+```
+
+A `timestamp` column shares only on a client that hands its mappers the value's TEXT: **under a driver's default
+parsing a timestamp arrives as a `Date`, which is never shared** (and a mapper written for the text fails on it). With
+a text pass-through parser for `timestamp` — node-postgres `pg.types.setTypeParser(1114, v => v)` or a pool's `types`,
+postgres.js `types`, PGlite `parsers`; see [What a batched query reads](./querying.md#what-a-batched-query-reads) —
+the text is the key:
+
+```typescript
+// The client hands this mapper the timestamp's text ('2026-09-28 10:00:00'): a text pass-through parser for 1114
+export const plainDateTime = createCustomType<{ data: Temporal.PlainDateTime; driverData: string }>({
+  dataType: () => 'timestamp',
+  toDriver: value => (value == null ? null : value.toString().replace('T', ' ')),
+  fromDriver: value => (value == null ? null : Temporal.PlainDateTime.from(value.replace(' ', 'T'))),
+  immutable: true,
+});
+```
+
+`customType({ …, immutable: true })` takes it too, and so does a hand-written mapper object (`TypeMapper.immutable`).
+An expression reads through such a type with `.mapWith(type)`; an inline function mapper (`.mapWith(fn)`) never
+shares.
+
+What is shared:
+
+- **Within one result set** — one query execution, one `QueryBatch` branch (its text rebuilt from the batch's JSON
+  form is the driver value), one collection's items across all of its parent rows — **and within one column**: each
+  value a projection reads through the type (a column, a navigation's column, a nested object's, an expression's)
+  keeps its own memo. Never across queries, statements, batch branches, or executions of one future or prepared
+  query.
+- Every read path: plain selects, navigation columns and navigation rows projected whole, nested objects, collections
+  (nested ones included), `QueryBatch`, futures, prepared queries, grouped queries (keys, `min` / `max`) and their
+  joins, UNIONs, CTEs (joined, as a query's root, `withAggregation` items), `agg.arrayAgg()` elements, table
+  `toList()`, and every mutation's `.returning()`.
+- The key is the driver value when it is a string, a number, a bigint or a boolean. NULL / undefined, and a driver
+  value of any other kind (a `Date`, a `Buffer`, an array, a parsed json document), go through `fromDriver` every
+  time, as without the flag; so does `-0` (a key equal to `0`, a value that is not).
+- Bounded: at most 1,024 distinct values per column and result set. A column whose first distinct values bring no
+  repeat stops sharing — after 128 of them, or, for a result set of N values (its rows; a collection's items across
+  them), after N / 2, at most 1,024 — so a column whose values repeat only more than 128 rows apart (a calendar of a
+  year read entity by entity) still shares once each value repeats; an all-distinct column costs that many lookups.
+  (Where the count is not known — a collection nested in another's items, an `agg.arrayAgg()` list — after 128.)
+  A column that fills the 1,024 with fewer repeats than distinct values stops too; one with at least as many keeps
+  what it holds. A result set of fewer than two values reads through the type itself, without a memo.
+- A `fromDriver` that throws fails the read as it always did (the same error, from the same value).
+
+Declare it only for values nothing mutates: sharing makes equal values **identical** — mutating one changes every
+row that holds it, and code that tells values apart by identity (`===` between two of them, a `Set` / `Map` keyed by
+them, a `WeakMap`) sees one value where it used to see several. Default: off — `fromDriver` runs for every value, and
+every row gets a value of its own.
+
 ## Complete Example
 
 Here's a complete schema configuration:

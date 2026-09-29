@@ -326,7 +326,8 @@ VERBENCH_MOCK_ROW_CACHE=1 node bench/versions/compare.mjs --base v1.0.5 --head H
 then read "MockRowCache on". With the cache on, a query's build costs a fraction of what it costs with it off (a
 primary-key lookup ~3.5 µs against ~15 µs), so the same added µs weigh more in relative terms.
 `results/1.0.5-vs-1.0.10-1.0.11-1.0.12.md` compares 1.0.5 with 1.0.10, 1.0.11 and the 1.0.12 performance series in
-both modes, with a per-release breakdown.
+both modes, with a per-release breakdown. `results/1.0.16-vs-1.0.17.md` compares 1.0.16 with 1.0.17 (QueryBatch's
+type tests and repeated texts), with the geometric means against 1.0.5.
 
 `compare.mjs` extracts each ref's `src/` and the `debug/` model into `--work-dir` (default
 `<tmp>/linkgress-verbench`) and compiles it with the ref's own compiler options plus `harness.ts` and

@@ -44,6 +44,7 @@ import { selectingOnlyColumns } from '../query/sql-functions';
 import type { Subquery } from '../query/subquery';
 import type { UnionQueryBuilder } from '../query/union-builder';
 import type { FutureQuery, FutureSingleQuery, FutureCountQuery } from '../query/future-query';
+import { forResultSet } from '../query/shared-values';
 import {
   getQualifiedTableName,
   buildReturningColumnList,
@@ -5335,6 +5336,8 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     const parentsByOrd = new Map<number, any>();
     const parentPks = new Map<number, unknown>();
     const strippedRows: Array<Record<string, any>> = [];
+    // The parents' columns as this result set reads them (a type declared immutable shares its values)
+    const parentCols = (parentSelCols ?? []).map(col => ({ prop: col.prop, mapper: forResultSet(col.mapper, rawRows.length) }));
 
     for (const row of rawRows) {
       const ord = Number(row['__ibwc_parent__.__ord']);
@@ -5342,7 +5345,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       if (!parentsByOrd.has(ord)) {
         const parentRow: Record<string, any> = {};
 
-        for (const col of parentSelCols ?? []) {
+        for (const col of parentCols) {
           const raw = row[`__ibwc_parent__.${col.prop}`];
           parentRow[col.prop] = col.mapper ? col.mapper.fromDriver(raw) : raw;
         }
@@ -6773,7 +6776,8 @@ RETURNING 1`;
    *
    * All rows of one result set share the same column shape, so the
    * present-column subset of the mapping plan is derived from the first row
-   * once, and the per-row loop runs without `in` checks.
+   * once, and the per-row loop runs without `in` checks. A type declared
+   * immutable shares its mapped values across the rows (see forResultSet).
    */
   private mapResultsToEntities(results: any[]): UnwrapDbColumns<TEntity>[] {
     if (results.length === 0) {
@@ -6784,7 +6788,7 @@ RETURNING 1`;
     const restoreZeroScale = this._getClient().losesNumericZeroScale();
     const presentPlan = this.getEntityMappingPlan()
       .filter(entry => entry.dbColumnName in results[0])
-      .map(entry => ({ ...entry, mapper: entry.mapper ?? (restoreZeroScale ? entry.zeroScale : undefined) }));
+      .map(entry => ({ ...entry, mapper: forResultSet(entry.mapper, results.length) ?? (restoreZeroScale ? entry.zeroScale : undefined) }));
     const mapped: UnwrapDbColumns<TEntity>[] = new Array(results.length);
 
     for (let rowIndex = 0; rowIndex < results.length; rowIndex++) {

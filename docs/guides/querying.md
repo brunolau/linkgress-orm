@@ -1025,7 +1025,9 @@ const users = await db.users
 `.mapWith(fn)` reads the fragment's driver value through `fn` (null stays null) — at the top level,
 inside nested objects, in a collection's items, in a grouped query and in any mutation's
 `.returning()`. The fragment's value type is what `fn` returns; `.mapWith(customType)` takes a
-mapper object with `fromDriver` / `toDriver` instead:
+mapper object with `fromDriver` / `toDriver` instead — one declared `immutable: true` shares each
+distinct value's mapped value within the result set (see [Immutable Values](./schema-configuration.md#immutable-values-immutable-true)),
+which an inline `fn` never does:
 
 ```typescript
 const rows = await db.orders.select(o => ({
@@ -1544,11 +1546,17 @@ one alongside each row, and each such value's type once, over its query wrapped 
 with declared int8 / numeric columns is one of these now: 1.0.10 merged their texts into a `jsonb` row; the
 values are the same.)
 
-That costs, per query, a header of about 50 bytes plus about 10 per value sent as text, and one catalog
-lookup per such value; per row, a type test per runtime-typed value, and the texts that are needed. Measured
-on PostgreSQL 18: a correlated scalar subquery per row (400 rows over 20 000) runs once per row, 244 ms, as on
-its own (235 ms; without the `OFFSET 0` wrapper PostgreSQL would evaluate it at every reference, 1 184 ms);
-50 000 rows with one `lower()` take 27 ms where 1.0.10's envelope took 20 ms (ordered: 30 ms and 28 ms).
+That costs, per query, a header of about 60 bytes plus about 10 per value sent as text, and one catalog
+lookup (for the values that are domains); per row, one type test per runtime-typed value, and the texts that
+are needed. A text a value repeats is parsed once for the query's result: every row still gets a value of its
+own — a Date is copied for each row, even when the parser returned one Date it shares between texts (a parser
+that caches its results) — and a value its parser makes into anything but a string, a number, a boolean, a
+bigint, null or a plain Date (a Buffer, an interval object, a custom parser's object, a frozen Date) is parsed
+row by row, as is a text a client's own json parser made into something else. Measured on PostgreSQL 18: a
+correlated scalar subquery per row (400 rows over 20 000) runs once per row, 244 ms, as on its own (235 ms;
+without the `OFFSET 0` wrapper PostgreSQL would evaluate it at every reference, 1 184 ms); 50 000 rows of one
+`lower(md5(…))` take 67 ms where 1.0.10's envelope took 59 ms (ordered: 63 ms and 61 ms). A query sends as
+many values as text in a batch as it selects on its own (a PostgreSQL target list holds 1 664 entries).
 
 ### Known limitations of the JSON transport
 

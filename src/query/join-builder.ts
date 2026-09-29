@@ -6,6 +6,7 @@ import { QueryExecutor } from '../entity/db-context';
 import { parseOrderBy, getTableAlias } from './query-utils';
 import { createNestedFieldRefProxy, getColumnNameMapForSchema, holdsSqlValue, projectionLiteralSql } from './query-builder';
 import { selectorProjectingConditions } from './sql-functions';
+import { forResultSet } from './shared-values';
 
 /**
  * Whether a projected value of a join is a value rather than a column or an expression: a literal,
@@ -224,7 +225,8 @@ export class JoinQueryBuilder<TLeft, TRight> {
   /**
    * The rows read back field by field: a column of either table through its column's mapper, a
    * literal as itself (it rides the statement as a parameter the database hands back as text). The
-   * rows used to be returned as the driver delivered them.
+   * rows used to be returned as the driver delivered them. The reads serve this one result set (a type
+   * declared immutable shares its mapped values within it, see forResultSet).
    */
   private readRows(rows: any[]): any[] {
     const selection = this.selection!(
@@ -252,8 +254,10 @@ export class JoinQueryBuilder<TLeft, TRight> {
         mapper = ref.getMapper();
       }
 
-      readers.push([key, mapper && typeof mapper.fromDriver === 'function'
-        ? row => mapper.fromDriver(row[key])
+      const read = mapper && typeof mapper.fromDriver === 'function' ? forResultSet(mapper, rows.length) : undefined;
+
+      readers.push([key, read !== undefined
+        ? row => read.fromDriver(row[key])
         : row => row[key]]);
     }
 

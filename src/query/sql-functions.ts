@@ -21,6 +21,7 @@ import {
   varcharTypeName,
   WhereConditionBase,
 } from './conditions';
+import { readerThrough } from './shared-values';
 
 /**
  * SQL expression helpers — the built-in spelling of the expressions that otherwise end up
@@ -1729,7 +1730,11 @@ function readMapperOf(value: unknown): { fromDriver(value: unknown): unknown; to
   return mapper && typeof mapper.fromDriver === 'function' ? mapper : undefined;
 }
 
-/** How a list of the operand's values reads: each element through the operand's mapper. */
+/**
+ * How a list of the operand's values reads: each element through the operand's mapper — for a type declared
+ * immutable, through one memo per result set (see readerThrough): the elements of every row's list share it. The
+ * elements are not the result set's rows: a one-row result set still shares a list's elements.
+ */
 function arrayReadMapper(argument: unknown): any {
   const element = readMapperOf(argument);
 
@@ -1737,11 +1742,11 @@ function arrayReadMapper(argument: unknown): any {
     return DRIVER_VALUE_MAPPER;
   }
 
-  return {
+  return readerThrough(element, read => ({
     fromDriver: (value: unknown) => (Array.isArray(value)
-      ? value.map(item => (item === null || item === undefined ? item : element.fromDriver(item)))
+      ? value.map(item => (item === null || item === undefined ? item : read.fromDriver(item)))
       : value),
-  };
+  }), false);
 }
 
 /** `name(…)` parts / values: `[DISTINCT] <argument> [ORDER BY <key> <dir>, …]) [FILTER (WHERE <cond>)]`. */

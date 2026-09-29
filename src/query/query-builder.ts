@@ -30,6 +30,8 @@ import {
 import { assertExplicitAlias } from './aliased-scope';
 import { createSetRow, holdsSetReturningValue, lateralSetJoinsSql, lateralSetRefs, renderProjectedFragment, SetReturningFunction } from './set-returning';
 import type { LateralSetJoin, SetRow } from './set-returning';
+import { countedOnce, forResultSet, sharesValues, valuesAt } from './shared-values';
+import type { ValueCount } from './shared-values';
 
 /**
  * Field type categories for optimized result transformation
@@ -107,7 +109,7 @@ interface AggregatedItemRead {
 }
 
 /** The read of one value of an aggregated projection, `undefined` when it reads as JSON delivers it. */
-const aggregatedItemRead = (value: unknown): AggregatedItemRead | undefined => {
+const aggregatedItemRead = (value: unknown, itemCount: ValueCount): AggregatedItemRead | undefined => {
   if (value === undefined) {
     return undefined;
   }
@@ -119,7 +121,8 @@ const aggregatedItemRead = (value: unknown): AggregatedItemRead | undefined => {
   const fields = materializeMockSelection(value);
 
   if (isPlainNestedProjection(fields)) {
-    const nested = aggregatedItemReads(fields);
+    // One nested object per item
+    const nested = aggregatedItemReads(fields, itemCount);
 
     return nested === undefined ? undefined : { nested };
   }
@@ -128,7 +131,8 @@ const aggregatedItemRead = (value: unknown): AggregatedItemRead | undefined => {
   const mapper = fromDriverMapper(meta.__mapper)
     ?? (typeof meta.getMapper === 'function' ? fromDriverMapper(meta.getMapper()) : undefined);
 
-  return mapper === undefined ? undefined : { mapper };
+  // One result set's read (see aggregatedItemReads): a type declared immutable shares its values there
+  return mapper === undefined ? undefined : { mapper: forResultSet(mapper, itemCount) };
 };
 
 /**
@@ -136,13 +140,17 @@ const aggregatedItemRead = (value: unknown): AggregatedItemRead | undefined => {
  * mappers — a column's (`__mapper`), an expression's `mapWith` — a literal as itself, a nested
  * object key by key. The mappers used to be looked up by NAME among the columns of the table reading
  * the CTE: another table's mapper, or none at all. `undefined` when every key reads as delivered.
+ * Built for ONE result set, whose lists hold `itemCount` items (a mapper declared `immutable` shares its
+ * values within it, see forResultSet).
  * @internal
  */
-export const aggregatedItemReads = (innerMetadata: Record<string, any> | undefined): Record<string, AggregatedItemRead> | undefined => {
+export const aggregatedItemReads = (innerMetadata: Record<string, any> | undefined, itemCount?: ValueCount): Record<string, AggregatedItemRead> | undefined => {
   let reads: Record<string, AggregatedItemRead> | undefined;
+  // Counted once, and only when a mapper declared immutable asks
+  const itemTotal = countedOnce(itemCount);
 
   for (const key in innerMetadata) {
-    const read = aggregatedItemRead(innerMetadata[key]);
+    const read = aggregatedItemRead(innerMetadata[key], itemTotal);
 
     if (read !== undefined) {
       (reads ??= {})[key] = read;
@@ -974,12 +982,13 @@ export const fromDriverMapper = (mapper: any): any | undefined => {
 
 /**
  * How one value of a projection reads back from the column (or JSON value) delivered for it —
- * compiled once per query by `SelectQueryBuilder.compileFieldRead`, applied per row.
+ * compiled once per result set by `SelectQueryBuilder.compileFieldRead`, applied per row.
  */
 interface FieldRead {
   key: string;
   type: FieldType;
   value: any;
+  /** The mapper as this result set reads through it (a type declared `immutable`: its memo, see forResultSet) */
   mapper?: any;
   aggregationType?: string;
   collectionBuilder?: CollectionQueryBuilder<any>;
@@ -996,6 +1005,8 @@ interface FieldRead {
    * that has items, then applied to every row's (a FieldRead lives as long as one result set's read)
    */
   itemsRead?: (items: any[]) => any[];
+  /** COLLECTION_JSON / COLLECTION_SINGLE: the collection's items across the result set (see forResultSet) */
+  itemCount?: () => number;
 }
 
 /**
@@ -3290,23 +3301,9 @@ export class SelectQueryBuilder<TSelection> {
       customOids: this.client.customParsedTypeOids(),
     });
 
-    const reviveJsonRow = revivals.length === 0
-      ? undefined
-      : (row: any) => {
-          for (const { key, revive } of revivals) {
-            const value = row[key];
-
-            if (value !== null && value !== undefined) {
-              row[key] = revive(value);
-            }
-          }
-
-          return row;
-        };
-
     return {
       hasNestedPaths,
-      reviveJsonRow,
+      jsonRevivals: revivals.length === 0 ? undefined : revivals,
       textColumns: textColumns.length > 0 ? textColumns : undefined,
       runtimeTypedColumns: runtimeTyped.length > 0 ? runtimeTyped : undefined,
       // The batch addresses the one expression's column by name when it sends its text
@@ -5274,12 +5271,13 @@ export class SelectQueryBuilder<TSelection> {
   ): any[] {
     if (returning === true || read === undefined) {
       // Full entity mapping - apply fromDriver mappers (a numeric(p, s) zero gets back the scale a
-      // client dropped). Computed once per call, not per row.
+      // client dropped). Computed once per call, not per row — for this result set (a type declared
+      // immutable shares its mapped values across its rows, see forResultSet).
       const restoreZeroScale = this.client.losesNumericZeroScale();
       const columns = [...getSchemaColumnMeta(this.schema)].map(([propName, meta]) => ({
         propName,
         dbName: meta.name!,
-        mapper: meta.mapper ?? (restoreZeroScale ? numericZeroScaleMapper(this.schema.columnMetadataCache?.get(propName)?.config ?? {}) : undefined),
+        mapper: forResultSet(meta.mapper, rows.length) ?? (restoreZeroScale ? numericZeroScaleMapper(this.schema.columnMetadataCache?.get(propName)?.config ?? {}) : undefined),
       }));
 
       return rows.map(row => {
@@ -8003,7 +8001,7 @@ ${joinClauses.join('\n')}`;
     const reads: FieldRead[] = [];
 
     for (const key in selection) {
-      reads.push(this.compileFieldRead(key, selection[key], disableMappers, literalsFromRows, false));
+      reads.push(this.compileFieldRead(key, selection[key], disableMappers, literalsFromRows, false, rows, [key]));
     }
 
     // Transform each row using the compiled reads
@@ -8039,11 +8037,22 @@ ${joinClauses.join('\n')}`;
   }
 
   /**
-   * How one value of a projection reads back — decided once per query (see FieldRead). A value of a
+   * How one value of a projection reads back — decided once per result set (see FieldRead). A value of a
    * nested object (`nested`) keeps NULL as null, as nested values always did; at the top level a
-   * value that is not a column of the table reads NULL as undefined.
+   * value that is not a column of the table reads NULL as undefined. A value read through a mapper
+   * declared `immutable` shares its mapped values within the result set (forResultSet): a FieldRead
+   * never serves another result set. `rows` / `path`: the result set's rows and the keys down to this
+   * value in each of them — how many values a memo reads (a collection's items counted when one asks).
    */
-  private compileFieldRead(key: string, value: any, disableMappers: boolean, literalsFromRows: boolean, nested: boolean): FieldRead {
+  private compileFieldRead(
+    key: string,
+    value: any,
+    disableMappers: boolean,
+    literalsFromRows: boolean,
+    nested: boolean,
+    rows: readonly any[],
+    path: readonly string[]
+  ): FieldRead {
     // Check for navigation placeholders first (most common early exit)
     if (value === undefined) {
       // A nested undefined renders as NULL (see renderFlatNestedLeaf)
@@ -8066,7 +8075,7 @@ ${joinClauses.join('\n')}`;
       const children: FieldRead[] = [];
 
       for (const childKey in fields) {
-        children.push(this.compileFieldRead(childKey, fields[childKey], disableMappers, literalsFromRows, true));
+        children.push(this.compileFieldRead(childKey, fields[childKey], disableMappers, literalsFromRows, true, rows, [...path, childKey]));
       }
 
       return { key, type: FieldType.NESTED, value, children };
@@ -8088,11 +8097,14 @@ ${joinClauses.join('\n')}`;
         return { key, type: FieldType.COLLECTION_ARRAY, value };
       }
 
+      // The items across the result set, counted when a memo asks (see collectionItemsRead)
+      const itemCount = () => valuesAt(rows, path);
+
       if (value instanceof CollectionQueryBuilder && value.isSingleResult()) {
-        return { key, type: FieldType.COLLECTION_SINGLE, value, collectionBuilder: value };
+        return { key, type: FieldType.COLLECTION_SINGLE, value, collectionBuilder: value, itemCount };
       }
 
-      return { key, type: FieldType.COLLECTION_JSON, value, collectionBuilder: value instanceof CollectionQueryBuilder ? value : undefined };
+      return { key, type: FieldType.COLLECTION_JSON, value, collectionBuilder: value instanceof CollectionQueryBuilder ? value : undefined, itemCount };
     }
 
     // CTE aggregation array: its items read through the aggregated query's own mappers
@@ -8101,7 +8113,7 @@ ${joinClauses.join('\n')}`;
         key,
         type: FieldType.CTE_AGGREGATION,
         value,
-        itemReads: disableMappers ? undefined : aggregatedItemReads((value as any).__innerSelectionMetadata),
+        itemReads: disableMappers ? undefined : aggregatedItemReads((value as any).__innerSelectionMetadata, () => valuesAt(rows, path)),
       };
     }
 
@@ -8118,7 +8130,7 @@ ${joinClauses.join('\n')}`;
           : fromDriverMapper((value as any).__mapper) ?? (typeof (value as any).getMapper === 'function' ? fromDriverMapper((value as any).getMapper()) : undefined);
 
       return mapper
-        ? { key, type: FieldType.FIELD_REF_MAPPER, value, mapper }
+        ? { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: forResultSet(mapper, rows.length) }
         : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).__sqlType), keepNull: nested || literal };
     }
 
@@ -8128,7 +8140,7 @@ ${joinClauses.join('\n')}`;
 
       // Without a mapper: read like a column of the fragment's read type (withReadType), if any
       return mapper
-        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper }
+        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper: forResultSet(mapper, rows.length) }
         : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText((value as any).getReadType?.()), keepNull: nested };
     }
 
@@ -8146,7 +8158,7 @@ ${joinClauses.join('\n')}`;
       const cachedMapper = ownTable ? (cached?.hasMapper ? cached.mapper : undefined) : value.__mapper;
 
       if (cached && cachedMapper && typeof cachedMapper.fromDriver === 'function') {
-        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: cachedMapper };
+        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: forResultSet(cachedMapper, rows.length) };
       }
 
       if (cached) {
@@ -8162,7 +8174,7 @@ ${joinClauses.join('\n')}`;
       const fieldMapper = (value as any).__mapper;
 
       if (fieldMapper && typeof fieldMapper.fromDriver === 'function') {
-        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: fieldMapper };
+        return { key, type: FieldType.FIELD_REF_MAPPER, value, mapper: forResultSet(fieldMapper, rows.length) };
       }
 
       // A navigation's (or joined table's) text column keeps its text: '01234' used to read back as the number 1234
@@ -8176,7 +8188,7 @@ ${joinClauses.join('\n')}`;
       const mapper = disableMappers ? undefined : fromDriverMapper(scalarRead.mapper);
 
       return mapper
-        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper }
+        ? { key, type: FieldType.SQL_FRAGMENT_MAPPER, value, mapper: forResultSet(mapper, rows.length) }
         : { key, type: FieldType.SIMPLE, value, coerce: coercesNumericText(scalarRead.readType), keepNull: nested };
     }
 
@@ -8230,7 +8242,7 @@ ${joinClauses.join('\n')}`;
           return items;
         }
 
-        const transformed = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows))(items);
+        const transformed = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows, read.itemCount))(items);
         const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
 
         return scalarAlias !== undefined ? unwrapScalarItems(transformed, scalarAlias) : transformed;
@@ -8247,7 +8259,7 @@ ${joinClauses.join('\n')}`;
         }
 
         // Transform the single item using collection mapper if available
-        const transformedItems = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows))([rawValue]);
+        const transformedItems = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows, read.itemCount))([rawValue]);
         const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
         const item = scalarAlias !== undefined ? unwrapScalarItems(transformedItems, scalarAlias) : transformedItems;
 
@@ -8296,16 +8308,17 @@ ${joinClauses.join('\n')}`;
 
   /**
    * How a collection's items read back — through the fromDriver mappers of their fields (see
-   * collectionItemsReader) — set up once for a result set's rows (see FieldRead.itemsRead).
+   * collectionItemsReader) — set up once for a result set's rows (see FieldRead.itemsRead), whose
+   * items number `itemCount`.
    */
-  private collectionItemsRead(collectionBuilder: CollectionQueryBuilder<any>, literalsFromRows: boolean = false): (items: any[]) => any[] {
+  private collectionItemsRead(collectionBuilder: CollectionQueryBuilder<any>, literalsFromRows: boolean = false, itemCount?: ValueCount): (items: any[]) => any[] {
     // Check if mappers are disabled for performance
     if (this.executor?.getOptions().disableMappers ?? false) {
       // Skip mapper transformation for performance - return items as-is
       return items => items;
     }
 
-    return collectionItemsReader(collectionBuilder, this.schemaRegistry, !literalsFromRows);
+    return collectionItemsReader(collectionBuilder, this.schemaRegistry, !literalsFromRows, itemCount);
   }
 
   /**
@@ -9010,27 +9023,35 @@ export function transformCollectionItemsOf(
   fallbackRegistry: Map<string, TableSchema> | undefined,
   applyLiterals: boolean = true
 ): any[] {
-  return collectionItemsReader(collectionBuilder, fallbackRegistry, applyLiterals)(items);
+  return collectionItemsReader(collectionBuilder, fallbackRegistry, applyLiterals, items.length)(items);
 }
 
 /**
  * {@link transformCollectionItemsOf} for one collection of a query: its read setup — the mappers of its fields,
  * its nested collections' reads — built once, then applied to every parent row's items (it used to be built
- * again for each of them, and for each item's nested collection). @internal
+ * again for each of them, and for each item's nested collection). A reader serves ONE result set, whose rows hold
+ * `itemCount` items of the collection: a mapper declared `immutable` shares its values across them
+ * (forResultSet). A nested collection's reader gets no count: its items across the result set are not known.
+ * @internal
  */
 export function collectionItemsReader(
   collectionBuilder: CollectionQueryBuilder<any>,
   fallbackRegistry: Map<string, TableSchema> | undefined,
-  applyLiterals: boolean = true
+  applyLiterals: boolean = true,
+  itemCount?: ValueCount
 ): (items: any[]) => any[] {
   const targetSchema = collectionBuilder.getTargetTableSchema();
   const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
   const schemaRegistryForItems = collectionBuilder.getSchemaRegistry() || fallbackRegistry;
+  // Counted once, and only when a mapper declared immutable asks
+  const itemTotal = countedOnce(itemCount);
 
   if (!targetSchema) {
     // No schema to read mappers from — the projection's own reads (literals, expressions) still apply
+    const fieldMappers: FieldMappers = { byField: new Map(), itemCount: itemTotal };
+
     return hasFieldReads(selectedFieldConfigs, applyLiterals)
-      ? items => items.map(item => applyFieldReads({ ...item }, selectedFieldConfigs, undefined, schemaRegistryForItems, false, applyLiterals))
+      ? items => items.map(item => applyFieldReads({ ...item }, selectedFieldConfigs, undefined, schemaRegistryForItems, fieldMappers, false, applyLiterals))
       : items => items;
   }
 
@@ -9087,8 +9108,14 @@ export function collectionItemsReader(
     }
   }
 
+  // Each field's mapper as this reader's result set reads through it (a type declared immutable: its memo)
+  for (const [alias, mapper] of mapperCache) {
+    mapperCache.set(alias, forResultSet(mapper, itemTotal));
+  }
+
   // Literals and nested objects of the projection read through their own field configs
   const readsFields = hasFieldReads(selectedFieldConfigs, applyLiterals);
+  const fieldMappers: FieldMappers = { byField: new Map(), itemCount: itemTotal };
 
   // Build cache of nested collection info (fields that are themselves nested collections)
   // This is used for recursive transformation of nested collection results
@@ -9134,10 +9161,43 @@ export function collectionItemsReader(
           }
         }
       }
-      results[i] = readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
+      results[i] = readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, fieldMappers, true, applyLiterals) : transformedItem;
     }
     return results;
   };
+}
+
+/**
+ * The mappers the fields of a collection projection read through in {@link applyFieldReads}, for one reader: each
+ * resolved the first time an item needs it, as the reader's result set reads through it (forResultSet) — `null`:
+ * none — over the reader's items (one nested object per item).
+ */
+interface FieldMappers {
+  readonly byField: Map<SelectedField, { fromDriver(value: any): any } | null>;
+  readonly itemCount: ValueCount;
+}
+
+/** The mapper `field` of a collection projection reads through, for the reader `fieldMappers` belong to. */
+function fieldMapperOf(
+  field: SelectedField,
+  fieldMappers: FieldMappers,
+  columnCache: TableSchema['columnMetadataCache'],
+  schemaRegistry: Map<string, TableSchema> | undefined
+): { fromDriver(value: any): any } | null {
+  const known = fieldMappers.byField.get(field);
+
+  if (known !== undefined) {
+    return known;
+  }
+
+  const declared = field.mapper ?? selectedFieldMapper(field, columnCache, schemaRegistry);
+  const mapper: { fromDriver(value: any): any } | null = declared && typeof declared.fromDriver === 'function'
+    ? forResultSet(declared, fieldMappers.itemCount)
+    : null;
+
+  fieldMappers.byField.set(field, mapper);
+
+  return mapper;
 }
 
 /** The mapper of a collection field reading a column (of the item's table, or of a navigation's). */
@@ -9167,13 +9227,15 @@ function hasFieldReads(fields: SelectedField[] | undefined, applyLiterals: boole
  * back as its value (the database returns an untyped parameter as text — `42` came back "42",
  * `true` "true"), and a nested object's fields read like top-level ones — a literal as itself, a
  * column through its mapper, an expression through its own. `topLevelDone` skips the top level's
- * columns and expressions, which the caller already mapped.
+ * columns and expressions, which the caller already mapped. `fieldMappers`: the mappers of the reader
+ * the item is read by (see fieldMapperOf).
  */
 function applyFieldReads(
   item: any,
   fields: SelectedField[] | undefined,
   columnCache: TableSchema['columnMetadataCache'],
   schemaRegistry: Map<string, TableSchema> | undefined,
+  fieldMappers: FieldMappers,
   topLevelDone: boolean = false,
   applyLiterals: boolean = true
 ): any {
@@ -9190,12 +9252,12 @@ function applyFieldReads(
       const nested = item[field.alias];
 
       if (nested !== null && typeof nested === 'object') {
-        item[field.alias] = applyFieldReads({ ...nested }, field.nested, columnCache, schemaRegistry, false, applyLiterals);
+        item[field.alias] = applyFieldReads({ ...nested }, field.nested, columnCache, schemaRegistry, fieldMappers, false, applyLiterals);
       }
     } else if (!topLevelDone && field.alias in item) {
-      const mapper = field.mapper ?? selectedFieldMapper(field, columnCache, schemaRegistry);
+      const mapper = fieldMapperOf(field, fieldMappers, columnCache, schemaRegistry);
 
-      if (mapper && typeof mapper.fromDriver === 'function') {
+      if (mapper !== null) {
         item[field.alias] = mapper.fromDriver(item[field.alias]);
       }
     }
@@ -9207,7 +9269,8 @@ function applyFieldReads(
 /**
  * How a nested collection value (from firstOrDefault or toList inside another collection) reads back:
  * custom mappers applied to fields within the nested collection result. The read is set up once per
- * nested collection of a query and applied to each of its values (see collectionItemsReader).
+ * nested collection of a query and applied to each of its values (see collectionItemsReader) — of ONE
+ * result set: a mapper declared `immutable` shares its values across them (forResultSet).
  */
 function nestedCollectionValueReader(
   nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string },
@@ -9270,8 +9333,15 @@ function nestedCollectionValueReader(
     }
   }
 
+  // Each field's mapper as this reader's result set reads through it (a type declared immutable: its memo — over
+  // items whose number across the result set is not known)
+  for (const [alias, mapper] of mapperCache) {
+    mapperCache.set(alias, forResultSet(mapper));
+  }
+
   // Literals and nested objects of the projection read through their own field configs
   const readsFields = hasFieldReads(selectedFieldConfigs, applyLiterals);
+  const fieldMappers: FieldMappers = { byField: new Map(), itemCount: undefined };
 
   // Build cache for any deeply nested collections
   const deeplyNestedCache = new Map<string, { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string }>();
@@ -9312,7 +9382,7 @@ function nestedCollectionValueReader(
         }
       }
     }
-    return readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
+    return readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, fieldMappers, true, applyLiterals) : transformedItem;
   };
 
   if (nestedInfo.isSingleResult) {
@@ -9585,9 +9655,15 @@ export function renderPlainReturning(
 /**
  * A collection a mutation's RETURNING projects, read the way a SELECT reads it: an aggregate as its
  * number, a list's items (and a `firstOrDefault()`'s item) through their columns' mappers, and a
- * collection selecting ONE value as its values. @internal
+ * collection selecting ONE value as its values. `readItems`: how its items read (see
+ * collectionItemsReader) — the reader of the result set the value belongs to. @internal
  */
-export function readCollectionResult(collection: any, raw: any, registry: Map<string, TableSchema> | undefined): any {
+export function readCollectionResult(
+  collection: any,
+  raw: any,
+  registry: Map<string, TableSchema> | undefined,
+  readItems: (items: any[]) => any[] = items => transformCollectionItemsOf(items, collection, registry)
+): any {
   if (!(collection instanceof CollectionQueryBuilder)) {
     return raw;
   }
@@ -9607,18 +9683,67 @@ export function readCollectionResult(collection: any, raw: any, registry: Map<st
       return null;
     }
 
-    const items = transformCollectionItemsOf([raw], collection, registry);
+    const items = readItems([raw]);
 
     return (scalarAlias !== undefined ? unwrapScalarItems(items, scalarAlias) : items)[0] ?? null;
   }
 
-  const items = transformCollectionItemsOf(raw ?? [], collection, registry);
+  const items = readItems(raw ?? []);
 
   return scalarAlias !== undefined ? unwrapScalarItems(items, scalarAlias) : items;
 }
 
-/** A mutation's RETURNING rows, read through the plan its rendering built (see ReturningRead). @internal */
+/**
+ * A RETURNING shape as ONE result set of `rowCount` rows reads it: a value whose mapper shares its values within
+ * a result set (a type declared `immutable`) through a memo of its own (forResultSet); the shape itself when it
+ * has none — a plan serves every execution of its statement.
+ */
+function shapeForResultSet(shape: ReturningShape, rowCount: number): ReturningShape {
+  let fresh: ReturningShape | undefined;
+
+  for (let i = 0; i < shape.length; i++) {
+    const { key, read } = shape[i];
+    let freshRead: ReturningRead = read;
+
+    if (read.kind === 'value' && sharesValues(read.mapper)) {
+      freshRead = { ...read, mapper: forResultSet(read.mapper, rowCount) };
+    } else if (read.kind === 'nested') {
+      const nested = shapeForResultSet(read.shape, rowCount);
+
+      freshRead = nested === read.shape ? read : { kind: 'nested', shape: nested };
+    }
+
+    if (freshRead !== read) {
+      fresh ??= shape.slice();
+      fresh[i] = { key, read: freshRead };
+    }
+  }
+
+  return fresh ?? shape;
+}
+
+/**
+ * A mutation's RETURNING rows, read through the plan its rendering built (see ReturningRead) — as one result set:
+ * a type declared `immutable` shares its mapped values across the rows, and each collection value of the shape
+ * reads its items through one reader of its own (see collectionItemsReader) — also when a selector returns one
+ * collection under two keys: each key is a column, with a memo of its own, as in a SELECT. @internal
+ */
 export function readReturningRows(rows: any[], plan: ReturningReadPlan, registry: Map<string, TableSchema> | undefined): any[] {
+  // By the shape entry's read: one per key, whichever collection instance it reads
+  const itemReads = new Map<ReturningRead, (items: any[]) => any[]>();
+  const itemsReadOf = (read: Extract<ReturningRead, { kind: 'collection' }>): ((items: any[]) => any[]) => {
+    let readItems = itemReads.get(read);
+
+    if (readItems === undefined) {
+      let reader: ((items: any[]) => any[]) | undefined;
+
+      readItems = items => (reader ??= collectionItemsReader(read.collection, registry, true, () => valuesAt(rows, [read.column])))(items);
+      itemReads.set(read, readItems);
+    }
+
+    return readItems;
+  };
+
   const readShape = (row: any, shape: ReturningShape): any => {
     const out: any = {};
 
@@ -9633,7 +9758,7 @@ export function readReturningRows(rows: any[], plan: ReturningReadPlan, registry
           out[key] = read.value;
           break;
         case 'collection':
-          out[key] = readCollectionResult(read.collection, row[read.column], registry);
+          out[key] = readCollectionResult(read.collection, row[read.column], registry, itemsReadOf(read));
           break;
         case 'nested':
           out[key] = readShape(row, read.shape);
@@ -9644,8 +9769,10 @@ export function readReturningRows(rows: any[], plan: ReturningReadPlan, registry
     return out;
   };
 
+  const shape = shapeForResultSet(plan.shape, rows.length);
+
   return rows.map(row => {
-    const out = readShape(row, plan.shape);
+    const out = readShape(row, shape);
 
     return plan.scalar ? out[SCALAR_SELECTION_ALIAS] : out;
   });

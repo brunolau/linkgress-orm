@@ -12,6 +12,7 @@ import {
   aggregatedItemReads,
   assertProjectionArrayOfValues,
   coercesNumericText,
+  fromDriverMapper,
   getColumnNameMapForSchema,
   getRelationEntriesForSchema,
   getTargetSchemaForRelation,
@@ -26,6 +27,7 @@ import { lateralSetJoinsSql, lateralSetRefs } from './set-returning';
 import type { LateralSetJoin } from './set-returning';
 import { flatRowBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, isCustomReadMapper } from './future-query';
 import type { BatchFieldDelivery, FutureBatchMeta } from './future-query';
+import { forResultSet, readersForResultSet, readerThrough, valuesAt } from './shared-values';
 import { needsClientParse } from '../database/typed-text';
 
 /**
@@ -585,14 +587,18 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   }
 
   /**
-   * Transform database results - convert aggregate values and apply mappers
+   * Transform database results - convert aggregate values and apply mappers. `readers` may serve several
+   * result sets (a future's): they are made for this one first (a type declared immutable shares its mapped
+   * values within it, see readersForResultSet).
    */
-  private transformResults(rows: any[], readers: Map<string, (value: any) => any> = this.buildFieldReaders()): any[] {
+  private transformResults(rows: any[], readers: ReadonlyMap<string, (value: any) => any> = this.buildFieldReaders()): any[] {
+    const reads = readersForResultSet(readers, rows.length);
+
     return rows.map(row => {
       const transformed: any = {};
 
       for (const [key, value] of Object.entries(row)) {
-        const read = readers.get(key);
+        const read = reads.get(key);
         transformed[key] = read ? read(value) : value;
       }
 
@@ -606,6 +612,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * column through its mapper; a field without a reader reads as the driver delivers it. Shared by
    * toList() and by a join of this grouped query, whose rows carry the grouped fields as they are —
    * they used to come back raw there (a count as the driver's string, a mapped MIN unmapped).
+   * The readers serve any number of result sets: read one through `readersForResultSet()` of them (a
+   * reader through a type declared immutable then shares its values within that result set only).
    * @internal
    */
   buildFieldReaders(): Map<string, (value: any) => any> {
@@ -634,23 +642,25 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       if (mockValue && typeof mockValue === 'object' && '__isAggregate' in mockValue && mockValue.__isAggregate) {
         const aggType = (mockValue as AggregateFieldRef).__aggregateType;
 
-        readers.set(key, aggType === 'MIN' || aggType === 'MAX'
+        if (aggType === 'MIN' || aggType === 'MAX') {
           // An extreme of a value is a value of its type
-          ? value => this.readExtremeValue(value, mockValue as AggregateFieldRef, mockOriginalSelection)
+          const { mapper, sqlType } = this.extremeTypeOf(mockValue as AggregateFieldRef, mockOriginalSelection);
+
+          readers.set(key, readerThrough(mapper, read => (value: any) => this.readExtremeValue(value, read, sqlType)));
+        } else {
           // COUNT, SUM and AVG are numbers (SUM / AVG are cast to double precision)
-          : value => (value === null ? null : Number(value)));
+          readers.set(key, value => (value === null ? null : Number(value)));
+        }
       }
       // Check if this field has a mapper
       else if (columnMetadataCache[key]?.hasMapper) {
-        const mapper = columnMetadataCache[key].mapper;
-
-        readers.set(key, value => {
+        readers.set(key, readerThrough(columnMetadataCache[key].mapper, mapper => (value: any) => {
           if (value === null || value === undefined) {
             return null;
           }
 
           return typeof mapper.fromDriver === 'function' ? mapper.fromDriver(value) : value;
-        });
+        }));
       }
       // A read-typed fragment (withReadType) reads like a column of its type: numeric text of a
       // numeric type becomes a number, any other type stays as delivered (NULL stays null here)
@@ -668,7 +678,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * a column's — a grouping key, also renamed (the `p.key.distinctDay` of `{ distinctDay: p.day }`) —
    * is its SOURCE column's (see {@link columnReadMapperOf}). Read by {@link buildFieldReaders}, by the
    * batch deliveries (which revive a mapper's input as the mapper expects it) and, per column, by
-   * {@link getSelectionMetadata}.
+   * {@link getSelectionMetadata}. Each is the object that has `fromDriver` (fromDriverMapper): the builder
+   * form of a custom type (`customType()`) as its type — it used to be kept as the builder, which has no
+   * `fromDriver`, so the value came back as the driver delivered it.
    */
   private projectionMappers(mockResult: object): Record<string, { hasMapper: boolean; mapper?: any }> {
     const columnMetadataCache: Record<string, { hasMapper: boolean; mapper?: any }> = {};
@@ -676,14 +688,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     for (const [key, mockValue] of Object.entries(mockResult)) {
       // Check if mockValue has getMapper (SqlFragment or aliased field with mapper)
       if (typeof mockValue === 'object' && mockValue !== null && typeof (mockValue as any).getMapper === 'function') {
-        const mapper = (mockValue as any).getMapper();
+        const mapper = fromDriverMapper((mockValue as any).getMapper());
         if (mapper) {
           columnMetadataCache[key] = { hasMapper: true, mapper };
         }
       }
       // A column
       else if (typeof mockValue === 'object' && mockValue !== null && '__fieldName' in mockValue) {
-        const mapper = this.columnReadMapperOf(mockValue);
+        const mapper = fromDriverMapper(this.columnReadMapperOf(mockValue));
         if (mapper) {
           columnMetadataCache[key] = { hasMapper: true, mapper };
         }
@@ -712,13 +724,12 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * number for a numeric column, as the driver delivers it for any other column (text, dates,
    * timestamps, uuid, …). Every MIN / MAX used to go through Number(): a text extreme came back NaN
    * (null in JSON) and a timestamp one as epoch milliseconds, and mapped columns skipped their mapper.
+   * `mapper` / `sqlType`: what the extreme is of (see extremeTypeOf), resolved once for the field.
    */
-  private readExtremeValue(value: any, aggregate: AggregateFieldRef, originalSelection: any): any {
+  private readExtremeValue(value: any, mapper: any, sqlType: string | undefined): any {
     if (value === null || value === undefined) {
       return null;
     }
-
-    const { mapper, sqlType } = this.extremeTypeOf(aggregate, originalSelection);
 
     if (mapper && typeof mapper.fromDriver === 'function') {
       return mapper.fromDriver(value);
@@ -734,7 +745,8 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
   /**
    * What the MIN / MAX `aggregate` is an extreme of: the mapper and SQL type of its column (or the
-   * mapper of its `sql` expression), as far as they are known.
+   * mapper of its `sql` expression), as far as they are known. The mapper is the object that has
+   * `fromDriver` (fromDriverMapper): the builder form of a custom type (`customType()`) as its type.
    */
   private extremeTypeOf(aggregate: AggregateFieldRef, originalSelection: any): { mapper?: any; sqlType?: string; scale?: number } {
     let source: any;
@@ -746,11 +758,13 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     if (source && typeof source === 'object') {
       if (typeof source.getMapper === 'function') {
-        return { mapper: source.getMapper() };
+        return { mapper: fromDriverMapper(source.getMapper()) };
       }
 
       if ('__fieldName' in source) {
-        return this.columnTypeOf(source);
+        const type = this.columnTypeOf(source);
+
+        return { ...type, mapper: fromDriverMapper(type.mapper) };
       }
     }
 
@@ -2402,6 +2416,8 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
    * aggregate as a number, a MIN / MAX of a mapped column through the column's mapper), a joined
    * column or an `sql` expression through its mapper, a literal as itself. The rows used to be
    * returned as the driver delivered them — a count as a string, a mapped MIN as its storage value.
+   * The reads are made for this one result set (a type declared immutable shares its mapped values
+   * within it, see forResultSet).
    */
   private transformRows(rows: any[]): any[] {
     const mockResult = this.resultSelector(this.createLeftMock(), this.createRightMock()) as Record<string, unknown>;
@@ -2421,7 +2437,7 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
       }
 
       if (kind === 'expression') {
-        const mapper = readMapperOf(value);
+        const mapper = forResultSet(readMapperOf(value), rows.length);
         readers.push([key, row => (mapper ? mapper.fromDriver(row[key]) : row[key])]);
         continue;
       }
@@ -2431,13 +2447,13 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
 
       if (ref.__isAggregationArray) {
         // A withAggregation CTE's items, through the aggregated query's own mappers
-        const itemReads = aggregatedItemReads(ref.__innerSelectionMetadata);
+        const itemReads = aggregatedItemReads(ref.__innerSelectionMetadata, () => valuesAt(rows, [key]));
         readers.push([key, row => (itemReads && Array.isArray(row[key]) ? mapAggregatedItems(row[key], itemReads) : row[key])]);
         continue;
       }
 
-      const readGrouped = ref.__tableAlias === this.leftAlias ? this.leftReaders.get(ref.__fieldName) : undefined;
-      const mapper = readGrouped === undefined ? readMapperOf(ref) : undefined;
+      const readGrouped = ref.__tableAlias === this.leftAlias ? forResultSet(this.leftReaders.get(ref.__fieldName), rows.length) : undefined;
+      const mapper = readGrouped === undefined ? forResultSet(readMapperOf(ref), rows.length) : undefined;
 
       readers.push([key, row => {
         const raw = row[key];

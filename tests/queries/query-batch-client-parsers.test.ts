@@ -252,6 +252,41 @@ describe('a batched value is what THIS client delivers standalone, whatever its 
     expect(standalone['an int8 column and an int8 expression'][0].exposure).toBe('9007199254740993');
   });
 
+  /**
+   * A batch parses a text a column repeats once for its result set (a runtime-typed day, a timestamp rebuilt from
+   * its JSON form, a declared date revived from it): the values are those of the same query on its own, and every
+   * row still gets a Date of its own — changing one row's leaves the others as they were.
+   */
+  test('a value repeated across rows: what the same query reads on its own, every row a Date of its own', async () => {
+    const db = new ObservatoryDatabase(defaultClient);
+    const build = () => db.observations
+      .select(o => ({ id: o.id, day: dateTrunc('month', o.observedAt), at: sql<Date>`TIMESTAMPTZ '2024-03-01 06:00:00+00' + ${o.id} * interval '0 hour'`, on: o.observedOn }))
+      .orderBy(o => o.id);
+    const alone = await build().toList();
+    const batch = new QueryBatch();
+    const key = batch.addList(build(), 'repeated');
+    await batch.executeBatch();
+    const batched = batch.getList(key);
+
+    expectSameValues(batched, alone, 'repeated');
+    for (const column of ['day', 'at', 'on'] as const) {
+      const values = batched.map(row => row[column] as unknown as Date);
+
+      // The same instant (the month, a timestamp) or date on several rows, each a Date of its own
+      expect({ column, dates: values.every(value => value instanceof Date), own: new Set(values).size }).toEqual({ column, dates: true, own: 3 });
+    }
+    expect(new Set(batched.map(row => (row.day as unknown as Date).getTime())).size).toBe(1);
+    expect(new Set(batched.map(row => (row.at as unknown as Date).getTime())).size).toBe(1);
+    expect(new Set(batched.slice(1).map(row => (row.on as unknown as Date).getTime())).size).toBe(1);
+
+    const [first, second, third] = batched;
+    const days = [second.day, third.day].map(day => (day as unknown as Date).getTime());
+    (first.day as unknown as Date).setFullYear(1999);
+    (second.on as unknown as Date).setTime(0);
+    expect([second.day, third.day].map(day => (day as unknown as Date).getTime())).toEqual(days);
+    expect((third.on as unknown as Date).getTime()).toBe((alone[2].on as unknown as Date).getTime());
+  });
+
   test.skipIf(!reachesServer)('postgres.js with text passthrough for timestamp / timestamptz / date: the driver\'s text', async () => {
     const instance = postgres({
       ...testConnectionConfig(),

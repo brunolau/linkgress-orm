@@ -29,6 +29,7 @@ import { parseOrderBy } from './query-utils';
 import { Subquery } from './subquery';
 import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
 import { renderProjectedFragment } from './set-returning';
+import { forResultSet, valuesAt } from './shared-values';
 
 /**
  * Join types supported when a CTE is the FROM root.
@@ -908,7 +909,7 @@ export function buildSelectParts(
   return parts;
 }
 
-/** How one projected value reads back (compiled once per query by {@link compileRead}). */
+/** How one projected value reads back (compiled once per result set by {@link compileRead}). */
 interface CteFieldRead {
   key: string;
   /** The row key the value is delivered under (a nested value's path alias) */
@@ -922,7 +923,7 @@ interface CteFieldRead {
   itemReads?: Record<string, any>;
 }
 
-function compileRead(key: string, rowKey: string, value: any): CteFieldRead {
+function compileRead(key: string, rowKey: string, value: any, rows: readonly any[]): CteFieldRead {
   if (value === undefined || isScalarLiteralSelection(value) || (Array.isArray(value) && !holdsSqlValue(value))) {
     // A literal reads back as itself (a parameter of unknown type comes back as text)
     return { key, rowKey, kind: 'literal', value };
@@ -935,13 +936,13 @@ function compileRead(key: string, rowKey: string, value: any): CteFieldRead {
       key,
       rowKey,
       kind: 'nested',
-      children: Object.keys(value).map(childKey => compileRead(childKey, `${prefix}__${childKey}`, value[childKey])),
+      children: Object.keys(value).map(childKey => compileRead(childKey, `${prefix}__${childKey}`, value[childKey], rows)),
     };
   }
 
   if (value.__isAggregationArray) {
     // A withAggregation CTE's items, through the aggregated query's own mappers
-    return { key, rowKey, kind: 'items', itemReads: aggregatedItemReads(value.__innerSelectionMetadata) };
+    return { key, rowKey, kind: 'items', itemReads: aggregatedItemReads(value.__innerSelectionMetadata, () => valuesAt(rows, [rowKey])) };
   }
 
   const literalColumn = value.__cteKind === 'literal';
@@ -950,7 +951,8 @@ function compileRead(key: string, rowKey: string, value: any): CteFieldRead {
     : fromDriverMapper(value.__mapper) ?? (typeof value.getMapper === 'function' ? fromDriverMapper(value.getMapper()) : undefined);
 
   if (mapper) {
-    return { key, rowKey, kind: 'mapper', mapper };
+    // A read of one result set (see transformRows): a type declared immutable shares its values there
+    return { key, rowKey, kind: 'mapper', mapper: forResultSet(mapper, rows.length) };
   }
 
   // A column of the CTE body keeps its text ('01234' used to read back as 1234); an expression's
@@ -994,12 +996,13 @@ function readValue(read: CteFieldRead, row: any): any {
  * itself, a nested object rebuilt from its path aliases, a json_agg column's items through the
  * aggregated query's mappers. NULLs are preserved as `null` (faithful to the SQL — a CTE-rooted
  * projection mirrors raw column output, unlike the entity path which maps absent columns to
- * `undefined`).
+ * `undefined`). The reads serve these rows only (a type declared immutable shares its mapped values
+ * within them, see forResultSet).
  * @internal
  */
 export function transformRows(rows: any[], selection: Record<string, any>): any[] {
   // Pre-analyze each selected field once.
-  const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key]));
+  const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key], rows));
 
   return rows.map(row => {
     const out: any = {};
