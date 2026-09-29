@@ -295,15 +295,24 @@ interface Batchable extends Listable {
 
 /**
  * The pieces of the envelope of a branch that sends texts (spelled out in full once, in 'the envelope'):
- * the types whose values a batch sends as their text for a client without parsers of its own, a column of
- * the branch's row, the per-row test whether its type needs the text, and the header of the branch's types.
+ * the types whose values the server sends as their text for a client without parsers of its own (a date /
+ * time / timestamp / interval, money, bytea, point and circle are rebuilt from their JSON form — a date /
+ * timestamp / timestamptz only under DateStyle ISO), a column of the branch's row, the per-row test whether
+ * its type needs the text (the FILTER asks for the DateStyle once per row), and the header of the branch's types.
  */
-const TEXT_TYPES = '\'{1082,1083,1266,1114,1184,1186,20,1700,790,17,600,718,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[]';
+const TEXT_TYPES = '\'{20,1700,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[]';
+const ISO_DATE_STYLE = '(SELECT current_setting(\'DateStyle\') LIKE \'ISO%\')';
 const batchColumn = (name: string): string => `(__batch_q."${name}")`;
-const needsText = (name: string): string => `(pg_typeof(${batchColumn(name)})::oid = ANY(${TEXT_TYPES}) OR pg_typeof(${batchColumn(name)})::oid >= 16384)`;
+const needsServerText = (name: string): string => `pg_typeof(${batchColumn(name)})::oid = ANY(${TEXT_TYPES}) OR pg_typeof(${batchColumn(name)})::oid >= 16384`;
+const dateStyled = (name: string): string => `pg_typeof(${batchColumn(name)})::oid = ANY('{1082,1114,1184}'::oid[])`;
+const needsText = (name: string): string => `(${needsServerText(name)} OR (NOT ${ISO_DATE_STYLE} AND ${dateStyled(name)}))`;
+const needsTextFilter = (names: string[]): string =>
+  `${names.map(needsServerText).join(' OR ')} OR (NOT ${ISO_DATE_STYLE} AND (${names.map(dateStyled).join(' OR ')}))`;
 const textWhenNeeded = (name: string): string => `CASE WHEN ${needsText(name)} THEN concat(${batchColumn(name)}) END`;
+// A domain resolves to the type it is over when the server sends its text: a user-defined one, or one of the text types
 const typeHeader = (count: number): string => `to_json(ARRAY[${Array.from({ length: count }, (_, i) => '(SELECT (CASE WHEN __batch_t.typtype = \'d\' '
-  + `THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t${i})`).join(', ')}]::bigint[])`;
+  + `AND (__batch_t.oid >= 16384 OR __batch_t.oid = ANY(${TEXT_TYPES})) THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint `
+  + `FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t${i})`).join(', ')}]::bigint[])`;
 
 /**
  * The fenced envelope of branch `ix` running `sql`: `texts` — the texts it sends of each row (in order), with
@@ -722,7 +731,7 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
         build().future().getSql(),
         [textWhenNeeded('pulses'), textWhenNeeded('pressure')],
         ['pulses', 'pressure'],
-        `${needsText('pulses')} OR ${needsText('pressure')}`
+        needsTextFilter(['pulses', 'pressure'])
       ));
       expect(statement).not.toContain('to_jsonb');
     });
@@ -1084,14 +1093,21 @@ describe('a plain select\'s untyped values in a QueryBatch', () => {
       const statement = await executeInOneRoundTrip(batch);
 
       const day = '(__batch_q."day")';
-      const textTypes = '\'{1082,1083,1266,1114,1184,1186,20,1700,790,17,600,718,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[]';
-      const needsItsText = `(pg_typeof(${day})::oid = ANY(${textTypes}) OR pg_typeof(${day})::oid >= 16384)`;
+      // The server sends the text of a type whose JSON form does not give it back; a date / timestamp /
+      // timestamptz's only under a DateStyle other than ISO (asked once per row)
+      const textTypes = '\'{20,1700,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[]';
+      const isoDateStyle = '(SELECT current_setting(\'DateStyle\') LIKE \'ISO%\')';
+      const needsServerText = `pg_typeof(${day})::oid = ANY(${textTypes}) OR pg_typeof(${day})::oid >= 16384`;
+      const dateStyled = `pg_typeof(${day})::oid = ANY('{1082,1114,1184}'::oid[])`;
+      const needsItsText = `(${needsServerText} OR (NOT ${isoDateStyle} AND ${dateStyled}))`;
+      // A domain resolves to the type it is over when the server sends its text (a user-defined one, one of the text types)
       expect(statement).toBe(
         'SELECT 0 AS __batch_ix, json_build_object(\'t\', to_json(ARRAY[(SELECT (CASE WHEN __batch_t.typtype = \'d\' '
-        + 'THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t0)]::bigint[]), '
+        + `AND (__batch_t.oid >= 16384 OR __batch_t.oid = ANY(${textTypes})) THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint `
+        + 'FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t0)]::bigint[]), '
         + '\'r\', __batch_s.r, \'x\', __batch_s.x) AS __batch_items '
         + 'FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), \'[]\'::json) AS r, '
-        + `json_agg(ARRAY[CASE WHEN ${needsItsText} THEN concat(${day}) END]) FILTER (WHERE ${needsItsText}) AS x, `
+        + `json_agg(ARRAY[CASE WHEN ${needsItsText} THEN concat(${day}) END]) FILTER (WHERE ${needsServerText} OR (NOT ${isoDateStyle} AND (${dateStyled}))) AS x, `
         + `min(pg_typeof(${day})::oid) AS t0 FROM (SELECT * FROM (\n`
         + `${build().future().getSql()}\n) __batch_q0 OFFSET 0) __batch_q) __batch_s`
       );

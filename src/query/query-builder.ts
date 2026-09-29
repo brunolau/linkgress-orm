@@ -1,6 +1,6 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
 import type { EnclosingCollectionScope } from './conditions';
-import { pgTypeOfValue, selectorProjectingConditions } from './sql-functions';
+import { pgTypeOfValue, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
 import { holdsAggregateFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
@@ -284,6 +284,15 @@ export function getDbToPropertyMapForSchema(schema: TableSchema): Map<string, st
 const MOCK_ROW_FIELD_REFS = Symbol('linkgressMockFieldRefs');
 const MOCK_ROW_NAV_CACHE = Symbol('linkgressMockNavCache');
 const MOCK_ROW_CHAIN_ID = Symbol('linkgressMockChainId');
+
+/**
+ * On the prototype of a SelectQueryBuilder's mock rows (non-enumerable): each column name's getter, as the
+ * prototype defines it. Reading every column of a mock row (a table's select-all row, see createSelectAllRow)
+ * calls these directly: `row[column]` looks each name up through a prototype that — with MockRowCache off —
+ * is new for every row, which V8 cannot cache, and was the largest part of building a select-all row.
+ * `getter.call(row)` is `row[column]`: the row has no own property of a column's name. @internal
+ */
+export const MOCK_ROW_COLUMN_GETTERS = Symbol('linkgressMockColumnGetters');
 
 type MockRowSlots = {
   [MOCK_ROW_FIELD_REFS]?: Record<string, any>;
@@ -982,6 +991,11 @@ interface FieldRead {
   children?: FieldRead[];
   /** CTE_AGGREGATION: the mapper of each aggregated item's key */
   itemReads?: Record<string, any>;
+  /**
+   * COLLECTION_JSON / COLLECTION_SINGLE: how the collection's items read back — set up by the first row
+   * that has items, then applied to every row's (a FieldRead lives as long as one result set's read)
+   */
+  itemsRead?: (items: any[]) => any[];
 }
 
 /**
@@ -2932,7 +2946,7 @@ export class SelectQueryBuilder<TSelection> {
       let rows = result.rows;
       if (nestedPaths.size > 0) {
         rows = tracer.trace('reconstructNestedObjects', () =>
-          rows.map(row => this.reconstructNestedObjects(row, nestedPaths)),
+          this.reconstructNestedRows(rows, nestedPaths),
           { rowCount: rows.length }
         );
       }
@@ -3091,7 +3105,7 @@ export class SelectQueryBuilder<TSelection> {
   _applyUnionPostProcessing(rows: any[], meta: { nestedPaths: Set<string>; selectionResult: any }): TSelection[] {
     let processed = rows;
     if (meta.nestedPaths.size > 0) {
-      processed = rows.map(row => this.reconstructNestedObjects(row, meta.nestedPaths));
+      processed = this.reconstructNestedRows(rows, meta.nestedPaths);
     }
     // Every leg's rows go through the FIRST leg's selection here: a literal is read from its row,
     // as each leg projects its own
@@ -3136,7 +3150,7 @@ export class SelectQueryBuilder<TSelection> {
       // Reconstruct nested objects if needed
       let processedRows = rows;
       if (nestedPaths.size > 0) {
-        processedRows = rows.map(row => this.reconstructNestedObjects(row, nestedPaths));
+        processedRows = this.reconstructNestedRows(rows, nestedPaths);
       }
 
       return this.transformResults(processedRows, selectionResult) as ResolveCollectionResults<TSelection>[];
@@ -3199,7 +3213,7 @@ export class SelectQueryBuilder<TSelection> {
 
       let processedRows = rows;
       if (nestedPaths.size > 0) {
-        processedRows = rows.map(row => this.reconstructNestedObjects(row, nestedPaths));
+        processedRows = this.reconstructNestedRows(rows, nestedPaths);
       }
 
       return this.transformResults(processedRows, selectionResult) as ResolveCollectionResults<TSelection>[];
@@ -3686,7 +3700,7 @@ export class SelectQueryBuilder<TSelection> {
     let rows = result.rows;
     if (nestedPaths.size > 0) {
       rows = tracer.trace('reconstructNestedObjects', () =>
-        rows.map(row => this.reconstructNestedObjects(row, nestedPaths)),
+        this.reconstructNestedRows(rows, nestedPaths),
         { rowCount: rows.length }
       );
     }
@@ -3728,7 +3742,7 @@ export class SelectQueryBuilder<TSelection> {
     // rebuilt before the collections are merged into them. They used to stay flat — a nested object
     // came back without its columns, or not at all
     const rebuildNested = (rows: any[]): any[] =>
-      baseNestedPaths.size === 0 ? rows : rows.map(row => this.reconstructNestedObjects(row, baseNestedPaths));
+      baseNestedPaths.size === 0 ? rows : this.reconstructNestedRows(rows, baseNestedPaths);
 
     // Check if we can use fully optimized single-query approach
     // Requirements: PostgresClient with querySimpleMulti support AND no parameters in base query
@@ -4568,7 +4582,7 @@ export class SelectQueryBuilder<TSelection> {
 
       // Reconstruct nested objects from flat row data (if any)
       if (nestedPaths.size > 0) {
-        rows = rows.map(row => this.reconstructNestedObjects(row, nestedPaths));
+        rows = this.reconstructNestedRows(rows, nestedPaths);
       }
 
       // Transform results
@@ -5938,6 +5952,17 @@ ${joinClauses.join('\n')}`;
       }
     }
 
+    // The getter each column name ends up with on the prototype (a join or a relation of the same name
+    // wins, as above), for readers of every column (see MOCK_ROW_COLUMN_GETTERS)
+    const columnGetters = new Map<string, () => unknown>();
+    for (const colName of columnNameMap.keys()) {
+      const get = descriptors[colName]?.get;
+      if (typeof get === 'function') {
+        columnGetters.set(colName, get);
+      }
+    }
+    descriptors[MOCK_ROW_COLUMN_GETTERS] = { value: columnGetters, enumerable: false, configurable: true };
+
     return descriptors;
   }
 
@@ -6167,6 +6192,22 @@ ${joinClauses.join('\n')}`;
   }
 
   /**
+   * The rows of one result set with their nested objects rebuilt (see reconstructNestedObjects). Every row
+   * of a statement carries the same aliases, so the fold is compiled once from the first row's (see
+   * compileNestedFold) and replayed on every row that has exactly those; any other row — or any set of
+   * aliases a compiled fold might fold otherwise — is rebuilt alias by alias, each alias's path split once
+   * for the result set. Splitting every alias of every row was most of the time a navigation row projected
+   * whole (`{ author: p.user }`, a column per value) took to read.
+   */
+  private reconstructNestedRows(rows: any[], nestedPaths: Set<string>): any[] {
+    const splitPaths = new Map<string, string[]>();
+    const first = rows[0];
+    const fold = nestedPaths.size > 0 && first !== null && typeof first === 'object' ? compileNestedFold(Object.keys(first)) : undefined;
+
+    return rows.map(row => (fold !== undefined ? foldNestedRow(row, fold) : undefined) ?? this.reconstructNestedObjects(row, nestedPaths, splitPaths));
+  }
+
+  /**
    * Reconstruct nested objects from flat row data with path-encoded column names.
    * Transforms { "__nested__address__street": "Main St", "__nested__address__city": "NYC" }
    * into { address: { street: "Main St", city: "NYC" } }
@@ -6175,7 +6216,7 @@ ${joinClauses.join('\n')}`;
    * transformResults (a count's numeric string becomes a number there, a text column's '01234' stays
    * text — every nested numeric-looking string used to become a number here).
    */
-  private reconstructNestedObjects(row: any, nestedPaths: Set<string>): any {
+  private reconstructNestedObjects(row: any, nestedPaths: Set<string>, splitPaths?: Map<string, string[]>): any {
     if (nestedPaths.size === 0) {
       return row;
     }
@@ -6185,8 +6226,12 @@ ${joinClauses.join('\n')}`;
 
     for (const [key, value] of Object.entries(row)) {
       if (key.startsWith(nestedPrefix)) {
-        // This is a nested field - parse the path and set the value
-        const pathParts = key.substring(nestedPrefix.length).split('__');
+        // This is a nested field - parse the path (once per result set, see reconstructNestedRows) and set the value
+        let pathParts = splitPaths?.get(key);
+        if (pathParts === undefined) {
+          pathParts = key.substring(nestedPrefix.length).split('__');
+          splitPaths?.set(key, pathParts);
+        }
         let current = result;
         for (let i = 0; i < pathParts.length - 1; i++) {
           const part = pathParts[i];
@@ -7967,7 +8012,17 @@ ${joinClauses.join('\n')}`;
 
       while (i--) {
         const read = reads[i];
-        result[read.key] = this.readField(read, row[read.key], literalsFromRows);
+        const type = read.type;
+
+        // A column as the driver read it, or through its mapper — most values of most rows — read here
+        // rather than through readField() (the same reads: see its FIELD_REF_* / SQL_FRAGMENT_MAPPER cases)
+        if (type === FieldType.FIELD_REF_NO_MAPPER) {
+          result[read.key] = row[read.key];
+        } else if (type === FieldType.FIELD_REF_MAPPER || type === FieldType.SQL_FRAGMENT_MAPPER) {
+          result[read.key] = read.mapper.fromDriver(row[read.key]);
+        } else {
+          result[read.key] = this.readField(read, row[read.key], literalsFromRows);
+        }
       }
 
       results[rowIdx] = result as TSelection;
@@ -8138,7 +8193,16 @@ ${joinClauses.join('\n')}`;
 
         for (let i = 0; i < children.length; i++) {
           const child = children[i];
-          rawValue[child.key] = this.readField(child, rawValue[child.key], literalsFromRows);
+          const type = child.type;
+
+          // A column — the values of a navigation row projected whole — read here (see transformResults)
+          if (type === FieldType.FIELD_REF_NO_MAPPER) {
+            rawValue[child.key] = rawValue[child.key];
+          } else if (type === FieldType.FIELD_REF_MAPPER || type === FieldType.SQL_FRAGMENT_MAPPER) {
+            rawValue[child.key] = child.mapper.fromDriver(rawValue[child.key]);
+          } else {
+            rawValue[child.key] = this.readField(child, rawValue[child.key], literalsFromRows);
+          }
         }
 
         return rawValue;
@@ -8159,7 +8223,7 @@ ${joinClauses.join('\n')}`;
           return items;
         }
 
-        const transformed = this.transformCollectionItems(items, read.collectionBuilder, literalsFromRows);
+        const transformed = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows))(items);
         const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
 
         return scalarAlias !== undefined ? unwrapScalarItems(transformed, scalarAlias) : transformed;
@@ -8176,7 +8240,7 @@ ${joinClauses.join('\n')}`;
         }
 
         // Transform the single item using collection mapper if available
-        const transformedItems = this.transformCollectionItems([rawValue], read.collectionBuilder, literalsFromRows);
+        const transformedItems = (read.itemsRead ??= this.collectionItemsRead(read.collectionBuilder, literalsFromRows))([rawValue]);
         const scalarAlias = read.collectionBuilder.getScalarSelectionAlias();
         const item = scalarAlias !== undefined ? unwrapScalarItems(transformedItems, scalarAlias) : transformedItems;
 
@@ -8224,16 +8288,17 @@ ${joinClauses.join('\n')}`;
   }
 
   /**
-   * Transform collection items applying fromDriver mappers
+   * How a collection's items read back — through the fromDriver mappers of their fields (see
+   * collectionItemsReader) — set up once for a result set's rows (see FieldRead.itemsRead).
    */
-  private transformCollectionItems(items: any[], collectionBuilder: CollectionQueryBuilder<any>, literalsFromRows: boolean = false): any[] {
+  private collectionItemsRead(collectionBuilder: CollectionQueryBuilder<any>, literalsFromRows: boolean = false): (items: any[]) => any[] {
     // Check if mappers are disabled for performance
     if (this.executor?.getOptions().disableMappers ?? false) {
       // Skip mapper transformation for performance - return items as-is
-      return items;
+      return items => items;
     }
 
-    return transformCollectionItemsOf(items, collectionBuilder, this.schemaRegistry, !literalsFromRows);
+    return collectionItemsReader(collectionBuilder, this.schemaRegistry, !literalsFromRows);
   }
 
   /**
@@ -8358,12 +8423,16 @@ ${joinClauses.join('\n')}`;
     let projected: unknown;
     let evaluated = false;
 
-    try {
-      selection = this.selector(this._createMockRow());
-      projected = materializeMockSelection(selection);
-      evaluated = true;
-    } catch {
-      // no projection to check
+    // A table's select-all projection holds neither (only its columns — see SELECTS_ONLY_COLUMNS): nothing
+    // to evaluate it for
+    if ((this.selector as any)[SELECTS_ONLY_COLUMNS] !== true) {
+      try {
+        selection = this.selector(this._createMockRow());
+        projected = materializeMockSelection(selection);
+        evaluated = true;
+      } catch {
+        // no projection to check
+      }
     }
 
     if (evaluated) {
@@ -8793,6 +8862,133 @@ export function unwrapScalarItems(items: any[], alias: string): any[] {
   return items.map(item => (item !== null && typeof item === 'object' ? item[alias] : item));
 }
 
+/** One column of a row as a {@link NestedFold} writes it. */
+interface NestedFoldStep {
+  /** The row's key */
+  readonly key: string;
+  /** The object it is written to (0: the row's own) and under which name */
+  readonly target: number;
+  readonly name: string;
+  /** The objects this column is the first to need, outermost first: each `{}` set under `name` of `parent` */
+  readonly creates: ReadonlyArray<{ readonly parent: number; readonly name: string; readonly slot: number }>;
+}
+
+/** How rows with exactly the keys `keys` (in that order) fold into nested objects — see compileNestedFold. */
+interface NestedFold {
+  readonly keys: readonly string[];
+  readonly steps: readonly NestedFoldStep[];
+  /** Objects per row, the row's own included */
+  readonly slots: number;
+}
+
+/** A node of the tree of paths a NestedFold writes: an object (`slot`) or a written value (`value`). */
+interface NestedFoldNode {
+  readonly slot?: number;
+  readonly value?: true;
+  readonly children?: Map<string, NestedFoldNode>;
+}
+
+/** An object as the fold creates it: a name `in` it is one every object inherits (`constructor`, `__proto__`, …). */
+const FRESH_OBJECT: object = {};
+
+/**
+ * What SelectQueryBuilder.reconstructNestedObjects does to a row whose keys are `keys`, as a plan: its
+ * top-level keys copied, each `__nested__<a>__<b>…` value written into the objects of its path, every
+ * object created by the first key that needs it — in key order, so every object keeps the key order the
+ * rebuild gives it. `undefined` where a plan could do otherwise than that rebuild — which then folds the
+ * row itself: a path segment every object has (`part in {}`: `constructor`, `__proto__`, …), a value
+ * written where a path goes through (or the other way round), two keys written to one place.
+ */
+function compileNestedFold(keys: readonly string[]): NestedFold | undefined {
+  const root: NestedFoldNode = { slot: 0, children: new Map() };
+  const steps: NestedFoldStep[] = [];
+  let slots = 1;
+
+  for (const key of keys) {
+    const parts = key.startsWith('__nested__') ? key.substring('__nested__'.length).split('__') : [key];
+
+    if (parts.some(part => part in FRESH_OBJECT)) {
+      return undefined;
+    }
+
+    const creates: Array<{ parent: number; name: string; slot: number }> = [];
+    let node = root;
+
+    for (let i = 0; i < parts.length - 1; i++) {
+      let child = node.children!.get(parts[i]);
+
+      if (child === undefined) {
+        child = { slot: slots++, children: new Map() };
+        node.children!.set(parts[i], child);
+        creates.push({ parent: node.slot!, name: parts[i], slot: child.slot! });
+      } else if (child.value) {
+        return undefined;
+      }
+
+      node = child;
+    }
+
+    const name = parts[parts.length - 1];
+
+    if (node.children!.has(name)) {
+      return undefined;
+    }
+
+    node.children!.set(name, { value: true });
+    steps.push({ key, target: node.slot!, name, creates });
+  }
+
+  return { keys, steps, slots };
+}
+
+/**
+ * `row` folded by `fold` — when it carries exactly the fold's keys, in the fold's order (every row of the
+ * statement the fold was compiled for does); else `undefined`.
+ */
+function foldNestedRow(row: any, fold: NestedFold): any {
+  if (row === null || typeof row !== 'object') {
+    return undefined;
+  }
+
+  const keys = fold.keys;
+  let count = 0;
+
+  // Own enumerable keys in order — and any inherited one, which no fold has: such a row is folded otherwise
+  for (const key in row) {
+    if (key !== keys[count]) {
+      return undefined;
+    }
+
+    count++;
+  }
+
+  if (count !== keys.length) {
+    return undefined;
+  }
+
+  const result: any = {};
+  const objects: any[] = new Array(fold.slots);
+  objects[0] = result;
+
+  const steps = fold.steps;
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const creates = step.creates;
+
+    for (let c = 0; c < creates.length; c++) {
+      const create = creates[c];
+      const object = {};
+      objects[create.parent][create.name] = object;
+      objects[create.slot] = object;
+    }
+
+    objects[step.target][step.name] = row[step.key];
+  }
+
+  return result;
+}
+
 /**
  * Collection items read back through the mappers of the columns they carry (an aliased column, a
  * navigation's column, a nested collection's items) — how a SELECT reads a collection's items, and
@@ -8807,6 +9003,19 @@ export function transformCollectionItemsOf(
   fallbackRegistry: Map<string, TableSchema> | undefined,
   applyLiterals: boolean = true
 ): any[] {
+  return collectionItemsReader(collectionBuilder, fallbackRegistry, applyLiterals)(items);
+}
+
+/**
+ * {@link transformCollectionItemsOf} for one collection of a query: its read setup — the mappers of its fields,
+ * its nested collections' reads — built once, then applied to every parent row's items (it used to be built
+ * again for each of them, and for each item's nested collection). @internal
+ */
+export function collectionItemsReader(
+  collectionBuilder: CollectionQueryBuilder<any>,
+  fallbackRegistry: Map<string, TableSchema> | undefined,
+  applyLiterals: boolean = true
+): (items: any[]) => any[] {
   const targetSchema = collectionBuilder.getTargetTableSchema();
   const selectedFieldConfigs = collectionBuilder.getSelectedFieldConfigs();
   const schemaRegistryForItems = collectionBuilder.getSchemaRegistry() || fallbackRegistry;
@@ -8814,8 +9023,8 @@ export function transformCollectionItemsOf(
   if (!targetSchema) {
     // No schema to read mappers from — the projection's own reads (literals, expressions) still apply
     return hasFieldReads(selectedFieldConfigs, applyLiterals)
-      ? items.map(item => applyFieldReads({ ...item }, selectedFieldConfigs, undefined, schemaRegistryForItems, false, applyLiterals))
-      : items;
+      ? items => items.map(item => applyFieldReads({ ...item }, selectedFieldConfigs, undefined, schemaRegistryForItems, false, applyLiterals))
+      : items => items;
   }
 
   // Use pre-cached column metadata from target schema
@@ -8888,30 +9097,40 @@ export function transformCollectionItemsOf(
   // Get schema registry for nested collection transformation
   const schemaRegistry = collectionBuilder.getSchemaRegistry() || fallbackRegistry;
 
+  // The read of each nested collection's values, built the first time one is read
+  const nestedReads = new Map<string, (value: any) => any>();
+
   // Transform items using pre-built mapper cache
-  const results: any[] = new Array(items.length);
-  let i = items.length;
-  while (i--) {
-    const item = items[i];
-    const transformedItem: any = {};
-    for (const key in item) {
-      const value = item[key];
-      const mapper = mapperCache.get(key);
-      if (mapper) {
-        transformedItem[key] = mapper.fromDriver(value);
-      } else {
-        // Check if this field is a nested collection that needs recursive transformation
-        const nestedInfo = nestedCollectionCache.get(key);
-        if (nestedInfo && value !== null && value !== undefined && schemaRegistry) {
-          transformedItem[key] = transformNestedCollectionValueOf(value, nestedInfo, schemaRegistry, applyLiterals);
+  return (items: any[]): any[] => {
+    const results: any[] = new Array(items.length);
+    let i = items.length;
+    while (i--) {
+      const item = items[i];
+      const transformedItem: any = {};
+      for (const key in item) {
+        const value = item[key];
+        const mapper = mapperCache.get(key);
+        if (mapper) {
+          transformedItem[key] = mapper.fromDriver(value);
         } else {
-          transformedItem[key] = value;
+          // Check if this field is a nested collection that needs recursive transformation
+          const nestedInfo = nestedCollectionCache.get(key);
+          if (nestedInfo && value !== null && value !== undefined && schemaRegistry) {
+            let nestedRead = nestedReads.get(key);
+            if (nestedRead === undefined) {
+              nestedRead = nestedCollectionValueReader(nestedInfo, schemaRegistry, applyLiterals);
+              nestedReads.set(key, nestedRead);
+            }
+            transformedItem[key] = nestedRead(value);
+          } else {
+            transformedItem[key] = value;
+          }
         }
       }
+      results[i] = readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
     }
-    results[i] = readsFields ? applyFieldReads(transformedItem, selectedFieldConfigs, columnCache, schemaRegistry, true, applyLiterals) : transformedItem;
-  }
-  return results;
+    return results;
+  };
 }
 
 /** The mapper of a collection field reading a column (of the item's table, or of a navigation's). */
@@ -8979,39 +9198,43 @@ function applyFieldReads(
 }
 
 /**
- * Transform a nested collection value (from firstOrDefault or toList inside another collection)
- * Applies custom mappers to fields within the nested collection result.
+ * How a nested collection value (from firstOrDefault or toList inside another collection) reads back:
+ * custom mappers applied to fields within the nested collection result. The read is set up once per
+ * nested collection of a query and applied to each of its values (see collectionItemsReader).
  */
-function transformNestedCollectionValueOf(
-  value: any,
+function nestedCollectionValueReader(
   nestedInfo: { targetTable: string; selectedFieldConfigs?: SelectedField[]; isSingleResult?: boolean; flattenResultType?: 'number' | 'string'; scalarAlias?: string },
   schemaRegistry: Map<string, TableSchema>,
   applyLiterals: boolean = true
-): any {
+): (value: any) => any {
   // Flattened lists (toNumberList/toStringList) return a primitive array directly
   // from the driver — no per-element object transformation applies. Iterating with
   // `for (const key in item)` on a number/string would yield an empty object, so
   // short-circuit here before touching any elements.
   if (nestedInfo.flattenResultType) {
-    return value;
+    return value => value;
   }
 
   // A collection selecting ONE value reads as its values (see isScalarSelection): its items are
   // transformed as the one-field objects they arrive as, then unwrapped
   if (nestedInfo.scalarAlias !== undefined) {
     const { scalarAlias, ...objectInfo } = nestedInfo;
-    const transformed = transformNestedCollectionValueOf(value, objectInfo, schemaRegistry, applyLiterals);
+    const objectRead = nestedCollectionValueReader(objectInfo, schemaRegistry, applyLiterals);
 
-    if (Array.isArray(transformed)) {
-      return unwrapScalarItems(transformed, scalarAlias);
-    }
+    return value => {
+      const transformed = objectRead(value);
 
-    return transformed !== null && typeof transformed === 'object' ? transformed[scalarAlias] : transformed;
+      if (Array.isArray(transformed)) {
+        return unwrapScalarItems(transformed, scalarAlias);
+      }
+
+      return transformed !== null && typeof transformed === 'object' ? transformed[scalarAlias] : transformed;
+    };
   }
 
   const nestedSchema = schemaRegistry.get(nestedInfo.targetTable);
   if (!nestedSchema?.columnMetadataCache) {
-    return value;  // No schema info, return as-is
+    return value => value;  // No schema info, return as-is
   }
 
   const columnCache = nestedSchema.columnMetadataCache;
@@ -9053,6 +9276,9 @@ function transformNestedCollectionValueOf(
     }
   }
 
+  // The read of each deeply nested collection's values, built the first time one is read
+  const deepNestedReads = new Map<string, (value: any) => any>();
+
   // Transform the value(s)
   const transformItem = (item: any): any => {
     if (item === null || item === undefined) {
@@ -9068,7 +9294,12 @@ function transformNestedCollectionValueOf(
         // Check for deeply nested collections
         const deepNestedInfo = deeplyNestedCache.get(key);
         if (deepNestedInfo && fieldValue !== null && fieldValue !== undefined) {
-          transformedItem[key] = transformNestedCollectionValueOf(fieldValue, deepNestedInfo, schemaRegistry, applyLiterals);
+          let deepNestedRead = deepNestedReads.get(key);
+          if (deepNestedRead === undefined) {
+            deepNestedRead = nestedCollectionValueReader(deepNestedInfo, schemaRegistry, applyLiterals);
+            deepNestedReads.set(key, deepNestedRead);
+          }
+          transformedItem[key] = deepNestedRead(fieldValue);
         } else {
           transformedItem[key] = fieldValue;
         }
@@ -9079,14 +9310,11 @@ function transformNestedCollectionValueOf(
 
   if (nestedInfo.isSingleResult) {
     // Single item (firstOrDefault)
-    return transformItem(value);
-  } else if (Array.isArray(value)) {
-    // Array of items (toList)
-    return value.map(transformItem);
-  } else {
-    // Single object that should be treated as single result
-    return transformItem(value);
+    return value => transformItem(value);
   }
+
+  // Array of items (toList); a single object is treated as a single result
+  return value => (Array.isArray(value) ? value.map(transformItem) : transformItem(value));
 }
 
 /**
@@ -9923,13 +10151,26 @@ const primaryKeyColumns = (schema: TableSchema | undefined): string[] => {
   return columns;
 };
 
-/** An alias's length as PostgreSQL counts it: UTF-8 bytes (it truncates identifiers past 63). */
-const utf8ByteLength = (identifier: string): number => {
+/** An alias's length as PostgreSQL counts it: UTF-8 bytes (it truncates identifiers past 63). @internal */
+export const utf8ByteLength = (identifier: string): number => {
   let bytes = 0;
 
-  for (const char of identifier) {
-    const code = char.codePointAt(0)!;
-    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  // By UTF-16 code unit (a string iterator made a string of every character): a surrogate pair is one code
+  // point of 4 bytes, a lone surrogate 3 bytes — as iterating the code points counted them
+  for (let i = 0; i < identifier.length; i++) {
+    const code = identifier.charCodeAt(i);
+
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < identifier.length
+      && identifier.charCodeAt(i + 1) >= 0xdc00 && identifier.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4;
+      i++;
+    } else {
+      bytes += 3;
+    }
   }
 
   return bytes;

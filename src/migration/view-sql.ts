@@ -1,5 +1,11 @@
-import { createHash } from 'crypto';
+import type * as nodeCrypto from 'crypto';
 import { TableSchema } from '../schema/table-builder';
+
+/** node:crypto, loaded the first time a view's marker is computed — not by every import of the package (2.4 ms). */
+let cryptoModule: typeof nodeCrypto | undefined;
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const createHash = (algorithm: string) => (cryptoModule ??= require('crypto') as typeof nodeCrypto).createHash(algorithm);
 
 /**
  * Shared SQL for model-managed views (`model.view()`), used by the live

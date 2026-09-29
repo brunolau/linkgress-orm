@@ -73,8 +73,14 @@ compared fairly end to end.
 | `coll-aggregates-lateral`, `-cte` | per user: `count()`, `max()`, `toNumberList()`, `firstOrDefault()` |
 | `coll-nested-lateral`, `-cte` | 100 products → prices → capacity groups (with a navigation) |
 | `coll-exists-where` | `where(p => p.postComments.where(…).exists())` |
+| `selectmany-count` | 100 products: `productPrices.selectMany(pp => pp.productPriceCapacityGroups).count()` (no `where` before `selectMany`) |
 | `groupby-having`, `groupby-small` | `groupBy` + `having` + count/sum (1,474 groups); `groupBy` over the table (4 groups) |
 | `left-join`, `union`, `subquery-exists`, `cte-aggregation` | explicit `leftJoin`; `union`; `where(exists(correlated subquery))`; `DbCteBuilder.withAggregation` + `leftJoin` |
+| `batch-plain` | `QueryBatch`: a filtered list of 50 + a primary-key `firstOrDefault` + a `count`, plain columns only |
+| `batch-numeric` | `QueryBatch`: 500 orders and 200 product prices, each with a `decimal(10,2)` column |
+| `batch-expression` | `QueryBatch`: 500 posts projecting `` sql`lower(…)` `` and `` sql`date_trunc('day', …)` `` |
+| `batch-collection-max` | `QueryBatch`: a 500-row page of active users with `posts.max(publishedAt)` + the total `count` |
+| `transaction-reads` | `transaction`: a primary-key lookup + a `count` + a 10-row list |
 | `insert-one`, `insert-bulk-100`, `insert-bulk-1000-ret` | `insert().returning()`; `insertBulk` of 100; of 1,000 with `.returning()` |
 | `upsert-bulk-100`, `bulk-update-100` | `upsertBulk` of 100 (conflict → update); `bulkUpdate` of 100 by key |
 | `update-where-ret`, `delete-where`, `transaction` | `where().update().returning()` (50 rows); `where().delete()` (20); insert + update in a transaction |
@@ -311,7 +317,16 @@ node bench/versions/compare.mjs --base v1.0.5 --head HEAD
 
 # a subset
 node bench/versions/compare.mjs --phases bench,report --runtimes node --rounds 4 --filter '^coll-'
+
+# with MockRowCache on in both versions (off is the library default)
+VERBENCH_MOCK_ROW_CACHE=1 node bench/versions/compare.mjs --base v1.0.5 --head HEAD --runtimes node
 ```
+
+`VERBENCH_MOCK_ROW_CACHE=1` makes both versions call `MockRowCache.setEnabled(true)`; the report's runtime lines
+then read "MockRowCache on". With the cache on, a query's build costs a fraction of what it costs with it off (a
+primary-key lookup ~3.5 µs against ~15 µs), so the same added µs weigh more in relative terms.
+`results/1.0.5-vs-1.0.10-1.0.11-1.0.12.md` compares 1.0.5 with 1.0.10, 1.0.11 and the 1.0.12 performance series in
+both modes, with a per-release breakdown.
 
 `compare.mjs` extracts each ref's `src/` and the `debug/` model into `--work-dir` (default
 `<tmp>/linkgress-verbench`) and compiles it with the ref's own compiler options plus `harness.ts` and

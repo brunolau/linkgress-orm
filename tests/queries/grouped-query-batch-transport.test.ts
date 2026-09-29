@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { isTextParsedType, needsClientParse, parseBuiltInTypedText, parsePgArrayText, TEXT_TRANSPORT_TYPE_OIDS, withArrayTypes } from '../../src/database/typed-text';
+import {
+  isTextParsedType, JSON_TEXT_TYPE_OIDS, needsClientParse, parseBuiltInTypedText, parsePgArrayText, TEXT_TRANSPORT_TYPE_OIDS, textOfJsonForm, withArrayTypes,
+} from '../../src/database/typed-text';
 import { applyBatchOverrides, canonicalJsonColumnType, flatRowBatchMeta, jsonColumnDelivery } from '../../src/query/future-query';
 
 /** A date column's value as node-postgres reads it: local midnight of that day. */
@@ -76,12 +78,125 @@ describe('the QueryBatch transport of a row', () => {
     const meta = { runtimeTypedColumns: ['day'] };
     const client = recordingClient();
 
-    expect(applyBatchOverrides([{ day: '2024-03-04' }], undefined, meta, [1082], client, TEXT_TYPES)).toEqual([{ day: '2024-03-04' }]);
+    // An int8 and a numeric: their JSON form gives no text back — nothing to parse without the server's
+    expect(applyBatchOverrides([{ big: 12, exact: 1.5 }], undefined, { runtimeTypedColumns: ['big', 'exact'] }, [20, 1700], client, TEXT_TYPES))
+      .toEqual([{ big: 12, exact: 1.5 }]);
     expect(applyBatchOverrides([{ day: '2024-03-04' }], [null], meta, [1082], client, TEXT_TYPES)).toEqual([{ day: '2024-03-04' }]);
     expect(applyBatchOverrides([], [], meta, [null], client, TEXT_TYPES)).toEqual([]);
+    expect(applyBatchOverrides([], undefined, meta, [null], client, TEXT_TYPES)).toEqual([]);
     // Over no rows `min(pg_typeof(…))` is NULL: a text (there is none) would stay as it is
     expect(applyBatchOverrides([{ day: '2024-03-04' }], [['2024-03-04']], meta, [null], client, TEXT_TYPES)).toEqual([{ day: '2024-03-04' }]);
+    // A plain branch has no types at all
+    expect(applyBatchOverrides([{ day: '2024-03-04' }], undefined, meta, undefined, client, TEXT_TYPES)).toEqual([{ day: '2024-03-04' }]);
     expect(client.calls).toEqual([]);
+  });
+
+  test('a value whose JSON form gives its text back — the server sent none — is parsed from the text that form rebuilds; a text the server sent wins', () => {
+    const columns = ['day', 'at', 'stamp', 'time', 'timetz', 'span', 'money', 'raw', 'point', 'circle'];
+    const meta = { runtimeTypedColumns: columns };
+    const oids = [1082, 1114, 1184, 1083, 1266, 1186, 790, 17, 600, 718];
+    // As row_to_json writes them (the ISO form of a date / timestamp, every other type's output text)
+    const json = {
+      day: '0044-03-15 BC', at: '2024-03-01T06:00:00.123', stamp: '2024-03-01T06:00:00.5+01:00', time: '06:00:00.123',
+      timetz: '06:00:00+05:30', span: '1 day 01:30:00', money: '$12.50', raw: '\\x00ff', point: '(1.5,2)', circle: '<(1,2),3>',
+    };
+    const client = recordingClient();
+
+    // No texts at all (no value of the branch needed the server's), and texts whose values the server sent none of
+    for (const texts of [undefined, [new Array(columns.length).fill(null)]]) {
+      client.calls.length = 0;
+      const [row] = applyBatchOverrides([{ ...json, id: 7 }], texts, meta, oids, client, TEXT_TYPES, { parameterized: true });
+
+      expect(row).toEqual({
+        day: '1082:0044-03-15 BC', at: '1114:2024-03-01 06:00:00.123', stamp: '1184:2024-03-01 06:00:00.5+01', time: '1083:06:00:00.123',
+        timetz: '1266:06:00:00+05:30', span: '1186:1 day 01:30:00', money: '790:$12.50', raw: '17:\\x00ff', point: '600:(1.5,2)', circle: '718:<(1,2),3>',
+        id: 7,
+      });
+      expect(Object.keys(row)).toEqual([...columns, 'id']);
+      expect(client.calls.every(([, , parameterized]) => parameterized === true)).toBe(true);
+    }
+
+    // Under a DateStyle other than ISO the server sends a date's / timestamp's text: that text, not the JSON form's
+    const sent = applyBatchOverrides([{ day: '2024-03-04', at: '2024-03-01T06:00:00', n: 1 }], [['03/04/2024', '03/01/2024 06:00:00']],
+      { runtimeTypedColumns: ['day', 'at'] }, [1082, 1114], client, TEXT_TYPES);
+    expect(sent).toEqual([{ day: '1082:03/04/2024', at: '1114:03/01/2024 06:00:00', n: 1 }]);
+
+    // NULL stays NULL, unparsed; a type the client does not parse keeps its JSON value
+    client.calls.length = 0;
+    expect(applyBatchOverrides([{ day: null, at: undefined, note: 'calm' }], undefined, { runtimeTypedColumns: ['day', 'at', 'note'] }, [1082, 1114, 25], client, TEXT_TYPES))
+      .toEqual([{ day: null, at: undefined, note: 'calm' }]);
+    expect(client.calls).toEqual([]);
+  });
+
+  test('for a client that parses json itself nothing is rebuilt from the row: only the texts the server sent are parsed', () => {
+    const client = recordingClient();
+    const meta = { runtimeTypedColumns: ['at', 'day'] };
+    // Its json parser made the first row's timestamp a Date already: the server sent its text, which wins
+    const revived = new Date(Date.UTC(2024, 2, 1, 6));
+    const rows = [{ at: revived, day: '2024-03-01' }, { at: '2024-03-02T07:00:00', day: '2024-03-02' }];
+    const merged = applyBatchOverrides(rows, [['2024-03-01 06:00:00', '2024-03-01'], [null, null]], meta, [1114, 1082], client, TEXT_TYPES, undefined, false);
+
+    expect(merged).toEqual([{ at: '1114:2024-03-01 06:00:00', day: '1082:2024-03-01' }, { at: '2024-03-02T07:00:00', day: '2024-03-02' }]);
+    // No texts at all: the rows as they came
+    expect(applyBatchOverrides([{ at: '2024-03-02T07:00:00' }], undefined, { runtimeTypedColumns: ['at'] }, [1114], client, TEXT_TYPES, undefined, false))
+      .toEqual([{ at: '2024-03-02T07:00:00' }]);
+    expect(client.calls).toEqual([[1114, '2024-03-01 06:00:00', undefined], [1082, '2024-03-01', undefined]]);
+  });
+
+  test('a value repeated on consecutive rows is parsed for every row — each row gets a value of its own', () => {
+    const parsed: string[] = [];
+    const client = {
+      parseTypedText: (oid: number, text: string): unknown => {
+        parsed.push(text);
+
+        return { oid, text };
+      },
+    };
+    const rows = ['2024-03-01T00:00:00', '2024-03-01T00:00:00', '2024-03-02T00:00:00', '2024-03-01T00:00:00'].map(day => ({ day }));
+    const merged = applyBatchOverrides(rows, undefined, { runtimeTypedColumns: ['day'] }, [1114], client, TEXT_TYPES);
+
+    expect(parsed).toEqual(['2024-03-01 00:00:00', '2024-03-01 00:00:00', '2024-03-02 00:00:00', '2024-03-01 00:00:00']);
+    expect(merged.map(row => row.day)).toEqual(parsed.map(text => ({ oid: 1114, text })));
+    expect(merged[0].day).not.toBe(merged[1].day);
+  });
+
+  test('a client\'s parser for one type is resolved once per branch, then called per value — exactly as parseTypedText would be', () => {
+    const resolved: Array<[number, boolean | undefined]> = [];
+    const client = {
+      ...recordingClient(),
+      typedTextParser: (oid: number, read?: { parameterized?: boolean }) => {
+        resolved.push([oid, read?.parameterized]);
+
+        return (text: string) => `${oid}~${text}`;
+      },
+    };
+    const rows = [{ at: '2024-03-01T06:00:00', big: 1 }, { at: '2024-03-02T07:00:00', big: 2 }, { at: null, big: 3 }];
+
+    expect(applyBatchOverrides(rows, [[null, '1'], [null, '2'], [null, '3']], { runtimeTypedColumns: ['at', 'big'] }, [1114, 20], client, TEXT_TYPES, { parameterized: false }))
+      .toEqual([{ at: '1114~2024-03-01 06:00:00', big: '20~1' }, { at: '1114~2024-03-02 07:00:00', big: '20~2' }, { at: null, big: '20~3' }]);
+    expect(resolved).toEqual([[1114, false], [20, false]]);
+    expect(client.calls).toEqual([]);
+  });
+
+  test('the text of a date / time / timestamp / interval, money, bytea, point or circle from its JSON form', () => {
+    // A timestamp's T; a timestamptz's whole-hour offset (not a half-hour one, not one with seconds), before BC too
+    expect(textOfJsonForm(1114, '2024-03-01T06:00:00')).toBe('2024-03-01 06:00:00');
+    expect(textOfJsonForm(1114, '0044-03-15T06:00:00.5 BC')).toBe('0044-03-15 06:00:00.5 BC');
+    expect(textOfJsonForm(1114, '12024-01-01T00:00:00')).toBe('12024-01-01 00:00:00');
+    expect(textOfJsonForm(1184, '2024-03-01T06:00:00+01:00')).toBe('2024-03-01 06:00:00+01');
+    expect(textOfJsonForm(1184, '2024-03-01T06:00:00.123456-03:00')).toBe('2024-03-01 06:00:00.123456-03');
+    expect(textOfJsonForm(1184, '2024-03-01T06:00:00+05:30')).toBe('2024-03-01 06:00:00+05:30');
+    expect(textOfJsonForm(1184, '1900-01-01T00:00:00+00:19:32')).toBe('1900-01-01 00:00:00+00:19:32');
+    expect(textOfJsonForm(1184, '0044-03-15T07:16:20+01:16:20 BC')).toBe('0044-03-15 07:16:20+01:16:20 BC');
+    expect(textOfJsonForm(1184, '0044-03-15T06:00:00+00:00 BC')).toBe('0044-03-15 06:00:00+00 BC');
+    // ±infinity, a date, and every other type: the JSON form is the text
+    expect(['infinity', '-infinity'].map(text => [textOfJsonForm(1114, text), textOfJsonForm(1184, text), textOfJsonForm(1082, text)]))
+      .toEqual([['infinity', 'infinity', 'infinity'], ['-infinity', '-infinity', '-infinity']]);
+    expect([[1082, '0044-03-15 BC'], [1083, '06:00:00'], [1266, '06:00:00+05:30'], [1186, '1 day'], [790, '$12.50'], [17, '\\x01'], [600, '(1,2)'], [718, '<(1,2),3>']]
+      .map(([oid, text]) => textOfJsonForm(oid as number, text as string))).toEqual(['0044-03-15 BC', '06:00:00', '06:00:00+05:30', '1 day', '$12.50', '\\x01', '(1,2)', '<(1,2),3>']);
+    // They are text-sent types; an int8, a numeric and every array are not rebuilt
+    expect([...JSON_TEXT_TYPE_OIDS].every(oid => TEXT_TRANSPORT_TYPE_OIDS.includes(oid))).toBe(true);
+    expect([20, 1700, 1182, 1115, 1185, 1016, 1231, 1001].some(oid => JSON_TEXT_TYPE_OIDS.has(oid))).toBe(false);
   });
 
   test('a value of a domain over a type JSON carries keeps its JSON value; one of a user-defined type, or of a type the client parses itself, is parsed', () => {

@@ -1,8 +1,9 @@
-import { describe, test, expect, afterEach } from 'bun:test';
+import { describe, test, expect, afterEach, spyOn } from 'bun:test';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn,
-  integer, varchar, boolean, eq, MockRowCache,
+  integer, varchar, boolean, eq, MockRowCache, SelectQueryBuilder,
 } from '../../src';
+import { MOCK_ROW_COLUMN_GETTERS } from '../../src/query/query-builder';
 import {
   DatabaseClient, QueryResult, PooledConnection, QueryExecutionOptions,
 } from '../../src/database/database-client.interface';
@@ -251,4 +252,43 @@ describe('select-all rows inherit their navigation getters from a per-schema pro
       expect(Object.getOwnPropertyNames(Object.getPrototypeOf(postRow))).toEqual(['user']);
     });
   });
+});
+
+/**
+ * A select-all row copies its columns from the query's mock row by calling the getters that mock row's
+ * prototype holds for them (MOCK_ROW_COLUMN_GETTERS) rather than reading `mock[column]` through a prototype
+ * V8 cannot cache (MockRowCache off: a new one per row). The getters are the prototype's own accessors, so
+ * the select-all row holds exactly the FieldRefs the mock row hands out — with the cache off and on.
+ */
+describe('a select-all row reads its columns through the mock row\'s own getters', () => {
+  afterEach(() => {
+    MockRowCache.reset();
+  });
+
+  for (const cacheOn of [false, true]) {
+    test(`the same FieldRefs as reading the mock row (MockRowCache ${cacheOn ? 'on' : 'off'})`, async () => {
+      MockRowCache.setEnabled(cacheOn);
+      const { db } = makeDb();
+      const mockRows = spyOn(SelectQueryBuilder.prototype, '_createMockRow');
+
+      try {
+        const row = await captureSelectAllRow(db);
+        const mock = mockRows.mock.results[mockRows.mock.results.length - 1].value;
+        const prototype = Object.getPrototypeOf(mock);
+        const getters: Map<string, () => unknown> = prototype[MOCK_ROW_COLUMN_GETTERS];
+
+        expect(Object.keys(row)).toEqual(['id', 'name', 'email', 'active', 'profileId']);
+        for (const column of Object.keys(row)) {
+          expect(row[column]).toBe(mock[column]);
+          expect(getters.get(column)).toBe(Object.getOwnPropertyDescriptor(prototype, column)!.get);
+        }
+
+        // Internal: not a column, not enumerable, not in any key listing of the row or the prototype
+        expect(Object.getOwnPropertyDescriptor(prototype, MOCK_ROW_COLUMN_GETTERS)!.enumerable).toBe(false);
+        expect(Object.keys(prototype)).not.toContain(MOCK_ROW_COLUMN_GETTERS as any);
+      } finally {
+        mockRows.mockRestore();
+      }
+    });
+  }
 });

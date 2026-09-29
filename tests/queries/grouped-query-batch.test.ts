@@ -1413,7 +1413,9 @@ describe('grouped queries in a QueryBatch', () => {
       // run once per row
       for (const [ix, column] of [[1, 'day'], [3, 'weight']] as const) {
         const value = `(__batch_q."${column}")`;
+        // A domain resolves to the type it is over when the server sends its text (a user-defined one, one of the text types)
         expect(branches[ix]).toContain(`SELECT ${ix} AS __batch_ix, json_build_object('t', to_json(ARRAY[(SELECT (CASE WHEN __batch_t.typtype = 'd' `
+          + 'AND (__batch_t.oid >= 16384 OR __batch_t.oid = ANY(\'{20,1700,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719}\'::oid[])) '
           + 'THEN __batch_t.typbasetype ELSE __batch_t.oid END)::bigint FROM pg_catalog.pg_type __batch_t WHERE __batch_t.oid = __batch_s.t0)]::bigint[]), '
           + `'r', __batch_s.r, 'x', __batch_s.x) AS __batch_items `);
         expect(branches[ix]).toContain(`FROM (SELECT coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS r, json_agg(ARRAY[CASE WHEN (pg_typeof(${value})::oid = ANY('{`);

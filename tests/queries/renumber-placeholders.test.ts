@@ -91,3 +91,43 @@ describe('renumberPlaceholders', () => {
 		].join('\n'));
 	});
 });
+
+/**
+ * renumberPlaceholders scans the statement token by token instead of running a regular expression's replace
+ * with a callback per quoted identifier. The scan must do exactly what that replace did — including where the
+ * regex backtracks (an unclosed literal or comment is plain text; `'a''` is `'a'` then a new quote) — so it is
+ * pinned against it: the replace below is the implementation it took over from.
+ */
+describe('renumberPlaceholders, token by token, as the regular expression renumbered', () => {
+	const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|(--[^\n]*)|(\/\*[\s\S]*?\*\/)|\$(?<digits>\d+)/g;
+	const byRegExp = (sqlText: string, offset: number): string =>
+		sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, _lineComment, _blockComment, digits) =>
+			digits !== undefined ? `$${Number(digits) + offset}` : match);
+
+	test('unclosed and doubled quotes, unclosed comments, placeholders at both ends, long digit runs', () => {
+		const cases = [
+			`'a''`, `'a'' $1`, `"x""y" $2 "z`, `'it''s $1' $2 ''''`, `$1'`, `'$1`, `/* $1`, `/* a */ $1 /* $2`, `/*/ $1 */ $2`,
+			'-- $1', '--\n$1', '-$1', '/$1', '$', '$$1', '$0', '$007', '$123456789012345678901234', `'a'b'$1'c'$2`, '"a""""b" $3',
+			'', 'no placeholder at all', `$1`, `x$1y$2`, `'\n$1\n'`, '$1\r\n-- $2\r\n$3',
+		];
+
+		for (const sqlText of cases) {
+			expect({ sqlText, renumbered: renumberPlaceholders(sqlText, 7) }).toEqual({ sqlText, renumbered: byRegExp(sqlText, 7) });
+		}
+	});
+
+	test('50 000 generated statements of quotes, comments, dollars and digits', () => {
+		const pieces = ['\'', '"', '\'\'', '""', '-', '--', '/', '*', '/*', '*/', '$', '$1', '$12', '9', ' ', '\n', 'a', 'x = ', ',', '$$'];
+		let seed = 11;
+		const next = (): number => (seed = (seed * 1103515245 + 12345) % 2147483648);
+
+		for (let n = 0; n < 50000; n++) {
+			const sqlText = Array.from({ length: next() % 14 }, () => pieces[next() % pieces.length]).join('');
+			const offset = next() % 40;
+
+			if (renumberPlaceholders(sqlText, offset) !== byRegExp(sqlText, offset)) {
+				expect({ sqlText, offset, renumbered: renumberPlaceholders(sqlText, offset) }).toEqual({ sqlText, offset, renumbered: byRegExp(sqlText, offset) });
+			}
+		}
+	});
+});

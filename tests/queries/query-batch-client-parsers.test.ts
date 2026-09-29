@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import postgres from 'postgres';
 import {
   bigint,
@@ -26,6 +26,7 @@ import {
   timestamptz,
   varchar,
 } from '../../src';
+import { JSON_TEXT_TYPE_OIDS, textOfJsonForm } from '../../src/database/typed-text';
 import { isMemoryTestDatabase, memoryTcpEndpoint } from '../memory/shared-memory-db';
 import { createFreshClient, testConnectionConfig } from '../utils/test-database';
 
@@ -313,6 +314,110 @@ describe('a batched value is what THIS client delivers standalone, whatever its 
     }
   });
 
+  /**
+   * A json parser of the application's own — here one that revives ISO timestamp strings into Dates, a common
+   * idiom — runs on the batch's own envelope, its rows included, where a date / timestamp's JSON form is exactly
+   * such a string. A batch then has the server send those values' texts, as it always did, and rebuilds none
+   * from the row: every value is what the client's TYPE parser makes of its text (here the text itself), as
+   * standalone — never the json parser's Date.
+   */
+  const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)?$/;
+  const revivingJsonParse = (text: string): unknown =>
+    JSON.parse(text, (_key, value) => (typeof value === 'string' && ISO_TIMESTAMP.test(value) ? new Date(value) : value));
+  const passText = (value: string): string => value;
+
+  /** Every shape and two expressions (a dateTrunc(), a raw sql timestamptz) standalone and batched: alike, the timestamps text. */
+  const expectNothingRevived = async (db: ObservatoryDatabase): Promise<void> => {
+    const standalone = await expectBatchLikeStandalone(db);
+    const build = () => db.observations
+      .select(o => ({ id: o.id, day: dateTrunc('day', o.observedAt), atz: sql<string>`${o.recordedAt} + interval '0 hour'` }))
+      .orderBy(o => o.id);
+    const alone = await build().toList();
+    const batch = new QueryBatch();
+    const key = batch.addList(build(), 'expressions');
+    await batch.executeBatch();
+
+    expectSameValues(batch.getList(key), alone, 'expressions');
+    expect(alone.map(row => [typeof row.day, typeof row.atz])).toEqual([['string', 'string'], ['string', 'string'], ['string', 'string']]);
+    // Typed Date by the helper, the client's type parser makes it text
+    expect(alone[0].day as unknown).toBe('2024-03-01 00:00:00');
+    expect(standalone['a collection MAX() of a timestamp'][0].last).toBe('2024-03-02 22:00:00');
+  };
+
+  test.skipIf(!reachesServer)('node-postgres whose json parser revives ISO timestamps, timestamps as text: the type parsers\' text, as standalone', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const pgTypes = require('pg').types;
+    const { host, port, database, username, password } = testConnectionConfig();
+    const client = new PgClient({
+      host,
+      port,
+      database,
+      user: username,
+      password,
+      max: 1,
+      types: {
+        getTypeParser: (oid: number, format?: string) => {
+          if (oid === 114) {
+            return revivingJsonParse;
+          }
+
+          return oid === 1114 || oid === 1184 ? passText : pgTypes.getTypeParser(oid, format);
+        },
+      },
+    } as any);
+
+    try {
+      expect([...client.customParsedTypeOids()]).toContain(114);
+      await expectNothingRevived(new ObservatoryDatabase(client));
+
+      // The server sends the text of every date / time value (1.0.11's set of types), whatever the DateStyle
+      const db = new ObservatoryDatabase(client);
+      const statements = spyOn(client, 'query');
+      let statement = '';
+      try {
+        const batch = new QueryBatch();
+        batch.addList(db.observations.select(o => ({ id: o.id, day: dateTrunc('day', o.observedAt) })).orderBy(o => o.id), 'days');
+        await batch.executeBatch();
+        statement = String(statements.mock.calls[0][0]);
+      } finally {
+        statements.mockRestore();
+      }
+      expect(statement).toContain('ANY(\'{1082,1083,1266,1114,1184,1186,20,1700,790,17,600,718,1182,1183,1270,1115,1185,1187,1016,1231,791,1001,1017,719,');
+      expect(statement).not.toContain('DateStyle');
+    } finally {
+      await client.end();
+    }
+  });
+
+  test.skipIf(!reachesServer)('postgres.js whose json parser revives ISO timestamps, timestamps as text: the same', async () => {
+    const client = new PostgresClient(postgres({
+      ...testConnectionConfig(),
+      max: 1,
+      types: {
+        json: { to: 114, from: [114], serialize: (x: unknown) => JSON.stringify(x), parse: revivingJsonParse },
+        timestamp: { to: 1114, from: [1114], serialize: passText, parse: passText },
+        timestamptz: { to: 1184, from: [1184], serialize: passText, parse: passText },
+      },
+    }));
+
+    try {
+      await expectNothingRevived(new ObservatoryDatabase(client));
+    } finally {
+      await client.end();
+    }
+  });
+
+  test('PGlite whose json parser revives ISO timestamps, timestamps as text: the same', async () => {
+    const client = new PGliteClient({ parsers: { 114: revivingJsonParse, 1114: passText, 1184: passText } });
+
+    try {
+      await createSchema(client);
+      await expectNothingRevived(new ObservatoryDatabase(client));
+    } finally {
+      await client.end();
+    }
+  });
+
   test('PGlite with text passthrough parsers for timestamp / timestamptz / date: the driver\'s text', async () => {
     const client = new PGliteClient({
       parsers: { 1114: (value: string) => value, 1184: (value: string) => value, 1082: (value: string) => value },
@@ -490,14 +595,53 @@ describe('each client parses a value\'s text exactly as its driver parses the co
 
   test.each(TYPED_TEXTS.map(([literal, type]) => [`${literal}::${type}`, literal, type] as const))('%s', async (name, literal, type) => {
     const value = `CAST('${literal.replace(/'/g, "''")}' AS ${type})`;
-    // Its text as the batch sends it: the type's output function (a CAST to text differs for a boolean, an inet, a char(n))
-    const select = `SELECT ${value} AS v, concat(${value}) AS t, CAST(CAST(pg_typeof(${value}) AS oid) AS integer) AS oid`;
+    // Its text as the batch sends it: the type's output function (a CAST to text differs for a boolean, an inet, a char(n)) —
+    // and its JSON form, which a batch rebuilds that text from for a type of JSON_TEXT_TYPE_OIDS
+    const select = `SELECT ${value} AS v, concat(${value}) AS t, CAST(CAST(pg_typeof(${value}) AS oid) AS integer) AS oid, CAST(to_json(${value}) AS text) AS j`;
 
     const { rows: [plain] } = await client.query(select);
     expectSameValues(client.parseTypedText(Number(plain.oid), plain.t, { parameterized: false }), plain.v, name);
+    // The type's parser, resolved once, parses exactly as parseTypedText does
+    expectSameValues(client.typedTextParser(Number(plain.oid), { parameterized: false })(plain.t), plain.v, `${name} (its type's parser)`);
+
+    if (JSON_TEXT_TYPE_OIDS.has(Number(plain.oid))) {
+      expect({ name, text: textOfJsonForm(Number(plain.oid), JSON.parse(plain.j)) }).toEqual({ name, text: plain.t });
+    }
 
     const { rows: [bound] } = await client.query(`${select}, CAST($1 AS integer) AS p`, [1]);
     expectSameValues(client.parseTypedText(Number(bound.oid), bound.t, { parameterized: true }), bound.v, `${name} (a parameterised statement)`);
+    expectSameValues(client.typedTextParser(Number(bound.oid), { parameterized: true })(bound.t), bound.v, `${name} (its type's parser, a parameterised statement)`);
+  });
+
+  test('a client whose parseTypedText is its own — a subclass\'s, an instance\'s — gets it called for every text, not the driver\'s parser', async () => {
+    const config = { ...testConnectionConfig(), user: testConnectionConfig().username, max: 1 };
+
+    class OwnPg extends PgClient {
+      override parseTypedText(oid: number, text: string): unknown {
+        return `pg:${oid}:${text}`;
+      }
+    }
+
+    class OwnPostgres extends PostgresClient {
+      override parseTypedText(oid: number, text: string): unknown {
+        return `postgres:${oid}:${text}`;
+      }
+    }
+
+    const own = new OwnPg(config as any);
+    const patched = new PgClient(config as any);
+    patched.parseTypedText = (oid: number, text: string) => `patched:${oid}:${text}`;
+    const ownPostgres = new OwnPostgres(postgres({ ...testConnectionConfig(), max: 1 }));
+
+    try {
+      expect(own.typedTextParser(1114)('2024-03-01 06:00:00')).toBe('pg:1114:2024-03-01 06:00:00');
+      expect(patched.typedTextParser(1082)('2024-03-01')).toBe('patched:1082:2024-03-01');
+      expect(ownPostgres.typedTextParser(1184, { parameterized: true })('2024-03-01 06:00:00+01')).toBe('postgres:1184:2024-03-01 06:00:00+01');
+    } finally {
+      await own.end();
+      await patched.end();
+      await ownPostgres.end();
+    }
   });
 
   test('a client with parsers of its own parses with them — and names their types for the batch to send as text', async () => {
@@ -611,6 +755,194 @@ describe('values of user-defined types in a batch: as the client reads them stan
 
       expectSameValues(batched, standalone, 'user-defined');
       expect(standalone.map(row => [row.level, row.flag, row.day])).toEqual([[1, false, '2024-03-01'], [2, true, '2024-03-02'], [3, true, '2024-03-02']]);
+    } finally {
+      await passthrough.end();
+    }
+  });
+
+  /**
+   * 1.0.11 parity plus a known gap. A value of a domain the catalog itself defines (`information_schema.time_stamp`,
+   * over timestamptz, OID below 16384): the server sends no text for it and the batch reads its JSON form as it
+   * arrives — as 1.0.11 read it. The gap, left as it was: standalone reads it as the client reads a timestamptz (a
+   * Date through the default client), and a batch keeps its JSON form.
+   */
+  test('a value of a domain the catalog defines (information_schema.time_stamp): its JSON form, as 1.0.11 read it', async () => {
+    const db = new ObservatoryDatabase(client);
+    const build = () => db.observations
+      .select(o => ({ id: o.id, stamp: sql<Date>`CAST(${o.recordedAt} AS information_schema.time_stamp)` }))
+      .orderBy(o => o.id);
+    const standalone = await build().toList();
+    const batch = new QueryBatch();
+    const key = batch.addList(build(), 'catalog-domain');
+    await batch.executeBatch();
+    const { rows: forms } = await client.query(
+      'SELECT CAST(to_json(CAST(recorded_at AS information_schema.time_stamp)) AS text) AS j FROM cpx_observations ORDER BY id');
+
+    expect(batch.getList(key).map(row => row.stamp)).toEqual(forms.map(row => JSON.parse(row.j)));
+    expect(typeof batch.getList(key)[0].stamp).toBe('string');
+    expect(standalone[0].stamp).toBeInstanceOf(Date);
+  });
+});
+
+/**
+ * A batch has the server send NO text for a value of a type whose JSON form gives it back (JSON_TEXT_TYPE_OIDS):
+ * the client rebuilds it from the value's `row_to_json` form (textOfJsonForm) and parses THAT with its parser. So
+ * the rebuilt text must be exactly the text the server sends (`concat(v)`, the type's output function) — here for
+ * thousands of values of each such type, edge cases included: before Christ, past year 9999, ±infinity, every
+ * fraction length, time zones with half-hour, quarter-hour and seconds offsets (local mean time), DST, every
+ * IntervalStyle, both bytea outputs, the ISO DateStyles.
+ */
+const JSON_FORM_VALUES: ReadonlyArray<readonly [type: string, values: string, settings: ReadonlyArray<ReadonlyArray<string>>]> = [
+  ['date', `SELECT DATE '2000-01-01' + (g * 7919 % 4000001 - 2000000) AS v FROM generate_series(1, 2000) AS g
+    UNION ALL SELECT DATE '9999-12-01' + g * 11 FROM generate_series(1, 40) AS g
+    UNION ALL SELECT DATE '4713-01-01 BC' + g * 13 FROM generate_series(0, 40) AS g
+    UNION ALL SELECT CAST(x AS date) FROM (VALUES ('infinity'), ('-infinity'), ('0001-01-01'), ('0001-12-31 BC')) AS s(x)`,
+  [[], ['DateStyle = \'ISO, DMY\'']]],
+  ['timestamp', `SELECT TIMESTAMP '2000-01-01 00:00:00' + (g * 7919 % 4000001 - 2000000) * INTERVAL '1 day' + (g * 104729 % 86400000) * INTERVAL '1 millisecond' + (g % 1000) * INTERVAL '1 microsecond' AS v FROM generate_series(1, 2000) AS g
+    UNION ALL SELECT TIMESTAMP '2024-03-01 06:00:00' + g * INTERVAL '10 microseconds' FROM generate_series(0, 200) AS g
+    UNION ALL SELECT TIMESTAMP '9999-12-31 23:00:00' + g * INTERVAL '7 hours' FROM generate_series(0, 40) AS g
+    UNION ALL SELECT TIMESTAMP '4713-01-01 00:00:00 BC' + g * INTERVAL '13 days 1 hour' FROM generate_series(0, 40) AS g
+    UNION ALL SELECT CAST(x AS timestamp) FROM (VALUES ('infinity'), ('-infinity'), ('0001-01-01 00:00:00'), ('0001-12-31 23:59:59.999999 BC')) AS s(x)`,
+  [[], ['DateStyle = \'ISO, YMD\'']]],
+  ['timestamptz', `SELECT TIMESTAMPTZ '2000-01-01 00:00:00+00' + (g * 7919 % 4000001 - 2000000) * INTERVAL '1 day' + (g * 104729 % 86400000) * INTERVAL '1 millisecond' + (g % 1000) * INTERVAL '1 microsecond' AS v FROM generate_series(1, 2000) AS g
+    UNION ALL SELECT TIMESTAMPTZ '2024-03-01 06:00:00+00' + g * INTERVAL '10 microseconds' FROM generate_series(0, 200) AS g
+    UNION ALL SELECT TIMESTAMPTZ '1850-01-01 00:00:00+00' + g * INTERVAL '911 days 7 hours' FROM generate_series(0, 60) AS g
+    UNION ALL SELECT TIMESTAMPTZ '2024-03-09 00:00:00+00' + g * INTERVAL '15 minutes' FROM generate_series(0, 400) AS g
+    UNION ALL SELECT TIMESTAMPTZ '9999-12-31 23:00:00+00' + g * INTERVAL '7 hours' FROM generate_series(0, 40) AS g
+    UNION ALL SELECT TIMESTAMPTZ '4713-01-02 00:00:00+00 BC' + g * INTERVAL '13 days 1 hour' FROM generate_series(0, 40) AS g
+    UNION ALL SELECT CAST(x AS timestamptz) FROM (VALUES ('infinity'), ('-infinity')) AS s(x)`,
+  ['UTC', 'Europe/Budapest', 'Asia/Kolkata', 'Asia/Kathmandu', 'America/St_Johns', 'Pacific/Chatham', 'Australia/Lord_Howe', 'America/New_York', 'Africa/Monrovia']
+    .map(zone => [`TimeZone = '${zone}'`])],
+  ['time', `SELECT TIME '00:00:00' + (g * 104729 % 86400000) * INTERVAL '1 millisecond' + (g % 1000) * INTERVAL '1 microsecond' AS v FROM generate_series(1, 2000) AS g
+    UNION ALL SELECT CAST(x AS time) FROM (VALUES ('24:00:00'), ('23:59:59.999999'), ('00:00:00')) AS s(x)`,
+  [[]]],
+  ['timetz', `SELECT CAST(concat(TIME '00:00:00' + (g * 104729 % 86400000) * INTERVAL '1 millisecond', (ARRAY['+00', '+05:30', '-03:30', '+13:45', '-12', '+14', '+00:19:32'])[1 + g % 7]) AS timetz) AS v
+    FROM generate_series(1, 2000) AS g`,
+  [[]]],
+  ['interval', `SELECT make_interval(g % 7 - 3, g % 13 - 6, 0, g % 41 - 20, g % 49 - 24, g % 121 - 60, (g * 7919 % 100000) / 1000.0 - 50) AS v FROM generate_series(1, 2000) AS g
+    UNION ALL SELECT CAST(x AS interval) FROM (VALUES ('0'), ('-1 day'), ('1 year 2 mons'), ('-00:00:00.000001')) AS s(x)`,
+  ['postgres', 'postgres_verbose', 'sql_standard', 'iso_8601'].map(style => [`IntervalStyle = '${style}'`])],
+  ['money', 'SELECT CAST(CAST((g * 7919 % 2000001 - 1000000) / 100.0 AS text) AS money) AS v FROM generate_series(1, 2000) AS g', [[]]],
+  ['bytea', 'SELECT CAST(concat(\'\\x\', substring(md5(CAST(g AS text)) FROM 1 FOR 2 * (g % 17))) AS bytea) AS v FROM generate_series(1, 2000) AS g',
+    [['bytea_output = \'hex\''], ['bytea_output = \'escape\'']]],
+  ['point', 'SELECT CAST(concat(\'(\', g * 1.5 - 1000, \',\', g / 7.0, \')\') AS point) AS v FROM generate_series(1, 2000) AS g', [[]]],
+  ['circle', 'SELECT CAST(concat(\'<(\', g, \',\', g * 2, \'),\', g * 0.3, \'>\') AS circle) AS v FROM generate_series(1, 2000) AS g', [[]]],
+];
+
+describe('the text a batch rebuilds from a value\'s JSON form is the text the server sends', () => {
+  let client: DatabaseClient;
+
+  beforeAll(() => {
+    client = createFreshClient();
+  });
+
+  afterAll(async () => {
+    await client.end();
+  });
+
+  test.each(JSON_FORM_VALUES.map(([type, values, settings]) => [type, values, settings] as const))('%s', async (type, values, settings) => {
+    for (const setting of settings) {
+      const rows = await client.transaction(async query => {
+        for (const statement of setting) {
+          await query(`SET LOCAL ${statement}`);
+        }
+
+        // Its JSON form, its text as the wire sends it (the output function, concat()) and its cast to text
+        return (await query(`SELECT CAST(row_to_json(q) AS text) AS j, concat(q.v) AS t, CAST(q.v AS text) AS c, CAST(CAST(pg_typeof(q.v) AS oid) AS integer) AS oid FROM (${values}) AS q`)).rows;
+      });
+
+      const oid = Number(rows[0].oid);
+      const mismatches = rows
+        .map(row => ({ json: JSON.parse(row.j).v, text: row.t, cast: row.c }))
+        .filter(({ json, text, cast }) => textOfJsonForm(oid, json) !== text || textOfJsonForm(oid, json) !== cast);
+
+      expect({ type, setting, oid: JSON_TEXT_TYPE_OIDS.has(oid), rows: rows.length >= 2000, mismatches: mismatches.slice(0, 5) })
+        .toEqual({ type, setting, oid: true, rows: true, mismatches: [] });
+    }
+  });
+});
+
+/**
+ * Under a DateStyle other than ISO the text of a date / timestamp / timestamptz is not its JSON form (which is
+ * ISO whatever the style): the batch has the server send it, and the batched value is still what the same
+ * query reads on its own — also through a client that hands back the driver's text.
+ *
+ * Bun, as in 1.0.11 — a known gap: Bun's SQL client decodes such a text on its own standalone (DD/MM read as
+ * MM/DD, a zone abbreviation as an invalid Date), and exposes no parsers; its client's parsers reproduce Bun's
+ * decoding of the ISO style only, so a batched value is the text the server sent in that style.
+ */
+describe('a batched date / timestamp under a DateStyle other than ISO: the server\'s text, as standalone', () => {
+  let client: DatabaseClient;
+
+  beforeAll(async () => {
+    client = createFreshClient();
+    await createSchema(client);
+  });
+
+  afterAll(async () => {
+    await dropSchema(client);
+    await client.end();
+  });
+
+  type StyledTexts = { day: string; at: string; on: string; span: string };
+  type StyledReads = { standalone: any[]; batched: any[]; texts: StyledTexts[] };
+  const readBoth = async (db: ObservatoryDatabase, dateStyle: string): Promise<StyledReads> => db.transaction(async tx => {
+    await tx.query(`SET LOCAL DateStyle = '${dateStyle}'`);
+    const build = () => tx.observations
+      .select(o => ({
+        id: o.id,
+        day: dateTrunc('day', o.observedAt),
+        at: sql<Date>`${o.recordedAt} + interval '1 hour'`,
+        on: sql<Date>`${o.observedOn} + 1`,
+        span: sql<string>`${o.observedAt} - CAST(${o.recordedAt} AS timestamp)`,
+      }))
+      .orderBy(o => o.id);
+    const standalone = await build().toList();
+    const batch = new QueryBatch();
+    const key = batch.addList(build(), 'styled');
+    await batch.executeBatch();
+    // The same values' texts in this style, as the server writes them
+    const texts = await tx.query<StyledTexts>('SELECT concat(date_trunc(\'day\', observed_at)) AS day, '
+      + 'concat(recorded_at + interval \'1 hour\') AS at, concat(observed_on + 1) AS "on", '
+      + 'concat(observed_at - CAST(recorded_at AS timestamp)) AS span FROM cpx_observations ORDER BY id');
+
+    return { standalone, batched: batch.getList(key), texts };
+  });
+
+  test.each(['SQL, DMY', 'Postgres, MDY', 'German', 'ISO, DMY'])('DateStyle %s', async dateStyle => {
+    const { standalone, batched, texts } = await readBoth(new ObservatoryDatabase(client), dateStyle);
+
+    expect(batched).toHaveLength(3);
+
+    if (driver === 'bun' && !dateStyle.startsWith('ISO')) {
+      // 1.0.11 parity plus a known gap (see above): the server's text of every value, never one rebuilt from its JSON form
+      expect(batched.map(({ day, at, on, span }) => ({ day, at, on, span }))).toEqual(texts);
+      expect(texts[0].on).not.toMatch(/^\d{4}-/);
+
+      return;
+    }
+
+    expectSameValues(batched, standalone, dateStyle);
+  });
+
+  test.skipIf(!reachesServer)('postgres.js handing back the driver\'s text for dates and timestamps', async () => {
+    const passthrough = new PostgresClient(postgres({
+      ...testConnectionConfig(),
+      max: 1,
+      types: {
+        timestamp: { to: 1114, from: [1114], serialize: (x: string) => x, parse: (x: string) => x },
+        timestamptz: { to: 1184, from: [1184], serialize: (x: string) => x, parse: (x: string) => x },
+        date: { to: 25, from: [1082], serialize: (x: string) => x, parse: (x: string) => x },
+      },
+    }));
+
+    try {
+      for (const dateStyle of ['SQL, DMY', 'ISO, MDY']) {
+        const { standalone, batched } = await readBoth(new ObservatoryDatabase(passthrough), dateStyle);
+
+        expectSameValues(batched, standalone, dateStyle);
+        expect(typeof standalone[0].day).toBe('string');
+      }
     } finally {
       await passthrough.end();
     }

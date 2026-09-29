@@ -18,14 +18,19 @@
  *
  * Database: VERBENCH_DB (default linkgress_verbench) on DB_HOST / DB_PORT / DB_USER / DB_PASSWORD.
  * `--mode setup` drops and re-creates the AppDatabase schema there and seeds it (~2k users, ~20k posts).
+ *
+ * VERBENCH_MOCK_ROW_CACHE=1 turns `MockRowCache` on in both versions (it is off by default; applications
+ * that enable it build selectors through cached mock-row descriptors). The report's runtime line says so.
  */
 import { writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { AppDatabase } from '../../debug/schema/appDatabase';
 import {
   and, DbColumn, DbContext, DbCteBuilder, DbEntity, DbEntityTable, DbModelConfig, decimal, eq, exists,
-  gt, integer, jsonb, like, lt, lte, PgClient, timestamp, varchar,
+  gt, integer, jsonb, like, lt, lte, MockRowCache, PgClient, QueryBatch, sql, timestamp, varchar,
 } from '../../src';
+
+const mockRowCacheOn = process.env.VERBENCH_MOCK_ROW_CACHE === '1';
 
 type Tier = 'e2e' | 'overhead' | 'build';
 type ClientMode = 'live' | 'record' | 'replay' | 'empty';
@@ -286,7 +291,7 @@ interface Ctx {
 
 interface Scenario {
   id: string;
-  group: 'control' | 'read' | 'navigation' | 'collection' | 'aggregate' | 'write';
+  group: 'control' | 'read' | 'navigation' | 'collection' | 'aggregate' | 'batch' | 'write';
   title: string;
   tiers: Tier[];
   /** Untimed, live: the database state the scenario starts from (before every tier). */
@@ -478,6 +483,17 @@ const scenarios: Scenario[] = [
       .select(p => ({ id: p.id, title: p.title }))
       .toList(),
   },
+  {
+    // No where() before selectMany(): 1.0.10 crashed on that shape, so it has nothing to compare. Products →
+    // prices → capacity groups (8 per product, 4 prices): both hops are cheap for PostgreSQL, where
+    // users → posts → comments spends ~80 ms scanning post_comments (no index on post_id) for 100 users.
+    id: 'selectmany-count', group: 'collection', title: 'productPrices.selectMany(pp => pp.productPriceCapacityGroups).count(), 100 products', tiers: ALL,
+    run: c => c.lateral.products
+      .where(p => lte(p.id, 100))
+      .orderBy(p => p.id)
+      .select(p => ({ id: p.id, name: p.name, groups: p.productPrices!.selectMany(pp => pp.productPriceCapacityGroups!).count() }))
+      .toList(),
+  },
 
   // ---- grouping, joins, unions, subqueries, CTEs
   {
@@ -543,6 +559,97 @@ const scenarios: Scenario[] = [
         .leftJoin(perUser, (u, x) => eq(u.id, x.userId), (u, x) => ({ id: u.id, username: u.username, posts: x.posts }))
         .toList();
     },
+  },
+
+  // ---- QueryBatch: every branch in ONE statement, a UNION ALL of json envelopes. A value JSON cannot
+  //      carry as the driver delivers it (int8 / numeric, a timestamp expression, a collection's MAX)
+  //      rides as its text: 1.0.5 and 1.0.10 cast declared int8 / numeric columns (to_jsonb(…) || …);
+  //      1.0.11 sends such values with their type in a fenced row_to_json envelope and parses them with
+  //      the client's parser. Branches with no such value keep the plain envelope in every version.
+  {
+    id: 'batch-plain', group: 'batch', title: 'QueryBatch: filtered list of 50 + primary-key firstOrDefault + count, plain columns', tiers: ALL,
+    run: async (c, i) => {
+      const batch = new QueryBatch();
+      const posts = batch.addList(c.lateral.posts
+        .where(p => lte(p.userId, 100))
+        .orderBy(p => p.id)
+        .limit(50)
+        .select(p => ({ id: p.id, title: p.title, views: p.views, userId: p.userId })), 'posts');
+      const user = batch.addFirstOrDefault(c.lateral.users
+        .where(u => eq(u.id, 1 + (i % USERS)))
+        .select(u => ({ id: u.id, username: u.username, email: u.email, age: u.age, isActive: u.isActive })), 'user');
+      const count = batch.addCount(c.lateral.posts.where(p => lte(p.userId, 100)), 'count');
+      await batch.executeBatch();
+
+      return { posts: batch.getList(posts), user: batch.getItem(user), count: batch.getCount(count) };
+    },
+  },
+  {
+    // The model's decimal columns that hold data; its one bigint column (type_zoo.v_bigint) is in a table the seed leaves empty.
+    id: 'batch-numeric', group: 'batch', title: 'QueryBatch: 500 orders + 200 product prices, each with a decimal(10,2) column', tiers: ALL,
+    run: async c => {
+      const batch = new QueryBatch();
+      const orders = batch.addList(c.lateral.orders
+        .where(o => lte(o.userId, 100))
+        .orderBy(o => o.id)
+        .select(o => ({ id: o.id, userId: o.userId, totalAmount: o.totalAmount })), 'orders');
+      const prices = batch.addList(c.lateral.productPrices
+        .where(pp => lte(pp.productId, 50))
+        .orderBy(pp => pp.id)
+        .select(pp => ({ id: pp.id, productId: pp.productId, price: pp.price })), 'prices');
+      await batch.executeBatch();
+
+      return { orders: batch.getList(orders), prices: batch.getList(prices) };
+    },
+  },
+  {
+    id: 'batch-expression', group: 'batch', title: 'QueryBatch: 500 posts projecting sql`lower(…)` and sql`date_trunc(\'day\', …)`', tiers: ALL,
+    run: async c => {
+      const batch = new QueryBatch();
+      const posts = batch.addList(c.lateral.posts
+        .where(p => lte(p.id, 500))
+        .orderBy(p => p.id)
+        .select(p => ({
+          id: p.id,
+          titleLower: sql<string>`lower(${p.title})`,
+          publishedDay: sql<Date>`date_trunc('day', ${p.publishedAt})`,
+        })), 'posts');
+      await batch.executeBatch();
+
+      return { posts: batch.getList(posts) };
+    },
+  },
+  {
+    // A paginated admin list: one page with a collection's MAX of a timestamp per row, and the total. The chain
+    // starts with where(): 1.0.5's table-level orderBy() / limit() / offset() return an all-columns projection,
+    // whose select() sees no navigations.
+    id: 'batch-collection-max', group: 'batch', title: 'QueryBatch: page 2 (500) of active users with max(posts.publishedAt) + total count', tiers: ALL,
+    run: async c => {
+      const batch = new QueryBatch();
+      const page = batch.addList(c.lateral.users
+        .where(u => eq(u.isActive, true))
+        .orderBy(u => u.id)
+        .offset(500)
+        .limit(500)
+        .select(u => ({ id: u.id, username: u.username, lastPostAt: u.posts!.max(p => p.publishedAt) })), 'page');
+      const total = batch.addCount(c.lateral.users.where(u => eq(u.isActive, true)), 'total');
+      await batch.executeBatch();
+
+      return { page: batch.getList(page), total: batch.getCount(total) };
+    },
+  },
+
+  // ---- reads inside a transaction (BEGIN / COMMIT are PgClient's own: live in e2e, not replayed)
+  {
+    id: 'transaction-reads', group: 'read', title: 'transaction: primary-key lookup + count + 10-row list', tiers: ALL,
+    run: (c, i) => c.lateral.transaction(async (tx: AppDatabase) => {
+      const userId = 1 + (i % USERS);
+      const user = await tx.users.where(u => eq(u.id, userId)).firstOrDefault();
+      const orders = await tx.orders.where(o => eq(o.userId, userId)).count();
+      const posts = await tx.posts.orderBy(p => p.id).limit(10).select(p => ({ id: p.id, title: p.title, views: p.views })).toList();
+
+      return { user, orders, posts };
+    }),
   },
 
   // ---- writes (own table; reset before every tier)
@@ -847,9 +954,14 @@ function parseArgs(argv: string[]): Record<string, string> {
 }
 
 const runtimeName = (): string =>
-  (globalThis as any).Bun ? `bun ${(globalThis as any).Bun.version}` : `node ${process.version}`;
+  ((globalThis as any).Bun ? `bun ${(globalThis as any).Bun.version}` : `node ${process.version}`) +
+  (mockRowCacheOn ? ', MockRowCache on' : '');
 
 function createContext(): Ctx {
+  if (mockRowCacheOn) {
+    MockRowCache.setEnabled(true);
+  }
+
   const client = new BenchClient({
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '5432'),

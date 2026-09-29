@@ -546,7 +546,22 @@ function projectConditionValue(value: unknown, depth: number): unknown {
 }
 
 /**
- * Wrap a selector so its result goes through {@link projectConditionValues}; idempotent.
+ * Marks a selector that projects its row's COLUMNS and nothing else — a table's select-all row: no
+ * expression, no aggregate, no set-returning value, no collection. What a query checks a projection for
+ * before counting its rows (`count()` / `exists()`) never holds there, so it is not evaluated for it.
+ * @internal
+ */
+export const SELECTS_ONLY_COLUMNS = Symbol('linkgress.selectsOnlyColumns');
+
+/** Marks `selector` as projecting only its row's columns (see {@link SELECTS_ONLY_COLUMNS}). @internal */
+export function selectingOnlyColumns<F extends (...args: any[]) => any>(selector: F): F {
+  (selector as any)[SELECTS_ONLY_COLUMNS] = true;
+  return selector;
+}
+
+/**
+ * Wrap a selector so its result goes through {@link projectConditionValues}; idempotent. The wrapper keeps
+ * the selector's {@link SELECTS_ONLY_COLUMNS} mark.
  * @internal
  */
 export function selectorProjectingConditions<F extends (...args: any[]) => any>(selector: F): F {
@@ -556,6 +571,9 @@ export function selectorProjectingConditions<F extends (...args: any[]) => any>(
 
   const wrapped = ((...args: any[]) => projectConditionValues(selector(...args))) as F;
   (wrapped as any).__projectsConditions = true;
+  if ((selector as any)[SELECTS_ONLY_COLUMNS] === true) {
+    (wrapped as any)[SELECTS_ONLY_COLUMNS] = true;
+  }
   return wrapped;
 }
 

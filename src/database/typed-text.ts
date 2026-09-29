@@ -9,15 +9,98 @@
 export const FIRST_USER_TYPE_OID = 16384;
 
 /**
- * The types whose values a QueryBatch sends as their text: their JSON form is not what the drivers
+ * The types whose values a QueryBatch hands the client as their text: their JSON form is not what the drivers
  * deliver — date / time / timetz / timestamp / timestamptz / interval, int8, numeric, money, bytea, the
  * geometric point / circle (node-postgres parses them) — and their arrays. A value of a user-defined type,
- * and of any type the client parses with a parser of its own, travels as its text too.
+ * and of any type the client parses with a parser of its own, travels as its text too. The text of a value
+ * of JSON_TEXT_TYPE_OIDS is rebuilt from its JSON form; the server sends every other one.
  */
 export const TEXT_TRANSPORT_TYPE_OIDS: readonly number[] = [
   1082, 1083, 1266, 1114, 1184, 1186, 20, 1700, 790, 17, 600, 718,
   1182, 1183, 1270, 1115, 1185, 1187, 1016, 1231, 791, 1001, 1017, 719,
 ];
+
+/**
+ * The scalar types whose TEXT a QueryBatch rebuilds from the value's JSON form rather than having the server
+ * send it (see textOfJsonForm): `row_to_json` writes a time / timetz / interval / money / bytea / point / circle
+ * as its type's output text, and a date / timestamp / timestamptz in the ISO form, which is that text under
+ * `DateStyle` ISO but for a timestamp's `T` separator and a timestamptz's whole-hour offset
+ * (`+01:00` for `+01`). An int8 / numeric (a JSON number loses digits and scale), an array (its JSON form
+ * loses the literal's quoting and bounds) and a value of any other type still travel as their text.
+ */
+export const JSON_TEXT_TYPE_OIDS: ReadonlySet<number> = new Set([1082, 1083, 1266, 1114, 1184, 1186, 790, 17, 600, 718]);
+
+/**
+ * Those of JSON_TEXT_TYPE_OIDS whose JSON form is ISO whatever the session's `DateStyle`: under another style
+ * (`SQL`, `Postgres`, `German`) their text differs, and a QueryBatch has the server send it.
+ */
+export const DATE_STYLE_TYPE_OIDS: readonly number[] = [1082, 1114, 1184];
+
+/**
+ * `json` — the type of a QueryBatch's envelope. A client that parses it with a parser of its own runs that
+ * parser on the rows a text would be rebuilt from (a reviver may make a date's ISO JSON form a Date): a batch
+ * then has the server send every text and rebuilds none (see JSON_TEXT_TYPE_OIDS).
+ */
+export const JSON_TYPE_OID = 114;
+
+const isDigitAt = (text: string, at: number): boolean => {
+  const code = text.charCodeAt(at);
+
+  return code >= 48 && code <= 57;
+};
+
+/**
+ * Whether the ISO JSON form of a timestamptz ends — before its end `end` (a ` BC` suffix excluded) — in an
+ * offset of whole hours, `+01:00`, which the output text writes `+01`. An offset with minutes (`+05:30`) or
+ * seconds (`+00:19:32`, local mean time) the output text writes in full too.
+ */
+const endsInWholeHourOffset = (json: string, end: number): boolean => {
+  if (end < 6) {
+    return false;
+  }
+
+  const sign = json.charCodeAt(end - 6);
+
+  // `+` or `-`, two digits, `:00`
+  return (sign === 43 || sign === 45) && isDigitAt(json, end - 5) && isDigitAt(json, end - 4)
+    && json.charCodeAt(end - 3) === 58 && json.charCodeAt(end - 2) === 48 && json.charCodeAt(end - 1) === 48;
+};
+
+/**
+ * The output text (as the wire protocol sends it under `DateStyle` ISO) of a value of the type `oid` — one of
+ * JSON_TEXT_TYPE_OIDS — from its `row_to_json` form `json`: a timestamp's `T` separator becomes a space, a
+ * timestamptz's whole-hour offset loses its `:00` minutes (`+05:30` and an offset with seconds, `+00:19:32`,
+ * stay as they are — the output writes them in full too); every other type's JSON form is its text.
+ * `infinity`, a date before Christ and a year past 9999 read the same in both forms.
+ *
+ * A rebuilt text is joined from its parts (`Array.prototype.join` makes a flat string): a string made by
+ * `replace()` or `+` is a rope the drivers' date parsers flatten on every regular expression they run,
+ * which made parsing one about 40 % slower than parsing a text the server sent.
+ */
+export function textOfJsonForm(oid: number, json: string): string {
+  if (oid !== 1114 && oid !== 1184) {
+    return json;
+  }
+
+  const separator = json.indexOf('T');
+
+  // ±infinity: no date and time to separate, no offset
+  if (separator < 0) {
+    return json;
+  }
+
+  const date = json.slice(0, separator);
+
+  if (oid === 1114) {
+    return [date, json.slice(separator + 1)].join(' ');
+  }
+
+  const end = json.endsWith(' BC') ? json.length - 3 : json.length;
+
+  return endsInWholeHourOffset(json, end)
+    ? [date, ' ', json.slice(separator + 1, end - 3), json.slice(end)].join('')
+    : [date, json.slice(separator + 1)].join(' ');
+}
 
 /**
  * The element type of each array type the built-in parsers read element by element (an array of any other

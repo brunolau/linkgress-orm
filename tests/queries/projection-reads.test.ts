@@ -477,3 +477,72 @@ describe('an array in a projection', () => {
     });
   });
 });
+
+/**
+ * A result set's rows are rebuilt into their nested objects by ONE fold compiled from the first row's keys
+ * (every row of a statement carries the same) — exactly what rebuilding each row key by key gives, key
+ * order included. A row with other keys, and a set of keys a fold could rebuild otherwise (a path segment
+ * every object has, a value written where a path goes through), is rebuilt key by key.
+ */
+describe('a result set\'s nested objects, rebuilt by one fold', () => {
+  /** The rows rebuilt as a result set, next to each row rebuilt on its own — compared with their key order. */
+  const rebuildBoth = (builder: any, rows: any[]): { folded: string; oneByOne: string } => {
+    const paths = new Set(rows.flatMap(row => Object.keys(row).filter(key => key.startsWith('__nested__'))));
+
+    return {
+      folded: JSON.stringify(builder.reconstructNestedRows(rows.map(row => ({ ...row })), paths)),
+      oneByOne: JSON.stringify(rows.map(row => builder.reconstructNestedObjects({ ...row }, paths))),
+    };
+  };
+
+  const builderOf = (db: any): any => db.posts.select((p: any) => ({ id: p.id, author: p.user }));
+
+  test('a navigation row, nested objects several levels deep, interleaved paths: the same objects, the same key order', async () => {
+    await withDatabase(async db => {
+      const builder = builderOf(db);
+      const shapes: any[][] = [
+        [1, 2, 3].map(n => ({ id: n, __nested__author__id: n * 10, __nested__author__username: `u${n}`, __nested__author__createdAt: new Date(n) })),
+        [1, 2].map(n => ({ __nested__a__b__c: n, x: 'top', __nested__d__e: [n], __nested__a__f: null, __nested__a__b__g: n + 1, __nested__h: true })),
+        [{ id: 1, title: 'no nested value at all' }],
+        [{ __nested__a____b: 1, __nested__a__: 2, __nested__: 3 }],
+      ];
+
+      for (const rows of shapes) {
+        const { folded, oneByOne } = rebuildBoth(builder, rows);
+        expect(folded).toBe(oneByOne);
+      }
+
+      expect(JSON.parse(rebuildBoth(builder, shapes[1]).folded)[0]).toEqual({ a: { b: { c: 1, g: 2 }, f: null }, x: 'top', d: { e: [1] }, h: true });
+      expect(builder.reconstructNestedRows([], new Set(['__nested__a__b']))).toEqual([]);
+    });
+  });
+
+  test('rows whose keys differ from the first row\'s, keys a fold could rebuild otherwise: each such row rebuilt key by key, alike', async () => {
+    await withDatabase(async db => {
+      const builder = builderOf(db);
+      const mixed = [
+        { id: 1, __nested__author__id: 10, __nested__author__name: 'a' },
+        { __nested__author__id: 20, id: 2, __nested__author__name: 'b' },
+        { id: 3, __nested__author__id: 30 },
+        { id: 4, __nested__author__id: 40, __nested__author__name: 'd', extra: true },
+        { id: 5, __nested__author__id: 50, __nested__author__name: 'e' },
+      ];
+      const inherited = [{ __nested__meta__constructor: 1, __nested__meta__toString: 'x', valueOf: 2 }];
+      const pathThenValue = [{ __nested__a__b: 1, __nested__a: 2 }, { __nested__a__b: 3, __nested__a: 4 }];
+
+      for (const rows of [mixed, inherited, pathThenValue]) {
+        const { folded, oneByOne } = rebuildBoth(builder, rows);
+        expect(folded).toBe(oneByOne);
+      }
+
+      expect(JSON.parse(rebuildBoth(builder, pathThenValue).folded)).toEqual([{ a: 2 }, { a: 4 }]);
+      expect(Object.getOwnPropertyNames(builder.reconstructNestedRows(inherited, new Set(['__nested__meta__constructor']))[0].meta))
+        .toEqual(['constructor', 'toString']);
+
+      // A value written where a path goes through fails as it always did, and so does a row that is not one
+      const valueThenPath = [{ __nested__a: 1, __nested__a__b: 2 }];
+      expect(() => builder.reconstructNestedRows(valueThenPath, new Set(['__nested__a']))).toThrow(TypeError);
+      expect(() => builder.reconstructNestedRows([{ __nested__a: 1 }, null], new Set(['__nested__a']))).toThrow(TypeError);
+    });
+  });
+});

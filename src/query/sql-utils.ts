@@ -24,10 +24,78 @@ import type { TableSchema } from '../schema/table-builder';
  */
 const QUOTED_OR_PLACEHOLDER = /('(?:[^']|'')*')|("(?:[^"]|"")*")|(--[^\n]*)|(\/\*[\s\S]*?\*\/)|\$(?<digits>\d+)/g;
 
-export const renumberPlaceholders = (sqlText: string, offset: number): string =>
-  sqlText.replace(QUOTED_OR_PLACEHOLDER, (match, _single, _dbl, _lineComment, _blockComment, digits) =>
-    digits !== undefined ? `$${Number(digits) + offset}` : match
-  );
+const isDigitCode = (code: number): boolean => code >= 48 && code <= 57;
+
+/**
+ * Where the quoted segment opened by the quote at `open` ends — what QUOTED_OR_PLACEHOLDER's `'…'` / `"…"`
+ * arm matches there: its content is any text in which the quote only appears doubled, and the match is the
+ * LONGEST such segment closed by a quote (the regex is greedy and backtracks: `'a''` is `'a'`, followed by a
+ * new quote). -1 when no quote closes it — the arm does not match, and the quote is plain text.
+ */
+const quotedSegmentEnd = (sqlText: string, open: number, quote: string): number => {
+  let lastClose = -1;
+  let from = open + 1;
+
+  for (;;) {
+    const at = sqlText.indexOf(quote, from);
+
+    if (at < 0) {
+      return lastClose;
+    }
+
+    if (sqlText[at + 1] !== quote) {
+      return at;
+    }
+
+    // A doubled quote: part of the content — or, if nothing closes the segment later, its closing quote
+    lastClose = at;
+    from = at + 2;
+  }
+};
+
+/**
+ * `sqlText` with every bare `$N` renumbered to `$(N + offset)` — exactly what replacing QUOTED_OR_PLACEHOLDER's
+ * matches does (see above), without running a callback for every quoted identifier of the statement: the
+ * scan jumps from one token start (`'`, `"`, `--`, `/*`, `$`) to the next and copies the text between.
+ */
+export const renumberPlaceholders = (sqlText: string, offset: number): string => {
+  const length = sqlText.length;
+  let out = '';
+  let copied = 0;
+  let at = 0;
+
+  while (at < length) {
+    const code = sqlText.charCodeAt(at);
+
+    if (code === 39 || code === 34) {
+      // '…' or "…": verbatim — an unclosed quote is plain text
+      const end = quotedSegmentEnd(sqlText, at, code === 39 ? '\'' : '"');
+      at = end < 0 ? at + 1 : end + 1;
+    } else if (code === 45 && sqlText.charCodeAt(at + 1) === 45) {
+      // -- comment, up to (not including) the end of its line
+      const newline = sqlText.indexOf('\n', at + 2);
+      at = newline < 0 ? length : newline;
+    } else if (code === 47 && sqlText.charCodeAt(at + 1) === 42) {
+      // /* comment */ — an unclosed one is plain text
+      const close = sqlText.indexOf('*/', at + 2);
+      at = close < 0 ? at + 1 : close + 2;
+    } else if (code === 36 && isDigitCode(sqlText.charCodeAt(at + 1))) {
+      let end = at + 2;
+
+      while (end < length && isDigitCode(sqlText.charCodeAt(end))) {
+        end++;
+      }
+
+      out += `${sqlText.slice(copied, at)}$${Number(sqlText.slice(at + 1, end)) + offset}`;
+      copied = end;
+      at = end;
+    } else {
+      at++;
+    }
+  }
+
+  return copied === 0 ? sqlText : out + sqlText.slice(copied);
+};
 
 /**
  * True when the SQL fragment contains a bare `$N` placeholder OUTSIDE quoted

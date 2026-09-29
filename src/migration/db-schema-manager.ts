@@ -1,4 +1,4 @@
-import * as readline from 'readline';
+import type * as readline from 'readline';
 import { DatabaseClient } from '../database/database-client.interface';
 import { LogLevel } from '../entity/db-context';
 import { TableSchema, IndexMethod, IndexDefinition } from '../schema/table-builder';
@@ -281,7 +281,10 @@ export class DbSchemaManager {
    */
   private getReadlineInterface(): readline.Interface {
     if (!this.rl) {
-      this.rl = readline.createInterface({
+      // node:readline is loaded by the first prompt, not by every import of the package
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const readlineModule = require('readline') as typeof readline;
+      this.rl = readlineModule.createInterface({
         input: process.stdin,
         output: process.stdout,
       });

@@ -1,4 +1,5 @@
 import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, QueryTimeoutError, TransactionEndedError } from './database-client.interface';
+import type { TypedTextRead } from './database-client.interface';
 import type { PostgresOptions } from './types';
 import { withArrayTypes } from './typed-text';
 
@@ -462,6 +463,21 @@ export class PostgresClient extends DatabaseClient {
     }
 
     return parse.array === true ? parse(text.slice(1)) : parse(text);
+  }
+
+  /** The parser of the type `oid` postgres.js reads a column through, looked up once (see parseTypedText). @internal */
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    if (this.parseTypedText !== PostgresClient.prototype.parseTypedText) {
+      return super.typedTextParser(oid, read);
+    }
+
+    const parse = (this.sql as any)?.options?.parsers?.[oid];
+
+    if (typeof parse !== 'function') {
+      return (text) => text;
+    }
+
+    return parse.array === true ? (text) => parse(text.slice(1)) : (text) => parse(text);
   }
 
   /**

@@ -258,6 +258,17 @@ export abstract class DatabaseClient {
   }
 
   /**
+   * {@link parseTypedText} for every text of one type `oid`, read as `read` says — what a QueryBatch parses
+   * a column's texts with, one call per value: `parse(text)` is exactly `parseTypedText(oid, text, read)`.
+   * The built-in clients resolve their driver's parser for the type once, where `parseTypedText` looks it up
+   * per value; a client whose `parseTypedText` is its own (a subclass's, an instance's) gets it called.
+   * @internal
+   */
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    return (text) => this.parseTypedText(oid, text, read);
+  }
+
+  /**
    * The types (OIDs) this client's driver parses with a parser the application configured, beyond the
    * driver's defaults: a QueryBatch sends every value of these types as its text, so that parser gets
    * it (see parseTypedText). Default: none.
@@ -357,6 +368,13 @@ export class TransactionalClient extends DatabaseClient {
 
   parseTypedText(oid: number, text: string, read?: TypedTextRead): unknown {
     return this.parentClient.parseTypedText(oid, text, read);
+  }
+
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    // This client's own parseTypedText is the parent's: the parent resolves its parser
+    return this.parseTypedText === TransactionalClient.prototype.parseTypedText
+      ? this.parentClient.typedTextParser(oid, read)
+      : super.typedTextParser(oid, read);
   }
 
   customParsedTypeOids(): readonly number[] {

@@ -518,6 +518,36 @@ export class BunClient extends DatabaseClient {
     return value;
   }
 
+  /** {@link parseTypedText} of the type `oid` read as `read` says, its decoding settled once. @internal */
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    if (this.parseTypedText !== BunClient.prototype.parseTypedText) {
+      return super.typedTextParser(oid, read);
+    }
+
+    const binary = !this.usesTextResults && read?.parameterized === true;
+    const scaledZero = oid === 1700 && binary;
+    const base = binary ? BUN_BINARY_PARSING : BUN_TEXT_PARSING;
+    const parsing = this.sql?.options?.bigint === true ? { ...base, int8AsBigInt: true } : base;
+    const datesAsStrings = this.datesAsStrings;
+
+    return (text) => {
+      if (scaledZero && /^-?0\.0+$/.test(text)) {
+        return '0';
+      }
+
+      const value = parseBuiltInTypedText(oid, text, parsing);
+
+      if (datesAsStrings && value instanceof Date) {
+        const row = { value };
+        convertDatesToPgText([row]);
+
+        return row.value;
+      }
+
+      return value;
+    };
+  }
+
   /**
    * Get access to the underlying Bun SQL instance for advanced use cases
    */

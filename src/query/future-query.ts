@@ -1,5 +1,5 @@
 import type { DatabaseClient, QueryResult, TypedTextRead } from '../database/database-client.interface';
-import { isTextParsedType } from '../database/typed-text';
+import { isTextParsedType, JSON_TEXT_TYPE_OIDS, textOfJsonForm } from '../database/typed-text';
 import type { QueryExecutor } from '../entity/db-context';
 import { DRIVER_VALUE_MAPPER } from './conditions';
 
@@ -57,17 +57,33 @@ export interface FutureBatchMeta {
 export type BatchTypeOids = ReadonlyArray<number | null>;
 
 /** What a batch parses the texts it sends with: the client the batch runs on. */
-type TypedTextParser = Pick<DatabaseClient, 'parseTypedText'>;
+type TypedTextParser = Pick<DatabaseClient, 'parseTypedText'> & Partial<Pick<DatabaseClient, 'typedTextParser'>>;
+
+/** How a batch reads one text-sent value of a branch: under `key`, parsed by `parse`, from its JSON form too (`fromJson`). */
+interface BatchValueRead {
+  readonly index: number;
+  readonly key: string;
+  readonly parse: (text: string) => unknown;
+  /** The value's text from its JSON form, for a type whose text the server does not send (see JSON_TEXT_TYPE_OIDS). */
+  readonly fromJson?: (json: string) => string;
+  /** The JSON form last rebuilt, and its text: a column often repeats one value on consecutive rows (a day, a status' timestamp) */
+  lastJson?: string;
+  lastText?: string;
+}
 
 /**
- * The rows of a QueryBatch branch with the TEXTS the branch sent alongside them parsed in — `texts`: one
- * array per row, in row order, of one text (or NULL) per text-sent value (the branch's text columns, then
- * its runtime-typed ones), or `undefined` when none of the branch's values needed one; `typeOids`: the
- * (base) type of each. A value with a text whose (base) type the client parses from its text (see
- * isTextParsedType — `textTypeOids`) becomes what `client` delivers for that type standalone
- * (DatabaseClient.parseTypedText), read as the branch's own statement reads it (`read`: whether it binds
- * parameters). Any other value stays as the JSON row carries it: NULL (the text of NULL is empty), and a
- * value of a domain over a type JSON carries as the drivers deliver it. Each row keeps its key order.
+ * The rows of a QueryBatch branch with the TEXTS of their values parsed in — `texts`: one array per row, in
+ * row order, of one text (or NULL) per text-sent value (the branch's text columns, then its runtime-typed
+ * ones), or `undefined` when none of the branch's values needed the server to send one; `typeOids`: the
+ * (base) type of each. A value whose (base) type the client parses from its text (see isTextParsedType —
+ * `textTypeOids`) becomes what `client` delivers for that type standalone (DatabaseClient.parseTypedText),
+ * read as the branch's own statement reads it (`read`: whether it binds parameters) — from the text the
+ * server sent, or, for a type whose JSON form gives its text back (JSON_TEXT_TYPE_OIDS, which the server
+ * sends no text for — under a `DateStyle` other than ISO, only for a type of those whose JSON form ignores
+ * it), from the text rebuilt from that form (textOfJsonForm). Any other value stays as the JSON row carries
+ * it: NULL (the text of NULL is empty), and a value of a domain over a type JSON carries as the drivers
+ * deliver it. Each row keeps its key order. `rebuildsFromJson` false (a client that parses json itself, see
+ * JSON_TYPE_OID — the server then sent every text): no text is rebuilt, only those sent are parsed.
  * @internal
  */
 export function applyBatchOverrides(
@@ -77,34 +93,74 @@ export function applyBatchOverrides(
   typeOids: BatchTypeOids | undefined,
   client: TypedTextParser,
   textTypeOids: ReadonlySet<number>,
-  read?: TypedTextRead
+  read?: TypedTextRead,
+  rebuildsFromJson: boolean = true
 ): Array<Record<string, any>> {
-  if (!texts) {
+  // A branch that sends no texts has no types either: nothing to parse
+  if (!typeOids || typeOids.length === 0) {
     return rows;
   }
 
   const keys = [...(meta.textColumns ?? []), ...(meta.runtimeTypedColumns ?? [])];
-  const parsed = keys.map((_, i) => {
+  const reads: BatchValueRead[] = [];
+  let fromJson = false;
+
+  for (let i = 0; i < keys.length; i++) {
     const oid = typeOids?.[i];
 
-    return typeof oid === 'number' && isTextParsedType(oid, textTypeOids) ? oid : undefined;
-  });
+    if (typeof oid !== 'number' || !isTextParsedType(oid, textTypeOids)) {
+      continue;
+    }
+
+    const rebuilds = rebuildsFromJson && JSON_TEXT_TYPE_OIDS.has(oid);
+
+    // Neither a text sent nor one to rebuild: the value stays as it is, and needs no parser
+    if (!texts && !rebuilds) {
+      continue;
+    }
+
+    fromJson ||= rebuilds;
+    reads.push({
+      index: i,
+      key: keys[i],
+      parse: client.typedTextParser ? client.typedTextParser(oid, read) : (text) => client.parseTypedText(oid, text, read),
+      fromJson: rebuilds ? (json) => textOfJsonForm(oid, json) : undefined,
+    });
+  }
+
+  if (reads.length === 0 || (!texts && !fromJson)) {
+    return rows;
+  }
 
   for (let rowIx = 0; rowIx < rows.length; rowIx++) {
-    const rowTexts = texts[rowIx];
+    const rowTexts = texts?.[rowIx];
 
-    if (!rowTexts) {
+    if (texts && !rowTexts) {
       continue;
     }
 
     const row = rows[rowIx];
 
-    for (let i = 0; i < keys.length; i++) {
-      const text = rowTexts[i];
-      const oid = parsed[i];
+    for (let r = 0; r < reads.length; r++) {
+      const valueRead = reads[r];
+      const value = row[valueRead.key];
 
-      if (oid !== undefined && text !== null && text !== undefined && row[keys[i]] !== null && row[keys[i]] !== undefined) {
-        row[keys[i]] = client.parseTypedText(oid, text, read);
+      if (value === null || value === undefined) {
+        continue;
+      }
+
+      const text = rowTexts?.[valueRead.index];
+
+      if (text !== null && text !== undefined) {
+        row[valueRead.key] = valueRead.parse(text);
+      } else if (valueRead.fromJson && typeof value === 'string') {
+        // Parsed per row (every row gets a value of its own); the text only rebuilt for a new JSON form
+        if (value !== valueRead.lastJson) {
+          valueRead.lastJson = value;
+          valueRead.lastText = valueRead.fromJson(value);
+        }
+
+        row[valueRead.key] = valueRead.parse(valueRead.lastText!);
       }
     }
   }

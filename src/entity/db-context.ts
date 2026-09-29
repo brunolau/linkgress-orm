@@ -15,6 +15,7 @@ import {
   SelectQueryBuilder,
   QueryBuilder,
   QueryContext,
+  MOCK_ROW_COLUMN_GETTERS,
   RETURNING_PLACEHOLDER_COLUMN,
   classifyReturningValue,
   fragmentReadMapper,
@@ -39,6 +40,7 @@ import { projectedColumnRef } from '../query/cte-builder';
 import { CteRootQueryBuilder } from '../query/cte-root-query';
 import { AliasedScope } from '../query/aliased-scope';
 import { SetQueryBuilder } from '../query/set-returning';
+import { selectingOnlyColumns } from '../query/sql-functions';
 import type { Subquery } from '../query/subquery';
 import type { UnionQueryBuilder } from '../query/union-builder';
 import type { FutureQuery, FutureSingleQuery, FutureCountQuery } from '../query/future-query';
@@ -192,9 +194,13 @@ function createSelectAllRow(schema: any, source: any): any {
     columnNames = Object.keys(schema.columns);
     selectAllColumnNames.set(schema, columnNames);
   }
+  // A query's mock row carries its columns' getters (see MOCK_ROW_COLUMN_GETTERS): called directly, they read
+  // what `source[colName]` reads, without a property lookup V8 cannot cache
+  const getters: Map<string, () => unknown> | undefined = source?.[MOCK_ROW_COLUMN_GETTERS];
   for (let i = 0; i < columnNames.length; i++) {
     const colName = columnNames[i];
-    result[colName] = source[colName];
+    const get = getters?.get(colName);
+    result[colName] = get !== undefined ? get.call(source) : source[colName];
   }
 
   return result;
@@ -4224,7 +4230,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
   private selectAllQuery(): unknown {
     const schema = this._getSchema();
 
-    return this.context.getTable(this.tableName).select((e: any) => createSelectAllRow(schema, e));
+    return this.context.getTable(this.tableName).select(selectingOnlyColumns((e: any) => createSelectAllRow(schema, e)));
   }
 
   /**
@@ -4264,7 +4270,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
     // Own enumerable columns + navigation getters inherited from the per-schema prototype
     // (see createSelectAllRow): the chained-selector surface is unchanged, the default
     // projection stays columns-only.
-    const allColumnsSelector = (e: any) => createSelectAllRow(schema, e);
+    const allColumnsSelector = selectingOnlyColumns((e: any) => createSelectAllRow(schema, e));
 
     const queryBuilder = this.context.getTable(this.tableName)
       .where(condition as any)
@@ -4346,7 +4352,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
   private asEntityQueryable(): IEntityQueryable<TEntity> {
     const schema = this._getSchema();
     // See createSelectAllRow for the shape (own enumerable columns, inherited navigations).
-    const allColumnsSelector = (e: any) => createSelectAllRow(schema, e);
+    const allColumnsSelector = selectingOnlyColumns((e: any) => createSelectAllRow(schema, e));
 
     const queryBuilder = this.context.getTable(this.tableName).select(allColumnsSelector);
     return queryBuilder as any as IEntityQueryable<TEntity>;
@@ -4420,13 +4426,13 @@ export class DbEntityTable<TEntity extends DbEntity> {
   futureCount(): FutureCountQuery {
     const schema = this._getSchema();
 
-    const allColumnsSelector = (e: any) => {
+    const allColumnsSelector = selectingOnlyColumns((e: any) => {
       const result: any = {};
       for (const colName of Object.keys(schema.columns)) {
         result[colName] = e[colName];
       }
       return result;
-    };
+    });
 
     const queryBuilder = this.context.getTable(this.tableName).select(allColumnsSelector);
     return (queryBuilder as any).futureCount();
@@ -4439,7 +4445,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const schema = this._getSchema();
 
     // See createSelectAllRow for the shape (own enumerable columns, inherited navigations).
-    const allColumnsSelector = (e: any) => createSelectAllRow(schema, e);
+    const allColumnsSelector = selectingOnlyColumns((e: any) => createSelectAllRow(schema, e));
 
     const queryBuilder = this.context.getTable(this.tableName)
       .with(...ctes)

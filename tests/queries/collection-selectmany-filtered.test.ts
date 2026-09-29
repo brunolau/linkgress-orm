@@ -3360,3 +3360,41 @@ describe('typing', () => {
     void typeOnly;
   });
 });
+
+/**
+ * A hop's alias takes a suffix within PostgreSQL's 63-byte identifiers, counted in UTF-8 bytes
+ * (utf8ByteLength): by UTF-16 code unit, a surrogate pair as one 4-byte code point, a lone surrogate as 3
+ * bytes — exactly as counting the string's code points does.
+ */
+describe('an alias\'s length in UTF-8 bytes', () => {
+  const byCodePoint = (identifier: string): number => {
+    let bytes = 0;
+
+    for (const char of identifier) {
+      const code = char.codePointAt(0)!;
+      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    }
+
+    return bytes;
+  };
+
+  test('ASCII, 2-, 3- and 4-byte characters, lone and reversed surrogates — and 20 000 generated strings', async () => {
+    const { utf8ByteLength } = await import('../../src/query/query-builder');
+    const fixed = ['', 'shelves__bridge1', 'café', '€uro', '書架', '📚books', 'a\ud83d', '\ud83da', '\udcdab', '\udc00\ud800', 'x'.repeat(61)];
+
+    expect(fixed.map(utf8ByteLength)).toEqual([0, 16, 5, 6, 6, 9, 4, 4, 4, 6, 61]);
+
+    // Code units drawn from every range that counts differently, surrogates included
+    const units = [0x41, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff];
+    let seed = 7;
+    const next = (): number => (seed = (seed * 1103515245 + 12345) % 2147483648);
+
+    for (let n = 0; n < 20000; n++) {
+      const text = String.fromCharCode(...Array.from({ length: next() % 9 }, () => units[next() % units.length]));
+
+      if (utf8ByteLength(text) !== byCodePoint(text)) {
+        expect({ text, bytes: utf8ByteLength(text) }).toEqual({ text, bytes: byCodePoint(text) });
+      }
+    }
+  });
+});

@@ -1,5 +1,5 @@
-import { describe, test, expect, afterEach } from 'bun:test';
-import { MockRowCache } from '../../src';
+import { describe, test, expect, afterEach, spyOn } from 'bun:test';
+import { agg, eq, MockRowCache, SelectQueryBuilder } from '../../src';
 import { LscDatabase, makeLscDb } from '../utils/lateral-shape-model';
 
 /**
@@ -86,5 +86,55 @@ describe('query-build shape caches — regression guards', () => {
     })).toList();
 
     expect(client.last!.sql).toMatchSnapshot();
+  });
+});
+
+/**
+ * count() / exists() evaluate a query's projection only to refuse one that would miscount (a set-returning
+ * value, a whole-set aggregate). A table's select-all projection — `db.t.where(…)`, `db.t.orderBy(…)` — holds
+ * only its columns: it is not evaluated for them, which built a mock row (and, with the mock-row cache off,
+ * its prototype) for nothing. The statements are the same; a projection of the chain's own is still checked.
+ */
+describe('count() / exists() over a table\'s select-all projection', () => {
+  test('evaluate no projection for their checks — the statements unchanged', async () => {
+    const { client, db } = makeLscDb();
+    const mockRows = spyOn(SelectQueryBuilder.prototype, '_createMockRow');
+
+    try {
+      expect(await db.lscUsers.where(u => eq(u.active, true)).count()).toBe(0);
+      expect(client.last).toEqual({ sql: 'SELECT COUNT(*) as count\nFROM "lsc_users"\nWHERE "lsc_users"."active" = $1', params: [true] });
+      expect(await db.lscUsers.where(u => eq(u.active, true)).exists()).toBe(false);
+      expect(client.last!.sql.startsWith('SELECT EXISTS(')).toBe(true);
+      expect(db.lscPosts.where(p => eq(p.published, true)).futureCount().getSql())
+        .toBe('SELECT COUNT(*) as count\nFROM "lsc_posts"\nWHERE "lsc_posts"."published" = $1');
+      expect(db.lscPosts.futureCount().getSql()).toBe('SELECT COUNT(*) as count\nFROM "lsc_posts"');
+      expect(mockRows).toHaveBeenCalledTimes(0);
+
+      // orderBy() reads the projection (one mock row); count() then reads none
+      await db.lscUsers.orderBy(u => u.name).count();
+      expect(mockRows).toHaveBeenCalledTimes(1);
+    } finally {
+      mockRows.mockRestore();
+    }
+  });
+
+  test('a projection of the chain\'s own is still evaluated — and refused when it would miscount', async () => {
+    const { db } = makeLscDb();
+    const mockRows = spyOn(SelectQueryBuilder.prototype, '_createMockRow');
+
+    try {
+      await db.lscUsers.where(u => eq(u.active, true)).select(u => ({ id: u.id, name: u.name })).count();
+      expect(mockRows).toHaveBeenCalledTimes(1);
+
+      let refusal: unknown;
+      try {
+        await db.lscUsers.where(u => eq(u.active, true)).select(() => ({ n: agg.count() })).count();
+      } catch (error) {
+        refusal = error;
+      }
+      expect(String((refusal as Error)?.message)).toContain('count(): this select projects aggregates (agg.*) without groupBy()');
+    } finally {
+      mockRows.mockRestore();
+    }
   });
 });

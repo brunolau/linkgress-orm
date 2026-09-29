@@ -1,5 +1,6 @@
 import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, TransactionEndedError } from './database-client.interface';
 import { withArrayTypes } from './typed-text';
+import type { TypedTextRead } from './database-client.interface';
 import type { PGliteClientOptions } from './types';
 
 // Resolved lazily so '@electric-sql/pglite' stays an optional dependency
@@ -423,6 +424,17 @@ export class PGliteClient extends DatabaseClient {
     const parse = this.pglite?.parsers?.[oid];
 
     return typeof parse === 'function' ? parse(text, oid) : text;
+  }
+
+  /** The parser of the type `oid` the instance holds, looked up once (see parseTypedText). @internal */
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    if (this.parseTypedText !== PGliteClient.prototype.parseTypedText) {
+      return super.typedTextParser(oid, read);
+    }
+
+    const parse = this.pglite?.parsers?.[oid];
+
+    return typeof parse === 'function' ? (text) => parse(text, oid) : (text) => text;
   }
 
   /**

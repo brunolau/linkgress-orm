@@ -1,4 +1,5 @@
 import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, TransactionEndedError } from './database-client.interface';
+import type { TypedTextRead } from './database-client.interface';
 import type { PoolConfig } from './types';
 
 // Use dynamic import to make pg optional
@@ -70,9 +71,32 @@ const CUSTOMIZABLE_TYPE_OIDS = [
   1000, 1005, 1007, 1028, 1021, 1022, 199, 3807, 1009, 1015, 1014, 1008, 2951, 1040, 1041, 651,
 ];
 
+/**
+ * What a parser function's source says, per function — its text never changes, so it is read once (a
+ * QueryBatch asks customParsedTypeOids() for every query it batches, and `Function.prototype.toString` was
+ * most of that call).
+ */
+const nativeCodeParsers = new WeakMap<object, boolean>();
+const noParseParsers = new WeakMap<object, boolean>();
+
+const sourceSays = (cache: WeakMap<object, boolean>, parser: Function, test: (source: string) => boolean): boolean => {
+  let says = cache.get(parser);
+
+  if (says === undefined) {
+    says = test(Function.prototype.toString.call(parser));
+    cache.set(parser, says);
+  }
+
+  return says;
+};
+
 /** Whether a parser is pg-types's default json one — `JSON.parse` bound anew on every registration. */
 const isNativeJsonParser = (parser: unknown): boolean =>
-  typeof parser === 'function' && Function.prototype.toString.call(parser).includes('[native code]');
+  typeof parser === 'function' && sourceSays(nativeCodeParsers, parser, (source) => source.includes('[native code]'));
+
+/** Whether a parser is pg-types's `noParse` — what it hands out for a type it has no parser for. */
+const isNoParseParser = (parser: Function): boolean =>
+  sourceSays(noParseParsers, parser, (source) => source.startsWith('function noParse'));
 
 /**
  * Wrapper for the pooled connection from pg library
@@ -265,6 +289,13 @@ export class PgClient extends DatabaseClient {
     return parsers ? parsers.getTypeParser(oid, 'text')(text) : super.parseTypedText(oid, text);
   }
 
+  /** The parser of the type `oid` this pool reads a column through, looked up once (see parseTypedText). @internal */
+  typedTextParser(oid: number, read?: TypedTextRead): (text: string) => unknown {
+    const parsers = this.parseTypedText === PgClient.prototype.parseTypedText ? this.typeParsers() : null;
+
+    return parsers ? parsers.getTypeParser(oid, 'text') : super.typedTextParser(oid, read);
+  }
+
   /**
    * The builtin types this pool parses with a parser of the application's: the pool's own `types`
    * where they differ from node-postgres's registry, and that registry where `pg.types.setTypeParser`
@@ -294,7 +325,7 @@ export class PgClient extends DatabaseClient {
       const original = pristine[oid];
 
       return original === undefined
-        ? !Function.prototype.toString.call(live).startsWith('function noParse')
+        ? !isNoParseParser(live)
         : live !== original && !(isNativeJsonParser(live) && isNativeJsonParser(original));
     });
   }
