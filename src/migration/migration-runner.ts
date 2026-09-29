@@ -15,7 +15,9 @@ import { MigrationLoader } from './migration-loader';
  * - Tracks applied migrations in a journal table
  * - Executes pending migrations in chronological order
  * - Supports rolling back migrations
- * - Runs each migration within a transaction for atomicity
+ * - Runs each migration within a transaction for atomicity, unless the
+ *   migration opts out with `transaction = false` (e.g. CREATE INDEX
+ *   CONCURRENTLY, which PostgreSQL refuses inside a transaction block)
  *
  * @example
  * ```typescript
@@ -55,6 +57,23 @@ export class MigrationRunner {
   }
 
   /**
+   * Run one direction of a migration — inside a transaction unless the
+   * migration declares `transaction = false`, in which case it runs on the
+   * runner's own context and every statement commits on its own.
+   */
+  private async execute(migration: LoadedMigration, direction: 'up' | 'down'): Promise<void> {
+    if (migration.migration.transaction === false) {
+      this.log(`  (no transaction — each statement commits on its own)`, 'info');
+      await migration.migration[direction](this.db);
+      return;
+    }
+
+    await this.db.transaction(async (txDb) => {
+      await migration.migration[direction](txDb);
+    });
+  }
+
+  /**
    * Run all pending migrations in chronological order.
    *
    * If the journal table does not exist (fresh database), the schema is
@@ -66,8 +85,9 @@ export class MigrationRunner {
    * executed in journal order after the model build and recorded with
    * `baselined = false`.
    *
-   * Each migration is executed within a transaction. If a migration fails,
-   * the transaction is rolled back and execution stops.
+   * Each migration is executed within a transaction (unless it declares
+   * `transaction = false`). If a migration fails, the transaction is rolled
+   * back, the migration stays pending, and execution stops.
    *
    * @returns Result containing applied, skipped, baselined, and failed migrations
    */
@@ -108,10 +128,7 @@ export class MigrationRunner {
         try {
           this.log(`Applying (runOnBaseline): ${migration.filename}`, 'info');
 
-          // Execute migration within a transaction
-          await this.db.transaction(async (txDb) => {
-            await migration.migration.up(txDb);
-          });
+          await this.execute(migration, 'up');
 
           // Record only after successful commit — it really ran, so baselined = false
           await this.journal.recordApplied(migration.filename);
@@ -161,10 +178,7 @@ export class MigrationRunner {
       try {
         this.log(`Applying: ${migration.filename}`, 'info');
 
-        // Execute migration within a transaction
-        await this.db.transaction(async (txDb) => {
-          await migration.migration.up(txDb);
-        });
+        await this.execute(migration, 'up');
 
         // Record only after successful commit
         await this.journal.recordApplied(migration.filename);
@@ -193,7 +207,8 @@ export class MigrationRunner {
   /**
    * Revert the last N migrations in reverse chronological order.
    *
-   * Each migration's down() method is executed within a transaction.
+   * Each migration's down() method is executed within a transaction (unless
+   * the migration declares `transaction = false`).
    *
    * If a migration's file cannot be found (e.g. reverting from a build that
    * does not contain it), nothing is reverted and the journal row is KEPT —
@@ -244,10 +259,7 @@ export class MigrationRunner {
       try {
         this.log(`Reverting: ${migration.filename}`, 'info');
 
-        // Execute down migration within a transaction
-        await this.db.transaction(async (txDb) => {
-          await migration.migration.down(txDb);
-        });
+        await this.execute(migration, 'down');
 
         // Remove from journal only after successful rollback
         await this.journal.recordReverted(migration.filename);
