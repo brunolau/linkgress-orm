@@ -478,6 +478,30 @@ export class EntityConfigBuilder<TEntity extends DbEntity> {
   }
 
   /**
+   * Mark the table as owned outside this model — another team, an ETL job or a data
+   * warehouse creates and changes it, and this context only reads or writes its rows.
+   *
+   * `migrate()` still creates the table when it is MISSING (a fresh, local or test
+   * database), but never compares an existing one against the model: no column, index,
+   * extended-statistics, CHECK or foreign-key operation is ever planned for it, and
+   * `ensureCreated()` adds none of those to a table that already existed. The model's
+   * columns must still name the real ones for queries to work — the mapping is simply
+   * no longer a migration.
+   *
+   * @example
+   * model.entity(SkiRun, entity => {
+   *   entity.toTable('skied_kilometers');
+   *   entity.toSchema('dwh');
+   *   entity.isExternallyManaged();
+   * });
+   */
+  isExternallyManaged(): this {
+    const metadata = EntityMetadataStore.getOrCreateMetadata(this.entityClass);
+    metadata.externallyManaged = true;
+    return this;
+  }
+
+  /**
    * Configure a property
    */
   property<K extends keyof TEntity>(

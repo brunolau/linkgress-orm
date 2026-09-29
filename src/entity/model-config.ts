@@ -132,6 +132,7 @@ export class DbModelConfig {
       tableBuilder.withStatistics(metadata.statistics || []);
       tableBuilder.withCheckConstraints(metadata.checkConstraints || []);
       if (metadata.view) tableBuilder.asView(metadata.view);
+      if (metadata.externallyManaged) tableBuilder.asExternallyManaged();
       tablesWithoutNav.set(metadata.tableName, { table: tableBuilder, entityClass, metadata });
     }
 
@@ -219,6 +220,7 @@ export class DbModelConfig {
         mergedTable.withCheckConstraints(metadata.checkConstraints || []);
         if (metadata.view) mergedTable.asView(metadata.view);
         if (metadata.partitioning) mergedTable.partitionBy(metadata.partitioning);
+        if (metadata.externallyManaged) mergedTable.asExternallyManaged();
         tables.set(metadata.tableName, mergedTable);
       } else {
         if (metadata.partitioning) tableBuilder.partitionBy(metadata.partitioning);
@@ -291,6 +293,7 @@ export class DbModelConfig {
       const existingStatistics = (tableBuilder as any).statisticsDefs || [];
       const existingCheckConstraints = (tableBuilder as any).checkConstraintDefs || [];
       const existingView = (tableBuilder as any).viewDef as TableViewDefinition | undefined;
+      const existingExternallyManaged = (tableBuilder as any).externallyManagedDef === true;
       const foreignKeys = foreignKeysByTable.get(tableName) || [];
 
       const finalTable = new TableBuilder(tableName, existingSchema, existingIndexes, foreignKeys, existingSchemaName);
@@ -298,6 +301,7 @@ export class DbModelConfig {
       finalTable.withCheckConstraints(existingCheckConstraints);
       if (existingView != null) finalTable.asView(existingView);
       if (existingPartitioning) finalTable.partitionBy(existingPartitioning);
+      if (existingExternallyManaged) finalTable.asExternallyManaged();
       finalTables.set(tableName, finalTable);
     }
 

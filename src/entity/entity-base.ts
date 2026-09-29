@@ -62,6 +62,8 @@ export interface EntityMetadata<T extends DbEntity> {
   partitioning?: PartitioningConfig;
   /** Set when this class is a VIEW declared via `model.view()`, not a table. */
   view?: ViewMetadata;
+  /** The table is owned outside this model, set via `.isExternallyManaged()`. */
+  externallyManaged?: boolean;
 }
 
 /**

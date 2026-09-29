@@ -10,6 +10,7 @@ This guide covers database migrations using Linkgress ORM, including automatic m
   - [How It Works](#how-it-works)
   - [Running Migrations](#running-migrations)
   - [Interactive Confirmations](#interactive-confirmations)
+  - [Tables Owned Elsewhere (`isExternallyManaged`)](#tables-owned-elsewhere-isexternallymanaged)
 - [Manual Migrations (File-Based)](#manual-migrations-file-based)
   - [Overview](#manual-migrations-overview)
   - [Migration Files](#migration-files)
@@ -164,6 +165,36 @@ The automatic migrator can detect and handle the following changes:
 - Create foreign keys
 - Drop foreign keys
 - Modify foreign key actions (CASCADE, SET NULL, etc.)
+
+### Tables Owned Elsewhere (`isExternallyManaged`)
+
+Some tables your context reads are not yours: a data warehouse loads them, another service owns
+their DDL, and your migrating role may not even own them. Declaring them as ordinary entities makes
+every difference between your mapping and their DDL a migration, and `migrate()` would try to
+"repair" their table, or fail with `must be owner of table` when it can't.
+
+Mark such an entity with `isExternallyManaged()`:
+
+```typescript
+model.entity(SkiRun, entity => {
+  entity.toTable('skied_kilometers');
+  entity.toSchema('dwh');
+  entity.isExternallyManaged();
+
+  entity.property(e => e.id).hasType(bigint('id')).isPrimaryKey();
+  entity.property(e => e.userId).hasType(bigint('user_id')).isRequired();
+  entity.hasIndex('ix_skied_kilometers_user_id', e => [e.userId]);
+});
+```
+
+- **The table exists:** `analyze()` plans nothing for it. There are no column, index,
+  extended-statistics, CHECK or foreign-key operations, however far the table has drifted from the
+  model. `ensureCreated()` leaves it alone too.
+- **The table is missing** (a fresh, local or test database): it is created from the model, with its
+  indexes, CHECK constraints and foreign keys, like any other table. From then on it is left alone.
+
+The mapping still has to name the real columns, or your queries fail. What the flag removes is the
+migration, not the need for a correct model.
 
 ## Schema Creation and Deletion
 

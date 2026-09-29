@@ -203,6 +203,11 @@ export interface TableSchema<TColumns extends Record<string, ColumnBuilder> = an
   /** Set when this entry is a model-managed VIEW, not a table. */
   view?: TableViewDefinition;
   /**
+   * The table is owned outside this model: auto-migration creates it when missing,
+   * but never plans an operation against an existing one.
+   */
+  externallyManaged?: boolean;
+  /**
    * Performance optimization: Pre-computed map of property names to database column names
    * Avoids repeated .build().name calls during query building
    */
@@ -271,6 +276,7 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   private checkConstraintDefs: CheckConstraintDefinition[] = [];
   private partitioningDef?: PartitioningConfig;
   private viewDef?: TableViewDefinition;
+  private externallyManagedDef = false;
 
   constructor(name: string, schema: TSchema, indexes?: IndexDefinition[], foreignKeys?: ForeignKeyConstraint[], schemaName?: string) {
     this.tableName = name;
@@ -351,6 +357,15 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
   }
 
   /**
+   * Mark this table as owned outside the model (see `EntityConfigBuilder.isExternallyManaged()`).
+   */
+  asExternallyManaged(): this {
+    this.externallyManagedDef = true;
+    this._cachedSchema = undefined; // invalidate cached schema
+    return this;
+  }
+
+  /**
    * Build the final table schema
    */
   build(): TableSchema<any> {
@@ -396,6 +411,8 @@ export class TableBuilder<TSchema extends SchemaDefinition = any> {
       partitioning: this.partitioningDef,
       // Only a view's entry gets the key — a table's schema keeps exactly the shape it had before views existed.
       ...(this.viewDef != null ? { view: this.viewDef } : {}),
+      // Same for an externally managed table — every other table keeps its exact shape.
+      ...(this.externallyManagedDef ? { externallyManaged: true } : {}),
       columnNameMap,
       relationEntries,
       relationSchemaCache,
