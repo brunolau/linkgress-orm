@@ -6011,6 +6011,13 @@ ${joinClauses.join('\n')}`;
             if ((value as any).__joinPath) {
               fieldRef.__joinPath = (value as any).__joinPath;
             }
+            // Keep the query identity. Without it a ref that reaches a correlated subquery is
+            // anonymous, `isForeignChainRef()` takes it for the subquery's own, and its alias is
+            // resolved by NAME against the subquery's relations — joining a same-named hasOne
+            // navigation that shadows the outer table and binds the correlation to itself.
+            if ((value as any).__chainId != null) {
+              fieldRef.__chainId = (value as any).__chainId;
+            }
             return fieldRef;
           } else {
             // For ORDER BY: use the alias (property name) as the column name

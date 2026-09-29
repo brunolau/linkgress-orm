@@ -88,12 +88,29 @@ class NavNameCollisionDatabase extends DbContext {
 
 describe('Correlated EXISTS with an inner navigation named like the outer table', () => {
 	let db: NavNameCollisionDatabase;
+	const captured: string[] = [];
+
+	/** The last statement the context ran — to pin the SQL a row count alone cannot explain. */
+	const lastSql = (): string => {
+		const statement = captured[captured.length - 1];
+		expect(statement).toBeDefined();
+
+		return statement;
+	};
 
 	beforeAll(async () => {
 		(EntityMetadataStore as any).metadata.clear();
 
 		const client = createFreshClient();
-		db = new NavNameCollisionDatabase(client);
+		db = new NavNameCollisionDatabase(client, {
+			logQueries: true,
+			logParameters: false,
+			logger: (message: string, kind?: string) => {
+				if (kind === 'sql' && message !== '\n[SQL Query]') {
+					captured.push(message);
+				}
+			},
+		});
 
 		await client.query(`DROP TABLE IF EXISTS shelf CASCADE`);
 		await client.query(`DROP TABLE IF EXISTS library CASCADE`);
@@ -337,5 +354,79 @@ describe('Correlated EXISTS with an inner navigation named like the outer table'
 			'Central',
 			'Central Open',
 		]);
+	});
+
+	// The SECOND family of entry points: a WHERE lambda on a SelectQueryBuilder — `.where()`
+	// after `.select()`, a second `.where()`, a `joinFilter` callback. Its argument is rebuilt
+	// from the projection by `createFieldRefProxy`, which used to drop the ref's chain identity,
+	// so the outer `library.id` reached the subquery anonymous and was resolved by NAME against
+	// the subquery's own `library` navigation — the misbinding above, on every such builder
+	// (QA_AT-1072).
+	const openShelfOf = (libraryId: any) => db.shelves
+		.where(s => and(eq(s.libraryId, libraryId), eq(s.isOpen, true)))
+		.select(s => ({ id: s.id }))
+		.asSubquery();
+
+	test('EXISTS in a WHERE placed after select() correlates to the outer row', async () => {
+		const result = await db.libraries
+			.select(l => ({ id: l.id, name: l.name }))
+			.where(l => exists(openShelfOf(l.id)))
+			.orderBy(l => l.name)
+			.toList();
+
+		expect(result.map(r => r.name)).toEqual(['Central']);
+		// No second `library` inside the subquery: the correlation names the outer table.
+		expect(lastSql()).not.toMatch(/JOIN "library" AS "library"/);
+		expect(lastSql()).toContain('"shelf"."library_id" = "library"."id"');
+	});
+
+	test('NOT EXISTS in a WHERE placed after select() yields the exact complement', async () => {
+		const result = await db.libraries
+			.select(l => ({ id: l.id, name: l.name }))
+			.where(l => notExists(openShelfOf(l.id)))
+			.orderBy(l => l.name)
+			.toList();
+
+		expect(result.map(r => r.name)).toEqual([
+			'Annex',
+			'Empty',
+		]);
+		expect(lastSql()).not.toMatch(/JOIN "library" AS "library"/);
+	});
+
+	test('EXISTS in a SECOND where() correlates to the outer row', async () => {
+		const result = await db.libraries
+			.where(l => eq(l.name, l.name))
+			.where(l => exists(openShelfOf(l.id)))
+			.select(l => ({ name: l.name }))
+			.orderBy(l => l.name)
+			.toList();
+
+		expect(result.map(r => r.name)).toEqual(['Central']);
+		expect(lastSql()).not.toMatch(/JOIN "library" AS "library"/);
+	});
+
+	test('EXISTS in a joinFilter filter callback correlates to the outer row', async () => {
+		// A self-join on the key: one right row per library, so the join itself filters nothing.
+		const result = await db.libraries
+			.joinFilter(db.libraries, (l, other) => eq(other.id, l.id), l => exists(openShelfOf(l.id)))
+			.select(l => ({ name: l.name }))
+			.orderBy(l => l.name)
+			.toList();
+
+		expect(result.map(r => r.name)).toEqual(['Central']);
+		expect(lastSql()).not.toMatch(/JOIN "library" AS "library"/);
+	});
+
+	test('the shadow clash is refused in a WHERE placed after select() too', async () => {
+		// With the identity lost this rendered and misbound silently; with it the subquery sees
+		// the correlation and refuses the clash exactly as the table-level path does.
+		await expectToReject(db.libraries
+			.select(l => ({ id: l.id, name: l.name }))
+			.where(l => exists(db.shelves
+				.where(s => and(eq(s.libraryId, l.id), eq(s.library!.name, 'Central')))
+				.select(s => ({ id: s.id }))
+				.asSubquery()))
+			.toList(), /would shadow the outer table/i);
 	});
 });
