@@ -15,6 +15,7 @@ This guide covers database migrations using Linkgress ORM, including automatic m
   - [Overview](#manual-migrations-overview)
   - [Migration Files](#migration-files)
   - [MigrationRunner](#migrationrunner)
+  - [Migrations that cannot run in a transaction (`transaction = false`)](#migrations-that-cannot-run-in-a-transaction-transaction--false)
   - [MigrationScaffold](#migrationscaffold)
   - [Migration Status](#migration-status)
   - [Rolling Back Migrations](#rolling-back-migrations)
@@ -915,7 +916,30 @@ await db.dispose();
 | `status()` | Get detailed status of all migrations |
 
 **Transaction Safety:**
-Each migration runs inside a database transaction. If a migration fails, it is automatically rolled back, and subsequent migrations are not executed.
+Each migration runs inside a database transaction. If a migration fails, it is automatically rolled back, and subsequent migrations are not executed. A migration that sets `transaction = false` runs without one (see below).
+
+### Migrations that cannot run in a transaction (`transaction = false`)
+
+PostgreSQL refuses some statements inside a transaction block: `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `REINDEX … CONCURRENTLY`, `VACUUM`. A long data backfill may also need to commit in batches rather than hold every lock until one final commit. Declare `transaction = false` on such a migration:
+
+```typescript
+export default class implements Migration {
+  transaction = false;
+
+  async up(db: AppDatabase): Promise<void> {
+    await db.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_order_created ON "order" (created_at)`);
+  }
+
+  async down(db: AppDatabase): Promise<void> {
+    await db.query(`DROP INDEX CONCURRENTLY IF EXISTS ix_order_created`);
+  }
+}
+```
+
+- `up()` / `down()` receive the runner's own context, and each statement commits on its own. The migration is **not atomic**: a failure part-way keeps the statements that already ran.
+- It is recorded in the journal only after `up()` resolves, so a failed migration stays pending and the next `up()` retries it. Write it to be re-runnable (`IF NOT EXISTS`, `IF EXISTS`; a failed concurrent build leaves an INVALID index behind, drop it before building again).
+- On a pooled client, statements may run on different connections, so session state (`SET`, temp tables, advisory locks) does not carry over. Open a `db.transaction()` inside the migration for the parts that need it.
+- The flag applies on every path that executes a migration: pending `up()`, `runOnBaseline` on a fresh database, and `down()`.
 
 ### MigrationScaffold
 
@@ -1039,7 +1063,7 @@ console.log(`Reverted: ${result3.applied.join(', ')}`);
 
 **Important Notes:**
 - The `down()` method runs migrations in reverse order (most recent first)
-- Each rollback runs in a transaction for safety
+- Each rollback runs in a transaction for safety (unless the migration sets `transaction = false`)
 - Some operations cannot be auto-generated for `down()` (marked with comments in scaffolded files)
 - If a migration's FILE is missing (e.g. rolling back from a build that no longer ships it), `down()`
   does NOT delete the journal row or otherwise pretend the migration was reverted: nothing was

@@ -56,6 +56,33 @@ export interface Migration {
    * @default false
    */
   runOnBaseline?: boolean;
+
+  /**
+   * Whether the runner wraps up() / down() in a transaction.
+   *
+   * Set it to `false` for statements PostgreSQL refuses inside a transaction
+   * block — `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`,
+   * `REINDEX … CONCURRENTLY`, `ALTER TYPE … ADD VALUE` (before PG 12),
+   * `VACUUM` — or for long data backfills that should commit in batches
+   * instead of holding every lock until one final commit.
+   *
+   * Without a transaction the migration is NOT atomic: each statement
+   * commits on its own, so a failure part-way leaves the earlier statements
+   * applied. The migration is still recorded in the journal only after
+   * up() resolves, so a failed one stays pending and is retried by the next
+   * run — write it to be re-runnable (`IF NOT EXISTS`, `IF EXISTS`, and for
+   * a concurrent build that failed, drop the INVALID index it left behind
+   * before building again).
+   *
+   * The context passed to up() / down() is the runner's own. On a pooled
+   * client each statement may run on a different connection, so session
+   * state (`SET`, temp tables, advisory locks) does not carry over from one
+   * statement to the next; open an explicit `db.transaction()` inside the
+   * migration for the parts that need it.
+   *
+   * @default true
+   */
+  transaction?: boolean;
 }
 
 /**

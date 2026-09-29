@@ -54,7 +54,12 @@ function cleanupMigrationsDir() {
 }
 
 // Helper to create a test migration file
-function createTestMigration(filename: string, upSql: string, downSql: string) {
+function createTestMigration(
+  filename: string,
+  upSql: string,
+  downSql: string,
+  options?: { transaction?: boolean }
+) {
   if (!fs.existsSync(TEST_MIGRATIONS_DIR)) {
     fs.mkdirSync(TEST_MIGRATIONS_DIR, { recursive: true });
   }
@@ -62,12 +67,15 @@ function createTestMigration(filename: string, upSql: string, downSql: string) {
   // Escape backticks in SQL for template literals
   const escapedUpSql = upSql.replace(/`/g, '\\`');
   const escapedDownSql = downSql.replace(/`/g, '\\`');
+  const transactionFlag = options?.transaction !== undefined
+    ? `  transaction = ${options.transaction};\n\n`
+    : '';
 
   // Use query() which works with all database clients
   const content = `import type { Migration } from '../../../src';
 
 export default class implements Migration {
-  async up(db: any): Promise<void> {
+${transactionFlag}  async up(db: any): Promise<void> {
     await db.query(\`${escapedUpSql}\`);
   }
 
@@ -572,6 +580,76 @@ describe('Manual Migration System', () => {
         ) as exists
       `);
       expect(tableExists.rows[0].exists).toBe(false);
+    });
+
+    it('should refuse CREATE INDEX CONCURRENTLY in a default (transactional) migration and keep it pending', async () => {
+      await client.query('CREATE TABLE test_table_one (id SERIAL PRIMARY KEY, name TEXT)');
+      createTestMigration(
+        '20260601-120000.ts',
+        'CREATE INDEX CONCURRENTLY ix_test_table_one_name ON test_table_one (name)',
+        'DROP INDEX CONCURRENTLY IF EXISTS ix_test_table_one_name'
+      );
+
+      const result = await runner.up();
+
+      expect(result.applied).toEqual([]);
+      expect(result.failed?.filename).toBe('20260601-120000.ts');
+      expect(result.failed?.error.message).toContain('cannot run inside a transaction block');
+      expect((await runner.getPending()).map(p => p.filename)).toEqual(['20260601-120000.ts']);
+    });
+
+    it('should run a transaction = false migration outside a transaction, both up() and down()', async () => {
+      await client.query('CREATE TABLE test_table_one (id SERIAL PRIMARY KEY, name TEXT)');
+      createTestMigration(
+        '20260602-120000.ts',
+        'CREATE INDEX CONCURRENTLY ix_test_table_one_name ON test_table_one (name)',
+        'DROP INDEX CONCURRENTLY IF EXISTS ix_test_table_one_name',
+        { transaction: false }
+      );
+
+      const indexExists = async () => (await client.query(`
+        SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'ix_test_table_one_name') as exists
+      `)).rows[0].exists;
+
+      const upResult = await runner.up();
+
+      expect(upResult.failed).toBeUndefined();
+      expect(upResult.applied).toEqual(['20260602-120000.ts']);
+      expect(await indexExists()).toBe(true);
+
+      const downResult = await runner.down(1);
+
+      expect(downResult.failed).toBeUndefined();
+      expect(downResult.applied).toEqual(['20260602-120000.ts']);
+      expect(await indexExists()).toBe(false);
+    });
+
+    it('should keep the committed statements of a failed transaction = false migration, and keep it pending', async () => {
+      fs.mkdirSync(TEST_MIGRATIONS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(TEST_MIGRATIONS_DIR, '20260603-120000.ts'), `import type { Migration } from '../../../src';
+
+export default class implements Migration {
+  transaction = false;
+
+  async up(db: any): Promise<void> {
+    await db.query('CREATE TABLE test_table_one (id SERIAL PRIMARY KEY)');
+    await db.query('CREATE TABLE test_table_two (id nonexistent_type_xyz PRIMARY KEY)');
+  }
+
+  async down(db: any): Promise<void> {}
+}
+`);
+
+      const result = await runner.up();
+
+      expect(result.failed?.filename).toBe('20260603-120000.ts');
+      expect((await runner.getPending()).map(p => p.filename)).toEqual(['20260603-120000.ts']);
+
+      // No transaction to roll back: the first statement committed on its own
+      const tableOne = await client.query(`
+        SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_table_one') as exists
+      `);
+      expect(tableOne.rows[0].exists).toBe(true);
     });
 
     it('should return correct status', async () => {
