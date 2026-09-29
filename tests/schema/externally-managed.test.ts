@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach } from 'bun:test';
-import { createFreshClient } from '../utils/test-database';
-import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar } from '../../src';
+import { createFreshClient, testConnectionConfig } from '../utils/test-database';
+import { DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, PgClient } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 
 // A data-warehouse shape: a season table and a per-user statistic that references it,
@@ -154,6 +154,52 @@ describe('isExternallyManaged() — tables owned outside the model', () => {
     } finally {
       await client.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
       await db.dispose();
+    }
+  });
+
+  // The in-memory engine models no privileges (every role sees and may do everything), so the
+  // situation below cannot be built there.
+  const privilegesModelled = process.env.LINKGRESS_TEST_DB !== 'memory';
+
+  test.skipIf(!privilegesModelled)('an external table the role holds NO privilege on still counts as existing', async () => {
+    // information_schema.tables hides a table the current role has no privilege on — the
+    // owner's DWH table this role was never granted. Read from there, the table looked
+    // missing and migrate() went on to build its index: "must be owner of table …".
+    const role = `lg_ext_reader_${process.pid}`;
+    const admin = createFreshClient();
+    const pglite = process.env.LINKGRESS_TEST_DRIVER === 'pglite';
+    // One session, so SET ROLE holds for every statement the context sends. PGlite is one
+    // session already; the server drivers get a single-connection pool.
+    const { host, port, database, username, password } = testConnectionConfig();
+    const client = pglite ? admin : new PgClient({ host, port, database, user: username, password, max: 1 });
+    const db = new ExternalDatabase(client);
+
+    try {
+      await createOwnersTables(admin);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+      await admin.query(`CREATE ROLE ${role} NOLOGIN`);
+      await admin.query(`GRANT USAGE ON SCHEMA ${SCHEMA} TO ${role}`);
+      await client.query(`SET ROLE ${role}`);
+
+      const visible = await client.query(
+        `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = $1`, [SCHEMA]);
+      expect(visible.rows[0].n).toBe(0);
+
+      const operations = await db.getSchemaManager().analyze();
+      expect(operations.filter(op => (op as any).schema === SCHEMA || op.type === 'create_table')).toEqual([]);
+    } finally {
+      await client.query('RESET ROLE');
+      if (client !== admin) {
+        await db.dispose();
+      }
+      await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
+      await admin.query(`DROP OWNED BY ${role}`);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+      if (client === admin) {
+        await db.dispose();
+      } else {
+        await admin.end();
+      }
     }
   });
 

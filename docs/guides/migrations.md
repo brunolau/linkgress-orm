@@ -196,6 +196,11 @@ model.entity(SkiRun, entity => {
 The mapping still has to name the real columns, or your queries fail. What the flag removes is the
 migration, not the need for a correct model.
 
+The table counts as existing even when your migrating role holds no privilege on it at all: existing
+tables are read from the `pg_class` catalog, which lists every table, not from
+`information_schema.tables`, which hides the ones the role cannot access (before 1.0.18 such a table
+looked missing, and `migrate()` failed building its indexes).
+
 ## Schema Creation and Deletion
 
 For development and testing, you can create or drop entire schemas programmatically.

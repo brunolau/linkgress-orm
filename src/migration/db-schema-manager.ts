@@ -2327,7 +2327,14 @@ $$`;
   }
 
   /**
-   * Get all existing tables in the database across all schemas used by the model
+   * Get all existing tables in the database across all schemas used by the model.
+   *
+   * Read from `pg_class`, not `information_schema.tables`: the latter lists only the tables
+   * the current role owns or holds a privilege on, so a table another role created without
+   * granting this one anything — typically an externally managed one — looked MISSING, and
+   * `migrate()` then planned its CREATE TABLE and every index of it against a table it may
+   * not alter ("must be owner of table …"). `relkind` r / p is what information_schema calls
+   * a BASE TABLE.
    */
   private async getExistingTables(): Promise<Map<string, true>> {
     // Collect all schemas used by the model
@@ -2339,9 +2346,10 @@ $$`;
     const tables = new Map<string, true>();
     for (const schemaName of schemas) {
       const result = await this.client.query(`
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+        SELECT c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
       `, [schemaName]);
 
       for (const row of result.rows) {
