@@ -191,6 +191,37 @@ describe('Expression & Partial Index Support', () => {
     }
   });
 
+  test('lookups on each key of a multi-expression index return that key\'s rows', async () => {
+    // The in-memory engine caches a heap index per expression-index lookup; with one cache per INDEX,
+    // the first key probed (lower(name)) answered every later lookup on the other key (lower(email)).
+    const client = createFreshClient();
+    const db = new MultiExpressionIndexTestDatabase(client);
+    const ids = async (where: string, value: string) =>
+      (await client.query(`SELECT id FROM users_multi_expr_idx_test WHERE ${where} = $1 ORDER BY id`, [value])).rows.map((r: { id: number }) => r.id);
+
+    try {
+      for (const nameFirst of [true, false]) {
+        await client.query(`DROP TABLE IF EXISTS users_multi_expr_idx_test CASCADE`);
+        await db.getSchemaManager().ensureCreated();
+        // 'alice' is a name of row 1 and an email of row 2: a lookup served by the other key's map finds the wrong row
+        await client.query(`INSERT INTO users_multi_expr_idx_test (name, email) VALUES ('Alice', 'BOB'), ('Bob', 'ALICE'), ('Carol', 'carol')`);
+
+        const byName = async () => expect(await ids('lower(name)', 'alice')).toEqual([1]);
+        const byEmail = async () => expect(await ids('lower(email)', 'alice')).toEqual([2]);
+        if (nameFirst) {
+          await byName();
+          await byEmail();
+        } else {
+          await byEmail();
+          await byName();
+        }
+      }
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS users_multi_expr_idx_test CASCADE`);
+      await db.dispose();
+    }
+  });
+
   test('should create mixed index: plain column + expression', async () => {
     const client = createFreshClient();
     const db = new MixedIndexTestDatabase(client);

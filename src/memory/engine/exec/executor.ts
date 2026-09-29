@@ -1980,7 +1980,8 @@ export class Executor implements SubqueryRunner {
     if (exprRelids(val).size > 0 || this.volatileForLookup(val) || !isHashableEquality(e.funcSrc, side.type, val.type, plan, e.inputCollation)) {
       return null;
     }
-    const spec = 'expr:' + match.ix.oid + ':' + side.type;
+    // one heap index per index KEY: an index over several expressions must not serve one key's map for another
+    const spec = 'expr:' + match.ix.oid + ':' + match.ix.index!.keys.indexOf(match.key) + ':' + side.type;
     const heaps = host.relationHeaps(rel, rte.inh, this.st);
     if (heaps.length === 1 && poisonedExprIndexes.get(heaps[0].heap)?.has(spec)) {
       return null;
