@@ -857,24 +857,39 @@ $$`;
 
     // Create tables in dependency order
     const sortedTables = this.sortTablesByDependency();
-    for (const [tableName, tableSchema] of sortedTables) {
+
+    // An externally managed table that already exists belongs to its owner: CREATE TABLE
+    // IF NOT EXISTS leaves it alone, and so must every pass after it.
+    const preexistingExternal = new Set<string>();
+    if (sortedTables.some(([, tableSchema]) => tableSchema.externallyManaged)) {
+      const existingTables = await this.getExistingTables();
+      for (const [tableName, tableSchema] of sortedTables) {
+        const tableKey = tableSchema.schema && tableSchema.schema !== 'public' ? `${tableSchema.schema}.${tableName}` : tableName;
+        if (tableSchema.externallyManaged && existingTables.has(tableKey)) {
+          preexistingExternal.add(tableName);
+        }
+      }
+    }
+    const ownedTables = sortedTables.filter(([tableName]) => !preexistingExternal.has(tableName));
+
+    for (const [tableName, tableSchema] of ownedTables) {
       await this.createTable(tableName, tableSchema);
     }
 
     // Create indexes
-    for (const [tableName, tableSchema] of sortedTables) {
+    for (const [tableName, tableSchema] of ownedTables) {
       await this.createIndexes(tableName, tableSchema);
     }
 
     // Create CHECK constraints (existence-guarded — no ADD CONSTRAINT IF NOT
     // EXISTS in PostgreSQL, and ensureCreated must stay idempotent)
-    for (const [tableName, tableSchema] of sortedTables) {
+    for (const [tableName, tableSchema] of ownedTables) {
       await this.createCheckConstraints(tableName, tableSchema);
     }
 
     // Create extended-statistics objects (after indexes so the ANALYZE they
     // trigger also refreshes freshly indexed expression columns)
-    for (const [tableName, tableSchema] of sortedTables) {
+    for (const [tableName, tableSchema] of ownedTables) {
       await this.createStatistics(tableName, tableSchema);
     }
 
@@ -1192,10 +1207,11 @@ $$`;
       }
     }
 
-    // Compare columns for existing tables
+    // Compare columns for existing tables — except an externally managed one, whose
+    // owner decides its shape: it is created above when missing, never altered.
     for (const [tableName, schema] of this.schemaRegistry.entries()) {
       const tableKey = schema.schema && schema.schema !== 'public' ? `${schema.schema}.${tableName}` : tableName;
-      if (existingTables.has(tableKey)) {
+      if (existingTables.has(tableKey) && !schema.externallyManaged) {
         const existingColumns = await this.getExistingColumns(tableName, schema.schema);
         const modelColumns = new Map<string, ColumnConfig>();
 
