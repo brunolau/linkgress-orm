@@ -1966,6 +1966,10 @@ export class SqlParser extends Parser {
     if (this.acceptKws('SESSION', 'AUTHORIZATION')) {
       return { kind: 'NoopStmt', tag: 'RESET', description: 'RESET SESSION AUTHORIZATION', loc };
     }
+    // roles are not modelled: like SET ROLE, accepted and nothing is done
+    if (this.acceptKw('ROLE')) {
+      return { kind: 'NoopStmt', tag: 'RESET', description: 'RESET ROLE', loc };
+    }
     let name = this.parseName();
     while (this.acceptPunct('.')) {
       name += '.' + this.parseName();

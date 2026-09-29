@@ -157,14 +157,15 @@ describe('isExternallyManaged() — tables owned outside the model', () => {
     }
   });
 
-  // The in-memory engine models no privileges (every role sees and may do everything), so the
-  // situation below cannot be built there.
+  // The in-memory engine models no privileges: it accepts the role statements below and does
+  // nothing, so there every role sees (and may do) everything.
   const privilegesModelled = process.env.LINKGRESS_TEST_DB !== 'memory';
 
-  test.skipIf(!privilegesModelled)('an external table the role holds NO privilege on still counts as existing', async () => {
+  test('an external table the role holds NO privilege on still counts as existing', async () => {
     // information_schema.tables hides a table the current role has no privilege on — the
     // owner's DWH table this role was never granted. Read from there, the table looked
     // missing and migrate() went on to build its index: "must be owner of table …".
+    // In memory both tables stay visible, so there only the outcome of analyze() is compared.
     const role = `lg_ext_reader_${process.pid}`;
     const admin = createFreshClient();
     const pglite = process.env.LINKGRESS_TEST_DRIVER === 'pglite';
@@ -183,7 +184,7 @@ describe('isExternallyManaged() — tables owned outside the model', () => {
 
       const visible = await client.query(
         `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = $1`, [SCHEMA]);
-      expect(visible.rows[0].n).toBe(0);
+      expect(visible.rows[0].n).toBe(privilegesModelled ? 0 : 2);
 
       const operations = await db.getSchemaManager().analyze();
       expect(operations.filter(op => (op as any).schema === SCHEMA || op.type === 'create_table')).toEqual([]);

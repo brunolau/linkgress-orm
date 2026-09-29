@@ -1255,6 +1255,18 @@ END $$`,
     ],
   },
   {
+    // The in-memory database models no roles or privileges: it accepts the role statements and does
+    // nothing. Only statements whose outcome does not depend on a role are compared.
+    name: 'role statements',
+    statements: [
+      'RESET ROLE',
+      'SET ROLE NONE',
+      'SET LOCAL ROLE NONE',
+      'RESET ROLE',
+      'SELECT current_user = session_user',
+    ],
+  },
+  {
     name: 'catalog functions and type names',
     statements: [
       'CREATE TABLE cat_t (id bigserial PRIMARY KEY, n numeric(12,4), v varchar(30), ts timestamptz(3), arr int[], j jsonb NOT NULL DEFAULT \'{}\')',

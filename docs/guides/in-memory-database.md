@@ -201,6 +201,11 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
   position; `tests/memory/sql-parity.test.ts` holds a corpus of statements to that standard.
 - Not implemented (an error is raised instead): `COPY`, `EXCLUDE` constraints, `MERGE` into a view,
   `INSTEAD OF` triggers, `SELECT … INTO`.
+- Roles and privileges are not modelled. `CREATE ROLE`, `GRANT` / `REVOKE`, `SET ROLE` / `RESET ROLE`,
+  `DROP OWNED` and the other role statements are accepted and do nothing. A session stays the user it
+  connected as (`current_user` is `session_user`), every `has_*_privilege()` check answers true, and
+  `information_schema` lists every object. PostgreSQL hides the objects the current role holds no
+  privilege on.
 - Supported extensions: `pg_trgm`, `unaccent`, `uuid-ossp`, `pgcrypto` (UUID generation).
 - Object ids, backend pids and temp schema names are allocated by the in-memory database and
   differ from any particular server.
