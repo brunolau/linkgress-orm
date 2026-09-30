@@ -8,7 +8,7 @@ import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
 import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
 import { TimeTracer, QueryExecutor } from '../entity/db-context';
-import { assertNoCorrelatedAliasShadowing, forEachOrderByKey, getTableAlias, isForeignChainRef, parseOrderBy } from './query-utils';
+import { assertNoCorrelatedAliasShadowing, forEachOrderByKey, getTableAlias, hasFieldName, isForeignChainRef, parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
 import { GroupedQueryBuilder } from './grouped-query';
@@ -10311,6 +10311,40 @@ export const utf8ByteLength = (identifier: string): number => {
 };
 
 /**
+ * Whether a projected value is an object of fields — a projection, or a nested object in one — rather than
+ * a column, an expression, a builder, a navigation row or a list.
+ */
+const isFieldsObject = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || hasFieldName(value) || isReferenceMockRow(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+
+  return prototype === Object.prototype || prototype === null;
+};
+
+/**
+ * The row a collection's `orderBy()` reads after a projection (see CollectionQueryBuilder.orderByRow): a field
+ * of `projection` reads as the value it projects — a nested object of fields as a row of its own — and every
+ * other name reads `item`, the collection's item (its columns and navigations). The item's getters run on the
+ * item itself: they read its state slots through `this`, and a collection they mint records the row that
+ * minted it (see CollectionQueryBuilder.mintedBy).
+ */
+const projectionOrderRow = (projection: Record<string, unknown>, item?: object): any =>
+  new Proxy(item ?? projection, {
+    get: (_target, prop) => {
+      if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(projection, prop)) {
+        const value = projection[prop];
+
+        return isFieldsObject(value) ? projectionOrderRow(value) : value;
+      }
+
+      return item === undefined ? undefined : Reflect.get(item, prop, item);
+    },
+  });
+
+/**
  * Collection query builder for nested queries
  */
 export class CollectionQueryBuilder<TItem = any> {
@@ -10766,7 +10800,7 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
-   * Order collection items
+   * Order collection items. After `select()`, the selector reads the projection (see {@link orderByRow}).
    * @example
    * .orderBy(p => p.colName)
    * .orderBy(p => [p.colName, p.otherCol])
@@ -10777,8 +10811,7 @@ export class CollectionQueryBuilder<TItem = any> {
   orderBy<T>(selector: (item: TItem) => Array<[T, OrderDirection]>): this;
   orderBy<T>(selector: (item: TItem) => T | T[] | Array<[T, OrderDirection]>): this {
     this.writtenInPlace = true;
-    const mockItem = this.createMockItem();
-    const result = selector(mockItem);
+    const result = selector(this.orderByRow());
     forEachOrderByKey(result, (key, direction) => {
       this.orderByFields.push({ field: key.__dbColumnName || key.__fieldName, direction, table: getTableAlias(key), ref: key });
     }, (fragment, direction) => {
@@ -10786,6 +10819,23 @@ export class CollectionQueryBuilder<TItem = any> {
       this.orderByFields.push({ field: '', direction, fragment });
     });
     return this;
+  }
+
+  /**
+   * The row an `orderBy()` selector reads: the item — and after `select()` / `selectDistinct()`, or a
+   * `selectMany()` whose collection projects its items, the projection over it, as the selector's type
+   * says. A projected field reads as the value it projects: a column (a navigation's too) as that column,
+   * an expression as that expression. It used to read the ITEM's column of that name: none for a field the
+   * projection renames (the key was dropped from the ORDER BY without a word), another column for a field
+   * named like one, a navigation row (refused) for a field named like a navigation. A name the projection
+   * does not select still reads the item's column or navigation, as a key written before `select()` does.
+   * A projection of one value (`ed => ed.label`) has no fields: the selector reads the item.
+   */
+  private orderByRow(): any {
+    const item = this.createMockItem();
+    const projection = this.evaluateSelector();
+
+    return isFieldsObject(projection) ? projectionOrderRow(projection, item) : item;
   }
 
   /**

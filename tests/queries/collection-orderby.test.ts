@@ -18,7 +18,10 @@
  * - the CTE and temp-table aggregates ordered by names their subquery output does not carry
  *   (`column "name" does not exist`), and the temp-table strategy joined no navigation at all;
  * - a DISTINCT list could not order by what it lists, a LIMITed scalar ignored its ORDER BY and
- *   LIMIT, and the correlated toStringList form dropped every key read through a navigation.
+ *   LIMIT, and the correlated toStringList form dropped every key read through a navigation;
+ * - a key written AFTER select() read the item instead of the projection: a field the projection
+ *   renamed named no column (the key was dropped from the ORDER BY without a word) or another column
+ *   of the item, and a field named like a navigation was that navigation's row (refused).
  *
  * Every key now renders as its qualified expression — or, where an aggregate reads an inner
  * SELECT's output, as the projected field selecting that expression or a hidden column carrying it.
@@ -99,6 +102,97 @@ for (const strategy of LIBRARY_STRATEGIES) {
 
       // Paperback line was seeded after Hardback line, so it has the higher id
       expect(dune.editions).toEqual(['E-2', 'E-5', 'E-3']);
+    });
+  });
+
+  describe(`collection ORDER BY after select(): the projection's fields — ${strategy}`, () => {
+    test('a column the projection renames', async () => {
+      const [dune, emma] = perBook(await books()
+        .select(b => ({ id: b.id, editions: b.editions!.select(ed => ({ tag: ed.label })).orderBy(ed => [[ed.tag, 'DESC']]).toList() }))
+        .toList());
+
+      expect(dune.editions).toEqual([{ tag: 'E-5' }, { tag: 'E-3' }, { tag: 'E-2' }]);
+      expect(emma.editions).toEqual([{ tag: 'E-4' }, { tag: 'E-1' }]);
+    });
+
+    test('the first row by a renamed column — limit, firstOrDefault', async () => {
+      const [dune, emma] = perBook(await books()
+        .select(b => ({
+          id: b.id,
+          last: b.editions!.select(ed => ({ tag: ed.label })).orderBy(ed => [[ed.tag, 'DESC']]).limit(1).toList(),
+          first: b.editions!.select(ed => ({ tag: ed.label })).orderBy(ed => [[ed.tag, 'DESC']]).firstOrDefault(),
+        }))
+        .toList());
+
+      expect([dune.last, dune.first]).toEqual([[{ tag: 'E-5' }], { tag: 'E-5' }]);
+      expect([emma.last, emma.first]).toEqual([[{ tag: 'E-4' }], { tag: 'E-4' }]);
+    });
+
+    test('a field named like ANOTHER column of the item orders by what it projects', async () => {
+      const [dune] = perBook(await books()
+        .select(b => ({
+          id: b.id,
+          editions: b.editions!.select(ed => ({ id: ed.id, label: ed.category!.name })).orderBy(ed => [[ed.label, 'DESC'], [ed.id, 'DESC']]).toList(),
+        }))
+        .toList());
+
+      // By the category name projected as `label` (Paperback line first), not by the edition's own label
+      expect((dune.editions as any[]).map(ed => ed.id)).toEqual([fx.ids.e5, fx.ids.e2, fx.ids.e3]);
+    });
+
+    test('a field named like a navigation of the item', async () => {
+      const [dune] = perBook(await books()
+        .select(b => ({
+          id: b.id,
+          editions: b.editions!.select(ed => ({ label: ed.label, category: ed.category!.name })).orderBy(ed => [[ed.category, 'ASC'], [ed.label, 'DESC']]).toList(),
+        }))
+        .toList());
+
+      expect(dune.editions).toEqual([
+        { label: 'E-3', category: 'Hardback line' },
+        { label: 'E-5', category: 'Paperback line' },
+        { label: 'E-2', category: 'Paperback line' },
+      ]);
+    });
+
+    test('a projected SQL expression', async () => {
+      const [ada] = perMember(await members()
+        .select(m => ({ id: m.id, loans: m.loans!.select(ln => ({ note: ln.note, reversed: sql<string>`reverse(${ln.note})` })).orderBy(ln => ln.reversed).toList() }))
+        .toList());
+
+      expect(ada.loans).toEqual([{ note: 'second', reversed: 'dnoces' }, { note: 'first', reversed: 'tsrif' }]);
+    });
+
+    test('a distinct projection by a field it selects', async () => {
+      const [dune] = perBook(await books()
+        .select(b => ({ id: b.id, categories: b.editions!.selectDistinct(ed => ({ category: ed.category!.name })).orderBy(ed => [[ed.category, 'DESC']]).toList() }))
+        .toList());
+
+      expect(dune.categories).toEqual([{ category: 'Paperback line' }, { category: 'Hardback line' }]);
+    });
+
+    test('the projection of a flattened collection', async () => {
+      const [dune, emma] = perBook(await books()
+        .select(b => ({
+          id: b.id,
+          notes: (b.editions!.selectMany(ed => ed.loans!.select(ln => ({ text: ln.note })) as any) as any).orderBy((ln: any) => [[ln.text, 'DESC']]).toList(),
+        }))
+        .toList());
+
+      expect(dune.notes).toEqual([{ text: 'third' }, { text: 'second' }]);
+      expect(emma.notes).toEqual([{ text: 'first' }]);
+    });
+
+    test('a column the projection does not select still reads the item', async () => {
+      const [dune] = perBook(await books()
+        .select(b => ({
+          id: b.id,
+          editions: b.editions!.select(ed => ({ tag: ed.label })).orderBy(ed => [[(ed as any).categoryId, 'ASC'], [(ed as any).id, 'DESC']]).toList(),
+        }))
+        .toList());
+
+      // Hardback line (E-3) before Paperback line (E-2, E-5 by id, descending)
+      expect(dune.editions).toEqual([{ tag: 'E-3' }, { tag: 'E-5' }, { tag: 'E-2' }]);
     });
   });
 
@@ -400,6 +494,15 @@ describe('the ORDER BY each strategy renders', () => {
     const statement = fx.lastStatement();
     expect(statement).toContain('"book"."name" as "__order_0"');
     expect(statement).toContain('ORDER BY "__order_0" ASC, "id" DESC');
+  });
+
+  test('lateral: a key written after select() renders as the column the projection gives its name', async () => {
+    fx.resetCapture();
+    await fx.db.libBooks.withQueryOptions({ collectionStrategy: 'lateral' })
+      .select(b => ({ id: b.id, editions: b.editions!.select(ed => ({ tag: ed.label })).orderBy(ed => [[ed.tag, 'DESC']]).limit(1).toList() }))
+      .toList();
+
+    expect(fx.lastStatement()).toMatch(/ORDER BY "lateral_0_editions"\."label" DESC\s+LIMIT 1/);
   });
 
   test('temptable: the same aggregation, restricted to the temp table\'s parents', async () => {

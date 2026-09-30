@@ -583,7 +583,12 @@ const usersWithTopPosts = await db.users
 
 The keys are columns of the collection's item — whether the projection selects them or not, under
 the same name or another — or of its navigations (`p.category!.name`), or SQL expressions over them
-(`sql\`lower(${p.title})\``, a condition, a nested collection's `count()`). `limit()` / `offset()` apply
+(`sql\`lower(${p.title})\``, a condition, a nested collection's `count()`). Written after `select()`, as
+above, the selector reads the projection: a field reads as the value it projects, so one that renames a
+column (`select(p => ({ heading: p.title })).orderBy(p => p.heading)`) orders by that column and a
+projected expression by that expression, while a name the projection does not select still reads the
+item's column. (Before 1.0.19 a key written after `select()` read the item: a renamed field was dropped
+from the ORDER BY without a word, or read the item's own column of that name.) `limit()` / `offset()` apply
 per parent row, and a count, sum, min / max or flat list of a limited collection aggregates the rows
 the ordered, limited collection yields. Every collection strategy returns the same order. A
 `selectDistinct()` collection can only be ordered by values it selects; ordering it by anything else
