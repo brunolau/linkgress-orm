@@ -1,7 +1,7 @@
 import type * as readline from 'readline';
 import { DatabaseClient } from '../database/database-client.interface';
 import { LogLevel } from '../entity/db-context';
-import { TableSchema, IndexMethod, IndexDefinition } from '../schema/table-builder';
+import { TableSchema, IndexMethod, IndexDefinition, ForeignKeyConstraint } from '../schema/table-builder';
 import { ColumnConfig } from '../schema/column-builder';
 import { EnumTypeRegistry } from '../types/enum-builder';
 import { CollationRegistry, CollationDefinition } from '../types/collation-builder';
@@ -469,11 +469,13 @@ export class DbSchemaManager {
    * @param tableSchema - The table schema
    * @param options - Options for table creation
    * @param options.skipForeignKeys - If true, foreign keys will not be added (useful for deferred FK creation)
+   * @param options.deferredForeignKeys - Names of foreign keys left out of the statement, to be added later
+   *   (a column-level `references` goes by `fk_<table>_<column>`)
    */
   private async createTable(
     tableName: string,
     tableSchema: TableSchema,
-    options?: { skipForeignKeys?: boolean }
+    options?: { skipForeignKeys?: boolean; deferredForeignKeys?: ReadonlySet<string> }
   ): Promise<void> {
     const columnDefs: string[] = [];
     const primaryKeys: string[] = [];
@@ -544,6 +546,9 @@ export class DbSchemaManager {
       // Add foreign key constraints from schema.foreignKeys (includes ON DELETE/ON UPDATE actions)
       const foreignKeys = tableSchema.foreignKeys || [];
       for (const fk of foreignKeys) {
+        if (options?.deferredForeignKeys?.has(fk.name)) {
+          continue;
+        }
         const columnList = fk.columns.map(c => `"${c}"`).join(', ');
         const refColumnList = fk.referencedColumns.map(c => `"${c}"`).join(', ');
 
@@ -568,7 +573,7 @@ export class DbSchemaManager {
       const addedFkColumns = new Set(foreignKeys.flatMap(fk => fk.columns));
       for (const [colKey, colBuilder] of Object.entries(tableSchema.columns)) {
         const config = (colBuilder as any).build();
-        if (config.references && !addedFkColumns.has(config.name)) {
+        if (config.references && !addedFkColumns.has(config.name) && !options?.deferredForeignKeys?.has(`fk_${tableName}_${config.name}`)) {
           columnDefs.push(
             `FOREIGN KEY ("${config.name}") REFERENCES "${config.references.table}"("${config.references.column}")`
           );
@@ -872,13 +877,46 @@ $$`;
     }
     const ownedTables = sortedTables.filter(([tableName]) => !preexistingExternal.has(tableName));
 
+    // A table's UNIQUE indexes are built right after the table itself: a foreign key may
+    // reference one (a composite key over `(id, kind)`, say), and the dependency order
+    // creates the referencing table — with its inline FOREIGN KEY — only after this one.
+    //
+    // A foreign key goes inline into its CREATE TABLE only when the key it references exists at that point: the
+    // referenced table is there (created before, or this very table for its primary key / a UNIQUE column) and the key
+    // is its primary key, a UNIQUE column or one of its unique indexes. Any other — onto a table created later (a
+    // cycle), onto this table's own unique index, onto a key nothing covers yet — is added with ALTER TABLE once every
+    // table and its unique indexes exist.
+    const presentTables = new Set<string>(preexistingExternal);
+    const deferredForeignKeys: Array<{ tableName: string; tableSchema: TableSchema; constraint: ForeignKeyConstraint }> = [];
     for (const [tableName, tableSchema] of ownedTables) {
-      await this.createTable(tableName, tableSchema);
+      const deferredNames = new Set<string>();
+      for (const constraint of this.modelForeignKeys(tableName, tableSchema)) {
+        if (!this.referencedKeyExists(tableName, constraint, presentTables)) {
+          deferredNames.add(constraint.name);
+          deferredForeignKeys.push({ tableName, tableSchema, constraint });
+        }
+      }
+      await this.createTable(tableName, tableSchema, { deferredForeignKeys: deferredNames });
+      presentTables.add(tableName);
+      await this.createIndexes(tableName, tableSchema, 'unique');
     }
 
-    // Create indexes
+    // ensureCreated stays idempotent: a deferred foreign key a previous run added is left alone.
+    const existingForeignKeyNames = new Map<string, Set<string>>();
+    for (const { tableName, tableSchema, constraint } of deferredForeignKeys) {
+      let existing = existingForeignKeyNames.get(tableName);
+      if (!existing) {
+        existing = new Set((await this.getExistingForeignKeys(tableName, tableSchema.schema)).map(fk => fk.constraint_name));
+        existingForeignKeyNames.set(tableName, existing);
+      }
+      if (!existing.has(constraint.name)) {
+        await this.executeCreateForeignKey(tableName, constraint, tableSchema.schema);
+      }
+    }
+
+    // Create the remaining (non-unique) indexes
     for (const [tableName, tableSchema] of ownedTables) {
-      await this.createIndexes(tableName, tableSchema);
+      await this.createIndexes(tableName, tableSchema, 'nonUnique');
     }
 
     // Create CHECK constraints (existence-guarded — no ADD CONSTRAINT IF NOT
@@ -918,10 +956,60 @@ $$`;
   }
 
   /**
-   * Create indexes for a table
+   * The foreign keys of a table's model: its `foreignKeys`, then each column-level `references` they do not cover
+   * (named `fk_<table>_<column>`, as migrate() names it).
    */
-  private async createIndexes(tableName: string, tableSchema: TableSchema): Promise<void> {
-    const indexes = tableSchema.indexes || [];
+  private modelForeignKeys(tableName: string, tableSchema: TableSchema): ForeignKeyConstraint[] {
+    const foreignKeys = [...(tableSchema.foreignKeys || [])];
+    const coveredColumns = new Set(foreignKeys.flatMap(fk => fk.columns));
+    for (const colBuilder of Object.values(tableSchema.columns)) {
+      const config = (colBuilder as any).build();
+      if (config.references && !coveredColumns.has(config.name)) {
+        foreignKeys.push({
+          name: `fk_${tableName}_${config.name}`,
+          columns: [config.name],
+          referencedTable: config.references.table,
+          referencedColumns: [config.references.column],
+        });
+      }
+    }
+    return foreignKeys;
+  }
+
+  /**
+   * Whether the key a foreign key of `tableName` references exists while `tableName` is created: the referenced table
+   * is present (`presentTables`, or `tableName` itself) and the key — as a set of columns — is its primary key, a
+   * UNIQUE column, or (another table's) plain unique index, built right after that table. A table the model does not
+   * know is taken as present, as before.
+   */
+  private referencedKeyExists(tableName: string, fk: ForeignKeyConstraint, presentTables: ReadonlySet<string>): boolean {
+    const target = this.schemaRegistry.get(fk.referencedTable);
+    if (!target) {
+      return true;
+    }
+    const isSelf = fk.referencedTable === tableName;
+    if (!isSelf && !presentTables.has(fk.referencedTable)) {
+      return false;
+    }
+    const key = [...fk.referencedColumns].sort().join('\u0000');
+    const configs = Object.values(target.columns).map(colBuilder => (colBuilder as any).build());
+    const primaryKey = configs.filter(config => config.primaryKey).map(config => config.name as string);
+    if (primaryKey.length > 0 && [...primaryKey].sort().join('\u0000') === key) {
+      return true;
+    }
+    if (fk.referencedColumns.length === 1 && configs.some(config => config.unique && config.name === fk.referencedColumns[0])) {
+      return true;
+    }
+    return !isSelf && (target.indexes || []).some(index =>
+      index.isUnique && !index.where && !(index.expressions && index.expressions.length > 0)
+      && [...index.columns].sort().join('\u0000') === key);
+  }
+
+  /**
+   * Create the unique, or the non-unique, indexes of a table
+   */
+  private async createIndexes(tableName: string, tableSchema: TableSchema, which: 'unique' | 'nonUnique'): Promise<void> {
+    const indexes = (tableSchema.indexes || []).filter(index => !!index.isUnique === (which === 'unique'));
     for (const index of indexes) {
       await this.executeCreateIndex(tableName, index, tableSchema.schema);
     }
@@ -1207,6 +1295,11 @@ $$`;
       }
     }
 
+    // Foreign keys to add go after EVERY table's index operations: one may reference a unique
+    // index of a table that comes later in the registry (a migration file scaffolded from
+    // this list runs it in this order).
+    const foreignKeyOperations: MigrationOperation[] = [];
+
     // Compare columns for existing tables — except an externally managed one, whose
     // owner decides its shape: it is created above when missing, never altered.
     for (const [tableName, schema] of this.schemaRegistry.entries()) {
@@ -1334,7 +1427,7 @@ $$`;
             dbFk.constraint_name === modelFk.name
           );
           if (!exists) {
-            operations.push({
+            foreignKeyOperations.push({
               type: 'create_foreign_key',
               tableName,
               schema: schema.schema,
@@ -1344,6 +1437,8 @@ $$`;
         }
       }
     }
+
+    operations.push(...foreignKeyOperations);
 
     // Database-level settings declared via `model.hasDbSetting(...)` —
     // converge-only (missing or drifted values; undeclared keys untouched).
@@ -1461,8 +1556,8 @@ $$`;
 
       // Separate operations into phases:
       // Phase 1: Schema, enum, table creation (without FKs), column additions
-      // Phase 2: Foreign key constraints
-      // Phase 3: Indexes and other operations
+      // Phase 2: Unique index builds (created or recreated), then foreign key constraints (an FK may reference one)
+      // Phase 3: Other indexes and other operations
       // Phase 4: Repairs of INVALID indexes
       const phase1Ops: MigrationOperation[] = [];
       const phase2Ops: MigrationOperation[] = [];
@@ -1474,6 +1569,18 @@ $$`;
       // Repairs run after everything else, each on its own: one that fails (a unique index
       // still over duplicate rows) leaves the rest of the migration done, not half done.
       const repairOps: RepairIndexOperation[] = [];
+      // Index builds whose result is UNIQUE — a new unique index, or an index recreated as unique — open phase 2,
+      // before the foreign keys: a foreign key may reference one (a composite key over `(id, kind)`, say;
+      // PostgreSQL refuses the FK until a unique index covers exactly its referenced columns). Every other index
+      // operation stays in phase 3. One pass, no per-index query.
+      const uniqueIndexOps: MigrationOperation[] = [];
+      const pushIndexPhaseOp = (op: MigrationOperation): void => {
+        if ((op.type === 'create_index' || op.type === 'recreate_index') && op.isUnique) {
+          uniqueIndexOps.push(op);
+        } else {
+          phase3Ops.push(op);
+        }
+      };
 
       // Track which tables are being created so we can add their FKs later
       const tablesToCreate = new Set<string>();
@@ -1498,7 +1605,7 @@ $$`;
           // Destructive operations go first (before creating new things that might conflict)
           phase1Ops.unshift(op);
         } else {
-          phase3Ops.push(op);
+          pushIndexPhaseOp(op);
         }
       }
 
@@ -1540,7 +1647,7 @@ $$`;
           // Add indexes for newly created tables to phase 3
           const indexes = schema.indexes || [];
           for (const index of indexes) {
-            phase3Ops.push({ type: 'create_index', ...this.indexOperationFields(tableName, schema.schema, index) });
+            pushIndexPhaseOp({ type: 'create_index', ...this.indexOperationFields(tableName, schema.schema, index) });
           }
 
           // Add CHECK constraints for newly created tables to phase 3
@@ -1555,6 +1662,8 @@ $$`;
           }
         }
       }
+
+      phase2Ops.unshift(...uniqueIndexOps);
 
       const totalOps = viewDropOps.length + phase1Ops.length + phase2Ops.length + phase3Ops.length + viewCreateOps.length + repairOps.length;
       this.logger(`📋 Found ${totalOps} operations to perform:\n`);
@@ -1583,7 +1692,7 @@ $$`;
 
       // Phase 2: Add foreign key constraints
       if (phase2Ops.length > 0) {
-        this.logger('🔗 Phase 2: Adding foreign key constraints...\n');
+        this.logger('🔗 Phase 2: Adding unique indexes and foreign key constraints...\n');
         for (const operation of phase2Ops) {
           await this.executeOperation(operation);
         }
@@ -1985,6 +2094,31 @@ $$`;
     const useConcurrent = operation.concurrent || this.concurrentIndexes;
 
     this.logger(`  Recreating index "${operation.indexName}"${operation.reason ? ` (changed: ${operation.reason})` : ''}...\n`);
+
+    // A foreign key may rest on the existing index — only a UNIQUE one can carry one — and PostgreSQL refuses to
+    // drop it then (2BP01). Those foreign keys are dropped and added back around the rebuild, all in ONE transaction:
+    // either they end up on the new index or (it no longer covers their key: 42830) nothing changed at all.
+    const previouslyUnique = operation.previousDef === undefined || /^CREATE UNIQUE /i.test(operation.previousDef);
+    const dependentForeignKeys = previouslyUnique ? await this.getForeignKeysOnIndex(operation.indexName, operation.schema) : [];
+    if (dependentForeignKeys.length > 0) {
+      const names = dependentForeignKeys.map(fk => `"${fk.constraint_name}"`).join(', ');
+      if (useConcurrent) {
+        this.logger(`    (blocking recreate: foreign key${dependentForeignKeys.length === 1 ? '' : 's'} ${names} rest on the index — PostgreSQL drops it only with them, so they are moved over in one transaction)\n`, 'warn');
+      }
+      await this.client.transaction(async query => {
+        for (const fk of dependentForeignKeys) {
+          await query(`ALTER TABLE ${this.getQualifiedTableName(fk.table_name, fk.table_schema)} DROP CONSTRAINT "${fk.constraint_name}"`);
+        }
+        await query(buildDropIndexStatement(this.qualifiedIndexName(operation.indexName, operation.schema), { concurrent: false, ifExists: true }));
+        await query(buildCreateIndexStatement(spec, this.getQualifiedTableName(operation.tableName, operation.schema), { concurrent: false, ifNotExists: false }));
+        for (const fk of dependentForeignKeys) {
+          await query(`ALTER TABLE ${this.getQualifiedTableName(fk.table_name, fk.table_schema)} ADD CONSTRAINT "${fk.constraint_name}" ${fk.definition}`);
+        }
+      });
+      this.logger(`  ✓ ${spec.isUnique ? 'UNIQUE ' : ''}Index "${operation.indexName}" recreated, foreign key${dependentForeignKeys.length === 1 ? '' : 's'} ${names} kept on it\n`);
+      return;
+    }
+
     if (!useConcurrent) {
       this.logger(`    (blocking recreate — enable concurrentIndexes or .concurrent() for non-blocking)\n`, 'warn');
     }
@@ -2561,6 +2695,23 @@ $$`;
   /**
    * Get all foreign key constraints for a table
    */
+  /** The foreign keys that rest on an index (`pg_constraint.conindid`), each with its definition as PostgreSQL deparses it. */
+  private async getForeignKeysOnIndex(
+    indexName: string,
+    schemaName?: string
+  ): Promise<Array<{ constraint_name: string; definition: string; table_schema: string; table_name: string }>> {
+    const result = await this.client.query(`
+      SELECT con.conname AS constraint_name, pg_get_constraintdef(con.oid) AS definition,
+        n.nspname AS table_schema, cr.relname AS table_name
+      FROM pg_constraint con
+      JOIN pg_class cr ON cr.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = cr.relnamespace
+      WHERE con.contype = 'f' AND con.conindid = to_regclass($1)
+      ORDER BY con.conname
+    `, [this.qualifiedIndexName(indexName, schemaName)]);
+    return result.rows;
+  }
+
   private async getExistingForeignKeys(tableName: string, schemaName?: string): Promise<DbForeignKeyInfo[]> {
     // The column lists come as JSON, which every driver decodes to an array: an
     // array_agg of information_schema's identifiers is a name[], which the pg
