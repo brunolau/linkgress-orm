@@ -3,14 +3,14 @@
 Built-in, type-safe spellings of the SQL expressions that otherwise end up hand-written in
 `sql` templates: casts, literals, bound parameters, `CASE`, `GREATEST` / `LEAST` / `NULLIF`,
 `IS DISTINCT FROM`, string, math and date/time functions, JSON paths, builders and mutations,
-array-column operators and aggregates.
+array-column operators, aggregates and window ranking functions.
 
 ```typescript
 import {
   cast, castAsInt, caseWhen, caseOf, literal, literalOf, param, typedNull, asBoolean,
   greatest, least, nullIf, isDistinctFrom, lower, concatWs, concatStrict, round, modulo,
   atTimeZone, dateTrunc, datePart, addInterval, jsonbPathText, jsonbValueText, jsonbSet,
-  jsonBuildObject, arrayContains, agg,
+  jsonBuildObject, arrayContains, agg, win,
 } from 'linkgress-orm';
 ```
 
@@ -477,6 +477,65 @@ db.members.select(m => ({
   `int4[]`) — a known driver defect, for every native-array read on it, `arrayAgg` included.
   Filter NULLs out (`.filter(isNotNull(x))`) or use `jsonAgg` where elements can be NULL on that
   driver.
+
+## Window functions (`win`)
+
+```typescript
+win.rowNumber()                      // row_number() OVER ()
+win.rowNumber().over({ partitionBy: m.clubId, orderBy: [[m.points, 'DESC'], m.id] })
+                                     // row_number() OVER (PARTITION BY club_id ORDER BY points DESC, id ASC)
+win.rank().over({ orderBy: m.points })                     // rank() OVER (ORDER BY points ASC)
+win.denseRank().over({ partitionBy: [m.clubId, lower(m.name)] })   // dense_rank() OVER (PARTITION BY …, …)
+```
+
+Window ranking functions as fragments. Unlike an aggregate, a window value keeps every input row: a
+select of them is one row per row it reads, numbered (or ranked) within its partition:
+
+```typescript
+const ranked = await db.members
+  .select(m => ({
+    name: m.name,
+    rowInClub: win.rowNumber().over({ partitionBy: m.clubId, orderBy: [[m.points, 'DESC'], m.id] }),
+    byPoints: win.rank().over({ orderBy: m.points }),        // ties share a rank: 1, 1, 3
+    denseByPoints: win.denseRank().over({ orderBy: m.points }), // without gaps: 1, 1, 2
+  }))
+  .toList();
+```
+
+- `partitionBy`: a column or an expression, or a list of them; `orderBy`: a key or `[key, 'ASC' |
+  'DESC']`, one or a list — the ORDER BY keys of the list aggregates. A plain JS value as a key is
+  refused. Both are optional: `over({})` and no `over()` at all render `OVER ()`.
+- `.over()` returns a new fragment over the window it is given; a window given before is replaced.
+- A navigation used only in a key is joined, like anywhere else in a fragment. Parameters number in
+  textual order: the PARTITION BY keys, then the ORDER BY keys.
+- Reads a JS number (the drivers deliver the int8 as text).
+- A partition key can be any expression — e.g. the local day of a UTC timestamp:
+  `castAsDate(atTimeZone(atTimeZone(r.takenAtUtc, 'UTC'), 'Europe/Oslo'))`.
+- In a collection navigation's select a window numbers each parent's items: such a collection renders as
+  LATERAL whatever the collection strategy — the CTE and temp-table strategies aggregate the items of every
+  parent in one pass, which would number them together.
+- PostgreSQL computes window functions after WHERE, GROUP BY and HAVING, so a window value cannot be
+  filtered by the query that computes it: a later `where()` on it — or a join's `on` / filter over that
+  projection — is refused with a `TypeError` (the condition could only reach the alias, which that query
+  has no column for, or which names a column of the table that would be filtered instead). Compute it in
+  a CTE and filter where the CTE is read:
+
+```typescript
+const ranked = new DbCteBuilder().with('ranked_members', db.members.select(m => ({
+  memberId: m.id,
+  rowInClub: win.rowNumber().over({ partitionBy: m.clubId, orderBy: [[m.points, 'DESC'], m.id] }),
+})));
+
+const firstOfEachClub = await db.selectFromCte(ranked.cte).where(r => eq(r.rowInClub, 1)).select(r => ({ id: r.memberId })).toList();
+
+// …or as an IN subquery of an entity query (the subquery declares the CTE itself)
+await db.members
+  .where(m => inSubquery(m.id, db.selectFromCte(ranked.cte).where(r => eq(r.rowInClub, 1)).select(r => ({ id: r.memberId })).asSubquery('array')))
+  .toList();
+```
+
+Other window functions (`lag`, `lead`, aggregates with `OVER`, frames) stay raw `sql` templates — see
+[Window Functions](./querying.md#window-functions).
 
 ## Conditions nested in fragments
 

@@ -1447,8 +1447,11 @@ const noInactiveUsers = await db.users
 
 ### Window Functions
 
+The ranking functions are built in — `win.rowNumber()`, `win.rank()`, `win.denseRank()`, each with
+`.over({ partitionBy, orderBy })` (see [SQL Expression Helpers](./sql-expressions.md#window-functions-win)):
+
 ```typescript
-import { sql } from 'linkgress-orm';
+import { win } from 'linkgress-orm';
 
 // Row number partitioned by category
 const rankedPosts = await db.posts
@@ -1457,12 +1460,18 @@ const rankedPosts = await db.posts
     title: p.title,
     categoryId: p.categoryId,
     views: p.views,
-    rank: sql<number>`ROW_NUMBER() OVER (
-      PARTITION BY ${p.categoryId}
-      ORDER BY ${p.views} DESC
-    )`
+    rank: win.rowNumber().over({ partitionBy: p.categoryId, orderBy: [[p.views, 'DESC']] }),
   }))
   .toList();
+```
+
+A window value cannot be filtered by the query that computes it (PostgreSQL computes it after WHERE):
+compute it in a CTE and filter where the CTE is read — `db.selectFromCte(cte).where(r => eq(r.rank, 1))`.
+
+Any other window expression — an aggregate with `OVER`, `lag` / `lead`, a frame — is a raw `sql` template:
+
+```typescript
+import { sql } from 'linkgress-orm';
 
 // Running total
 const postsWithTotal = await db.posts

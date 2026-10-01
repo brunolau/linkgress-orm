@@ -1,7 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
 import type { EnclosingCollectionScope } from './conditions';
 import { pgTypeOfValue, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
-import { holdsAggregateFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
+import { holdsAggregateFragment, holdsWindowFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
@@ -3592,7 +3592,7 @@ export class SelectQueryBuilder<TSelection> {
     // (see CollectionQueryBuilder.getOuterFieldRefs): an aggregate over temp-table parent ids
     // cannot see that row.
     const collections = tracer.trace('detectCollections', () => this.detectCollections(selectionResult))
-      .filter(collection => this.collectionStrategy !== 'temptable' || collection.builder.getOuterFieldRefs().length === 0);
+      .filter(collection => this.collectionStrategy !== 'temptable' || !collection.builder.rendersLateral());
     const useTempTableStrategy = this.collectionStrategy === 'temptable' && collections.length > 0;
 
     tracer.endPhase();
@@ -6030,6 +6030,18 @@ ${joinClauses.join('\n')}`;
 
         // If the value is a SqlFragment, treat it as a FieldRef using the property name as the alias
         if (value && typeof value === 'object' && value instanceof SqlFragment) {
+          // A condition (a later where(), a join's on / filter) reaches a computed value only by its
+          // alias: the query computing it has no such column, or the table has one by that name,
+          // which the condition would filter instead. PostgreSQL computes a window after WHERE and the
+          // joins, so a window value can never be filtered here — refuse it rather than filter wrong.
+          if (preserveOriginal && holdsWindowFragment(value)) {
+            throw new TypeError(
+              `\`${String(prop)}\` is a window function value: PostgreSQL computes window functions after WHERE and the joins, `
+              + 'so it cannot be filtered in the query that computes it — compute it in a CTE (DbCteBuilder.with) and filter '
+              + 'where the CTE is read: db.selectFromCte(cte).where(…)'
+            );
+          }
+
           return {
             __fieldName: prop as string,
             __dbColumnName: prop as string,
@@ -8377,8 +8389,8 @@ ${joinClauses.join('\n')}`;
       }
     }
 
-    // Build FROM clause with JOINs
-    let fromClause = `FROM "${this.schema.name}"`;
+    // Build FROM clause with JOINs — the root table WITH its schema, as every other root read names it
+    let fromClause = `FROM ${this.getQualifiedTableName(this.schema.name, this.schema.schema)}`;
 
     // Add manual JOINs
     for (const manualJoin of this.manualJoins) {
@@ -11605,6 +11617,17 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * Whether this collection renders as LATERAL whatever the collection strategy. The CTE and temp-table
+   * strategies aggregate the items of EVERY parent in one pass: a collection that reads its parent row
+   * beyond the relation key ({@link getOuterFieldRefs}) has no such row there, and a window value it
+   * projects would number the items of all parents together (`row_number()` 1…n across them) instead
+   * of each parent's.
+   */
+  rendersLateral(): boolean {
+    return this.getOuterFieldRefs().length > 0 || holdsWindowFragment(this.evaluateSelector());
+  }
+
+  /**
    * Runs `build` with the refs this collection reads from an ENCLOSING collection's row renamed from
    * that collection's marker (`"__collection_<table>__"`) to the alias the row renders under: an
    * enclosing lateral's inner alias (its entry in `aliasMap`), else the table's own name — the CTE and
@@ -13371,10 +13394,11 @@ export class CollectionQueryBuilder<TItem = any> {
     // aggregation the temp-table strategy runs, over every parent (the temp-table strategy's
     // promise used to land in the SQL as a join to a CTE nobody declared). A collection that reads
     // its enclosing row beyond the relation key (see getOuterFieldRefs) cannot be aggregated apart
-    // from that row, which is what the CTE and temp-table strategies do: it renders as LATERAL.
+    // from that row, which is what the CTE and temp-table strategies do: it renders as LATERAL — and so
+    // does one that projects a window value (see rendersLateral).
     const configuredStrategy: CollectionStrategyType = context.collectionStrategy || 'lateral';
     const requestedStrategy: CollectionStrategyType = configuredStrategy === 'temptable' && parentIds === undefined ? 'cte' : configuredStrategy;
-    const strategyType: CollectionStrategyType = requestedStrategy !== 'lateral' && this.getOuterFieldRefs().length > 0
+    const strategyType: CollectionStrategyType = requestedStrategy !== 'lateral' && this.rendersLateral()
       ? 'lateral'
       : requestedStrategy;
     const strategy = CollectionStrategyFactory.getStrategy(strategyType);

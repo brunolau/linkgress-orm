@@ -311,6 +311,17 @@ export type {
   AggregateFunctions,
 } from './query/sql-functions';
 
+// 1.0.21: window ranking functions (win)
+export {
+  win,
+  WindowFragment,
+} from './query/sql-functions';
+
+export type {
+  WindowOptions,
+  WindowFunctions,
+} from './query/sql-functions';
+
 export {
   eqAnySubquery,
   neAllSubquery,

@@ -9,7 +9,7 @@ import {
   literalOf, lower, lt, lte, modulo, MutationBatch, ne, neAll, neAllSubquery, normalizedEq, normalizedLike,
   normalizedStartsWith, not, notExists, notInArray, notInArrayOpt, or, param, regexMatches, regexMatchesCaseInsensitive,
   regexNoMatch, regexNoMatchCaseInsensitive, sql, SqlFragment, startsWith, substring, unnest, unnestZip,
-  jsonbArrayElements, jsonbEachText,
+  jsonbArrayElements, jsonbEachText, win,
 } from '../../src';
 import * as Surface from '../../src';
 import { SqlBuildContext } from '../../src/query/conditions';
@@ -529,6 +529,7 @@ describe('1. every expression builder renders a self-delimited expression', () =
     arrayIsNotEmpty: frag(() => Surface.arrayIsNotEmpty(A)),
     agg: frag(() => agg.count(), () => agg.count(N), () => agg.countDistinct(N), () => agg.sum(N), () => agg.avg(N), () => agg.min(N), () => agg.max(N),
       () => agg.bitOr(S), () => agg.bitAnd(S), () => agg.arrayAgg(N, { orderBy: [[N, 'DESC']] }), () => agg.jsonAgg(N), () => agg.jsonbAgg(N)),
+    win: frag(() => win.rowNumber(), () => win.rank().over({ orderBy: N }), () => win.denseRank().over({ partitionBy: [S, lower(T)], orderBy: [[N, 'DESC']] })),
     // subqueries, scopes, sets
     exists: frag(() => exists(sub()), () => exists({ exists: () => sql<boolean>`EXISTS (SELECT 1)` } as any)),
     notExists: frag(() => notExists(sub()), () => notExists({ exists: () => sql<boolean>`EXISTS (SELECT 1)` } as any)),
@@ -539,6 +540,7 @@ describe('1. every expression builder renders a self-delimited expression', () =
     // classes whose members build fragments
     SqlFragment: frag(() => coalesce(N, 0).as('x'), () => coalesce(N, 0).mapWith(Number), () => jsonbPathText(J, 'a').withReadType('text'), () => jsonbPathText(J, 'a').castAsInt()),
     AggregateFragment: frag(() => agg.count().filter(gt(N, 1)).filter(sql`${B} OR ${B}`)),
+    WindowFragment: frag(() => win.rowNumber().over({ partitionBy: sql`${N} + ${B}`, orderBy: [[sql`${N} || ${T}`, 'DESC'], T] })),
     CaseWhenExpression: frag(() => caseWhen(eq(N, 1), 1).when(gt(N, 5), 2)),
     CaseOfBuilder: frag(() => caseOf(N).when(1, 'a')),
     CaseOfExpression: frag(() => caseOf(N).when(1, 'a').when(2, 'b').else('c')),

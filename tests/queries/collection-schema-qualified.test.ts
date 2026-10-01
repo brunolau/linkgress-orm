@@ -16,6 +16,9 @@
  * did the `exists()` / `count()` subquery of a collection in a WHERE or a `sql` fragment, the hop
  * of a navigation a collection hangs off (`p.kind.pets`), a selectMany bridge, and the single
  * round-trip temp-table form of the multi-statement drivers.
+ *
+ * The same held for the ROOT table of a grouped read (`select(…).groupBy(…).select(…)`) and of a
+ * scalar `min` / `max` / `sum`: both built their FROM from the bare table name.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -347,6 +350,32 @@ describe('a collection over a table of another schema — conditions, fragments,
       .returning((o: any) => ({ name: o.name, pets: o.pets!.orderBy((p: any) => p.id).select((p: any) => ({ name: p.name })).toList('pets'), count: o.pets!.count() }));
 
     expect(rows as any).toEqual([{ name: 'Ann', pets: [{ name: 'Tom' }, { name: 'Rex' }], count: 2 }]);
+  });
+});
+
+describe('a grouped read and a scalar aggregate over a table of another schema', () => {
+  test('select → groupBy → select reads the schema-qualified root table', async () => {
+    takeStatements();
+    const rows = await db.pets
+      .select(p => ({ kindId: p.kindId, name: p.name }))
+      .groupBy(p => ({ kindId: p.kindId }))
+      .select(g => ({ kindId: g.key.kindId, pets: g.count() }))
+      .toList();
+
+    expect([...rows].sort((a, b) => a.kindId - b.kindId)).toEqual([
+      { kindId: ids.cat, pets: 1 },
+      { kindId: ids.dog, pets: 2 },
+    ]);
+    expect(takeStatements().join('\n')).toContain('FROM "sq_zoo"."sq_pets"');
+  });
+
+  test('min, max and sum read the schema-qualified root table', async () => {
+    takeStatements();
+
+    expect(Number(await db.pets.select(p => ({ id: p.id })).min(p => p.id))).toBe(ids.tom);
+    expect(Number(await db.pets.select(p => ({ id: p.id })).max(p => p.id))).toBe(ids.fido);
+    expect(Number(await db.pets.select(p => ({ kindId: p.kindId })).sum(p => p.kindId))).toBe(ids.dog * 2 + ids.cat);
+    expect(takeStatements().join('\n')).toContain('FROM "sq_zoo"."sq_pets"');
   });
 });
 

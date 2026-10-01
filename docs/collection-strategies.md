@@ -264,8 +264,9 @@ DROP TABLE IF EXISTS tmp_base_0;
 ```
 
 A collection that cannot be aggregated apart from its parent row — one whose WHERE, projection or
-ORDER BY reads a column of the enclosing row beyond the relation key — renders as LATERAL in the base
-query instead. And a query built as ONE statement (`countOver()`, `prepare()`, a UNION leg, a future
+ORDER BY reads a column of the enclosing row beyond the relation key, or one that projects a window value
+(`win.rowNumber()…`, which would number the items of all parents together) — renders as LATERAL in the base
+query instead, under the CTE strategy as well. And a query built as ONE statement (`countOver()`, `prepare()`, a UNION leg, a future
 of a batch) cannot run phases: its temp table collections take the CTE form, which is the very
 aggregation the phases would run, over every parent.
 

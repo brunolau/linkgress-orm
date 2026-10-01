@@ -2143,6 +2143,168 @@ export const agg: AggregateFunctions = Object.freeze({
 });
 
 // ============================================================================
+// Window functions
+// ============================================================================
+
+/** The window of a {@link WindowFragment}: `OVER ([PARTITION BY …] [ORDER BY …])`. */
+export interface WindowOptions {
+  /** `PARTITION BY` — columns or expressions; the function starts over in each partition. */
+  partitionBy?: SqlOperand | readonly SqlOperand[];
+  /** `ORDER BY` inside the window — a key or `[key, 'ASC' | 'DESC']`, as the `agg` list aggregates take it. */
+  orderBy?: AggOrderKey | readonly AggOrderKey[];
+}
+
+/** What a {@link WindowFragment} renders. @internal */
+interface WindowSpec {
+  /** The SQL function, lower-case (`row_number`, `rank`, `dense_rank`) */
+  readonly name: string;
+  /** The builder's name for error messages (`rowNumber()`) */
+  readonly fnName: string;
+  readonly partitionBy: readonly unknown[];
+  readonly orderBy: ReadonlyArray<readonly [unknown, 'ASC' | 'DESC']>;
+}
+
+/** The PARTITION BY keys of a window, validated: columns or expressions, never plain JS values. */
+function windowPartitionKeys(fnName: string, partitionBy: WindowOptions['partitionBy']): unknown[] {
+  if (partitionBy === undefined) {
+    return [];
+  }
+
+  const keys: readonly unknown[] = Array.isArray(partitionBy) ? partitionBy : [partitionBy];
+
+  return keys.map(key => {
+    if (isPlainSqlValue(key)) {
+      throw new TypeError(
+        `${fnName}.over(): a PARTITION BY key must be a column or an expression — got ${
+          key === null ? 'null' : Array.isArray(key) ? 'an array' : typeof key
+        }`
+      );
+    }
+
+    return key;
+  });
+}
+
+/** `name() OVER ([PARTITION BY <key>, …] [ORDER BY <key> <dir>, …])` parts / values. */
+function compileWindow(spec: WindowSpec): { parts: string[]; values: unknown[] } {
+  // parts[i] precedes values[i]; the last part is the running tail
+  const parts: string[] = [`${spec.name}() OVER (`];
+  const values: unknown[] = [];
+  const text = (sqlText: string): void => {
+    parts[parts.length - 1] += sqlText;
+  };
+  const value = (operand: unknown): void => {
+    values.push(operand);
+    parts.push('');
+  };
+
+  spec.partitionBy.forEach((key, index) => {
+    text(index === 0 ? 'PARTITION BY ' : ', ');
+    value(key);
+  });
+
+  spec.orderBy.forEach(([key, direction], index) => {
+    text(index > 0 ? ', ' : spec.partitionBy.length > 0 ? ' ORDER BY ' : 'ORDER BY ');
+    value(key);
+    text(` ${direction}`);
+  });
+
+  text(')');
+
+  return { parts, values };
+}
+
+/**
+ * A window ranking function — built by {@link win} — over the window {@link over} gives it:
+ * `row_number() OVER (PARTITION BY … ORDER BY …)`; without `over()` the window is empty (`OVER ()`).
+ * Immutable: `over()` returns a new fragment. Reads as a JS number (the drivers deliver int8 as text).
+ *
+ * Unlike an {@link AggregateFragment} it keeps every input row. PostgreSQL computes window functions
+ * after WHERE, GROUP BY and HAVING, so a window value cannot be filtered in the query that computes
+ * it: compute it in a CTE (`DbCteBuilder.with`) or a table subquery and filter where that is read
+ * (`db.selectFromCte(cte).where(…)`).
+ */
+export class WindowFragment<T> extends SqlFragment<T> {
+  private readonly spec: WindowSpec;
+
+  /** @internal — window fragments are built through {@link win}. */
+  constructor(spec: WindowSpec) {
+    const compiled = compileWindow(spec);
+    super(compiled.parts, compiled.values, NUMBER_RESULT_MAPPER);
+    this.spec = spec;
+  }
+
+  /**
+   * The window: `OVER ([PARTITION BY …] [ORDER BY …])`. Returns a new fragment over THIS window — a
+   * window given before is replaced, not merged.
+   *
+   * @example
+   * win.rowNumber().over({ partitionBy: m.clubId, orderBy: [[m.points, 'DESC'], m.id] })
+   */
+  over(window: WindowOptions): WindowFragment<T> {
+    return new WindowFragment<T>({
+      ...this.spec,
+      partitionBy: windowPartitionKeys(this.spec.fnName, window?.partitionBy),
+      orderBy: aggregateOrderKeys(`${this.spec.fnName}.over()`, window?.orderBy),
+    });
+  }
+}
+
+/**
+ * Whether a projected value holds a window fragment — at its top, through `.as()` / `.mapWith()`, in a
+ * nested object or inside an `sql` expression. A subquery's or a nested collection's window is its own.
+ * Getters (navigations) are not followed. @internal
+ */
+export function holdsWindowFragment(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === null || typeof value !== 'object' || '__dbColumnName' in value) {
+    return false;
+  }
+
+  if (value instanceof WindowFragment) {
+    return true;
+  }
+
+  const values: readonly unknown[] = value instanceof SqlFragment
+    // A plain fragment's template values (read the way sql.join reads them)
+    ? ((value as unknown as { values?: readonly unknown[] }).values ?? [])
+    : isPlainObject(value)
+      ? Object.values(Object.getOwnPropertyDescriptors(value)).filter(d => 'value' in d).map(d => d.value)
+      : [];
+
+  return values.some(inner => holdsWindowFragment(inner, depth + 1));
+}
+
+/** The window ranking functions of {@link win}. */
+export interface WindowFunctions {
+  /** `row_number() OVER (…)` — 1, 2, 3, … in the window's order, starting over in each partition. */
+  rowNumber(): WindowFragment<number>;
+  /** `rank() OVER (…)` — rows tied in the window's ORDER BY share a rank; the next rank skips (1, 1, 3). */
+  rank(): WindowFragment<number>;
+  /** `dense_rank() OVER (…)` — like `rank()` without gaps (1, 1, 2). */
+  denseRank(): WindowFragment<number>;
+}
+
+const windowFunction = (fnName: string, name: string): WindowFragment<number> =>
+  new WindowFragment<number>({ name, fnName, partitionBy: [], orderBy: [] });
+
+/**
+ * Window ranking functions as expressions — `row_number()`, `rank()`, `dense_rank()` — each over the
+ * window `.over({ partitionBy, orderBy })` gives it.
+ *
+ * @example
+ * // The 1st, 2nd, … member of each club by points
+ * db.members.select(m => ({
+ *   id: m.id,
+ *   rowInClub: win.rowNumber().over({ partitionBy: m.clubId, orderBy: [[m.points, 'DESC'], m.id] }),
+ * }))
+ */
+export const win: WindowFunctions = Object.freeze({
+  rowNumber: (): WindowFragment<number> => windowFunction('rowNumber()', 'row_number'),
+  rank: (): WindowFragment<number> => windowFunction('rank()', 'rank'),
+  denseRank: (): WindowFragment<number> => windowFunction('denseRank()', 'dense_rank'),
+});
+
+// ============================================================================
 // Array columns
 // ============================================================================
 

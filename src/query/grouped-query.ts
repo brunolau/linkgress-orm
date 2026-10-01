@@ -28,6 +28,7 @@ import type { LateralSetJoin } from './set-returning';
 import { flatRowBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, isCustomReadMapper } from './future-query';
 import type { BatchFieldDelivery, FutureBatchMeta } from './future-query';
 import { forResultSet, readersForResultSet, readerThrough, valuesAt } from './shared-values';
+import { getQualifiedTableName } from './sql-utils';
 import { needsClientParse } from '../database/typed-text';
 
 /**
@@ -1389,8 +1390,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     // Detect joins from WHERE condition
     this.detectAndAddJoinsFromCondition(this.whereCond, navigationJoins);
 
-    // Build base FROM clause with JOINs
-    let baseFromClause = `"${this.schema.name}"`;
+    // Build base FROM clause with JOINs. The root table is named WITH its schema, like every other
+    // root read: a bare name resolves through the search_path — `relation … does not exist` for a table
+    // outside it, or silently another schema's table of the same name. Columns still reference it by
+    // its bare name, which PostgreSQL accepts as the qualified table's implicit alias.
+    let baseFromClause = getQualifiedTableName(this.schema);
 
     // Add navigation property JOINs first
     for (const navJoin of navigationJoins) {
