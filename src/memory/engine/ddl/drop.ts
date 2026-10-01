@@ -50,6 +50,16 @@ export function dropRelation(ctx: DropCtx, rel: Relation, requested: boolean): v
       }
     }
   }
+  // A foreign key rests on the unique index it was resolved through (pg_constraint.conindid): a normal dependency.
+  // An index a PRIMARY KEY / UNIQUE / EXCLUDE constraint owns is refused below, as that constraint's, first.
+  if (rel.kind === 'i' && ![...cat.constraints.values()].some((c) => c.indexOid === rel.oid && (c.type === 'p' || c.type === 'u' || c.type === 'x'))) {
+    for (const c of [...cat.constraints.values()]) {
+      if (c.type === 'f' && c.indexOid === rel.oid && !ctx.dropped.has(c.relOid)) {
+        const other = cat.getRelation(c.relOid)!;
+        deps.push({ text: `constraint ${c.name} on table ${other.name} depends on index ${rel.name}`, drop: () => cat.removeConstraint(c.oid) });
+      }
+    }
+  }
   for (const v of [...cat.relations.values()]) {
     if ((v.kind === 'v' || v.kind === 'm') && v.oid !== rel.oid && !ctx.dropped.has(v.oid) && v.view && viewReferences(v.view.text, rel.name)) {
       deps.push({ text: `view ${v.name} depends on ${kindName} ${rel.name}`, drop: () => dropRelation(ctx, v, false) });
