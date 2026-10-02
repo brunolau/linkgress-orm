@@ -3370,6 +3370,12 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
     condition: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>) => Condition
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
+  /**
+   * Join a reference navigation of the ROOT entity as a LATERAL probe of its target's key — see
+   * {@link IEntityQueryable.lateralJoin}. The navigation reads the root row, not the selection.
+   */
+  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): EntitySelectQueryBuilder<TEntity, TSelection>;
+
   /** INNER JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.joinFilter}. */
   joinFilter<TRight extends DbEntity>(
     rightTable: DbEntityTable<TRight>,

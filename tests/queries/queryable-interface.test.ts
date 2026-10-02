@@ -263,6 +263,21 @@ describe('IEntityQueryable Interface', () => {
         });
       });
     });
+
+    test('should accept a where().select() builder where IEntityQueryable<any> is expected', async () => {
+      await withDatabase(async (db) => {
+        await seedTestData(db);
+
+        // A helper typed over IEntityQueryable<any> receives a projected builder: the select builder must
+        // carry every IEntityQueryable member (lateralJoin included) to stay assignable.
+        const listAll = (query: IEntityQueryable<any>) => query.toList();
+
+        const rows = await listAll(
+          db.users.where(u => eq(u.isActive, true)).select(u => ({ id: u.id, username: u.username }))
+        );
+        expect(rows.map((r: { username: string }) => r.username).sort()).toEqual(['alice', 'bob']);
+      });
+    });
   });
 
   describe('Edge cases', () => {
