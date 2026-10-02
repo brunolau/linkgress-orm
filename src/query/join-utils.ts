@@ -37,6 +37,39 @@ export function quoteTableReference(table: string, schema?: string): string {
 }
 
 /**
+ * The join of a reference navigation `lateralJoin()` opted in: a LATERAL probe of the target's key for
+ * each row of the source,
+ *
+ *   LEFT JOIN LATERAL (SELECT "<alias>__probe".* FROM <target> "<alias>__probe"
+ *                      WHERE "<alias>__probe"."<pk>" = "<source>"."<fk>" [AND …] OFFSET 0) "<alias>" ON true
+ *
+ * (INNER for a required navigation). A plain join leaves the planner free to merge-join the source rows
+ * against the target's whole primary-key index — which it does when the statistics of the foreign-key
+ * column end far below the keys the source rows hold; the probe can only be a nested loop over one key
+ * lookup per source row. `OFFSET 0` keeps PostgreSQL from pulling the subquery up into a plain join again
+ * (`LIMIT 1` would too, but would drop rows for a principal key that is not unique). The probe reads its
+ * table under an alias of its own: under the table's name, a navigation of a table to itself would read
+ * the foreign key off the probed row instead of the source row. Every key pair goes into the probe's
+ * WHERE, a constant part included. Columns of the target nobody reads cost nothing: PostgreSQL drops them
+ * from the subquery's output.
+ *
+ * @param join   The navigation's join: its alias, target table and key pairs.
+ * @param source The alias the foreign-key side is read from, as the enclosing FROM renders it.
+ */
+export function renderLateralNavigationJoin(
+  join: { alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean },
+  source: string,
+): string {
+  const probe = `${join.alias}__probe`;
+  const keys = join.foreignKeys
+    .map((fk, index) => `${formatJoinValue(probe, join.matches[index] || 'id')} = ${formatJoinValue(source, fk)}`)
+    .join(' AND ');
+
+  return `${join.isMandatory ? 'INNER' : 'LEFT'} JOIN LATERAL (SELECT "${probe}".* FROM ${quoteTableReference(join.targetTable, join.targetSchema)} "${probe}" `
+    + `WHERE ${keys} OFFSET 0) "${join.alias}" ON true`;
+}
+
+/**
  * Build the literal-only filter predicates from a navigation's composite FK/match
  * arrays. Used by strategies that DO NOT carry a source-table reference inside
  * the collection subquery (e.g. CTE, temptable). In those strategies the

@@ -164,6 +164,12 @@ export interface NavigationJoin {
    * The source table alias for this join (the table that has the FK)
    */
   sourceAlias: string;
+
+  /**
+   * Set on the join of a navigation `lateralJoin()` opted in: it renders as a LATERAL probe of the
+   * target's key (see renderLateralNavigationJoin) instead of a plain join.
+   */
+  lateral?: boolean;
 }
 
 /**

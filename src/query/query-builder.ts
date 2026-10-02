@@ -22,7 +22,7 @@ import type { ColumnConfig } from '../schema/column-builder';
 import { createColumnRow } from '../entity/column-row';
 import { MockRowCache } from './mock-row-cache';
 import { NavigationPathCache } from './navigation-path-cache';
-import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, buildLiteralOnlyPredicates, NavigationAliasPlan, quoteTableReference } from './join-utils';
+import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, buildLiteralOnlyPredicates, NavigationAliasPlan, quoteTableReference, renderLateralNavigationJoin } from './join-utils';
 import type { NavigationPathNode } from './join-utils';
 import {
   assertStatementLevelCtes, attachReturningSelection, cteDeclarationAt, declareStatementCtes, isStatementCte, NestedDataModifyingCteError, stampChainId,
@@ -1056,6 +1056,8 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   private joinCounter: number = 0;
   private collectionStrategy?: CollectionStrategyType;
   private schemaRegistry?: Map<string, TableSchema>;
+  /** The reference navigations `lateralJoin()` opted in, by relation name (see SelectQueryBuilder.lateralJoin). */
+  private lateralNavigations: readonly string[] = [];
 
   // Performance: Cache the mock row to avoid recreating it
   private _cachedMockRow?: any;
@@ -1152,7 +1154,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       this.schemaRegistry,  // Pass schema registry for nested navigation resolution
       [],  // ctes - start with empty array
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     );
   }
 
@@ -1168,6 +1172,15 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     } else {
       this.whereCond = newCondition;
     }
+    return this;
+  }
+
+  /**
+   * Join the reference navigation `navigation` names (`row => row.author`) as a LATERAL probe of its
+   * target's key instead of a plain join — see {@link SelectQueryBuilder.lateralJoin}.
+   */
+  lateralJoin(navigation: (row: TRow) => unknown): this {
+    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(this.schema, navigation));
     return this;
   }
 
@@ -1190,7 +1203,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       this.schemaRegistry,  // Pass schema registry for nested navigation resolution
       ctes,
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     );
   }
 
@@ -1400,7 +1415,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         this.schemaRegistry,  // a joined table's navigations need its targets' relations
         [],  // ctes
         this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     );
       return qb.leftJoinSubquery(rightTable, alias, condition as any, selector as any);
     }
@@ -1452,7 +1469,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       this.schemaRegistry,  // a joined table's navigations need its targets' relations
       [],  // ctes
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
   }
 
@@ -1495,7 +1514,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       this.schemaRegistry,
       [cte as DbCte<any>],
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
   }
 
@@ -1535,7 +1556,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
         this.schemaRegistry,  // a joined table's navigations need its targets' relations
         [],  // ctes
         this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     );
       return qb.innerJoinSubquery(rightTable, alias, condition as any, selector as any);
     }
@@ -1587,7 +1610,9 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       this.schemaRegistry,  // a joined table's navigations need its targets' relations
       [],  // ctes
       this.collectionStrategy,
-      this.chainId
+      this.chainId,
+      undefined,  // lateralSets
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TSelection>>;
   }
 
@@ -1673,6 +1698,11 @@ export class SelectQueryBuilder<TSelection> {
   private collectionStrategy?: CollectionStrategyType;
   /** Set-returning functions joined to every row (`crossJoinLateral`), rendered after the navigation joins. */
   private lateralSets: LateralSetJoin[] = [];
+  /**
+   * The reference navigations of the root row `lateralJoin()` opted in, by relation name: their joins render as
+   * LATERAL probes of the target's key (see isLateralNavigationJoin). Never mutated in place: derived builders share it.
+   */
+  private lateralNavigations: readonly string[];
 
   /**
    * Get qualified table name with schema prefix if specified
@@ -1697,13 +1727,15 @@ export class SelectQueryBuilder<TSelection> {
     ctes?: DbCte<any>[],
     collectionStrategy?: CollectionStrategyType,
     chainId?: number,
-    lateralSets?: LateralSetJoin[]
+    lateralSets?: LateralSetJoin[],
+    lateralNavigations?: readonly string[]
   ) {
     this.schema = schema;
     this.client = client;
     // A condition value in the projection selects as a boolean column
     this.selector = selectorProjectingConditions(selector);
     this.chainId = chainId ?? ++chainIdSeq;
+    this.lateralNavigations = lateralNavigations ?? [];
     this.whereCond = whereCond;
     this.limitValue = limit;
     this.offsetValue = offset;
@@ -1782,7 +1814,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -1931,6 +1964,63 @@ export class SelectQueryBuilder<TSelection> {
       this.whereCond = newCondition;
     }
     return this;
+  }
+
+  /**
+   * Join the reference navigation `navigation` names (`row => row.author`) as a LATERAL probe of its
+   * target's key instead of a plain join:
+   *
+   *   LEFT JOIN LATERAL (SELECT "author__probe".* FROM "authors" "author__probe"
+   *                      WHERE "author__probe"."id" = "books"."author_id" OFFSET 0) "author" ON true
+   *
+   * (INNER JOIN LATERAL for a required navigation). PostgreSQL can only run it as one lookup of the target's
+   * key per row of this query — never as a merge join that reads the target's whole key index, which the
+   * plain join can turn into when the statistics of the foreign-key column end far below the keys the rows
+   * hold. The rows are the ones the plain join reads, and a navigation reached through it
+   * (`row.author.region`) joins off the probe's alias as before.
+   *
+   * Per navigation and opt-in: for a query whose rows are FEW (one parent's lines, a page) over a target
+   * that is LARGE. A navigation the WHERE filters on is the opposite case — the plain join lets PostgreSQL
+   * start from the target's matching rows, the probe does not. Call it once per navigation. Refused by
+   * `update()`, `delete()` and `groupBy()`.
+   *
+   * @example
+   * await db.books
+   *   .where(b => eq(b.shelfId, shelfId))
+   *   .lateralJoin(b => b.author)
+   *   .select(b => ({ title: b.title, author: b.author.name }))
+   *   .toList();
+   */
+  lateralJoin(navigation: (row: any) => unknown): this {
+    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(this.schema, navigation));
+    return this;
+  }
+
+  /**
+   * Whether `join` — a navigation join of this query's FROM — is the join of a navigation `lateralJoin()`
+   * opted in: a reference of the root row, joined from the root table under the alias the build's navigation
+   * plan gives it (its relation name, unless the plan renames it).
+   */
+  private isLateralNavigationJoin(join: { alias: string; sourceAlias?: string }): boolean {
+    if (this.lateralNavigations.length === 0 || (join.sourceAlias && join.sourceAlias !== this.schema.name)) {
+      return false;
+    }
+
+    return this.lateralNavigations.some(name => (this.navigationPlan?.nodeForPath([name])?.alias ?? name) === join.alias);
+  }
+
+  /**
+   * `update()` / `delete()` refuse `lateralJoin()`: their navigations join as `FROM` / `USING` items, and
+   * PostgreSQL lets no LATERAL subquery there read the row the statement writes.
+   */
+  private assertNoLateralNavigation(verb: 'update' | 'delete'): void {
+    if (this.lateralNavigations.length > 0) {
+      throw new Error(
+        `lateralJoin() cannot be combined with ${verb}(): PostgreSQL lets no LATERAL subquery read the row an UPDATE or DELETE `
+        + `writes. Read the value through a correlated scalar subquery instead — db.<target>.where(t => eq(t.<key>, row.<foreignKey>))`
+        + `.select(t => t.<column>).asSubquery('scalar')`
+      );
+    }
   }
 
   /**
@@ -2182,6 +2272,14 @@ export class SelectQueryBuilder<TSelection> {
   groupBy<TGroupingKey>(
     selector: (row: TSelection) => TGroupingKey
   ): GroupedQueryBuilder<TSelection, TGroupingKey> {
+    // A grouped query renders its own joins and has no LATERAL form of them: refused, never dropped
+    if (this.lateralNavigations.length > 0) {
+      throw new Error(
+        `lateralJoin() is not supported on a grouped query (groupBy()): "${this.lateralNavigations.join('", "')}" would join there `
+        + 'as a plain join — drop lateralJoin() from this query'
+      );
+    }
+
     return new GroupedQueryBuilder(
       this.schema,
       this.client,
@@ -2257,7 +2355,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2358,7 +2457,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2431,7 +2531,8 @@ export class SelectQueryBuilder<TSelection> {
       ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2494,7 +2595,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2569,7 +2671,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2640,7 +2743,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      [...this.lateralSets, { set, alias }]
+      [...this.lateralSets, { set, alias }],
+      this.lateralNavigations
     ) as SelectQueryBuilder<UnwrapSelection<TNewSelection>>;
   }
 
@@ -2766,7 +2870,8 @@ export class SelectQueryBuilder<TSelection> {
       this.ctes,
       this.collectionStrategy,
       this.chainId,
-      this.lateralSets
+      this.lateralSets,
+      this.lateralNavigations
     );
   }
 
@@ -4648,6 +4753,7 @@ export class SelectQueryBuilder<TSelection> {
 
   delete(): FluentDelete<TSelection> {
     SelectQueryBuilder.assertWritable(this.schema, 'delete from');
+    this.assertNoLateralNavigation('delete');
     const queryBuilder = this;
 
     const executeDelete = async <TResult>(
@@ -4859,6 +4965,7 @@ export class SelectQueryBuilder<TSelection> {
    */
   update(data: Partial<Record<string, any>> | ((row: TSelection) => Partial<Record<string, any>>)): FluentQueryUpdate<TSelection> {
     SelectQueryBuilder.assertWritable(this.schema, 'update');
+    this.assertNoLateralNavigation('update');
     const queryBuilder = this;
 
     const executeUpdate = async <TResult>(
@@ -7519,6 +7626,11 @@ ${joinClauses.join('\n')}`;
 
     // Add JOINs for single navigation (references)
     for (const join of joins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (this.isLateralNavigationJoin(join)) {
+        fromClause += `\n${renderLateralNavigationJoin(join, join.sourceAlias || this.schema.name)}`;
+        continue;
+      }
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       // Build ON clause for the join
       // For multi-level navigation, use the sourceAlias (the intermediate table)
@@ -7928,6 +8040,11 @@ ${joinClauses.join('\n')}`;
 
     // Add JOINs for single navigation
     for (const join of joins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (this.isLateralNavigationJoin(join)) {
+        fromClause += `\n${renderLateralNavigationJoin(join, join.sourceAlias || this.schema.name)}`;
+        continue;
+      }
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       const sourceTable = join.sourceAlias || this.schema.name;
       const onConditions: string[] = [];
@@ -8420,6 +8537,11 @@ ${joinClauses.join('\n')}`;
 
     // Add JOINs for navigation properties referenced in WHERE clause
     for (const join of navJoins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (this.isLateralNavigationJoin(join)) {
+        fromClause += `\n${renderLateralNavigationJoin(join, join.sourceAlias || this.schema.name)}`;
+        continue;
+      }
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       const sourceTable = join.sourceAlias || this.schema.name;
       const onConditions: string[] = [];
@@ -8566,6 +8688,11 @@ ${joinClauses.join('\n')}`;
 
     // Add JOINs for navigation properties referenced in WHERE clause
     for (const join of joins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (this.isLateralNavigationJoin(join)) {
+        fromClause += `\n${renderLateralNavigationJoin(join, join.sourceAlias || this.schema.name)}`;
+        continue;
+      }
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       // Build ON clause for the join
       // For multi-level navigation, use the sourceAlias (the intermediate table)
@@ -10219,6 +10346,44 @@ interface LevelScope {
   orderKeyNavigationJoins(keys: readonly CollectionOrderKey[]): NavigationJoin[];
 }
 
+/** What a relation of `lateralJoin()`'s row reads as (see lateralNavigationName): the relation's name. */
+const LATERAL_NAVIGATION = Symbol('linkgressLateralNavigation');
+
+/**
+ * The relation `lateralJoin(navigation)` names. The selector runs on a row whose properties are the
+ * relations of `schema` (nothing else), and must return one of them as it is: a reference (many-to-one /
+ * one-to-one) navigation of the row itself. A column, a collection, or a navigation reached through
+ * another one has no join of this row's own to probe — refused, never ignored.
+ */
+const lateralNavigationName = (schema: TableSchema, navigation: (row: any) => unknown): string => {
+  const relations = schema.relations ?? {};
+  const row: Record<string, unknown> = {};
+
+  for (const name of Object.keys(relations)) {
+    row[name] = { [LATERAL_NAVIGATION]: name };
+  }
+
+  const picked = navigation(row);
+  const name = picked != null && typeof picked === 'object' ? (picked as Record<symbol, unknown>)[LATERAL_NAVIGATION] : undefined;
+
+  if (typeof name !== 'string') {
+    throw new Error(
+      `lateralJoin() takes a reference navigation of the "${schema.name}" row itself (row => row.<relation>, a many-to-one or `
+      + 'one-to-one relation of that table) — not a column, and not a navigation reached through another one'
+    );
+  }
+
+  if (relations[name].type !== 'one') {
+    throw new Error(`lateralJoin(): "${name}" is a collection of "${schema.name}" — a LATERAL probe joins a reference (many-to-one / one-to-one) navigation`);
+  }
+
+  return name;
+};
+
+/** `names` with `name` added (once): a new array — the lists are shared by derived builders. */
+const withLateralNavigation = (names: readonly string[], name: string): readonly string[] =>
+  (names.includes(name) ? names : [...names, name]);
+
 /** A join on every key pair of its relation (a constant key part included), its source mapped by `source`. */
 const renderNavigationJoin = (join: NavigationJoin, source: (alias: string) => string): string =>
   `${join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN'} ${quoteTableReference(join.targetTable, join.targetSchema)} "${join.alias}" ON ${join.foreignKeys
@@ -10413,6 +10578,9 @@ export class CollectionQueryBuilder<TItem = any> {
   // The hops as the build in progress renders them (see withRenderedHops); undefined between builds.
   // Never copied to derived builders
   private renderedHops?: HopRendering;
+  // The reference navigations of our item lateralJoin() opted in, by relation name: their joins render as
+  // LATERAL probes of the target's key (see markLateralJoins). Never mutated in place: derived builders share it
+  private lateralNavigations: readonly string[] = [];
 
   /**
    * @internal The mock row whose navigation getter minted this collection — a collection's item, or a
@@ -10534,6 +10702,7 @@ export class CollectionQueryBuilder<TItem = any> {
     newBuilder.itemRelationName = this.itemRelationName;
     newBuilder.itemConstraints = this.itemConstraints;
     newBuilder.itemBaseOrder = this.itemBaseOrder;
+    newBuilder.lateralNavigations = this.lateralNavigations;
     newBuilder.mintedBy = this.mintedBy;
     newBuilder.chainId = this.chainId;
     // The item the filter and the order keys were written on is the item the projection reads (as a
@@ -10598,6 +10767,7 @@ export class CollectionQueryBuilder<TItem = any> {
     snapshot.itemRelationName = this.itemRelationName;
     snapshot.itemConstraints = this.itemConstraints;
     snapshot.itemBaseOrder = this.itemBaseOrder;
+    snapshot.lateralNavigations = this.lateralNavigations;
     snapshot.innerProjection = this.innerProjection;
     snapshot.mintedBy = this.mintedBy;
     snapshot.chainId = this.chainId;
@@ -10643,6 +10813,43 @@ export class CollectionQueryBuilder<TItem = any> {
       this.whereCond = newCondition;
     }
     return this;
+  }
+
+  /**
+   * Join the reference navigation of the collection's item that `navigation` names (`it => it.author`) as a
+   * LATERAL probe of its target's key instead of a plain join — see {@link SelectQueryBuilder.lateralJoin}.
+   * The collection's rows (one parent's) drive; under every strategy (lateral, cte, temptable) the probe
+   * reads the foreign key of the row the strategy renders the item as.
+   *
+   * @example
+   * db.shelves.select(s => ({
+   *   books: s.books.lateralJoin(b => b.author).select(b => ({ title: b.title, author: b.author.name })).toList(),
+   * }))
+   */
+  lateralJoin(navigation: (item: TItem) => unknown): this {
+    // In place, like where() — and flagged likewise (see writtenInPlace)
+    this.writtenInPlace = true;
+
+    if (this.hops.length > 0) {
+      throw CollectionQueryBuilder.flattenedLateralError(this.relationName);
+    }
+
+    const schema = this.targetTableSchema ?? this.schemaRegistry?.get(this.targetTable);
+
+    if (schema === undefined) {
+      throw new Error(`lateralJoin(): the schema of "${this.targetTable}" is unknown — its relations cannot be read`);
+    }
+
+    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(schema, navigation as (item: any) => unknown));
+    return this;
+  }
+
+  /**
+   * `lateralJoin()` and `selectMany()` do not combine, in either order: the flattened items join from their
+   * hops, which have no LATERAL form — the opt-in would be dropped.
+   */
+  private static flattenedLateralError(relation: string): Error {
+    return new Error(`lateralJoin() is not supported on a collection flattened by selectMany() ("${relation}") — join the navigation plainly there`);
   }
 
   /**
@@ -11052,11 +11259,19 @@ export class CollectionQueryBuilder<TItem = any> {
     const relation = this.itemRelationName ?? this.relationName;
     this.assertFlattenable(relation);
 
+    if (this.lateralNavigations.length > 0) {
+      throw CollectionQueryBuilder.flattenedLateralError(relation);
+    }
+
     const item = this.createMockItem();
     // After select(), the selector is handed the projection: the collection it returns is one the
     // projection holds (base handed it the item itself — right only for a field named like the navigation)
     const projected = this.selector !== undefined;
     const inner = this.flattenedCollectionOf(selector(projected ? this.selector!(item) : item), relation, projected);
+
+    if (inner.lateralNavigations.length > 0) {
+      throw CollectionQueryBuilder.flattenedLateralError(inner.itemRelationName ?? inner.relationName);
+    }
 
     // The inner collection's rows — and those of its own hops — were minted with a chain of their own;
     // the flattened collection owns them now (they are its items and its hops)
@@ -11967,7 +12182,13 @@ export class CollectionQueryBuilder<TItem = any> {
     // ours that is the inverse of our key IS the row we correlate to — under the alias that row renders
     // under here (the table's name read another row once the enclosing subquery took an alias)
     const itemNavigationJoins = this.resolveWhereNavigationJoins(correlationSource);
+    this.markLateralJoins(itemNavigationJoins);
     for (const nav of itemNavigationJoins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (nav.lateral === true) {
+        allJoins.push(renderLateralNavigationJoin(nav, ownRef(nav.sourceAlias)));
+        continue;
+      }
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
@@ -12680,6 +12901,29 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     return nodes;
+  }
+
+  /**
+   * Marks, in `joins` — a list the build in progress made — the joins of the navigations `lateralJoin()`
+   * opted in: a reference of our item, joined from our table under the alias the build's navigation plan
+   * gives it (its relation name, unless the plan renames it). Each is replaced by a copy with `lateral` set
+   * (join objects are shared with other builds), which every renderer of a collection's joins draws as the
+   * LATERAL probe (see renderLateralNavigationJoin).
+   */
+  private markLateralJoins(joins: NavigationJoin[]): void {
+    if (this.lateralNavigations.length === 0) {
+      return;
+    }
+
+    const aliases = new Set(this.lateralNavigations.map(name => this.navigationPlan?.nodeForPath([name])?.alias ?? name));
+
+    for (let i = 0; i < joins.length; i++) {
+      const join = joins[i];
+
+      if (join.sourceAlias === this.targetTable && aliases.has(join.alias)) {
+        joins[i] = { ...join, lateral: true };
+      }
+    }
   }
 
   /**
@@ -13866,6 +14110,9 @@ export class CollectionQueryBuilder<TItem = any> {
         navigationJoins.push(nav);
       }
     }
+
+    // The navigations lateralJoin() opted in join as LATERAL probes of their target's key
+    this.markLateralJoins(navigationJoins);
 
     // Step 5a: What was written on the collections a selectMany() flattened us through (our hops) —
     // their filters and limits, each under its hop's alias — and the limits on our items (see

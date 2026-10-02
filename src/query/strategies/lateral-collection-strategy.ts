@@ -9,7 +9,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { formatJoinValue, buildCollectionCorrelationWhere, quoteTableReference } from '../join-utils';
+import { formatJoinValue, buildCollectionCorrelationWhere, quoteTableReference, renderLateralNavigationJoin } from '../join-utils';
 import { LateralSqlCache } from '../lateral-sql-cache';
 
 /** Key-part separator: a control character no alias, column name or SQL text contains. */
@@ -28,7 +28,7 @@ const appendNavigationJoinsKey = (key: string, joins: NavigationJoin[] | undefin
 
   for (const join of joins) {
     key += join.alias + KEY_SEP + join.targetTable + KEY_SEP + (join.targetSchema ?? '') + KEY_SEP
-      + listKey(join.foreignKeys) + KEY_SEP + listKey(join.matches) + KEY_SEP + (join.isMandatory ? 'I' : 'L') + KEY_SEP
+      + listKey(join.foreignKeys) + KEY_SEP + listKey(join.matches) + KEY_SEP + (join.isMandatory ? 'I' : 'L') + (join.lateral === true ? 'P' : '') + KEY_SEP
       + join.sourceAlias + KEY_SEP + (aliasMap?.get(join.sourceAlias) ?? '') + KEY_SEP;
   }
 
@@ -593,6 +593,31 @@ WHERE ${whereSQL})`;
     const joinClauses: string[] = [];
 
     for (const join of navigationJoins) {
+      // Use innerTableAlias if the source alias matches the collection's target table or relation name
+      // This handles the case where we've aliased the main FROM table
+      let sourceAlias = join.sourceAlias;
+      if (pathHops !== undefined && pathHops.includes(join)) {
+        // The first hop reads the enclosing row: a parent lateral exposes it under its own alias
+        if (join === pathHops[0] && lateralAliasMap && lateralAliasMap.has(sourceAlias)) {
+          sourceAlias = lateralAliasMap.get(sourceAlias)!;
+        }
+      } else if (targetTable && sourceAlias === targetTable) {
+        // This join's source is the current collection's table - use inner alias
+        sourceAlias = innerTableAlias;
+      } else if (sourceAlias === relationName) {
+        sourceAlias = innerTableAlias;
+      } else if (lateralAliasMap && lateralAliasMap.has(sourceAlias)) {
+        // For nested collections, if the source references a parent collection's table,
+        // use the parent's aliased name from the map
+        sourceAlias = lateralAliasMap.get(sourceAlias)!;
+      }
+
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (join.lateral === true) {
+        joinClauses.push(renderLateralNavigationJoin(join, sourceAlias));
+        continue;
+      }
+
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       const qualifiedTable = quoteTableReference(join.targetTable, join.targetSchema);
 
@@ -603,24 +628,6 @@ WHERE ${whereSQL})`;
       for (let i = 0; i < join.foreignKeys.length; i++) {
         const fk = join.foreignKeys[i];
         const pk = join.matches[i] || 'id';
-        // Use innerTableAlias if the source alias matches the collection's target table or relation name
-        // This handles the case where we've aliased the main FROM table
-        let sourceAlias = join.sourceAlias;
-        if (pathHops !== undefined && pathHops.includes(join)) {
-          // The first hop reads the enclosing row: a parent lateral exposes it under its own alias
-          if (join === pathHops[0] && lateralAliasMap && lateralAliasMap.has(sourceAlias)) {
-            sourceAlias = lateralAliasMap.get(sourceAlias)!;
-          }
-        } else if (targetTable && sourceAlias === targetTable) {
-          // This join's source is the current collection's table - use inner alias
-          sourceAlias = innerTableAlias;
-        } else if (sourceAlias === relationName) {
-          sourceAlias = innerTableAlias;
-        } else if (lateralAliasMap && lateralAliasMap.has(sourceAlias)) {
-          // For nested collections, if the source references a parent collection's table,
-          // use the parent's aliased name from the map
-          sourceAlias = lateralAliasMap.get(sourceAlias)!;
-        }
         onConditions.push(`${formatJoinValue(sourceAlias, fk)} = ${formatJoinValue(join.alias, pk)}`);
       }
 

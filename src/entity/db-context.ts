@@ -3013,6 +3013,12 @@ export interface EntityCollectionQuery<TEntity extends DbEntity> {
   // Filtering
   where(condition: (item: EntityQuery<TEntity>) => Condition): this;
 
+  /**
+   * Join the item's reference navigation `navigation` names (`it => it.author`) as a LATERAL probe of its
+   * target's key instead of a plain join — see {@link IEntityQueryable.lateralJoin}. Call it before select().
+   */
+  lateralJoin(navigation: (item: EntityQuery<TEntity>) => unknown): this;
+
   // Ordering and pagination
   orderBy<T>(selector: (item: EntityQuery<TEntity>) => T): this;
   orderBy<T>(selector: (item: EntityQuery<TEntity>) => T[]): this;
@@ -3113,6 +3119,16 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Add a WHERE condition. Multiple where() calls are chained with AND logic.
    */
   where(condition: (entity: EntityQuery<TEntity>) => Condition): IEntityQueryable<TEntity>;
+
+  /**
+   * Join the reference navigation `navigation` names (`b => b.author`) as a LATERAL probe of its target's key
+   * instead of a plain join — `LEFT JOIN LATERAL (SELECT … FROM <target> WHERE <key> = <foreign key> OFFSET 0)
+   * "<alias>" ON true`, INNER for a required navigation: one key lookup per row, whatever the statistics of
+   * the foreign-key column say. Same rows as the plain join. Opt-in per navigation, for a query whose rows
+   * are few over a large target — never for a navigation the WHERE filters the rows by. Refused by
+   * update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
+   */
+  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity>;
 
   /**
    * INNER JOIN used purely as a row FILTER — keeps the entity shape (no
@@ -4316,6 +4332,13 @@ export class DbEntityTable<TEntity extends DbEntity> {
       .where(condition as any)
       .select(allColumnsSelector);
     return queryBuilder as any as IEntityQueryable<TEntity>;
+  }
+
+  /**
+   * Join a reference navigation as a LATERAL probe of its target's key — see {@link IEntityQueryable.lateralJoin}.
+   */
+  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity> {
+    return (this.selectAllQuery() as any).lateralJoin(navigation) as IEntityQueryable<TEntity>;
   }
 
   /**

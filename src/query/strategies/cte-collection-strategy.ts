@@ -8,7 +8,7 @@ import {
   NavigationJoin,
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
-import { formatJoinValue, buildLiteralOnlyPredicates, quoteTableReference } from '../join-utils';
+import { formatJoinValue, buildLiteralOnlyPredicates, quoteTableReference, renderLateralNavigationJoin } from '../join-utils';
 
 /** A column of an aggregation's inner SELECT output: its alias and the (qualified) expression it selects. */
 interface OutputColumn {
@@ -238,6 +238,12 @@ export class CteCollectionStrategy implements ICollectionStrategy {
     const joinClauses: string[] = [];
 
     for (const join of navigationJoins) {
+      // A navigation lateralJoin() opted in: a LATERAL probe of its target's key
+      if (join.lateral === true) {
+        joinClauses.push(renderLateralNavigationJoin(join, join.sourceAlias));
+        continue;
+      }
+
       const joinType = join.isMandatory ? 'INNER JOIN' : 'LEFT JOIN';
       const qualifiedTable = quoteTableReference(join.targetTable, join.targetSchema);
 

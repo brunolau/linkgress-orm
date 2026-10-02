@@ -107,6 +107,11 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Performance comparison and benchmarking
   - Security considerations
 
+- **[Lateral Navigation Joins](./guides/lateral-navigation-joins.md)** - `lateralJoin()`: one reference navigation as a key probe per row
+  - `LEFT / INNER JOIN LATERAL (… WHERE <key> = <foreign key> OFFSET 0) ON true` — no merge join over the target's whole key index
+  - When to use it (few rows, large target, lagging foreign-key statistics) and when not (a navigation the WHERE filters by)
+  - Root queries and collections under every strategy; batches, unions, prepared statements; what is refused
+
 - **[Subqueries](./guides/subquery-guide.md)** - Using subqueries in queries
   - Scalar subqueries
   - Array subqueries
