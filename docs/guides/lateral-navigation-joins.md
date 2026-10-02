@@ -63,6 +63,19 @@ join of this query and nothing else — every other navigation, and every other 
 
 - **Root queries** — on a table (`db.books.lateralJoin(...)`), after `where()`, and on the untyped builders
   (`QueryBuilder`, `SelectQueryBuilder`). Call it once per navigation to probe several.
+- **After `select()`** — and on every other select builder: `selectDistinct()`, `innerJoin()` / `leftJoin()`,
+  the end of the chain, or a builder taken as an `IEntityQueryable`. The selector names a navigation of the
+  query's ROOT row (`b => b.author`), whatever the projection; the projection and the chain are kept. The
+  navigation joins are rendered when the query is built, so the call order does not matter — the statement is
+  the one the same `lateralJoin()` renders before `select()`:
+
+  ```typescript
+  db.books
+    .where(b => eq(b.shelfId, shelfId))
+    .select(b => ({ title: b.title, author: b.author.name }))
+    .lateralJoin(b => b.author) // the same statement as .lateralJoin(b => b.author).select(…)
+    .orderBy(r => r.title)
+  ```
 - **Collections** — before `select()`: the collection's rows (one parent's) drive, and the probe reads the
   foreign key of the row the strategy renders the item as, under every strategy (`lateral`, `cte`, `temptable`):
 

@@ -24,6 +24,7 @@
 import { describe, test, expect } from 'bun:test';
 import { withCapturedSql } from '../utils/test-database';
 import { expectToReject } from '../utils/expect-rejects';
+import { AssertType } from '../utils/type-tester';
 import {
   DatabaseClient,
   DbContext,
@@ -31,6 +32,7 @@ import {
   DbModelConfig,
   DbEntity,
   DbColumn,
+  IEntityQueryable,
   QueryBatch,
   boolean,
   integer,
@@ -394,6 +396,110 @@ describe('lateralJoin() — root query', () => {
       const probedMax = await north(true).select(b => ({ id: b.id })).max(r => r.id);
       expect(probedMax).toBe(plainMax);
       expect(lastStatement(captured)).toContain(AUTHOR_PROBE);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The select builder
+// ---------------------------------------------------------------------------
+
+/** A query taken as code written before lateralJoin() existed takes one: any builder of a table's rows. */
+interface QueryOptions {
+  baseQuery: IEntityQueryable<any>;
+}
+
+const baseQueryOf = (options: QueryOptions): IEntityQueryable<any> => options.baseQuery;
+
+describe('lateralJoin() — the select builder', () => {
+  test('every select builder is an IEntityQueryable, as before lateralJoin() existed, and probes through it', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      // 1.0.23 added lateralJoin() to IEntityQueryable but not to EntitySelectQueryBuilder — the type of select(),
+      // selectDistinct(), innerJoin(), leftJoin() and their chains — and every assignment below, each of which
+      // compiled on 1.0.22, failed to compile:
+      //   TS2741: Property 'lateralJoin' is missing in type 'EntitySelectQueryBuilder<LnjBook, …>'
+      //           but required in type 'IEntityQueryable<any>'.
+      const filtered: IEntityQueryable<any> = db.lnjBooks.where(b => gt(b.id, 0)).select(b => ({ id: b.id, author: b.author!.name }));
+      const projected: IEntityQueryable<any> = db.lnjBooks.select(b => ({ id: b.id, author: b.author!.name }));
+      const distinct: IEntityQueryable<any> = db.lnjBooks.selectDistinct(b => ({ author: b.author!.name }));
+      const chained: IEntityQueryable<any> = db.lnjBooks
+        .select(b => ({ id: b.id, author: b.author!.name }))
+        .where(r => gt(r.id, 0))
+        .orderBy(r => r.id)
+        .limit(3)
+        .offset(1);
+      const joined: IEntityQueryable<any> = db.lnjBooks
+        .innerJoin(db.lnjShelves, (b, s) => eq(b.shelfId, s.id), (b, s) => ({ id: b.id, author: b.author!.name, label: s.label }));
+      const leftJoined: IEntityQueryable<any> = db.lnjBooks
+        .leftJoin(db.lnjShelves, (b, s) => eq(b.shelfId, s.id), (b, s) => ({ id: b.id, author: b.author!.name, label: s.label }));
+      const options: QueryOptions = { baseQuery: db.lnjBooks.where(b => gt(b.id, 0)).select(b => ({ id: b.id, author: b.author!.name })) };
+      // Not run: PostgreSQL refuses FOR UPDATE on the nullable side of an outer join, plain or probed
+      const locking: IEntityQueryable<any> = db.lnjBooks.select(b => ({ id: b.id, author: b.author!.name })).withTimeout(5_000).forUpdate();
+      // The table always was one
+      const table: IEntityQueryable<LnjBook> = db.lnjBooks;
+
+      expect(typeof locking.lateralJoin).toBe('function');
+      expect(typeof table.lateralJoin).toBe('function');
+
+      // Through the interface, lateralJoin() swaps the author's plain join for the probe and changes nothing else
+      // (rows compared as sets: without an ORDER BY, the two joins may return them in different orders)
+      const rowSet = (rows: unknown[]): string[] => rows.map(row => JSON.stringify(row)).sort();
+
+      for (const query of [filtered, projected, distinct, chained, joined, leftJoined, options.baseQuery]) {
+        const plainRows = await query.toList();
+        const plainText = lastStatement(captured);
+        const probedRows = await query.lateralJoin(b => b.author).toList();
+        const probedText = lastStatement(captured);
+
+        expect(plainText).toContain(AUTHOR_PLAIN);
+        expect(probedText).toContain(AUTHOR_PROBE);
+        expect(probedText.replace(AUTHOR_PROBE, AUTHOR_PLAIN)).toBe(plainText);
+        expect(probedRows.length).toBeGreaterThan(0);
+        expect(rowSet(probedRows)).toEqual(rowSet(plainRows));
+      }
+
+      expect(await baseQueryOf(options).count()).toBe(5);
+    });
+  });
+
+  test('lateralJoin() after select() renders the statement it renders before select(), and reads the same rows', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const project = (query: IEntityQueryable<LnjBook>) =>
+        query.select(b => ({ id: b.id, title: b.title, author: b.author!.name, region: b.author!.region!.name }));
+      const run = async (query: { toList(): Promise<object[]> }) => ({ rows: await query.toList(), text: lastStatement(captured) });
+
+      const plain = await run(project(db.lnjBooks.where(b => gt(b.id, 0))).orderBy(r => r.id));
+      const before = await run(project(db.lnjBooks.where(b => gt(b.id, 0)).lateralJoin(b => b.author)).orderBy(r => r.id));
+
+      // The select builder's own lateralJoin() keeps the builder — its projection, and the chain after it
+      const projected = project(db.lnjBooks.where(b => gt(b.id, 0)));
+      const probed = projected.lateralJoin(b => b.author);
+      const kept: AssertType<typeof probed, typeof projected> = probed;
+      const after = await run(kept.orderBy(r => r.id));
+
+      // At the end of the chain, and through the IEntityQueryable a caller took the builder as
+      const last = await run(project(db.lnjBooks.where(b => gt(b.id, 0))).orderBy(r => r.id).lateralJoin(b => b.author));
+      const taken = await run(
+        baseQueryOf({ baseQuery: project(db.lnjBooks.where(b => gt(b.id, 0))).orderBy(r => r.id) }).lateralJoin(b => b.author),
+      );
+
+      expect(before.text).toContain(AUTHOR_PROBE);
+      expect(before.text).toContain('LEFT JOIN "lnj_regions" AS "region" ON "author"."region_id" = "region"."id"');
+      expect(before.text.replace(AUTHOR_PROBE, AUTHOR_PLAIN)).toBe(plain.text);
+      expect(before.rows).toEqual(plain.rows);
+
+      for (const probedRun of [after, last, taken]) {
+        expect(probedRun.text).toBe(before.text);
+        expect(probedRun.rows).toEqual(plain.rows);
+      }
+
+      expect((after.rows as Array<{ title: string; author?: string; region?: string }>).map(r => [r.title, value(r.author), value(r.region)])).toEqual([
+        ['Alpha', 'Ann', 'North'],
+        ['Beta', 'Ben', 'South'],
+        ['Gamma', null, null],
+        ['Delta', 'Cyd', null],
+        ['Eps', 'Ann', 'North'],
+      ]);
     });
   });
 });

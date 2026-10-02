@@ -3370,6 +3370,14 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
     condition: (entity: TSelection extends DbEntity ? EntityQuery<TSelection> : ToFieldRefs<TSelection>) => Condition
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
+  /**
+   * Join a reference navigation of the query's ROOT row (`b => b.author`, whatever the projection) as a LATERAL
+   * probe of its target's key — see {@link IEntityQueryable.lateralJoin}. The navigation joins are rendered when
+   * the query is built, so the mark renders the same statement here — after select(), selectDistinct(), a join,
+   * or at the end of the chain — as before select(). The projection and the chain are kept.
+   */
+  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): EntitySelectQueryBuilder<TEntity, TSelection>;
+
   /** INNER JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.joinFilter}. */
   joinFilter<TRight extends DbEntity>(
     rightTable: DbEntityTable<TRight>,
