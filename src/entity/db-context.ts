@@ -35,8 +35,10 @@ import { DbSchemaManager } from '../migration/db-schema-manager';
 import { splitViewsFromRegistry } from '../migration/view-sql';
 import { renderViewDefinition } from '../migration/view-query-sql';
 import { DbSequence, SequenceConfig, renderSequenceOptions } from '../schema/sequence-builder';
-import type { DbCte } from '../query/cte-builder';
-import { projectedColumnRef } from '../query/cte-builder';
+import type { DbCte, CompiledStatement } from '../query/cte-builder';
+import {
+  attachReturningSelection, cteDeclarationAt, declareStatementCtes, NestedDataModifyingCteError, projectedColumnRef,
+} from '../query/cte-builder';
 import { CteRootQueryBuilder } from '../query/cte-root-query';
 import { AliasedScope } from '../query/aliased-scope';
 import { SetQueryBuilder } from '../query/set-returning';
@@ -103,6 +105,16 @@ interface ReturningNavigationRenderInfo {
   navigationFields: Map<string, ReturningNavigationField>;
   nestedObjects?: Map<string, any>;
   collectionFields?: Map<string, any>;
+}
+
+/**
+ * A bare INSERT of a table (no RETURNING) and the CTE declarations its statement-level WITH carries
+ * (`"name" AS (…), …`, their parameters at the head of `params`) — `insertFrom`'s `with`.
+ */
+interface InsertStatement {
+  sql: string;
+  params: any[];
+  prefixCtes?: string;
 }
 
 /** Composition hooks of a navigation RETURNING, used by `insertWithChildren` and `mergeBulk`. */
@@ -1138,6 +1150,10 @@ export interface FluentInsert<TEntity extends DbEntity> extends PromiseLike<void
   returning(): PromiseLike<UnwrapDbColumns<TEntity>>;
   /** Return selected columns from the inserted row */
   returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>>;
+  /**
+   * Compile this INSERT into `{ sql, params }` WITHOUT executing it — see {@link FluentInsertMany.toStatement}.
+   */
+  toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult): import('../query/cte-builder').CompiledStatement<UnwrapSelection<TResult>>;
 }
 
 /**
@@ -1212,6 +1228,20 @@ export interface FluentInsertMany<TEntity extends DbEntity> extends PromiseLike<
   returning(): PromiseLike<UnwrapDbColumns<TEntity>[]>;
   /** Return selected columns from the inserted rows */
   returning<TResult>(selector: (entity: EntityQuery<TEntity>) => TResult): PromiseLike<ReturningRow<TResult>[]>;
+  /**
+   * Compile this INSERT into `{ sql, params }` WITHOUT executing it — exactly the statement execution
+   * runs (the same columns, `ON CONFLICT DO NOTHING`, `OVERRIDING SYSTEM VALUE`, values bound through
+   * the columns' mappers), `$1`-based, with the selector's columns as its RETURNING (none without a
+   * selector). Attach the result as a data-modifying CTE via {@link DbCteBuilder.withMutation} — typed
+   * by the selector's row, each column read through its mapper. Only a plain RETURNING compiles (the
+   * row's own columns, `sql` expressions over them, constants): a navigation or a collection is refused.
+   *
+   * A compiled statement is ONE statement: rows that execution would split into several chunks (the
+   * `chunkSize` option, or the automatic one under PostgreSQL's 65 535-parameter limit) are refused, as
+   * are zero rows. On `insertFrom(...)`, a statement whose `with` declares a data-modifying CTE is
+   * refused (PostgreSQL allows those only at the top level).
+   */
+  toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult): import('../query/cte-builder').CompiledStatement<UnwrapSelection<TResult>>;
 }
 
 /**
@@ -1233,6 +1263,15 @@ export type InsertFromValues<TEntity> = {
 export interface InsertFromOptions<TSource> {
   /** Insert only the source rows this condition holds for (`WHERE <condition>` over `"src"`). */
   where?: (src: InsertFromSourceRow<TSource>) => Condition;
+  /**
+   * CTEs the statement declares at its top level — `WITH <ctes> INSERT INTO … SELECT …` — in this order,
+   * their parameters first. Everything nested in the statement (the source, the map's expressions,
+   * `where`) reads them by name: the source is typically `db.selectFromCte(cte)…asSubquery('table')`.
+   * This is how a data-modifying CTE ({@link DbCteBuilder.withMutation}, e.g. over
+   * `insertBulk(...).toStatement(...)`) feeds the insert in ONE statement — PostgreSQL allows such a CTE
+   * only at the top level, so the source cannot declare it itself.
+   */
+  with?: readonly DbCte<any>[];
   /**
    * SQLSTATEs the statement is expected to fail with (a unique violation a caller retries): still thrown,
    * not reported by the failed-query logger — see {@link StatementExecutionOptions.expectedErrorCodes}.
@@ -4566,6 +4605,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
             ).then(onfulfilled, onrejected);
           }
         };
+      },
+      toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
+        return bulkBuilder.toStatement(selector);
       }
     };
   }
@@ -4620,6 +4662,20 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const table = this;
     const dataArray = Array.isArray(value) ? value : [value];
 
+    // The rows one statement takes: the `chunkSize` option, or ~60 % of what fits PostgreSQL's
+    // 65 535-parameter limit
+    const resolveChunkSize = (): number => {
+      if (options?.chunkSize != null) {
+        return options.chunkSize;
+      }
+
+      const POSTGRES_MAX_PARAMS = 65535;
+      const columnCount = Object.keys(dataArray[0]).length;
+      const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
+
+      return Math.floor(maxRowsPerBatch * 0.6);
+    };
+
     const executeInsertBulk = async <TResult>(
       returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
     ): Promise<any> => {
@@ -4627,14 +4683,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
         return returning === undefined ? undefined : [];
       }
 
-      // Calculate chunk size
-      let chunkSize = options?.chunkSize;
-      if (chunkSize == null) {
-        const POSTGRES_MAX_PARAMS = 65535;
-        const columnCount = Object.keys(dataArray[0]).length;
-        const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-        chunkSize = Math.floor(maxRowsPerBatch * 0.6);
-      }
+      const chunkSize = resolveChunkSize();
 
       // Process in chunks if needed
       if (dataArray.length > chunkSize) {
@@ -4667,6 +4716,31 @@ export class DbEntityTable<TEntity extends DbEntity> {
             return executeInsertBulk(returningConfig).then(onfulfilled, onrejected);
           }
         };
+      },
+      toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
+        if (dataArray.length === 0) {
+          throw new Error(`toStatement(): insertBulk() into "${table._getSchema().name}" has no rows — an empty insert compiles to no statement`);
+        }
+
+        const chunkSize = resolveChunkSize();
+
+        // Execution would run these rows as several statements: one compiled statement holding them all
+        // would not be what execution runs (and may not bind), one chunk of them would drop the rest
+        if (dataArray.length > chunkSize) {
+          throw new Error(
+            `toStatement(): ${dataArray.length} rows exceed the ${chunkSize}-row chunk of one insert into "${table._getSchema().name}" — `
+            + `insertBulk() would execute them as ${Math.ceil(dataArray.length / chunkSize)} statements, a compiled statement is one. `
+            + 'Compile the rows in batches of at most that many.'
+          );
+        }
+
+        const built = table._buildInsertBulkStatement(dataArray, options?.overridingSystemValue, options?.onConflictDoNothing);
+
+        if (!built) {
+          throw new Error(`toStatement(): the rows resolve to no insertable column of "${table._getSchema().name}"`);
+        }
+
+        return table.compileInsertStatement(built, selector);
       }
     };
   }
@@ -4713,9 +4787,10 @@ export class DbEntityTable<TEntity extends DbEntity> {
       ? { expectedErrorCodes: options.expectedErrorCodes }
       : undefined;
 
+    const build = () => table.buildInsertFromStatement(source, map, options?.where, options?.with);
     const executeInsertFrom = async <TResult>(
       returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
-    ): Promise<any> => table.runInsertStatement(table.buildInsertFromStatement(source, map, options?.where), returning, execution);
+    ): Promise<any> => table.runInsertStatement(build(), returning, execution);
 
     return {
       then<TResult1 = void, TResult2 = never>(
@@ -4734,23 +4809,41 @@ export class DbEntityTable<TEntity extends DbEntity> {
             return executeInsertFrom(returningConfig).then(onfulfilled, onrejected);
           }
         };
+      },
+      toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
+        const dataModifying = options?.with?.find(cte => cte.dataModifying);
+
+        // As a CTE body the statement's own WITH would be nested — where PostgreSQL refuses a DML CTE
+        if (dataModifying) {
+          throw new Error(
+            `toStatement(): this insertFrom() declares the data-modifying CTE "${dataModifying.name}", which PostgreSQL allows only at `
+            + 'the top level of the statement that executes — execute it, or declare that CTE on the statement this one would be a CTE of.'
+          );
+        }
+
+        return table.compileInsertStatement(build(), selector);
       }
     };
   }
 
-  /** The bare statement of {@link insertFrom} (no RETURNING). @internal */
+  /**
+   * The bare statement of {@link insertFrom} (no RETURNING): the INSERT, and the `with` CTEs as the
+   * declarations its WITH carries (`prefixCtes` — a navigation RETURNING declares them before its own
+   * mutation CTE). The parameters number in statement order: the CTEs', the source's, the SELECT list's,
+   * then `where`'s. @internal
+   */
   private buildInsertFromStatement<TSource extends Record<string, any>>(
     source: Subquery<TSource, 'table'>,
     map: (src: InsertFromSourceRow<TSource>) => InsertFromValues<TEntity>,
-    where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined
-  ): { sql: string; params: any[] } {
+    where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined,
+    ctes: readonly DbCte<any>[] | undefined
+  ): InsertStatement {
     const candidate = source as any;
 
     if (candidate == null || typeof candidate.buildSql !== 'function' || typeof candidate.isTable !== 'function' || !candidate.isTable()) {
       throw new TypeError("insertFrom: the source must be a table subquery — build it with .asSubquery('table')");
     }
 
-    const schema = this._getSchema();
     const src = DbEntityTable.insertFromSourceRow<TSource>(source);
     const values = map(src);
 
@@ -4759,6 +4852,69 @@ export class DbEntityTable<TEntity extends DbEntity> {
     }
 
     const context: SqlBuildContext = { paramCounter: 1, params: [] };
+    const declarations = DbEntityTable.declareInsertFromCtes(ctes ?? [], context);
+
+    try {
+      return { ...this.renderInsertFrom(source, src, values, where, context), prefixCtes: declarations };
+    } catch (error) {
+      // A data-modifying CTE the statement reads but does not declare: the nested read was told to
+      // `.with()` it on the executing query — here, that is insertFrom's own `with` option
+      if (error instanceof NestedDataModifyingCteError) {
+        throw new Error(
+          `insertFrom: the statement reads the data-modifying CTE "${error.cteName}", which PostgreSQL allows only at the top `
+          + `level of the statement — pass it in insertFrom's options: { with: [${error.cteName}Cte] }`
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * The WITH entries of an insertFrom statement's `with` CTEs, their parameters first in `context` (each
+   * body renumbered from where its parameters land), and the CTEs declared at statement level for every
+   * nested build — read by name there, neither re-declared nor re-bound. A name declared twice by two
+   * different CTEs is refused. `undefined` without CTEs.
+   */
+  private static declareInsertFromCtes(ctes: readonly DbCte<any>[], context: SqlBuildContext): string | undefined {
+    if (ctes.length === 0) {
+      return undefined;
+    }
+
+    const declared = new Map<string, DbCte<any>>();
+    const entries: string[] = [];
+
+    for (const cte of ctes) {
+      const previous = declared.get(cte.name);
+
+      if (previous === cte) {
+        continue;
+      }
+
+      if (previous !== undefined) {
+        throw new Error(`insertFrom: two different CTEs named "${cte.name}" in options.with`);
+      }
+
+      declared.set(cte.name, cte);
+      entries.push(cteDeclarationAt(cte, context.paramCounter));
+      context.params.push(...cte.params);
+      context.paramCounter += cte.params.length;
+    }
+
+    context.hoistedCteNames = declareStatementCtes(undefined, [...declared.values()]);
+
+    return entries.join(',\n');
+  }
+
+  /** The `INSERT … SELECT … FROM (<source>) AS "src" [WHERE …]` of {@link buildInsertFromStatement}. */
+  private renderInsertFrom<TSource extends Record<string, any>>(
+    source: Subquery<TSource, 'table'>,
+    src: InsertFromSourceRow<TSource>,
+    values: InsertFromValues<TEntity>,
+    where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined,
+    context: SqlBuildContext
+  ): { sql: string; params: any[] } {
+    const schema = this._getSchema();
     const sourceSql = source.buildSql(context);
     const columns: string[] = [];
     const selectList: string[] = [];
@@ -5544,7 +5700,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
    * @internal
    */
   private async runInsertStatement<TReturning>(
-    built: { sql: string; params: any[] },
+    built: InsertStatement,
     returning: TReturning,
     execution?: StatementExecutionOptions
   ): Promise<any[] | void> {
@@ -5558,11 +5714,13 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
 
     if (navigationInfo) {
       // Use CTE-based approach for navigation properties
+      // The statement's own CTEs precede the mutation CTE in the one WITH (a DML CTE cannot nest)
       const { sql, params: queryParams, read } = this.buildReturningWithNavigation(
         built.sql,
         built.params,
         returning as any,
-        navigationInfo
+        navigationInfo,
+        built.prefixCtes ? { prefixCtes: built.prefixCtes } : undefined
       );
 
       const result = executor
@@ -5575,7 +5733,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     // Standard RETURNING (no navigation properties)
     const returningClause = this.buildReturningClause(returning as any, undefined, { paramCounter: built.params.length + 1, params: built.params });
 
-    let sql = built.sql;
+    let sql = DbEntityTable.withPrefixCtes(built);
     if (returningClause) {
       sql += ` RETURNING ${returningClause.sql}`;
     }
@@ -5589,6 +5747,43 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     }
 
     return this.mapReturningResults(result.rows, returningClause);
+  }
+
+  /** The statement text of a bare INSERT: its WITH (when it declares CTEs), then the INSERT. */
+  private static withPrefixCtes(built: InsertStatement): string {
+    return built.prefixCtes ? `WITH ${built.prefixCtes}\n${built.sql}` : built.sql;
+  }
+
+  /**
+   * An INSERT compiled WITHOUT executing (`toStatement()`): the statement {@link runInsertStatement} runs
+   * with a plain RETURNING of the selector's columns — the selection attached, so a data-modifying CTE
+   * over it (`DbCteBuilder.withMutation`) reads each column with its type and mapper. A navigation
+   * RETURNING renders as a SELECT over the insert, which is not a statement a CTE can carry: refused.
+   * @internal
+   */
+  private compileInsertStatement<TResult>(
+    built: InsertStatement,
+    selector: ((entity: EntityQuery<TEntity>) => TResult) | undefined
+  ): CompiledStatement<any> {
+    if (selector != null && this.detectNavigationInReturning(selector as any)) {
+      throw new Error('toStatement(): navigation RETURNING is not supported in compiled INSERT statements — select plain or fragment columns only.');
+    }
+
+    const params = [...built.params];
+    const returningClause = selector != null
+      ? this.buildReturningClause(selector as any, undefined, { paramCounter: params.length + 1, params }, true)
+      : null;
+
+    let sql = DbEntityTable.withPrefixCtes(built);
+    if (returningClause) {
+      sql += ` RETURNING ${returningClause.sql}`;
+    }
+
+    if (params.length > 65535) {
+      throw new Error(`toStatement(): the compiled INSERT into "${this._getSchema().name}" binds ${params.length} parameters — over PostgreSQL's 65 535`);
+    }
+
+    return attachReturningSelection({ sql, params }, returningClause?.selection);
   }
 
   /**
@@ -7391,8 +7586,13 @@ WHERE ${effectiveWhereClause}`.trim();
      * The statement's parameters: an `sql` expression's append here (RETURNING ends the statement
      * text). Without it an expression's parameters had nowhere to go.
      */
-    paramContext: SqlBuildContext
-  ): { sql: string; columns: string[]; read?: ReturningReadPlan } | null {
+    paramContext: SqlBuildContext,
+    /**
+     * A compiled statement (`toStatement()`): constants bind as parameters (SQL reads only what the
+     * statement returns), and the selection is handed back for `attachReturningSelection`.
+     */
+    compiled: boolean = false
+  ): { sql: string; columns: string[]; read?: ReturningReadPlan; selection?: Record<string, unknown> } | null {
     if (returning === undefined) {
       return null; // No RETURNING
     }
@@ -7411,14 +7611,20 @@ WHERE ${effectiveWhereClause}`.trim();
     // renders qualified like a selected one — under MERGE's / bulkUpdate's alias, a bare or
     // table-qualified name is ambiguous or out of scope), literals, or ONE of those
     const { selection, scalar } = returningSelection(returning(this.createMockEntity() as any));
+
+    if (compiled && scalar) {
+      throw new Error('toStatement(): the RETURNING selector must return an object — its keys name the columns the compiled statement returns.');
+    }
+
     const rendered = renderPlainReturning(selection, {
       isOwnColumn: ref => this.isMutatedRowColumn(ref),
       columnSql: ref => `${prefix}"${ref.__dbColumnName}"`,
       columnMapper: ref => this.returningColumnMapper(ref),
       context: paramContext,
+      constantsAsParams: compiled,
     });
 
-    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar } };
+    return { sql: rendered.sql, columns: rendered.columns, read: { shape: rendered.shape, scalar }, selection };
   }
 
   /** Whether a RETURNING ref reads the mutated row itself — not a navigation's table. */
