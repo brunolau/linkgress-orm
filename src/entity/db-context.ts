@@ -4858,12 +4858,11 @@ export class DbEntityTable<TEntity extends DbEntity> {
       return { ...this.renderInsertFrom(source, src, values, where, context), prefixCtes: declarations };
     } catch (error) {
       // A data-modifying CTE the statement reads but does not declare: the nested read was told to
-      // `.with()` it on the executing query — here, that is insertFrom's own `with` option
+      // `.with()` it on the executing query — here, that is insertFrom's own `with` option. Only the
+      // message changes: the error stays the NestedDataModifyingCteError (with its cteName) it always was.
       if (error instanceof NestedDataModifyingCteError) {
-        throw new Error(
-          `insertFrom: the statement reads the data-modifying CTE "${error.cteName}", which PostgreSQL allows only at the top `
-          + `level of the statement — pass it in insertFrom's options: { with: [${error.cteName}Cte] }`
-        );
+        error.message = `insertFrom: the statement reads the data-modifying CTE "${error.cteName}", which PostgreSQL allows only at the top `
+          + `level of the statement — pass it in insertFrom's options: { with: [${error.cteName}Cte] }`;
       }
 
       throw error;

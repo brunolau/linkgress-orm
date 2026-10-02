@@ -5,6 +5,7 @@ import {
 } from '../../src';
 import type { DatabaseClient } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
+import { NestedDataModifyingCteError } from '../../src/query/cte-builder';
 import { createFreshClient } from '../utils/test-database';
 import { expectToReject } from '../utils/expect-rejects';
 
@@ -332,7 +333,10 @@ describe('insert as a data-modifying CTE feeding insertFrom (one statement)', ()
       const landed = db.selectFromCte(ins.cte).select(r => ({ id: r.id, code: r.code })).asSubquery('table');
       const map = (src: any) => ({ action: 'X', source: 'Y', discountId: 1, codeId: src.id, code: src.code, actorType: 'admin' as Actor });
 
-      await expectToReject(db.audit.insertFrom(landed, map), 'insertFrom: the statement reads the data-modifying CTE "ins"');
+      const refusal = await expectToReject(db.audit.insertFrom(landed, map), 'insertFrom: the statement reads the data-modifying CTE "ins"');
+      // Backward compatible: still the NestedDataModifyingCteError (and its cteName) a caller may catch.
+      expect(refusal).toBeInstanceOf(NestedDataModifyingCteError);
+      expect((refusal as NestedDataModifyingCteError).cteName).toBe('ins');
 
       // As a compiled statement it would be a CTE body, where PostgreSQL refuses a nested DML CTE
       expect(() => db.audit.insertFrom(landed, map, { with: [ins.cte] }).toStatement(a => ({ id: a.id })))
