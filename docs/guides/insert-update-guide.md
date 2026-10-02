@@ -218,6 +218,54 @@ const minted = await db.badges
 - `expectedErrorCodes`: SQLSTATEs the statement is expected to fail with. Such a failure is still thrown,
   but the failed-query logger ([`logFailedQueries`](./configuration.md)) does not report it; any other
   failure is reported as always.
+- `with`: CTEs the statement declares at its top level — `WITH <ctes> INSERT INTO … SELECT …`, their
+  parameters first. The source, the map's expressions and `where` read them by name. This is how a
+  data-modifying CTE feeds the insert (see below).
+
+### One statement: a bulk insert feeding another insert
+
+`insertBulk(...).toStatement(selector)` (and `insert(row).toStatement(selector)`) compiles the bulk insert
+WITHOUT executing it — the same columns, `ON CONFLICT DO NOTHING`, `OVERRIDING SYSTEM VALUE` and mappers as
+execution, the selector as its `RETURNING` — into a `CompiledStatement` that
+[`withMutation()`](./cte-guide.md#data-modifying-ctes-withmutation) turns into a data-modifying CTE.
+`insertFrom(..., { with: [cte] })` then inserts one row per row the CTE returns:
+
+```typescript
+const ins = new DbCteBuilder().withMutation(
+  'ins',
+  db.discountCodes
+    .insertBulk(codes.map(c => ({ discountId, code: c.code, userId: c.userId, active: true })), { onConflictDoNothing: true })
+    .toStatement(c => ({ id: c.id, code: c.code, userId: c.userId }))
+);
+
+await db.discountAuditLog.insertFrom(
+  db.selectFromCte(ins.cte).select(r => ({ id: r.id, code: r.code, userId: r.userId })).asSubquery('table'),
+  src => ({
+    action: 'CODE_CREATED',
+    source: caseWhen(isNull(src.userId), 'GENERATE').else('BULK_ASSIGN'),
+    discountId,
+    discountCodeId: src.id,
+    code: src.code,
+    actorAdminId: adminId,
+    customerId: src.userId,
+  }),
+  { with: [ins.cte] }
+);
+// WITH "ins" AS (INSERT INTO "discount_code" (…) VALUES ($1, …), (…) ON CONFLICT DO NOTHING
+//   RETURNING "id" AS "id", "code" AS "code", "user_id" AS "userId")
+// INSERT INTO "discount_audit_log" (…) SELECT CAST($n AS text), CASE WHEN "src"."userId" IS NULL THEN … END, …
+// FROM (SELECT "ins"."id" as "id", … FROM "ins") AS "src"
+```
+
+- A row `ON CONFLICT DO NOTHING` skips is not in the CTE's `RETURNING`, so it gets no audit row.
+- `.returning()` on the outer insert works as usual (a navigation RETURNING declares the statement's CTEs
+  ahead of its own mutation CTE, in the one `WITH`). Note PostgreSQL's snapshot rule: the statement's other
+  parts do not see the rows its CTE inserted in the TABLE — read them from the CTE.
+- `toStatement()` compiles ONE statement: rows that execution would split into chunks (`chunkSize`, or the
+  automatic chunk under PostgreSQL's 65 535-parameter limit) are refused, as are zero rows and a navigation
+  or collection in the selector. Compile larger sets in batches.
+- A data-modifying CTE the source reads but `with` does not declare is refused with a message naming the
+  option; `insertFrom(..., { with: [dmlCte] }).toStatement()` is refused (it would nest the DML CTE).
 
 ## Update Operations
 

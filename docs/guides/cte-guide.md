@@ -576,8 +576,8 @@ met `relation "<cte>" does not exist`), as `count()`, `exists()` and `toList()` 
 
 ## Data-Modifying CTEs: `withMutation()`
 
-`DbCteBuilder.withMutation(name, statement)` attaches a compiled `UPDATE` / `DELETE` — `.toStatement(selector)`
-on an update or a delete — as a data-modifying CTE. The selector is the statement's `RETURNING` list, and it
+`DbCteBuilder.withMutation(name, statement)` attaches a compiled `UPDATE` / `DELETE` / `INSERT` — `.toStatement(selector)`
+on an update, a delete, or an `insert(...)` / `insertBulk(...)` — as a data-modifying CTE. The selector is the statement's `RETURNING` list, and it
 types the CTE's columns:
 
 ```typescript
@@ -629,7 +629,9 @@ empty and so is the load.
   carry it, a subquery that carries it itself, a CTE body built over a query carrying it — it is refused:
   `CTE "gate" is data-modifying: a data-modifying CTE must be declared at statement level — attach it with
   .with() on the executing query`. (PostgreSQL rejects a data-modifying `WITH` nested in a subquery; before
-  1.0.9 the query builder emitted one per reading subquery, i.e. one UPDATE per occurrence.)
+  1.0.9 the query builder emitted one per reading subquery, i.e. one UPDATE per occurrence.) An `insertFrom()`
+  declares it through its `with` option — `insertFrom(source, map, { with: [ins.cte] })`, see
+  [the insert guide](./insert-update-guide.md#one-statement-a-bulk-insert-feeding-another-insert).
 
 ## Type Safety
 
