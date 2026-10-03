@@ -511,6 +511,7 @@ export type {
   EntityCollectionQuery,
   IEntityQueryable,
   EntitySelectQueryBuilder,
+  LateralNavigation,
   OrderDirection,
   OrderByTuple,
   OrderByResult,

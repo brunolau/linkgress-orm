@@ -1,13 +1,13 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
 import type { EnclosingCollectionScope } from './conditions';
-import { pgTypeOfValue, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
+import { pgTypeOfValue, selectingOnlyColumns, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
 import { holdsAggregateFragment, holdsWindowFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
 import { TableSchema } from '../schema/table-builder';
 import type { CollectionStrategyType, OrderDirection, OrderByResult, FluentDelete, FluentQueryUpdate } from '../entity/db-context';
-import { TimeTracer, QueryExecutor } from '../entity/db-context';
+import { TimeTracer, QueryExecutor, createSelectAllRow } from '../entity/db-context';
 import { assertNoCorrelatedAliasShadowing, forEachOrderByKey, getTableAlias, hasFieldName, isForeignChainRef, parseOrderBy } from './query-utils';
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 import { Subquery } from './subquery';
@@ -398,6 +398,43 @@ export const materializeMockSelection = (result: any): any => {
   }
 
   return out;
+};
+
+/**
+ * {@link materializeMockSelection} at every depth of a projection: a navigation row projected whole — the result
+ * itself, or a value of a plain object of it (`{ id: b.id, author: b.author }`) — read into its columns. A collection's
+ * projection renders the plain objects it holds as nested JSON objects of their own properties, and walked a nested
+ * navigation row by its own properties (it has none: its columns are inherited getters) — the row read back as `{}`.
+ * Every other value (a column, a fragment, a collection, a subquery, a list) is kept as it is; an object without a
+ * navigation row in it is the very object.
+ */
+const materializeNestedMockRows = (value: any): any => {
+  if (isReferenceMockRow(value)) {
+    return materializeMockSelection(value);
+  }
+
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || '__dbColumnName' in value) {
+    return value;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+
+  if (proto !== Object.prototype && proto !== null) {
+    return value;
+  }
+
+  let materialized: any;
+
+  for (const key of Object.keys(value)) {
+    const nested = materializeNestedMockRows(value[key]);
+
+    if (nested !== value[key]) {
+      materialized ??= { ...value };
+      materialized[key] = nested;
+    }
+  }
+
+  return materialized ?? value;
 };
 
 /**
@@ -1186,13 +1223,26 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   }
 
   /**
+   * The selector of a query over this table's whole row — after `with()`, and the left row of a subquery join: the
+   * select-all row (see createSelectAllRow), its columns the default projection and every navigation still reachable
+   * from the next `select()` / `where()` / `orderBy()` / `lateralJoin()`. The row itself (`row => row`) lost them there:
+   * every one of those reads the row it is handed through its columns only — `b.author` read `undefined` (a TypeError
+   * in a projection, `column "undefined"` in a WHERE, an ORDER BY key silently dropped).
+   */
+  private selectAllRow(): (row: any) => any {
+    const schema = this.schema;
+
+    return selectingOnlyColumns((row: any) => createSelectAllRow(schema, row));
+  }
+
+  /**
    * Add CTEs (Common Table Expressions) to the query
    */
   with(...ctes: DbCte<any>[]): SelectQueryBuilder<TRow> {
     return new SelectQueryBuilder(
       this.schema,
       this.client,
-      (row: any) => row,
+      this.selectAllRow(),
       this.whereCond,
       this.limitValue,
       this.offsetValue,
@@ -1404,7 +1454,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       const qb = new SelectQueryBuilder(
         this.schema,
         this.client,
-        (row: any) => row as TRow,
+        this.selectAllRow(),
         this.whereCond,
         this.limitValue,
         this.offsetValue,
@@ -1545,7 +1595,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
       const qb = new SelectQueryBuilder(
         this.schema,
         this.client,
-        (row: any) => row as TRow,
+        this.selectAllRow(),
         this.whereCond,
         this.limitValue,
         this.offsetValue,
@@ -8508,6 +8558,10 @@ ${joinClauses.join('\n')}`;
     const navJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
     this.detectAndAddJoinsFromCondition(this.whereCond, navJoins);
 
+    // ...and from the aggregated column itself: a column read through a navigation (`max(r => r.author)` of
+    // `select(b => ({ author: b.author.name }))`) rendered without its join — "missing FROM-clause entry"
+    this.detectAndAddJoinsFromSelection(fieldToAggregate, navJoins);
+
     // ...and from the lateral sets' function arguments (crossJoinLateral)
     const lateralRefs = this.lateralSetArgumentRefs();
     if (lateralRefs.length > 0) {
@@ -10513,6 +10567,20 @@ const renderNavigationJoin = (join: NavigationJoin, source: (alias: string) => s
     .join(' AND ')}`;
 
 /**
+ * The plain join of a navigation in an inline `count()` / `exists()` subquery (see CollectionQueryBuilder.buildSqlBody) —
+ * a hop of the path the collection hangs off, or a navigation its WHERE reads — under `alias`, its foreign key read off
+ * `source`: on EVERY key pair of its relation, the second column of a composite key and a constant key part included.
+ * It joined on the first pair only, and the subquery read rows the query's own join of the navigation does not:
+ * `withForeignKey(b => [b.authorId, true])` / `withPrincipalKey(a => [a.id, a.active])` counted an inactive author's
+ * books for a book whose active author is missing, a composite key matched every row sharing its first column. A key
+ * of one column renders the text it always rendered.
+ */
+const renderInlineNavigationJoin = (join: NavigationJoin, source: string, alias: string): string =>
+  `${join.isMandatory ? 'JOIN' : 'LEFT JOIN'} ${quoteTableReference(join.targetTable, join.targetSchema)} "${alias}" ON ${join.foreignKeys
+    .map((fk, index) => `${formatJoinValue(source, fk)} = ${formatJoinValue(alias, join.matches?.[index] || 'id')}`)
+    .join(' AND ')}`;
+
+/**
  * Stamps a mock row a flattened collection adopts (see CollectionQueryBuilder.selectMany) — and every ref
  * and reference row minted from it — with `chainId`: the collection a selector returns was built on rows
  * of a chain of its own, and the flattened collection owns them now.
@@ -12068,7 +12136,7 @@ export class CollectionQueryBuilder<TItem = any> {
     }
 
     if (this.evaluatedSelection === undefined) {
-      this.evaluatedSelection = { result: materializeMockSelection(this.selector(this.createMockItem())) };
+      this.evaluatedSelection = { result: materializeNestedMockRows(this.selector(this.createMockItem())) };
     }
 
     return this.evaluatedSelection.result;
@@ -12334,10 +12402,7 @@ export class CollectionQueryBuilder<TItem = any> {
         continue;
       }
 
-      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
-      const fk = nav.foreignKeys[0];
-      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${alias}" ON "${src}"."${fk}" = "${alias}"."${pk}"`);
+      allJoins.push(renderInlineNavigationJoin(nav, src, alias));
     }
 
     // The selectMany hops, from our table outwards, each under its own alias and on every key pair
@@ -12363,10 +12428,7 @@ export class CollectionQueryBuilder<TItem = any> {
         allJoins.push(renderLateralNavigationJoin(nav, ownRef(nav.sourceAlias)));
         continue;
       }
-      const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
-      const fk = nav.foreignKeys[0];
-      const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${nav.alias}" ON "${ownRef(nav.sourceAlias)}"."${fk}" = "${nav.alias}"."${pk}"`);
+      allJoins.push(renderInlineNavigationJoin(nav, ownRef(nav.sourceAlias), nav.alias));
     }
 
     // The navigations the hops' items are read through, joined from the hops

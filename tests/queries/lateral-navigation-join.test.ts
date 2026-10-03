@@ -1037,8 +1037,10 @@ describe('lateralJoin() — a nested reference path', () => {
 
   test('refused: a path ending in or running through a collection, a column, and the uses that refuse any probe', async () => {
     await withCapture('lateral', async (db) => {
+      // @ts-expect-error — a path ending in a collection: refused at compile time as well
       expect(() => db.lnjBooks.lateralJoin(b => b.author!.books)).toThrow(/lateralJoin\(\): "author\.books" is a collection of "lnj_authors"/);
       expect(() => db.lnjShelves.lateralJoin((s: any) => s.books.author)).toThrow(/lateralJoin\(\): "books" is a collection of "lnj_shelves"/);
+      // @ts-expect-error — a column reached through navigations: refused at compile time as well
       expect(() => db.lnjBooks.lateralJoin(b => b.author!.region!.name)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
 
       expect(() => db.lnjBooks.lateralJoin(b => b.author!.region).where(b => eq(b.author!.region!.name, 'North')).update({ title: 'x' }))
@@ -1053,6 +1055,7 @@ describe('lateralJoin() — a nested reference path', () => {
 
       // In a collection, the path is read off the item's relations
       await expectToReject(
+        // @ts-expect-error — a path ending in a collection: refused at compile time as well
         () => db.lnjShelves.select(s => ({ titles: s.books!.lateralJoin(b => b.author!.books).select(b => b.title).toList() })).toList(),
         /lateralJoin\(\): "author\.books" is a collection of "lnj_authors"/,
       );
@@ -1374,12 +1377,16 @@ describe('lateralJoin() — a collection hanging off the probed path', () => {
 describe('lateralJoin() — refused uses', () => {
   test('the selector must return a reference navigation of the row itself', async () => {
     await withCapture('lateral', async (db) => {
+      // @ts-expect-error — a column: refused at compile time as well
       expect(() => db.lnjBooks.lateralJoin(b => b.title)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
       // A column reached through a navigation (a path of references is taken: see "a nested reference path")
+      // @ts-expect-error — a column reached through a navigation: refused at compile time as well
       expect(() => db.lnjBooks.lateralJoin(b => b.author!.name)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
+      // @ts-expect-error — a collection: refused at compile time as well
       expect(() => db.lnjShelves.lateralJoin(s => s.books)).toThrow(/lateralJoin\(\): "books" is a collection of "lnj_shelves"/);
 
       await expectToReject(
+        // @ts-expect-error — a column: refused at compile time as well
         () => db.lnjShelves.select(s => ({ titles: s.books!.lateralJoin(b => b.title).select(b => b.title).toList() })).toList(),
         /lateralJoin\(\) takes a reference navigation of the "lnj_books" row/,
       );

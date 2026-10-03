@@ -193,7 +193,8 @@ function getSelectAllRelationPrototype(schema: any): object {
 /** Column property names per schema — `Object.keys(schema.columns)` allocated a fresh array per row. */
 const selectAllColumnNames = new WeakMap<object, string[]>();
 
-function createSelectAllRow(schema: any, source: any): any {
+/** @internal — also the row a query builder over a whole table starts from (see QueryBuilder.selectAllRow). */
+export function createSelectAllRow(schema: any, source: any): any {
   const result: any = Object.create(getSelectAllRelationPrototype(schema));
 
   Object.defineProperty(result, SELECT_ALL_SOURCE, {
@@ -2982,6 +2983,20 @@ type ToFieldRefs<T> = T extends object
   : FieldRef<string, T>;
 
 /**
+ * What a `lateralJoin()` selector may return, given what it returns (`TNavigation`): a reference navigation of the row
+ * (`b => b.author`), or one reached through others (`b => b.author.region`) — `unknown`, which accepts it as it is. A
+ * column, a collection, a value or nothing has no join to probe: `never`, so the selector does not compile (it is
+ * refused when the query is built as well). A selector typed `any` (an untyped row) is taken as it is.
+ */
+export type LateralNavigation<TNavigation> = 0 extends (1 & TNavigation)
+  ? unknown
+  : [NonNullable<TNavigation>] extends [never]
+    ? never
+    : NonNullable<TNavigation> extends DbColumn<any> | EntityCollectionQuery<any> | EntityCollectionQueryWithSelect<any, any> | SqlFragment<any> | string | number | boolean | bigint | symbol
+      ? never
+      : unknown;
+
+/**
  * Type helper to build entity query type with navigation support
  * Preserves class instances (Date, Map, Set, etc.) as-is without recursively mapping them
  */
@@ -3018,7 +3033,7 @@ export interface EntityCollectionQuery<TEntity extends DbEntity> {
    * through other references) as a LATERAL probe of its target's key instead of a plain join — see
    * {@link IEntityQueryable.lateralJoin}. Call it before select().
    */
-  lateralJoin(navigation: (item: EntityQuery<TEntity>) => unknown): this;
+  lateralJoin<TNavigation>(navigation: (item: EntityQuery<TEntity>) => TNavigation & LateralNavigation<TNavigation>): this;
 
   // Ordering and pagination
   orderBy<T>(selector: (item: EntityQuery<TEntity>) => T): this;
@@ -3131,7 +3146,7 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Opt-in per navigation, for a query whose rows are few over a large target — never for a navigation the WHERE
    * filters the rows by. Refused by update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
    */
-  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity>;
+  lateralJoin<TNavigation>(navigation: (entity: EntityQuery<TEntity>) => TNavigation & LateralNavigation<TNavigation>): IEntityQueryable<TEntity>;
 
   /**
    * INNER JOIN used purely as a row FILTER — keeps the entity shape (no
@@ -3380,7 +3395,7 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
    * the query is built, so the mark renders the same statement here — after select(), selectDistinct(), a join,
    * or at the end of the chain — as before select(). The projection and the chain are kept.
    */
-  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): EntitySelectQueryBuilder<TEntity, TSelection>;
+  lateralJoin<TNavigation>(navigation: (entity: EntityQuery<TEntity>) => TNavigation & LateralNavigation<TNavigation>): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   /** INNER JOIN as a pure row filter — selection shape preserved; see {@link IEntityQueryable.joinFilter}. */
   joinFilter<TRight extends DbEntity>(
@@ -4349,7 +4364,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
   /**
    * Join a reference navigation as a LATERAL probe of its target's key — see {@link IEntityQueryable.lateralJoin}.
    */
-  lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity> {
+  lateralJoin<TNavigation>(navigation: (entity: EntityQuery<TEntity>) => TNavigation & LateralNavigation<TNavigation>): IEntityQueryable<TEntity> {
     return (this.selectAllQuery() as any).lateralJoin(navigation) as IEntityQueryable<TEntity>;
   }
 
@@ -4517,15 +4532,8 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * Add CTEs (Common Table Expressions) to the query
    */
   with(...ctes: DbCte<any>[]): IEntityQueryable<TEntity> {
-    const schema = this._getSchema();
-
-    // See createSelectAllRow for the shape (own enumerable columns, inherited navigations).
-    const allColumnsSelector = selectingOnlyColumns((e: any) => createSelectAllRow(schema, e));
-
-    const queryBuilder = this.context.getTable(this.tableName)
-      .with(...ctes)
-      .select(allColumnsSelector);
-    return queryBuilder as any as IEntityQueryable<TEntity>;
+    // The select-all query, as orderBy / limit / offset / lateralJoin start from: the row keeps its navigations
+    return (this.selectAllQuery() as any).with(...ctes) as IEntityQueryable<TEntity>;
   }
 
   /**

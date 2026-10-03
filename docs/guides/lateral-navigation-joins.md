@@ -133,9 +133,9 @@ join of this query and nothing else — every other navigation, and every other 
 
 ## Where it applies
 
-- **Root queries** — on a table (`db.books.lateralJoin(...)`), after `where()`, and on the untyped builders
-  (`QueryBuilder`, `SelectQueryBuilder`). Call it once per navigation to probe several. Everywhere below, the
-  selector may name a navigation of the row itself or a path of them (`b => b.author.region`).
+- **Root queries** — on a table (`db.books.lateralJoin(...)`), after `where()` or `with(cte)`, and on the untyped
+  builders (`QueryBuilder`, `SelectQueryBuilder`). Call it once per navigation to probe several. Everywhere below,
+  the selector may name a navigation of the row itself or a path of them (`b => b.author.region`).
 - **After `select()`** — and on every other select builder: `selectDistinct()`, `innerJoin()` / `leftJoin()`,
   the end of the chain, or a builder taken as an `IEntityQueryable`. The selector names a navigation of the
   query's ROOT row (`b => b.author`), whatever the projection; the projection and the chain are kept. The
@@ -194,7 +194,10 @@ Each refusal throws when the query is built, never silently renders a plain join
 
 - a selector that returns a column (`b => b.author.name`), a collection, or a path that ends in or runs through a
   collection (`b => b.author.books`) — `lateralJoin()` takes a reference navigation of the row, or one reached
-  through reference navigations only;
+  through reference navigations only. On the typed builders (a table, `IEntityQueryable`, every select builder, a
+  collection) such a selector — or one that returns a value or nothing — does not compile either: its return type
+  is checked through `LateralNavigation<T>`, which is `never` for anything but a navigation (an untyped `any` row is
+  taken as it is);
 - `update()` / `delete()` — their navigations join as `FROM` / `USING` items, and PostgreSQL lets no LATERAL
   subquery there read the row the statement writes. Read the value through a correlated scalar subquery instead:
   `db.authors.where(a => eq(a.id, b.authorId)).select(a => a.name).asSubquery('scalar')`;
@@ -214,5 +217,36 @@ EXPLAIN (COSTS OFF) <the probe text>   -- Nested Loop Left Join → Index Scan u
 ```
 
 The in-memory database runs both shapes and returns the same rows.
+
+## Coverage
+
+`tests/queries/lateral-join-matrix.test.ts` generates its cases from the dimensions below and runs every one of them,
+on PostgreSQL, PGlite and in memory, against two oracles: the same query without `lateralJoin()` reads the same rows
+(in the same order where the query orders them), and every statement is the plain query's statement with each plain
+join of a probed hop — the row's own and every re-join a subquery makes of it — replaced by its probe, on every key
+pair, and nothing else changed (the parameters included). Where the fixture decides the rows (the key shapes), they
+are pinned as well.
+
+| Dimension | Covered |
+|---|---|
+| Where `lateralJoin()` is called | a table (`db.books.lateralJoin(…)`); after `where()`; after `with(cte)` — of a table, typed or untyped, before or after the probe; after `select()`, `selectDistinct()`, `innerJoin()` / `leftJoin()` of a table or of a table subquery; at the end of a chain; a builder taken as an `IEntityQueryable`; the untyped `QueryBuilder` / `SelectQueryBuilder`; `withPreparedStatements(true)`; a collection, before its `select()` |
+| The path | one, two and three hops; optional and required hops; a table navigating to itself, once and twice in one path; the same table reached by two paths; a prefix and the full path, in either call order; every hop of a three-hop path; independent paths; the same path named twice; a navigation whose probe alias passes PostgreSQL's 63-byte identifier limit |
+| The key | one column; a composite key; a constant key part on the principal side (`withPrincipalKey(a => [a.id, a.active])`) and on the foreign-key side (`withForeignKey(b => [b.authorId, b.isCurrent])` / `withPrincipalKey(a => [a.id, true])`); a principal key that is not `id`, custom-typed; a NULL and a dangling foreign key |
+| What reads the probed row | its columns along the path; the row projected whole — at the root and in a collection's projection; a nested object; mapped columns (a custom type, an enum, a date, JSON); a WHERE on it, `isNull()` / `isNotNull()` of it (a row whose probed row is missing keeps its row, as with the LEFT join); an ORDER BY; `min()` / `max()` / `sum()` over it |
+| What renders the query | `toList()`, `first()`, `firstOrDefault()`, `firstOrThrow()`, `count()`, `exists()`, `min()` / `max()` / `sum()`, LIMIT / OFFSET, DISTINCT, `countOver()`, a window function, `future()` / `futureFirstOrDefault()` / `futureCount()`, `FutureQueryRunner.runAsync()`, `QueryBatch` legs (a list, a first row, a count), `union()` / `unionAll()` legs, `prepare()`, a scalar / array / table subquery (`inSubquery()`, `notInSubquery()`, `exists()`, `notExists()`), a CTE body, the source of `insertFrom()`, a subquery in the WHERE of `update()` / `delete()`, `forUpdate()` (of a required navigation), `crossJoinLateral()`, `joinFilter()`, `with()` |
+| Collections | the item's own probe, and collections hanging off a probed path — of the root row and of a collection's item, off the probed hop, a hop before it and a hop beyond it: lists, filtered / ordered / limited lists, an offset, `firstOrDefault()`, DISTINCT, `count()` / `exists()` / `min()` / `max()` / `sum()`, `toStringList()` / `toNumberList()`, a `count()` in a `sql` fragment, `exists()` / `notExists()` / a `count()` in a WHERE, collections nested three deep with a probe at each level, a `selectMany()` of the root row — each under the `lateral`, `cte` and `temptable` strategies |
+| Other chains | a collection or a subquery of another row that joins the same alias keeps its plain join |
+| Caches | with `MockRowCache.setEnabled(true)` (which also gates `NavigationPathCache`) and the `LateralSqlCache`, a probed and a plain shape built in either order each render the text a fresh build renders |
+| Planner | PostgreSQL / PGlite, hash joins and nested loops off: a probed target is read through the probe's key lookups only — never scanned under the hop's own alias, where a merge join could read it |
+| Typing | every builder keeps its type through `lateralJoin()`, and every one is an `IEntityQueryable` |
+
+What it does not do, by design:
+
+- **A path the query joins nowhere renders nothing.** `lateralJoin(b => b.author).count()` reads nothing of the author:
+  the statement is the one without the probe.
+- **A required hop after an optional one joins INNER, probed or not.** `b.author.home` (the author optional, its home
+  required) drops a book without an author, as the plain join does: the probe returns the rows the plain join returns.
+- **Not offered** (the method does not exist): on the untyped table accessor itself (`getTable('books')` — call it
+  after `where()` or `select()`), and on a collection after its `select()` — call it before.
 
 See also: [Collection Strategies](../collection-strategies.md), [Querying](./querying.md).
