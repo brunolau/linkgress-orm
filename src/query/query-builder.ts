@@ -1056,7 +1056,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   private joinCounter: number = 0;
   private collectionStrategy?: CollectionStrategyType;
   private schemaRegistry?: Map<string, TableSchema>;
-  /** The reference navigations `lateralJoin()` opted in, by relation name (see SelectQueryBuilder.lateralJoin). */
+  /** The reference navigations `lateralJoin()` opted in, by relation path (see SelectQueryBuilder.lateralJoin). */
   private lateralNavigations: readonly string[] = [];
 
   // Performance: Cache the mock row to avoid recreating it
@@ -1176,11 +1176,12 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
   }
 
   /**
-   * Join the reference navigation `navigation` names (`row => row.author`) as a LATERAL probe of its
-   * target's key instead of a plain join — see {@link SelectQueryBuilder.lateralJoin}.
+   * Join the reference navigation `navigation` names (`row => row.author`, or `row => row.author.region`
+   * through other references) as a LATERAL probe of its target's key instead of a plain join — see
+   * {@link SelectQueryBuilder.lateralJoin}.
    */
   lateralJoin(navigation: (row: TRow) => unknown): this {
-    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(this.schema, navigation));
+    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationPath(this.schema, navigation, this.schemaRegistry));
     return this;
   }
 
@@ -1699,8 +1700,9 @@ export class SelectQueryBuilder<TSelection> {
   /** Set-returning functions joined to every row (`crossJoinLateral`), rendered after the navigation joins. */
   private lateralSets: LateralSetJoin[] = [];
   /**
-   * The reference navigations of the root row `lateralJoin()` opted in, by relation name: their joins render as
-   * LATERAL probes of the target's key (see isLateralNavigationJoin). Never mutated in place: derived builders share it.
+   * The reference navigations of the root row `lateralJoin()` opted in, by relation path (`author`, `author.region`):
+   * their joins render as LATERAL probes of the target's key (see isLateralNavigationJoin). Never mutated in place:
+   * derived builders share it.
    */
   private lateralNavigations: readonly string[];
 
@@ -1979,6 +1981,15 @@ export class SelectQueryBuilder<TSelection> {
    * hold. The rows are the ones the plain join reads, and a navigation reached through it
    * (`row.author.region`) joins off the probe's alias as before.
    *
+   * A reference reached through other references (`row => row.author.region`) probes the path's LAST hop,
+   * off the join of the hop before it — which keeps its plain join unless it is opted in as well:
+   *
+   *   LEFT JOIN "authors" AS "author" ON "books"."author_id" = "author"."id"
+   *   LEFT JOIN LATERAL (SELECT "region__probe".* FROM "regions" "region__probe"
+   *                      WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true
+   *
+   * Every hop of the path must be a reference (many-to-one / one-to-one) navigation.
+   *
    * Per navigation and opt-in: for a query whose rows are FEW (one parent's lines, a page) over a target
    * that is LARGE. A navigation the WHERE filters on is the opposite case — the plain join lets PostgreSQL
    * start from the target's matching rows, the probe does not. Call it once per navigation. Refused by
@@ -1992,21 +2003,28 @@ export class SelectQueryBuilder<TSelection> {
    *   .toList();
    */
   lateralJoin(navigation: (row: any) => unknown): this {
-    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(this.schema, navigation));
+    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationPath(this.schema, navigation, this.schemaRegistry));
     return this;
   }
 
   /**
    * Whether `join` — a navigation join of this query's FROM — is the join of a navigation `lateralJoin()`
-   * opted in: a reference of the root row, joined from the root table under the alias the build's navigation
-   * plan gives it (its relation name, unless the plan renames it).
+   * opted in: the last hop of an opted-in path from the root row, under the alias the build's navigation plan
+   * gives it (its relation name, unless the plan renames it), joined from the root table for a reference of
+   * the root row itself, else from the hop before it (see lateralNavigationJoinOf).
    */
   private isLateralNavigationJoin(join: { alias: string; sourceAlias?: string }): boolean {
-    if (this.lateralNavigations.length === 0 || (join.sourceAlias && join.sourceAlias !== this.schema.name)) {
+    if (this.lateralNavigations.length === 0) {
       return false;
     }
 
-    return this.lateralNavigations.some(name => (this.navigationPlan?.nodeForPath([name])?.alias ?? name) === join.alias);
+    const source = join.sourceAlias || this.schema.name;
+
+    return this.lateralNavigations.some((path) => {
+      const probed = lateralNavigationJoinOf(path, this.navigationPlan, this.schema.name);
+
+      return probed !== undefined && probed.alias === join.alias && probed.sourceAlias === source;
+    });
   }
 
   /**
@@ -10346,38 +10364,109 @@ interface LevelScope {
   orderKeyNavigationJoins(keys: readonly CollectionOrderKey[]): NavigationJoin[];
 }
 
-/** What a relation of `lateralJoin()`'s row reads as (see lateralNavigationName): the relation's name. */
+/**
+ * What a relation of `lateralJoin()`'s row reads as (see lateralNavigationPath): its relation path from
+ * that row, dot-joined (`author`, `author.region`) — the key a NavigationPathNode carries.
+ */
 const LATERAL_NAVIGATION = Symbol('linkgressLateralNavigation');
 
+/** The schema of a relation's target table: from the registry, else from the relation's own builder. */
+const lateralNavigationTarget = (relation: any, registry: Map<string, TableSchema> | undefined): TableSchema | undefined =>
+  registry?.get(relation.targetTable) ?? relation.targetTableBuilder?.build();
+
 /**
- * The relation `lateralJoin(navigation)` names. The selector runs on a row whose properties are the
- * relations of `schema` (nothing else), and must return one of them as it is: a reference (many-to-one /
- * one-to-one) navigation of the row itself. A column, a collection, or a navigation reached through
- * another one has no join of this row's own to probe — refused, never ignored.
+ * The row `lateralJoin()`'s selector runs on: one property per relation of `schema` (nothing else), each
+ * reading as that relation's path (`[LATERAL_NAVIGATION]`) and as a row of the same kind for the relation's
+ * target — built when the selector reads it, so a table that reaches itself is walked no further than the
+ * selector goes.
  */
-const lateralNavigationName = (schema: TableSchema, navigation: (row: any) => unknown): string => {
-  const relations = schema.relations ?? {};
-  const row: Record<string, unknown> = {};
+const lateralNavigationRow = (
+  schema: TableSchema | undefined,
+  path: string | undefined,
+  registry: Map<string, TableSchema> | undefined,
+): Record<string | symbol, unknown> => {
+  const row: Record<string | symbol, unknown> = path === undefined ? {} : { [LATERAL_NAVIGATION]: path };
+  const relations = schema?.relations ?? {};
 
   for (const name of Object.keys(relations)) {
-    row[name] = { [LATERAL_NAVIGATION]: name };
+    Object.defineProperty(row, name, {
+      enumerable: true,
+      get: () => lateralNavigationRow(lateralNavigationTarget(relations[name], registry), path === undefined ? name : `${path}.${name}`, registry),
+    });
   }
 
-  const picked = navigation(row);
-  const name = picked != null && typeof picked === 'object' ? (picked as Record<symbol, unknown>)[LATERAL_NAVIGATION] : undefined;
+  return row;
+};
 
-  if (typeof name !== 'string') {
+/**
+ * The navigation `lateralJoin(navigation)` names, as its relation path from the row (`author`,
+ * `author.region`). The selector runs on a row whose properties are the relations of `schema` (nothing
+ * else), and must return one of them as it is — a reference (many-to-one / one-to-one) navigation of the
+ * row itself — or a reference reached through references only (`row => row.author.region`): the probe
+ * replaces the join of the path's LAST hop, off the join of the hop before it. A column, a collection, or a
+ * path through a collection has no reference join to probe — refused, never ignored.
+ */
+const lateralNavigationPath = (
+  schema: TableSchema,
+  navigation: (row: any) => unknown,
+  registry: Map<string, TableSchema> | undefined,
+): string => {
+  const picked = navigation(lateralNavigationRow(schema, undefined, registry));
+  const path = picked != null && typeof picked === 'object' ? (picked as Record<symbol, unknown>)[LATERAL_NAVIGATION] : undefined;
+
+  if (typeof path !== 'string') {
     throw new Error(
-      `lateralJoin() takes a reference navigation of the "${schema.name}" row itself (row => row.<relation>, a many-to-one or `
-      + 'one-to-one relation of that table) — not a column, and not a navigation reached through another one'
+      `lateralJoin() takes a reference navigation of the "${schema.name}" row (row => row.<relation>, a many-to-one or `
+      + 'one-to-one relation of that table), or one reached through such navigations (row => row.<relation>.<relation>) — not a column'
     );
   }
 
-  if (relations[name].type !== 'one') {
-    throw new Error(`lateralJoin(): "${name}" is a collection of "${schema.name}" — a LATERAL probe joins a reference (many-to-one / one-to-one) navigation`);
+  const names = path.split('.');
+  let owner: TableSchema | undefined = schema;
+
+  for (let i = 0; i < names.length; i++) {
+    // Defined: the selector's rows have no other properties than the relations of their table
+    const relation = owner!.relations[names[i]];
+
+    if (relation.type !== 'one') {
+      throw new Error(
+        `lateralJoin(): "${names.slice(0, i + 1).join('.')}" is a collection of "${owner!.name}" — a LATERAL probe joins a reference `
+        + '(many-to-one / one-to-one) navigation' + (i < names.length - 1 ? ', reached through reference navigations only' : '')
+      );
+    }
+
+    owner = lateralNavigationTarget(relation, registry);
   }
 
-  return name;
+  return path;
+};
+
+/**
+ * The join the path `lateralJoin()` opted in renders as, in a build whose anchor table renders under `anchor`
+ * and whose navigation plan is `plan`: the alias of the path's last hop (the plan's, which renames a hop
+ * another path owns the name of), and the alias it joins from — the anchor for a reference of the row itself,
+ * the hop before it for a deeper one. `undefined` when the build's plan does not join the path at all.
+ */
+const lateralNavigationJoinOf = (
+  path: string,
+  plan: NavigationAliasPlan | undefined,
+  anchor: string,
+): { alias: string; sourceAlias: string } | undefined => {
+  const names = path.split('.');
+
+  if (names.length === 1) {
+    return { alias: plan?.nodeForPath(names)?.alias ?? path, sourceAlias: anchor };
+  }
+
+  // A path two hops deep or more is always planned (see NavigationAliasPlan.seal); without a plan its joins
+  // carry their relation names
+  if (plan === undefined) {
+    return { alias: names[names.length - 1], sourceAlias: names[names.length - 2] };
+  }
+
+  const node = plan.nodeForPath(names);
+
+  return node === undefined ? undefined : { alias: node.alias, sourceAlias: plan.parentAliasOf(node) };
 };
 
 /** `names` with `name` added (once): a new array — the lists are shared by derived builders. */
@@ -10578,8 +10667,9 @@ export class CollectionQueryBuilder<TItem = any> {
   // The hops as the build in progress renders them (see withRenderedHops); undefined between builds.
   // Never copied to derived builders
   private renderedHops?: HopRendering;
-  // The reference navigations of our item lateralJoin() opted in, by relation name: their joins render as
-  // LATERAL probes of the target's key (see markLateralJoins). Never mutated in place: derived builders share it
+  // The reference navigations of our item lateralJoin() opted in, by relation path (`author`, `author.region`):
+  // their joins render as LATERAL probes of the target's key (see markLateralJoins). Never mutated in place:
+  // derived builders share it
   private lateralNavigations: readonly string[] = [];
 
   /**
@@ -10819,7 +10909,8 @@ export class CollectionQueryBuilder<TItem = any> {
    * Join the reference navigation of the collection's item that `navigation` names (`it => it.author`) as a
    * LATERAL probe of its target's key instead of a plain join — see {@link SelectQueryBuilder.lateralJoin}.
    * The collection's rows (one parent's) drive; under every strategy (lateral, cte, temptable) the probe
-   * reads the foreign key of the row the strategy renders the item as.
+   * reads the foreign key of the row the strategy renders the item as. A reference reached through other
+   * references (`it => it.author.region`) probes the path's last hop, off the join of the hop before it.
    *
    * @example
    * db.shelves.select(s => ({
@@ -10840,7 +10931,10 @@ export class CollectionQueryBuilder<TItem = any> {
       throw new Error(`lateralJoin(): the schema of "${this.targetTable}" is unknown — its relations cannot be read`);
     }
 
-    this.lateralNavigations = withLateralNavigation(this.lateralNavigations, lateralNavigationName(schema, navigation as (item: any) => unknown));
+    this.lateralNavigations = withLateralNavigation(
+      this.lateralNavigations,
+      lateralNavigationPath(schema, navigation as (item: any) => unknown, this.schemaRegistry),
+    );
     return this;
   }
 
@@ -12905,22 +12999,31 @@ export class CollectionQueryBuilder<TItem = any> {
 
   /**
    * Marks, in `joins` — a list the build in progress made — the joins of the navigations `lateralJoin()`
-   * opted in: a reference of our item, joined from our table under the alias the build's navigation plan
-   * gives it (its relation name, unless the plan renames it). Each is replaced by a copy with `lateral` set
-   * (join objects are shared with other builds), which every renderer of a collection's joins draws as the
-   * LATERAL probe (see renderLateralNavigationJoin).
+   * opted in: the last hop of an opted-in path from our item, under the alias the build's navigation plan
+   * gives it (its relation name, unless the plan renames it), joined from our table for a reference of the
+   * item itself, else from the hop before it (see lateralNavigationJoinOf). Each is replaced by a copy with
+   * `lateral` set (join objects are shared with other builds), which every renderer of a collection's joins
+   * draws as the LATERAL probe (see renderLateralNavigationJoin).
    */
   private markLateralJoins(joins: NavigationJoin[]): void {
     if (this.lateralNavigations.length === 0) {
       return;
     }
 
-    const aliases = new Set(this.lateralNavigations.map(name => this.navigationPlan?.nodeForPath([name])?.alias ?? name));
+    const probed: Array<{ alias: string; sourceAlias: string }> = [];
+
+    for (const path of this.lateralNavigations) {
+      const join = lateralNavigationJoinOf(path, this.navigationPlan, this.targetTable);
+
+      if (join !== undefined) {
+        probed.push(join);
+      }
+    }
 
     for (let i = 0; i < joins.length; i++) {
       const join = joins[i];
 
-      if (join.sourceAlias === this.targetTable && aliases.has(join.alias)) {
+      if (probed.some(probe => probe.alias === join.alias && probe.sourceAlias === join.sourceAlias)) {
         joins[i] = { ...join, lateral: true };
       }
     }

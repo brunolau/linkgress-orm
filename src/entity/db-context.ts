@@ -3014,8 +3014,9 @@ export interface EntityCollectionQuery<TEntity extends DbEntity> {
   where(condition: (item: EntityQuery<TEntity>) => Condition): this;
 
   /**
-   * Join the item's reference navigation `navigation` names (`it => it.author`) as a LATERAL probe of its
-   * target's key instead of a plain join — see {@link IEntityQueryable.lateralJoin}. Call it before select().
+   * Join the item's reference navigation `navigation` names (`it => it.author`, or `it => it.author.region`
+   * through other references) as a LATERAL probe of its target's key instead of a plain join — see
+   * {@link IEntityQueryable.lateralJoin}. Call it before select().
    */
   lateralJoin(navigation: (item: EntityQuery<TEntity>) => unknown): this;
 
@@ -3124,9 +3125,10 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * Join the reference navigation `navigation` names (`b => b.author`) as a LATERAL probe of its target's key
    * instead of a plain join — `LEFT JOIN LATERAL (SELECT … FROM <target> WHERE <key> = <foreign key> OFFSET 0)
    * "<alias>" ON true`, INNER for a required navigation: one key lookup per row, whatever the statistics of
-   * the foreign-key column say. Same rows as the plain join. Opt-in per navigation, for a query whose rows
-   * are few over a large target — never for a navigation the WHERE filters the rows by. Refused by
-   * update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
+   * the foreign-key column say. Same rows as the plain join. A reference reached through other references
+   * (`b => b.author.region`) probes the path's last hop, off the join of the hop before it. Opt-in per
+   * navigation, for a query whose rows are few over a large target — never for a navigation the WHERE filters
+   * the rows by. Refused by update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
    */
   lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity>;
 
@@ -3371,8 +3373,9 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
   ): EntitySelectQueryBuilder<TEntity, TSelection>;
 
   /**
-   * Join a reference navigation of the query's ROOT row (`b => b.author`, whatever the projection) as a LATERAL
-   * probe of its target's key — see {@link IEntityQueryable.lateralJoin}. The navigation joins are rendered when
+   * Join a reference navigation of the query's ROOT row (`b => b.author`, or `b => b.author.region` through other
+   * references, whatever the projection) as a LATERAL probe of its target's key — see
+   * {@link IEntityQueryable.lateralJoin}. The navigation joins are rendered when
    * the query is built, so the mark renders the same statement here — after select(), selectDistinct(), a join,
    * or at the end of the chain — as before select(). The projection and the chain are kept.
    */

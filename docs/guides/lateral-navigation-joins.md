@@ -32,6 +32,36 @@ The rows are the same: an unmatched (or NULL) foreign key keeps its row with NUL
 required navigation (`.isRequired()`) renders `INNER JOIN LATERAL … ON true` and drops the row, as its INNER join
 did. Navigations reached through the probe (`b.author.region`) join off its alias, as before.
 
+## A navigation reached through other ones
+
+The selector may also name a reference reached through other references — a path of many-to-one / one-to-one
+navigations. The probe replaces the join of the path's LAST hop and reads its foreign key off the join of the hop
+before it, which keeps its plain join:
+
+```typescript
+await db.books
+  .where(b => eq(b.shelfId, shelfId))
+  .lateralJoin(b => b.author.region)
+  .select(b => ({ title: b.title, author: b.author.name, region: b.author.region.name }))
+  .toList();
+```
+
+```sql
+SELECT "books"."title" as "title", "author"."name" as "author", "region"."name" as "region"
+FROM "books"
+LEFT JOIN "authors" AS "author" ON "books"."author_id" = "author"."id"
+LEFT JOIN LATERAL (SELECT "region__probe".* FROM "regions" "region__probe" WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true
+WHERE "books"."shelf_id" = $1
+```
+
+It is the case of rows that reach a large table through a smaller one: the statistics that decide the last hop's
+join are those of the INTERMEDIATE table's foreign-key column — which, when that table references only a slice of
+the target, can end far below the newest keys it holds while the rows read exactly those. Opt in each hop that needs
+it: `.lateralJoin(b => b.author).lateralJoin(b => b.author.region)` probes both, the second probe reading the
+first one's alias. A path is told apart from another path that ends in the same relation (`b.author.region` and
+`b.author.mentor.region`, which renders under `"mentor__region"`): only the join of the path the selector names
+becomes a probe, under the alias that path renders under.
+
 ## When to use it
 
 When a query reads a FEW rows — the lines of one parent, one page — and joins them to a LARGE table through a
@@ -62,7 +92,8 @@ join of this query and nothing else — every other navigation, and every other 
 ## Where it applies
 
 - **Root queries** — on a table (`db.books.lateralJoin(...)`), after `where()`, and on the untyped builders
-  (`QueryBuilder`, `SelectQueryBuilder`). Call it once per navigation to probe several.
+  (`QueryBuilder`, `SelectQueryBuilder`). Call it once per navigation to probe several. Everywhere below, the
+  selector may name a navigation of the row itself or a path of them (`b => b.author.region`).
 - **After `select()`** — and on every other select builder: `selectDistinct()`, `innerJoin()` / `leftJoin()`,
   the end of the chain, or a builder taken as an `IEntityQueryable`. The selector names a navigation of the
   query's ROOT row (`b => b.author`), whatever the projection; the projection and the chain are kept. The
@@ -106,6 +137,7 @@ What the probe renders:
 | composite key | every key pair in the probe's WHERE |
 | constant key part (`withForeignKey(b => [b.authorId, true])` / `withPrincipalKey(a => [a.id, a.active])`) | `… AND "<alias>__probe"."active" = true` in the probe's WHERE |
 | of a table to itself (`a.mentor`) | the probe reads its table under `"<alias>__probe"`, so the outer row's foreign key is never read off the probed row |
+| a path (`b.author.region`) | the probe of the last hop, its WHERE reading the foreign key off the hop before it (`"author"."region_id"`); the earlier hops keep their joins |
 
 Columns of the target nothing reads cost nothing: PostgreSQL drops them from the subquery's output.
 
@@ -113,8 +145,9 @@ Columns of the target nothing reads cost nothing: PostgreSQL drops them from the
 
 Each refusal throws when the query is built, never silently renders a plain join:
 
-- a selector that returns a column, a collection, or a navigation reached through another one
-  (`b => b.author.region`) — `lateralJoin()` takes a reference navigation of the row itself;
+- a selector that returns a column (`b => b.author.name`), a collection, or a path that ends in or runs through a
+  collection (`b => b.author.books`) — `lateralJoin()` takes a reference navigation of the row, or one reached
+  through reference navigations only;
 - `update()` / `delete()` — their navigations join as `FROM` / `USING` items, and PostgreSQL lets no LATERAL
   subquery there read the row the statement writes. Read the value through a correlated scalar subquery instead:
   `db.authors.where(a => eq(a.id, b.authorId)).select(a => a.name).asSubquery('scalar')`;

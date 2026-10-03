@@ -17,6 +17,13 @@
  * does not opt in, renders exactly as before. The rows are the same either way: each test compares the
  * opted-in query with the same query without `lateralJoin()`.
  *
+ * A reference reached through other references (`lateralJoin(b => b.author.region)`) probes the LAST hop,
+ * correlated on the join of the hop before it — which keeps its own join:
+ *
+ *   LEFT JOIN "lnj_authors" AS "author" ON "lnj_books"."author_id" = "author"."id"
+ *   LEFT JOIN LATERAL (SELECT "region__probe".* FROM "lnj_regions" "region__probe"
+ *                      WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true
+ *
  * The fixture: Gamma has no author (an unmatched LEFT join), Ben is not active (the constant key part of
  * `activeAuthor` matches him nowhere), Cyd has no region, Ann has no mentor.
  */
@@ -668,6 +675,360 @@ describe('lateralJoin() — composition', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A nested reference path
+// ---------------------------------------------------------------------------
+
+const REGION_PROBE = 'LEFT JOIN LATERAL (SELECT "region__probe".* FROM "lnj_regions" "region__probe" '
+  + 'WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true';
+const REGION_PLAIN = 'LEFT JOIN "lnj_regions" AS "region" ON "author"."region_id" = "region"."id"';
+/** The same plain join inside a collection's subquery, which renders its joins without `AS`. */
+const ITEM_REGION_PLAIN = 'LEFT JOIN "lnj_regions" "region" ON "author"."region_id" = "region"."id"';
+
+/** Each book's title, its author and the author's region, as the fixture names them. */
+const BOOK_REGIONS = [
+  ['Alpha', 'Ann', 'North'],
+  ['Beta', 'Ben', 'South'],
+  ['Gamma', null, null],
+  ['Delta', 'Cyd', null],
+  ['Eps', 'Ann', 'North'],
+];
+
+describe('lateralJoin() — a nested reference path', () => {
+  test('a reference reached through another one probes the last hop, correlated on the join of the hop before it', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const query = (probe: boolean) => {
+        const filtered = db.lnjBooks.where(b => gt(b.id, 0));
+
+        return (probe ? filtered.lateralJoin(b => b.author!.region) : filtered)
+          .select(b => ({ id: b.id, title: b.title, author: b.author!.name, region: b.author!.region!.name }))
+          .orderBy(b => b.id)
+          .toList();
+      };
+
+      const plain = await query(false);
+      const plainText = lastStatement(captured);
+      const probed = await query(true);
+      const probedText = lastStatement(captured);
+
+      expect(probed).toEqual(plain);
+      expect(probed.map(b => [b.title, value(b.author), value(b.region)])).toEqual(BOOK_REGIONS);
+
+      expect(plainText).toContain(`${AUTHOR_PLAIN}\n${REGION_PLAIN}`);
+      expect(plainText).not.toContain('LATERAL');
+
+      // The intermediate hop keeps its plain join, the last hop probes off its alias, and nothing else changes
+      expect(probedText).toContain(`${AUTHOR_PLAIN}\n${REGION_PROBE}`);
+      expect(probedText).not.toContain(REGION_PLAIN);
+      expect(probedText.replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+    });
+  });
+
+  test('both hops probed: the last hop\'s probe reads the alias of the first one\'s, in either call order', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const project = (query: IEntityQueryable<LnjBook>) => query
+        .select(b => ({ id: b.id, title: b.title, author: b.author!.name, region: b.author!.region!.name }))
+        .orderBy(b => b.id)
+        .toList();
+
+      const plain = await project(db.lnjBooks);
+      const plainText = lastStatement(captured);
+      const probed = await project(db.lnjBooks.lateralJoin(b => b.author).lateralJoin(b => b.author!.region));
+      const probedText = lastStatement(captured);
+      const reversed = await project(db.lnjBooks.lateralJoin(b => b.author!.region).lateralJoin(b => b.author));
+      const reversedText = lastStatement(captured);
+
+      expect(probed).toEqual(plain);
+      expect(reversed).toEqual(plain);
+      expect(probedText).toContain(`${AUTHOR_PROBE}\n${REGION_PROBE}`);
+      expect(probedText.replace(AUTHOR_PROBE, AUTHOR_PLAIN).replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+      expect(reversedText).toBe(probedText);
+    });
+  });
+
+  test('every builder takes the path: the untyped QueryBuilder and SelectQueryBuilder, a select builder, an IEntityQueryable', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const plain = await db.lnjBooks.select(b => ({ id: b.id, region: b.author!.region!.name })).orderBy(b => b.id).toList();
+      const plainText = lastStatement(captured);
+      const books = (db as any).getTable('lnj_books');
+
+      const fromWhere = await books
+        .where((b: any) => gt(b.id, 0))
+        .lateralJoin((b: any) => b.author.region)
+        .select((b: any) => ({ id: b.id, region: b.author.region.name }))
+        .orderBy((b: any) => b.id)
+        .toList();
+      expect(fromWhere).toEqual(plain);
+      expect(lastStatement(captured)).toContain(`${AUTHOR_PLAIN}\n${REGION_PROBE}`);
+
+      const fromSelect = await books
+        .select((b: any) => ({ id: b.id, region: b.author.region.name }))
+        .lateralJoin((b: any) => b.author.region)
+        .orderBy((b: any) => b.id)
+        .toList();
+      expect(fromSelect).toEqual(plain);
+      expect(lastStatement(captured).replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+
+      // The typed select builder keeps its projection and its chain
+      const projected = db.lnjBooks.select(b => ({ id: b.id, region: b.author!.region!.name }));
+      const probed = projected.lateralJoin(b => b.author!.region);
+      const kept: AssertType<typeof probed, typeof projected> = probed;
+      expect(await kept.orderBy(r => r.id).toList()).toEqual(plain);
+      expect(lastStatement(captured).replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+
+      const taken = await baseQueryOf({ baseQuery: db.lnjBooks.select(b => ({ id: b.id, region: b.author!.region!.name })).orderBy(r => r.id) })
+        .lateralJoin(b => b.author.region)
+        .toList();
+      expect(taken).toEqual(plain);
+      expect(lastStatement(captured).replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+    });
+  });
+
+  test('the probe follows the alias the navigation plan gives its path — never another path ending in the same relation', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      // Two paths end in `region`: the shallower one keeps the plain alias, the other renders as "mentor__region"
+      const MENTOR_REGION_PLAIN = 'LEFT JOIN "lnj_regions" AS "mentor__region" ON "mentor"."region_id" = "mentor__region"."id"';
+      const MENTOR_REGION_PROBE = 'LEFT JOIN LATERAL (SELECT "mentor__region__probe".* FROM "lnj_regions" "mentor__region__probe" '
+        + 'WHERE "mentor__region__probe"."id" = "mentor"."region_id" OFFSET 0) "mentor__region" ON true';
+      const project = (query: IEntityQueryable<LnjBook>) => query
+        .select(b => ({ id: b.id, title: b.title, region: b.author!.region!.name, mentorRegion: b.author!.mentor!.region!.name }))
+        .orderBy(b => b.id)
+        .toList();
+
+      const plain = await project(db.lnjBooks);
+      const plainText = lastStatement(captured);
+      const deep = await project(db.lnjBooks.lateralJoin(b => b.author!.mentor!.region));
+      const deepText = lastStatement(captured);
+      const shallow = await project(db.lnjBooks.lateralJoin(b => b.author!.region));
+      const shallowText = lastStatement(captured);
+
+      expect(plain.map(b => [b.title, value(b.region), value(b.mentorRegion)])).toEqual([
+        ['Alpha', 'North', null],
+        ['Beta', 'South', 'North'],
+        ['Gamma', null, null],
+        ['Delta', null, 'South'],
+        ['Eps', 'North', null],
+      ]);
+      expect(deep).toEqual(plain);
+      expect(shallow).toEqual(plain);
+      expect(plainText).toContain(REGION_PLAIN);
+      expect(plainText).toContain(MENTOR_REGION_PLAIN);
+
+      // Three hops deep, under its path alias: only that join changes
+      expect(deepText).toContain(MENTOR_REGION_PROBE);
+      expect(deepText.replace(MENTOR_REGION_PROBE, MENTOR_REGION_PLAIN)).toBe(plainText);
+
+      // The shallower path ending in the same relation: only ITS join changes
+      expect(shallowText).toContain(REGION_PROBE);
+      expect(shallowText).toContain(MENTOR_REGION_PLAIN);
+      expect(shallowText.replace(REGION_PROBE, REGION_PLAIN)).toBe(plainText);
+    });
+  });
+
+  test('count(), exists() and max() probe the path too, with a WHERE on the probed alias', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const north = (probe: boolean) => (probe ? db.lnjBooks.lateralJoin(b => b.author!.region) : db.lnjBooks)
+        .where(b => eq(b.author!.region!.name, 'North'));
+
+      expect(await north(false).count()).toBe(2);
+      const plainCount = lastStatement(captured);
+      expect(await north(true).count()).toBe(2);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+      expect(lastStatement(captured).replace(REGION_PROBE, REGION_PLAIN)).toBe(plainCount);
+
+      expect(await north(true).exists()).toBe(true);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+
+      const plainMax = await north(false).select(b => ({ id: b.id })).max(r => r.id);
+      const probedMax = await north(true).select(b => ({ id: b.id })).max(r => r.id);
+      expect(probedMax).toBe(plainMax);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+    });
+  });
+
+  for (const strategy of ['lateral', 'cte', 'temptable'] as const) {
+    test(`an item path of a collection (${strategy} strategy)`, async () => {
+      await withCapture(strategy, async (db, captured) => {
+        const query = (probe: boolean) => db.lnjShelves
+          .select(s => ({
+            id: s.id,
+            label: s.label,
+            books: (probe ? s.books!.lateralJoin(b => b.author!.region) : s.books!)
+              .orderBy(b => b.title)
+              .select(b => ({ title: b.title, author: b.author!.name, region: b.author!.region!.name }))
+              .toList(),
+          }))
+          .orderBy(s => s.id)
+          .toList();
+
+        const plain = await query(false);
+        captured.length = 0;
+        const probed = await query(true);
+
+        expect(probed).toEqual(plain);
+        expect(probed.map(s => ({
+          label: s.label,
+          books: s.books.map(b => [b.title, value(b.author), value(b.region)]),
+        }))).toEqual([
+          { label: 'Fiction', books: BOOK_REGIONS.slice(0, 3) },
+          { label: 'Poetry', books: BOOK_REGIONS.slice(3) },
+        ]);
+
+        // The item's own hop keeps its plain join off the row the strategy renders the item as; the last hop probes off it
+        const text = statements(captured).join('\n');
+        const itemRow = strategy === 'lateral' ? 'lateral_\\d+_books' : 'lnj_books';
+        expect(text).toMatch(new RegExp(`LEFT JOIN "lnj_authors" "author" ON "${itemRow}"\\."author_id" = "author"\\."id"`));
+        expect(text).toContain(REGION_PROBE);
+        expect(text).not.toContain(ITEM_REGION_PLAIN);
+      });
+    });
+  }
+
+  for (const strategy of ['lateral', 'cte', 'temptable'] as const) {
+    test(`a navigation and a collection hanging off the nested probe read its alias (${strategy} strategy)`, async () => {
+      await withCapture(strategy, async (db, captured) => {
+        const MENTOR_PROBE = 'LEFT JOIN LATERAL (SELECT "mentor__probe".* FROM "lnj_authors" "mentor__probe" '
+          + 'WHERE "mentor__probe"."id" = "author"."mentor_id" OFFSET 0) "mentor" ON true';
+        const project = (b: any) => ({
+          title: b.title,
+          mentor: b.author.mentor.name,
+          mentorRegion: b.author.mentor.region.name,
+          mentorBooks: b.author.mentor.books.orderBy((m: any) => m.title).select((m: any) => ({ title: m.title })).toList(),
+        });
+
+        // Off the root row
+        const rootQuery = (probe: boolean) => (probe ? db.lnjBooks.lateralJoin(b => b.author!.mentor) : db.lnjBooks)
+          .select(b => ({ id: b.id, ...project(b) }))
+          .orderBy(b => b.id)
+          .toList();
+
+        const rootPlain = await rootQuery(false);
+        captured.length = 0;
+        const rootProbed = await rootQuery(true);
+
+        expect(rootProbed).toEqual(rootPlain);
+        expect(statements(captured).join('\n')).toContain(`${MENTOR_PROBE}\nLEFT JOIN "lnj_regions" AS "region" ON "mentor"."region_id" = "region"."id"`);
+
+        // Off a collection's item
+        const itemQuery = (probe: boolean) => db.lnjShelves
+          .select(s => ({
+            id: s.id,
+            books: (probe ? s.books!.lateralJoin(b => b.author!.mentor) : s.books!).orderBy(b => b.title).select(b => project(b)).toList(),
+          }))
+          .orderBy(s => s.id)
+          .toList();
+
+        const itemPlain = await itemQuery(false);
+        captured.length = 0;
+        const itemProbed = await itemQuery(true);
+
+        expect(itemProbed).toEqual(itemPlain);
+        expect(itemProbed.map(s => s.books.map((b: any) => [b.title, value(b.mentor), value(b.mentorRegion), b.mentorBooks.map((m: any) => m.title)]))).toEqual([
+          [['Alpha', null, null, []], ['Beta', 'Ann', 'North', ['Alpha', 'Eps']], ['Gamma', null, null, []]],
+          [['Delta', 'Ben', 'South', ['Beta']], ['Eps', null, null, []]],
+        ]);
+        const itemText = statements(captured).join('\n');
+        expect(itemText).toContain(MENTOR_PROBE);
+        expect(itemText).toContain('LEFT JOIN "lnj_regions" "region" ON "mentor"."region_id" = "region"."id"');
+      });
+    });
+  }
+
+  test('a collection\'s count() and exists() whose filter reads the probed path', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const counted = (probe: boolean) => db.lnjShelves
+        .select(s => ({
+          id: s.id,
+          north: (probe ? s.books!.lateralJoin(b => b.author!.region) : s.books!).where(b => eq(b.author!.region!.name, 'North')).count(),
+        }))
+        .orderBy(s => s.id)
+        .toList();
+
+      const plainCounts = await counted(false);
+      const probedCounts = await counted(true);
+      expect(probedCounts).toEqual(plainCounts);
+      expect(probedCounts.map(s => s.north)).toEqual([1, 1]);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+      expect(lastStatement(captured)).not.toContain(ITEM_REGION_PLAIN);
+
+      const south = (probe: boolean) => db.lnjShelves
+        .where(s => exists((probe ? s.books!.lateralJoin(b => b.author!.region) : s.books!).where(b => eq(b.author!.region!.name, 'South'))))
+        .select(s => ({ id: s.id, label: s.label }))
+        .toList();
+
+      const plainShelves = await south(false);
+      const probedShelves = await south(true);
+      expect(probedShelves).toEqual(plainShelves);
+      expect(probedShelves.map(s => s.label)).toEqual(['Fiction']);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+      expect(lastStatement(captured)).not.toContain(ITEM_REGION_PLAIN);
+    });
+  });
+
+  test('a QueryBatch leg and a UNION ALL leg carry the nested probe and read the same rows', async () => {
+    await withCapture('lateral', async (db, captured, ids) => {
+      const leg = (shelfId: number, probe: boolean) => (probe ? db.lnjBooks.lateralJoin(b => b.author!.region) : db.lnjBooks)
+        .where(b => eq(b.shelfId, shelfId))
+        .select(b => ({ id: b.id, region: b.author!.region!.name }));
+
+      const plainFiction = await leg(ids.fiction, false).orderBy(b => b.id).toList();
+      const standalone = await leg(ids.fiction, true).orderBy(b => b.id).toList();
+      expect(standalone).toEqual(plainFiction);
+
+      const batch = new QueryBatch();
+      const key = batch.addList(leg(ids.fiction, true).orderBy(b => b.id), 'books');
+      captured.length = 0;
+      await batch.executeBatch();
+
+      expect(batch.getList(key)).toEqual(standalone);
+      expect(statements(captured)).toHaveLength(1);
+      expect(lastStatement(captured)).toContain(REGION_PROBE);
+
+      const plainUnion = await leg(ids.fiction, false).unionAll(leg(ids.poetry, false)).toList();
+      const probedUnion = await leg(ids.fiction, true).unionAll(leg(ids.poetry, false)).toList();
+
+      expect(byId(probedUnion)).toEqual(byId(plainUnion));
+      expect(byId(probedUnion).map(b => value(b.region))).toEqual(['North', 'South', null, null, 'North']);
+      // The first leg probes, the second keeps its plain join
+      const unionText = lastStatement(captured);
+      expect(unionText).toContain(REGION_PROBE);
+      expect(unionText).toContain(REGION_PLAIN);
+    });
+  });
+
+  test('refused: a path ending in or running through a collection, a column, and the uses that refuse any probe', async () => {
+    await withCapture('lateral', async (db) => {
+      expect(() => db.lnjBooks.lateralJoin(b => b.author!.books)).toThrow(/lateralJoin\(\): "author\.books" is a collection of "lnj_authors"/);
+      expect(() => db.lnjShelves.lateralJoin((s: any) => s.books.author)).toThrow(/lateralJoin\(\): "books" is a collection of "lnj_shelves"/);
+      expect(() => db.lnjBooks.lateralJoin(b => b.author!.region!.name)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
+
+      expect(() => db.lnjBooks.lateralJoin(b => b.author!.region).where(b => eq(b.author!.region!.name, 'North')).update({ title: 'x' }))
+        .toThrow(/lateralJoin\(\) cannot be combined with update\(\)/);
+      expect(() => db.lnjBooks.lateralJoin(b => b.author!.region).where(b => eq(b.author!.region!.name, 'North')).delete())
+        .toThrow(/lateralJoin\(\) cannot be combined with delete\(\)/);
+      expect(() => db.lnjBooks
+        .lateralJoin(b => b.author!.region)
+        .select(b => ({ id: b.id, region: b.author!.region!.name }))
+        .groupBy(r => ({ region: r.region })))
+        .toThrow(/lateralJoin\(\) is not supported on a grouped query/);
+
+      // In a collection, the path is read off the item's relations
+      await expectToReject(
+        () => db.lnjShelves.select(s => ({ titles: s.books!.lateralJoin(b => b.author!.books).select(b => b.title).toList() })).toList(),
+        /lateralJoin\(\): "author\.books" is a collection of "lnj_authors"/,
+      );
+      await expectToReject(
+        () => db.lnjRegions.select(r => ({ titles: r.authors!.selectMany(a => a.books!).lateralJoin(b => b.author!.region).select(b => b.title).toList() })).toList(),
+        /lateralJoin\(\) is not supported on a collection flattened by selectMany\(\)/,
+      );
+
+      // Nothing was written
+      expect(await db.lnjBooks.count()).toBe(5);
+      expect(await db.lnjBooks.where(b => eq(b.title, 'x')).count()).toBe(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Refused uses
 // ---------------------------------------------------------------------------
 
@@ -675,7 +1036,8 @@ describe('lateralJoin() — refused uses', () => {
   test('the selector must return a reference navigation of the row itself', async () => {
     await withCapture('lateral', async (db) => {
       expect(() => db.lnjBooks.lateralJoin(b => b.title)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
-      expect(() => db.lnjBooks.lateralJoin(b => b.author!.region)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
+      // A column reached through a navigation (a path of references is taken: see "a nested reference path")
+      expect(() => db.lnjBooks.lateralJoin(b => b.author!.name)).toThrow(/lateralJoin\(\) takes a reference navigation of the "lnj_books" row/);
       expect(() => db.lnjShelves.lateralJoin(s => s.books)).toThrow(/lateralJoin\(\): "books" is a collection of "lnj_shelves"/);
 
       await expectToReject(
@@ -761,6 +1123,50 @@ describe('lateralJoin() — planner', () => {
       expect(probedPlan).not.toMatch(/Merge (Left |Right )?Join/);
       expect(probedPlan).toMatch(/Nested Loop/);
       expect(probedPlan).toMatch(/Index (Only )?Scan using \S+ on lnj_authors author__probe/);
+    });
+  });
+
+  test('a nested probe takes the merge join of its own hop away, and only that one', async () => {
+    await withCapture('lateral', async (db, captured) => {
+      const project = (query: IEntityQueryable<LnjBook>) => query.select(b => ({ id: b.id, region: b.author!.region!.name })).toList();
+
+      const plain = await project(db.lnjBooks);
+      const plainText = lastStatement(captured);
+      const nested = await project(db.lnjBooks.lateralJoin(b => b.author!.region));
+      const nestedText = lastStatement(captured);
+      const both = await project(db.lnjBooks.lateralJoin(b => b.author).lateralJoin(b => b.author!.region));
+      const bothText = lastStatement(captured);
+
+      expect(byId(nested)).toEqual(byId(plain));
+      expect(byId(both)).toEqual(byId(plain));
+
+      if (!planner) {
+        return;
+      }
+
+      const explain = (text: string) => db.transaction(async tx => {
+        await tx.query('SET LOCAL enable_hashjoin = off');
+        await tx.query('SET LOCAL enable_nestloop = off');
+        await tx.query('SET LOCAL enable_seqscan = off');
+        const rows = await tx.query(`EXPLAIN (COSTS OFF) ${text}`);
+
+        return rows.map((row: any) => row['QUERY PLAN']).join('\n');
+      });
+      const mergeJoins = (plan: string): number => (plan.match(/Merge (Left |Right |Full )?Join/g) ?? []).length;
+
+      const plainPlan = await explain(plainText);
+      const nestedPlan = await explain(nestedText);
+      const bothPlan = await explain(bothText);
+
+      // Plain: both hops merge-joined. The nested probe: books → authors still is, the region is one key lookup per
+      // row (the regions are read nowhere else). Both hops probed: no merge join left
+      expect(mergeJoins(plainPlan)).toBe(2);
+      expect(mergeJoins(nestedPlan)).toBe(1);
+      expect(nestedPlan).toMatch(/Index (Only )?Scan using \S+ on lnj_regions region__probe/);
+      expect(nestedPlan).not.toMatch(/on lnj_regions region(?!__)/);
+      expect(mergeJoins(bothPlan)).toBe(0);
+      expect(bothPlan).toMatch(/Index (Only )?Scan using \S+ on lnj_authors author__probe/);
+      expect(bothPlan).toMatch(/Index (Only )?Scan using \S+ on lnj_regions region__probe/);
     });
   });
 });
