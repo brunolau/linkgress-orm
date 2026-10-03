@@ -3126,9 +3126,10 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
    * instead of a plain join — `LEFT JOIN LATERAL (SELECT … FROM <target> WHERE <key> = <foreign key> OFFSET 0)
    * "<alias>" ON true`, INNER for a required navigation: one key lookup per row, whatever the statistics of
    * the foreign-key column say. Same rows as the plain join. A reference reached through other references
-   * (`b => b.author.region`) probes the path's last hop, off the join of the hop before it. Opt-in per
-   * navigation, for a query whose rows are few over a large target — never for a navigation the WHERE filters
-   * the rows by. Refused by update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
+   * (`b => b.author.region`) probes the path's last hop, off the join of the hop before it. A collection hanging
+   * off the probed path (`b.author.region.landmarks`) probes it too, where its subquery joins the path anew.
+   * Opt-in per navigation, for a query whose rows are few over a large target — never for a navigation the WHERE
+   * filters the rows by. Refused by update(), delete() and groupBy(). See docs/guides/lateral-navigation-joins.md.
    */
   lateralJoin(navigation: (entity: EntityQuery<TEntity>) => unknown): IEntityQueryable<TEntity>;
 

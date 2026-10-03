@@ -62,6 +62,48 @@ first one's alias. A path is told apart from another path that ends in the same 
 `b.author.mentor.region`, which renders under `"mentor__region"`): only the join of the path the selector names
 becomes a probe, under the alias that path renders under.
 
+## A collection hanging off a probed navigation
+
+A collection reached through navigations (`b.author.region.landmarks`) is correlated through that path. Where its
+subquery is correlated to the row by itself — the LATERAL of a list (`toList()`, a `limit()`ed list,
+`firstOrDefault()`), the subquery of a `count()` / `exists()` written in a `where()` or a `sql` fragment — it joins
+the path anew, from the row the path starts from. A hop of the path the query probes is probed there too:
+
+```typescript
+await db.books
+  .where(b => eq(b.shelfId, shelfId))
+  .lateralJoin(b => b.author.region)
+  .select(b => ({
+    title: b.title,
+    landmarks: b.author.region.landmarks.select(l => ({ name: l.name })).toList(),
+  }))
+  .toList();
+```
+
+```sql
+SELECT "books"."title" as "title", COALESCE("lateral_0".data, '[]'::json) as "landmarks"
+FROM "books"
+LEFT JOIN LATERAL (SELECT json_agg(json_build_object('name', "name")) as data
+FROM (
+  SELECT "lateral_0_landmarks"."name" as "name"
+  FROM "landmarks" "lateral_0_landmarks"
+  LEFT JOIN "authors" "author" ON "books"."author_id" = "author"."id"
+  LEFT JOIN LATERAL (SELECT "region__probe".* FROM "regions" "region__probe" WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true
+  WHERE "lateral_0_landmarks"."region_id" = "region"."id"
+) sub) "lateral_0" ON true
+WHERE "books"."shelf_id" = $1
+```
+
+A plain join of the region there would leave the planner the very merge join the probe takes away — decided by the
+same statistics, for the same few rows. Nothing is called on the collection: a hop of its path is probed when the
+query whose row the path starts from probes the same path (`lateralJoin(b => b.author.region)` probes the region
+hop of `b.author.region.landmarks`, `lateralJoin(b => b.author)` its author hop), in a root query and in a
+collection whose items the path starts from (`s.books.lateralJoin(b => b.author.region)` and, in its projection,
+`b.author.region.landmarks`). The other hops keep their plain joins; a path the query does not probe, and a query
+without `lateralJoin()`, render as before. What joins nothing of the path is unchanged: an aggregate correlated to
+the row's own join of it (`toStringList()`, a projected `count()`), and the CTE and temp-table aggregations, which
+the row's join — the probe — correlates (a LATERAL nested in a temp-table aggregation joins the path, and probes it).
+
 ## When to use it
 
 When a query reads a FEW rows — the lines of one parent, one page — and joins them to a LARGE table through a
@@ -124,6 +166,10 @@ join of this query and nothing else — every other navigation, and every other 
   ```
 
   A collection's `count()` / `exists()` — projected, or in a `where()` — probes too.
+- **Collections hanging off a probed path** — the probe reaches the join of the path their subquery makes anew,
+  without a call of their own (see "A collection hanging off a probed navigation"): a list's LATERAL under the
+  `lateral` strategy and nested in a temp-table aggregation, and a `count()` / `exists()` subquery under every
+  strategy.
 - **Everything that renders the query** — `toList()`, `first()`, `count()`, `exists()`, `min()` / `max()` / `sum()`,
   `countOver()`, `future()`, `prepare()`, `QueryBatch` legs and `union()` / `unionAll()` legs. The text is the same
   every time the query is built, so a prepared statement keeps ONE cached plan.
@@ -138,6 +184,7 @@ What the probe renders:
 | constant key part (`withForeignKey(b => [b.authorId, true])` / `withPrincipalKey(a => [a.id, a.active])`) | `… AND "<alias>__probe"."active" = true` in the probe's WHERE |
 | of a table to itself (`a.mentor`) | the probe reads its table under `"<alias>__probe"`, so the outer row's foreign key is never read off the probed row |
 | a path (`b.author.region`) | the probe of the last hop, its WHERE reading the foreign key off the hop before it (`"author"."region_id"`); the earlier hops keep their joins |
+| a collection hanging off a probed hop (`b.author.region.landmarks`) | its subquery's own join of that hop is the same probe, reading the foreign key off the hop before it as joined there (or off the row, for the first hop) |
 
 Columns of the target nothing reads cost nothing: PostgreSQL drops them from the subquery's output.
 

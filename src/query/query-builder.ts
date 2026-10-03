@@ -1988,7 +1988,9 @@ export class SelectQueryBuilder<TSelection> {
    *   LEFT JOIN LATERAL (SELECT "region__probe".* FROM "regions" "region__probe"
    *                      WHERE "region__probe"."id" = "author"."region_id" OFFSET 0) "region" ON true
    *
-   * Every hop of the path must be a reference (many-to-one / one-to-one) navigation.
+   * Every hop of the path must be a reference (many-to-one / one-to-one) navigation. A collection hanging off
+   * the probed path (`row.author.region.landmarks`) probes it too, where its subquery joins the path anew from
+   * the row (a list's LATERAL, a `count()` / `exists()` subquery).
    *
    * Per navigation and opt-in: for a query whose rows are FEW (one parent's lines, a page) over a target
    * that is LARGE. A navigation the WHERE filters on is the opposite case — the plain join lets PostgreSQL
@@ -6502,7 +6504,8 @@ ${joinClauses.join('\n')}`;
     const restore = sealed?.apply();
 
     try {
-      return build();
+      // The collections hanging off a path lateralJoin() opted in probe it where they join it anew
+      return withProbedPaths(this.chainId, this.schema.name, this.lateralNavigations, build);
     } finally {
       restore?.();
       this.navigationPlan = previous;
@@ -10469,6 +10472,36 @@ const lateralNavigationJoinOf = (
   return node === undefined ? undefined : { alias: node.alias, sourceAlias: plan.parentAliasOf(node) };
 };
 
+/**
+ * The paths `lateralJoin()` opted in, of each query whose statement is being built, by the chain of its row
+ * (MOCK_ROW_CHAIN_ID — a root query's, or a collection's for its items), with the name that row's navigations
+ * join from (`anchor`: the root's table, the collection's item table). A collection reached through such a
+ * path joins it anew in its own subquery, and probes there the hops the query probes (see
+ * CollectionQueryBuilder.probedNavigationPath). An entry lives while its query is built (see withProbedPaths):
+ * a build is synchronous, and a nested collection is built inside the build of the query whose row it hangs off.
+ */
+const probedPathsInBuild = new Map<number | string, { readonly anchor: string; readonly paths: readonly string[] }>();
+
+/** Runs `build` with `paths` registered as the probes of the query of chain `chain` (see probedPathsInBuild). */
+const withProbedPaths = <T>(chain: number, anchor: string, paths: readonly string[], build: () => T): T => {
+  if (paths.length === 0) {
+    return build();
+  }
+
+  const previous = probedPathsInBuild.get(chain);
+  probedPathsInBuild.set(chain, { anchor, paths });
+
+  try {
+    return build();
+  } finally {
+    if (previous === undefined) {
+      probedPathsInBuild.delete(chain);
+    } else {
+      probedPathsInBuild.set(chain, previous);
+    }
+  }
+};
+
 /** `names` with `name` added (once): a new array — the lists are shared by derived builders. */
 const withLateralNavigation = (names: readonly string[], name: string): readonly string[] =>
   (names.includes(name) ? names : [...names, name]);
@@ -10910,7 +10943,9 @@ export class CollectionQueryBuilder<TItem = any> {
    * LATERAL probe of its target's key instead of a plain join — see {@link SelectQueryBuilder.lateralJoin}.
    * The collection's rows (one parent's) drive; under every strategy (lateral, cte, temptable) the probe
    * reads the foreign key of the row the strategy renders the item as. A reference reached through other
-   * references (`it => it.author.region`) probes the path's last hop, off the join of the hop before it.
+   * references (`it => it.author.region`) probes the path's last hop, off the join of the hop before it. A
+   * collection of the item hanging off the probed path (`it.author.region.landmarks`) probes it too, where its
+   * subquery joins the path anew from the item.
    *
    * @example
    * db.shelves.select(s => ({
@@ -12101,6 +12136,44 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
+   * The navigation path this collection hangs off as its subquery joins it anew from the row the path starts
+   * from (the LATERAL form, a count() / exists() subquery): a hop the query of that row probes with
+   * `lateralJoin()` — the same relation path from the same row — is the same probe here, a copy of the hop
+   * with `lateral` set (every renderer of a navigation join draws it as the probe). The path itself when the
+   * query probes none of its hops, or when no query whose build is in progress probes anything (see
+   * probedPathsInBuild): a query without `lateralJoin()` renders the joins it always rendered.
+   *
+   * A collection of the root row hanging off `b.author.region` joins `author` from the book and `region` from
+   * `author` inside its subquery; with `lateralJoin(b => b.author.region)` the root's join of the region is a
+   * probe, and a plain join of it here would leave the planner the merge join the probe took away.
+   */
+  private probedNavigationPath(): NavigationJoin[] {
+    const path = this.navigationPath;
+    // The chain of the row the path starts from: the row that minted us carries it, and our path starts from
+    // the row of that same query (see mintReferenceMockRow)
+    const chain = path.length === 0 || probedPathsInBuild.size === 0 ? undefined : this.mintedChainId;
+    const probes = chain === undefined ? undefined : probedPathsInBuild.get(chain);
+
+    if (probes === undefined || path[0].sourceAlias !== probes.anchor) {
+      return path;
+    }
+
+    let rendered: NavigationJoin[] | undefined;
+    let relationPath = '';
+
+    for (const [index, step] of path.entries()) {
+      relationPath = index === 0 ? step.alias : `${relationPath}.${step.alias}`;
+
+      if (probes.paths.includes(relationPath)) {
+        rendered ??= [...path];
+        rendered[index] = { ...step, lateral: true };
+      }
+    }
+
+    return rendered ?? path;
+  }
+
+  /**
    * The alias of the row this collection hangs off, as the enclosing build renders it: the row that
    * minted it (see mintedBy), when an enclosing collection subquery renders that row — a row of one of
    * its selectMany() hops, or its items (see EnclosingCollectionScope) — else `table` under the alias
@@ -12251,12 +12324,19 @@ export class CollectionQueryBuilder<TItem = any> {
 
     // Navigation path joins (for reference navigation like pc.order → orders), under the aliases
     // pathAliasesIn gives them
-    for (const [index, nav] of this.navigationPath.entries()) {
+    for (const [index, nav] of this.probedNavigationPath().entries()) {
+      const src = index === 0 ? anchor : pathAliasOf(nav.sourceAlias);
+      const alias = pathAliases[index];
+
+      // A hop the query our path starts from probes: the same probe here (see probedNavigationPath)
+      if (nav.lateral === true) {
+        allJoins.push(renderLateralNavigationJoin({ ...nav, alias }, src));
+        continue;
+      }
+
       const joinType = nav.isMandatory ? 'JOIN' : 'LEFT JOIN';
       const fk = nav.foreignKeys[0];
       const pk = (nav.matches && nav.matches.length > 0) ? nav.matches[0] : 'id';
-      const src = index === 0 ? anchor : pathAliasOf(nav.sourceAlias);
-      const alias = pathAliases[index];
       allJoins.push(`${joinType} ${quoteTableReference(nav.targetTable, nav.targetSchema)} "${alias}" ON "${src}"."${fk}" = "${alias}"."${pk}"`);
     }
 
@@ -12904,7 +12984,9 @@ export class CollectionQueryBuilder<TItem = any> {
     const restore = sealed?.apply();
 
     try {
-      return build(sealed);
+      // The collections hanging off a path of our item lateralJoin() opted in probe it where they join it anew
+      // (without a schema, lateralJoin() refuses: there is nothing of ours to register then)
+      return withProbedPaths(this.chainId, this.targetTable, this.lateralNavigations, () => build(sealed));
     } finally {
       restore?.();
       this.navigationPlan = previous;
@@ -14280,9 +14362,11 @@ export class CollectionQueryBuilder<TItem = any> {
     // navigations of the hops' filters, which join from the hops
     // (the common case — no navigation path, no selectMany — reuses the detected array instead of
     // spreading it twice; strategies only read these lists)
-    const allNavigationJoins: NavigationJoin[] = this.navigationPath.length === 0 && bridgeJoins.length === 0
+    // A hop of that path the query it starts from probes renders as the same probe (see probedNavigationPath)
+    const pathJoins = this.probedNavigationPath();
+    const allNavigationJoins: NavigationJoin[] = pathJoins.length === 0 && bridgeJoins.length === 0
       ? navigationJoins
-      : [...this.navigationPath, ...bridgeJoins, ...navigationJoins, ...hopNavigationJoins];
+      : [...pathJoins, ...bridgeJoins, ...navigationJoins, ...hopNavigationJoins];
     // The correlated form joins the path this collection hangs off as well when the enclosing scope
     // renders the path's last hop under another alias (see buildCTE's `joinOwnPath`)
     const allSelectorJoins: NavigationJoin[] = joinOwnPath && strategyType === 'lateral' && this.navigationPath.length > 0
@@ -14326,7 +14410,8 @@ export class CollectionQueryBuilder<TItem = any> {
       counter: reservedCounter !== undefined ? reservedCounter : context.cteCounter++,
       navigationJoins: allNavigationJoins.length > 0 ? allNavigationJoins : undefined,
       selectorNavigationJoins: allSelectorJoins.length > 0 ? allSelectorJoins : undefined,
-      navigationPath: this.navigationPath.length > 0 ? this.navigationPath : undefined,
+      // The very join objects of `navigationJoins` — a strategy tells the path's hops by identity
+      navigationPath: pathJoins.length > 0 ? pathJoins : undefined,
     };
 
     // Step 6: Restore the lateralTableAliasMap to prevent sibling collections from seeing this alias
