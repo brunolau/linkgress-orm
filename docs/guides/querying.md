@@ -218,7 +218,13 @@ no type information, such as CTE columns, stay uncast; PostgreSQL infers the
 array type from context there.
 
 Semantics are identical to `inArray` / `notInArray` in every case, empty lists
-and NULLs included. **Choose on planning:**
+and NULLs included. An empty list — or a value that is not an array — is a
+constant for `inArray` / `notInArray`: `1=0` (no row, a NULL operand included)
+and `1=1` (every row). It binds nothing: the operand never reaches the statement,
+so the parameters of an expression operand
+(`coalesce(jsonbPathText(w.attributes, param('tier', 'text')), '')`) are left out
+with it. `eqAny` / `neAll` bind the empty array instead (`= ANY('{}')` is FALSE,
+`<> ALL('{}')` TRUE). **Choose on planning:**
 
 | | `inArray` / `notInArray` | `eqAny` / `neAll` |
 |---|---|---|

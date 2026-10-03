@@ -285,6 +285,16 @@ export const sqlParityCorpus: ParityCase[] = [
       'SELECT a1.k, b1.k FROM a1 JOIN b1 ON a1.k IS NOT DISTINCT FROM b1.k ORDER BY 1 NULLS LAST, b1.vb COLLATE "C"',
       'SELECT * FROM a1 JOIN b1 ON a1.k = b1.k AND b1.vb = \'y\'',
       'SELECT * FROM a1 LEFT JOIN b1 ON a1.k = b1.k WHERE b1.k IS NULL ORDER BY va COLLATE "C"',
+      // a WHERE qual on the nullable side keeps the outer join unless it rejects NULL: `x <> ALL(<empty array>)`
+      // is TRUE for a NULL x (no element to compare it with), so the null-extended rows stay — only `= ANY` and
+      // an ALL over an array known to be non-empty reject them
+      "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name <> ALL('{}'::text[]) ORDER BY e.id",
+      p('SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name <> ALL($1::text[]) ORDER BY e.id', '{}'),
+      p('SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name <> ALL($1::text[]) ORDER BY e.id', '{ops}'),
+      "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name <> ALL(ARRAY['ops']) ORDER BY e.id",
+      "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name NOT IN ('ops') ORDER BY e.id",
+      "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.name = ANY('{}'::text[]) ORDER BY e.id",
+      "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id WHERE d.id > ALL('{}'::int[]) ORDER BY e.id",
       'SELECT k FROM a1 JOIN b1 USING (k) JOIN emp ON emp.id = k',
       'SELECT name FROM emp JOIN dept ON dept.id = emp.dept_id',
       'SELECT * FROM emp e JOIN dept d',

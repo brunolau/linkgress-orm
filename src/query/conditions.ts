@@ -711,11 +711,15 @@ export class InComparison<V = any> extends WhereComparisonBase<V> {
   }
 
   buildSql(context: SqlBuildContext): string {
-    const fieldName = this.getDbColumnName(this.field, context);
-
+    // An empty list (or a non-array) matches no row, a NULL field included — decided BEFORE the field renders:
+    // the constant never reads it, and a field that binds parameters (`coalesce(jsonbPathText(col, param(k)), '')`,
+    // a fragment with values) left them bound with no `$N` referencing them, a statement PostgreSQL refuses. Its
+    // refs still reach getFieldRefs(), so the joins a navigation in it registers stay as they were.
     if (!Array.isArray(this.values) || this.values.length === 0) {
       return '1=0'; // No matches
     }
+
+    const fieldName = this.getDbColumnName(this.field, context);
 
     // Apply toDriver mapper if the field has one
     const mapper = getValueMapper(this.field);
@@ -745,11 +749,13 @@ export class NotInComparison<V = any> extends WhereComparisonBase<V> {
   }
 
   buildSql(context: SqlBuildContext): string {
-    const fieldName = this.getDbColumnName(this.field, context);
-
+    // An empty list (or a non-array) excludes nothing — every row matches, a NULL field included. Decided before
+    // the field renders, for the reason InComparison gives.
     if (!Array.isArray(this.values) || this.values.length === 0) {
       return '1=1'; // All match
     }
+
+    const fieldName = this.getDbColumnName(this.field, context);
 
     // Apply toDriver mapper if the field has one
     const mapper = getValueMapper(this.field);

@@ -135,10 +135,23 @@ export function splitConjuncts(e: TExpr | null): TExpr[] {
 }
 
 /**
+ * Whether an array operand of `x op ALL (array)` is known to hold an element (PostgreSQL's
+ * is_strict_saop): a non-NULL array constant with an element, or `ARRAY[…]` listing one. A parameter
+ * or any other expression may be the empty array.
+ */
+function holdsAnElement(e: TExpr): boolean {
+  if (e.k === 'const') {
+    return !e.isNull && Array.isArray(e.value) && (e.value as unknown[]).flat(Infinity as 1).length > 0;
+  }
+  return e.k === 'array' && e.elements.length > 0 && !e.multidims;
+}
+
+/**
  * find_nonnullable_rels: range table indexes (query level 0) whose columns must be non-NULL for the
  * qual to be TRUE — through strict operators / functions, AND (union), OR (intersection), IS NOT
- * NULL, IS TRUE / IS FALSE and = ANY. A WHERE qual like that turns an outer join whose nullable side
- * it references into an inner join (reduce_outer_joins).
+ * NULL, IS TRUE / IS FALSE, `= ANY` and an ALL over an array known to hold an element. A WHERE qual
+ * like that turns an outer join whose nullable side it references into an inner join
+ * (reduce_outer_joins).
  */
 export function nonNullableRels(e: TExpr, isStrict: (funcOid: number) => boolean): Set<number> {
   const out = new Set<number>();
@@ -193,7 +206,12 @@ export function nonNullableRels(e: TExpr, isStrict: (funcOid: number) => boolean
       }
       return out;
     case 'saop':
-      strictArgs(e.args[0]);
+      // `x op ANY (…)` is never TRUE for a NULL x; `x op ALL (…)` is TRUE for every x — NULL included — over
+      // an empty array, so it rejects a NULL x only when the array is known to hold an element: reduced over
+      // `x <> ALL('{}')`, a LEFT JOIN lost its null-extended rows
+      if (e.useOr || holdsAnElement(e.args[1])) {
+        strictArgs(e.args[0]);
+      }
       return out;
     default:
       strictArgs(e);

@@ -12,6 +12,7 @@ import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, mock } from 'bun:test';
+import { installParamAudit } from './utils/param-audit';
 import { disposeSharedDatabase } from './utils/test-database';
 
 const memoryMode = (process.env.LINKGRESS_TEST_DB || '').toLowerCase() === 'memory';
@@ -46,6 +47,11 @@ if (memoryMode) {
   mock.module(require.resolve('pg'), () => memoryPg);
   mock.module(require.resolve('postgres'), () => ({ ...memoryPostgres, default: memoryPostgres }));
 }
+
+// Every statement a built-in client sends with parameters must reference each of them, and bind each `$N`
+// it references (tests/utils/param-audit.ts): refused before it is sent, naming the statement and the
+// parameters, on every engine and driver alike.
+installParamAudit();
 
 if (process.env.LINKGRESS_TEST_RECORD_DIR) {
   // the statement recorder (tests/utils/query-recorder.ts) keys statements by test; Bun has no
