@@ -201,10 +201,12 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
   position; `tests/memory/sql-parity.test.ts` holds a corpus of statements to that standard.
 - Not implemented (an error is raised instead): `COPY`, `EXCLUDE` constraints, `MERGE` into a view,
   `INSTEAD OF` triggers, `SELECT … INTO`.
-- An aggregate is evaluated in the query it is written in. PostgreSQL places one whose arguments (and FILTER) read
-  only an OUTER query's columns — `(SELECT sum(o.n) FROM t)` — in that outer query; such an aggregate is refused
-  (0A000 "outer-level aggregates are not supported by the in-memory database", 1.0.31) rather than evaluated in
-  place, which gave another number without an error.
+- An aggregate is evaluated in the query it is written in. PostgreSQL places one whose aggregated arguments, ORDER
+  BY keys and FILTER read only an OUTER query's columns — `(SELECT sum(o.n) FROM t)` — in that outer query; such an
+  aggregate is refused (0A000 "outer-level aggregates are not supported by the in-memory database", 1.0.31) rather
+  than evaluated in place, which gave another result than PostgreSQL's without an error. One column of its own
+  query among those operands — `array_agg(o.n ORDER BY t.id)`, `sum(o.n) FILTER (WHERE t.n > 1)`, `sum(t.n + o.n)` —
+  makes it an aggregate of its own query, on both: those answer as PostgreSQL does.
 - A `FULL JOIN` is refused as PostgreSQL's planner refuses it (0A000 "FULL JOIN is only supported with merge-joinable
   or hash-joinable join conditions") — no equality between the two sides and a condition that is neither one nor a
   constant (`IS NOT DISTINCT FROM`, an inequality, an OR, a condition on one side alone, a volatile equality); a

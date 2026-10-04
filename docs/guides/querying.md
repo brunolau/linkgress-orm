@@ -634,10 +634,8 @@ db.users.select(u => ({
 (Such a selector used to throw "MAX requires an aggregate field".) An `sql` expression in a collection's
 items reads through its `mapWith`, as it does at the top level.
 
-**Mapped columns.** The columns of a collection's item carry their type mapper, as the root's and a reference
-navigation's do (1.0.31). A value compared with a mapped column in the collection's `where()` is bound through
-`toDriver`, and `min()` / `max()` of a mapped column read back through `fromDriver` — at the root, nested in
-another collection's items and in a mutation's RETURNING; `sum()` and `count()` stay numbers:
+**Mapped columns** (1.0.31). A column of a collection's item with a custom type binds and reads through its mapper
+in two places:
 
 ```typescript
 db.products
@@ -645,8 +643,20 @@ db.products
   .select(p => ({ id: p.id, lastEnd: p.timeSlots!.max(s => s.endsAt) }));                        // read through the mapper
 ```
 
-(The value used to be bound as it was written — an object or a Temporal value against a `smallint` / `timestamp`
-parameter — and the extreme came back as the stored value. `min()` / `max()` are still typed `number | null`.)
+- a value compared DIRECTLY with the bare column in the collection's `where()` — `eq` / `ne` / `gt` / `gte` / `lt` /
+  `lte` / `like` …, `between`, `inArray` / `notInArray`, `eqAny` / `neAll` and the `…Opt` forms — is bound through
+  `toDriver` (pass the application value, never the stored one);
+- `min()` / `max()` of the bare column — the item's, or one reached through the item's navigation — read back
+  through `fromDriver`: as a value of a root projection, of a collection's items, of a mutation's RETURNING, and in
+  a QueryBatch. They are still typed `number | null`.
+
+That is all. An EXPRESSION over a mapped item column — `coalesce(p.at, …)`, `add` / `sub` / `mul` / `div`,
+`greatest` / `least` / `nullIf`, `caseOf`, `caseWhen`, an `sql` template — binds its plain operands as written and
+reads the stored value, in the collection's filter and in its projection alike; `min()` / `max()` of an expression,
+`sum()` and `count()` are numbers; and a `min()` / `max()` read as a COLUMN of a CTE or of a joined table subquery is
+the stored value. (The item's lists of a bare mapped column — `select(p => ({ at: p.at })).toList()` — read through
+the mapper, as they always did.) At the root, a mapped column's expressions DO inherit its mapper — a difference
+between the root and a collection's item that is older than this release and kept by it.
 
 **A count as the summand.** `sum()` also sums a count of a collection of the item — reached directly or through
 reference navigations of the item, with its own filter (1.0.31: through a reference; the hop used to render
