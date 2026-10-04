@@ -106,16 +106,19 @@ linkgress-orm/
 ├── src/                  # Source code
 │   ├── entity/          # DbContext, entities, configuration
 │   ├── query/           # Query builders and executors
-│   ├── schema/          # Schema management
-│   ├── client/          # Database client implementations
+│   ├── schema/          # Table schema builders, navigation metadata
+│   ├── migration/       # Schema manager and migrations
+│   ├── database/        # Database client implementations
 │   └── index.ts         # Public API exports
 ├── tests/               # Test files
 │   ├── queries/        # Query tests
 │   ├── schema/         # Schema tests
 │   └── utils/          # Test utilities
-├── docs/                # Documentation
+├── debug/schema/        # The example model of the docs (AppDatabase)
+├── docs/                # Documentation (ships in the npm package)
 │   └── guides/         # User guides
-└── examples/            # Example code
+├── llms.txt             # Index of the docs for AI agents (ships in the npm package)
+└── changelog/           # One file per version (v1.0.30.md, ...)
 ```
 
 ## Code Style
@@ -174,23 +177,7 @@ npm run test:pglite
 
 ## Documentation
 
-### Updating Documentation
-
-When adding features or making changes:
-
-1. **Update relevant docs** in the `docs/` directory
-2. **Add examples** to demonstrate new functionality
-3. **Update README.md** if adding major features
-4. **Keep docs concise** and easy to follow
-5. **Use code samples** liberally
-
-### Documentation Style
-
-- Use **clear, simple language**
-- Provide **working code examples**
-- Include **type information** in examples
-- Add **cross-references** to related docs
-- Use **markdown formatting** consistently
+The docs are AI-first: their first reader is an AI coding agent choosing a call, and `docs/` ships in the npm package with `llms.txt`. Write each page to the same template: a "For agents" block under the title (the question it answers, when to use it, key APIs, round trips), sections named after tasks, the SQL each example sends as captured from a real run (never hand-written), then Pitfalls (Don't → Do) and See also. When you add or rename a page, update `llms.txt`, `docs/README.md` and `docs/api-index.md`; a new data-access API also gets a row in `docs/choosing-the-right-query.md`. A change to the example model (`debug/schema/appDatabase.ts`, `debug/model/`) or to `seedTestData()` updates `docs/example-model.md`. Only `docs/`, `llms.txt` and `README.md` ship in the package: link files outside them (`tests/`, `bench/`, `debug/`, `changelog/`, this file) with an absolute GitHub URL, never a relative path.
 
 ## Commit Messages
 
@@ -222,7 +209,7 @@ Changes
 Releases are handled by maintainers. The process:
 
 1. Update version in `package.json`
-2. Update `CHANGELOG.md` (if present)
+2. Add `changelog/v<version>.md`
 3. Create a git tag
 4. Publish to npm
 5. Create GitHub release

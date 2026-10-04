@@ -1,975 +1,1148 @@
-# CTE (Common Table Expression) Guide
+# CTEs (WITH queries)
 
-This guide demonstrates how to use Common Table Expressions (CTEs) in Linkgress ORM for complex queries with reusable subqueries.
+> **For agents:** How do I name a derived row set once with `WITH` and read it — joined, as a FROM root or from subqueries — or run a write and read its rows back, all in one statement?
+> **Use this page when:** joining per-key aggregates to entity rows, reading one derived set from several places of a statement, FULL / RIGHT / CROSS joins between derived sets, top N rows per group, candidate-set filters, writing and reading back in one round trip. **Look elsewhere when:** the set is read once in one place → [Subqueries](./subquery-guide.md); a JS list or JS rows as a relation → [Set-returning functions](./set-returning-functions.md); child lists through a navigation → [Collection strategies](../collection-strategies.md)
+> **Key APIs:** `DbCteBuilder`, `with()`, `withAggregation()`, `withMutation()`, `db.selectFromCte()`, `<table>.selectFromCte()`, `joinFilter()`, `afterMutation()`, `onTrue()`, `onFalse()` · **Round trips:** 1 per executed statement — declaring a CTE, joining it or reading it from a nested subquery adds none
 
-> **Note:** This guide covers the explicit `DbCteBuilder` API for creating custom CTEs in your queries. For information about how Linkgress automatically uses CTEs (or LATERAL joins) for collection navigation properties, see the [Collection Strategies](../collection-strategies.md) documentation.
+A CTE is built once with a `DbCteBuilder` and becomes a `DbCte`: a named relation that a statement declares in its
+`WITH` clause. A `DbCte` is not executed on its own: it runs inside the statement that declares it — the query that
+attaches it with `.with()`, joins it, reads it or is rooted on it.
 
-## What are CTEs?
+This page covers the explicit CTE API. For the CTEs and LATERAL joins the ORM emits by itself for collection
+navigations, see [Collection strategies](../collection-strategies.md).
 
-Common Table Expressions (CTEs) are temporary named result sets that you can reference within a SELECT, INSERT, UPDATE, or DELETE statement. They improve query readability and allow you to break down complex queries into manageable parts.
+## Contents
 
-## Benefits of CTEs
+- [Decide: CTE, subquery, join or collection](#decide-cte-subquery-join-or-collection)
+- [Join a per-key aggregate to entity rows: `with()` + `leftJoin()`](#join-a-per-key-aggregate-to-entity-rows-with--leftjoin)
+- [Choose the CTE body: any query a statement can run](#choose-the-cte-body-any-query-a-statement-can-run)
+- [How a CTE's columns read back](#how-a-ctes-columns-read-back)
+- [Read a CTE as the FROM root: `db.selectFromCte()`](#read-a-cte-as-the-from-root-dbselectfromcte)
+- [Join derived sets with FULL OUTER, RIGHT or CROSS joins](#join-derived-sets-with-full-outer-right-or-cross-joins)
+- [Read one CTE from several subqueries: declare it once](#read-one-cte-from-several-subqueries-declare-it-once)
+- [Keep the top N rows per group: rank in a CTE](#keep-the-top-n-rows-per-group-rank-in-a-cte)
+- [Drive a query from a candidate set: `joinFilter()` and `materialized: true`](#drive-a-query-from-a-candidate-set-joinfilter-and-materialized-true)
+- [Attach child rows as a JSON array per key: `withAggregation()`](#attach-child-rows-as-a-json-array-per-key-withaggregation)
+- [Read a CTE from a raw `sql` fragment: `cte.as(alias)`](#read-a-cte-from-a-raw-sql-fragment-cteasalias)
+- [Lock the rows a CTE reads: `.forUpdate()` in the body](#lock-the-rows-a-cte-reads-forupdate-in-the-body)
+- [Write and read back in one statement: `withMutation()`](#write-and-read-back-in-one-statement-withmutation)
+- [Order two writes in one statement: `afterMutation()`](#order-two-writes-in-one-statement-aftermutation)
+- [Run CTE statements on a table's own connection: `<table>.selectFromCte()`](#run-cte-statements-on-a-tables-own-connection-tableselectfromcte)
+- [Recursive queries: raw SQL](#recursive-queries-raw-sql)
+- [Combine CTEs of several builders: `getCtes()`, `clear()`](#combine-ctes-of-several-builders-getctes-clear)
+- [Type CTE columns](#type-cte-columns)
+- [Pitfalls](#pitfalls)
+- [See also](#see-also)
 
-- **Reusability** - Define a query once and reference it multiple times
-- **Readability** - Break complex queries into logical, named steps
-- **Performance** - PostgreSQL can optimize CTE execution
-- **Type Safety** - Linkgress provides full TypeScript type inference for CTE columns
+## Decide: CTE, subquery, join or collection
 
-## Basic Usage
+| Need | Use | SQL shape · round trips | Avoid |
+|---|---|---|---|
+| Per-key aggregates beside entity rows (totals per user) | a grouped body in `with()`, then `leftJoin(cte, on, select)` | `WITH "s" AS (… GROUP BY …) SELECT … LEFT JOIN "s" ON …` · 1 | a correlated scalar subquery per row over a large table |
+| One derived set read in 2+ places of one statement | `.with(cte)` on the executing query + `db.selectFromCte(cte)….asSubquery()` | one `WITH`, every reader reads it by name · 1 | leaving out `.with()`: each reader declares its own copy |
+| A derived set read once, in one place | a subquery or a table-subquery join — [Subqueries](./subquery-guide.md) | `(SELECT …)` inline · 1 | a CTE for this alone: PostgreSQL 12+ inlines a CTE read once into the same plan |
+| FULL OUTER / RIGHT / CROSS join of derived sets | `db.selectFromCte(a).fullOuterJoin(b, onTrue())` | `FROM "a" FULL OUTER JOIN "b" ON TRUE` · 1 | two queries merged in JS (2 round trips) |
+| Top N rows per group | a window value in the body, `db.selectFromCte(cte).where(…)` on it | `row_number() OVER (…)` inside the `WITH`, `WHERE "rank" <= $1` outside · 1 | `where()` on the window value in the query that computes it (refused) |
+| Rows whose key is in a large candidate set | `with(…, { materialized: true })` + `joinFilter(cte, on)` | `AS MATERIALIZED (…)` + `INNER JOIN "c" ON …` · 1 | fetching the ids, then querying by them (2 round trips) |
+| Child rows as a JSON list per parent, no navigation | `withAggregation(name, query, key, alias)` | `json_agg(json_build_object(…)) … GROUP BY` + `LEFT JOIN` · 1 | one query per parent (N+1) |
+| Child rows through a navigation | `u.posts!.select(…).toList()` — [Collection strategies](../collection-strategies.md) | per strategy · 1 with `'lateral'` (default) or `'cte'`; `'temptable'`: 6 statements on `PgClient`, 2 round trips on multi-statement clients | `withAggregation()` |
+| Write, then read the written rows | `withMutation(name, q.toStatement(sel))` + `db.selectFromCte(cte)` | `WITH "m" AS (UPDATE … RETURNING …) SELECT … FROM "m"` · 1 | write, then re-read: 2 round trips |
+| Close a row and insert its successor | two `withMutation()` legs, `afterMutation()`, a `unionAll()` readback | `WITH "closed" AS (UPDATE …), "opened" AS (INSERT … WHERE ((SELECT count(*) FROM "closed") >= 0) …)` · 1 | a FULL JOIN readback on a null-safe key (0A000) |
+| A plain write | `update()`, `insertBulk(…).returning()` — [Insert, update, delete](./insert-update-guide.md) | 1 | a data-modifying CTE |
+| A JS list or JS rows as a relation | `unnest()`, `fromRows()` — [Set-returning functions](./set-returning-functions.md) | `unnest(CAST($1 AS type[]))` · 1 | a CTE of literals |
+| A recursive walk (`WITH RECURSIVE`) | raw SQL through `` db.query(sql`…`) `` | as written · 1 | looking for a builder method: there is none |
 
-### Creating a CTE Builder
+## Join a per-key aggregate to entity rows: `with()` + `leftJoin()`
 
-```typescript
-import { DbCteBuilder } from 'linkgress-orm';
+`builder.with(name, query)` returns `{ cte }`. Join it to an entity query with `leftJoin(cte, on, select)` or
+`innerJoin(cte, on, select)`: the entity table stays the FROM root and the CTE's columns are read beside its
+columns. This is the right choice for per-key aggregates of many parents: the body runs once, as one GROUP BY
+pass, instead of one correlated subquery per parent row.
 
-const cteBuilder = new DbCteBuilder();
-```
+```ts
+import { DbCteBuilder, eq } from 'linkgress-orm';
 
-### Creating a Simple CTE
+const builder = new DbCteBuilder();
+const stats = builder.with('post_stats', db.posts
+  .select(p => ({ userId: p.userId, views: p.views }))
+  .groupBy(p => ({ userId: p.userId }))
+  .select(g => ({ userId: g.key.userId, totalViews: g.sum(p => p.views), postCount: g.count() })));
 
-Use the `with()` method to create a CTE from any query:
-
-```typescript
-const activeUsersCte = cteBuilder.with(
-  'active_users',
-  db.users
-    .where(u => eq(u.isActive, true))
-    .select(u => ({
-      userId: u.id,
-      username: u.username,
-      createdAt: u.createdAt,
-    }))
-);
-```
-
-### Using a CTE in a Query
-
-Attach CTEs to your query with `.with()` and join them like regular tables:
-
-```typescript
-const result = await db.users
-  .where(u => eq(u.id, 1))
-  .with(activeUsersCte.cte)
+const rows = await db.users
+  .with(stats.cte)
   .leftJoin(
-    activeUsersCte.cte,
-    (user, cte) => eq(user.id, cte.userId),
-    (user, cte) => ({
-      id: user.id,
-      username: user.username,
-      cteCreatedAt: cte.createdAt, // Access CTE columns!
-    })
+    stats.cte,
+    (u, s) => eq(u.id, s.userId),
+    (u, s) => ({ username: u.username, totalViews: s.totalViews, postCount: s.postCount }),
   )
+  .orderBy(r => r.username)
   .toList();
 ```
 
-`innerJoin` takes a CTE the same way, after a `select()` or straight off the table
-(`db.users.innerJoin(cte, …)`, `db.users.leftJoin(cte, …)`). A joined CTE the query does not carry yet is
-attached to its WITH list, as `.with(cte)` would — and one attached already is declared once. (An
-`innerJoin` of a CTE, and any join of one straight off the table, used to throw
-"rightTable._getSchema is not a function".)
+```sql
+WITH "post_stats" AS (SELECT "posts"."user_id" as "userId", CAST(SUM("posts"."views") AS DOUBLE PRECISION) as "totalViews", CAST(COUNT(*) AS INTEGER) as "postCount"
+  FROM "posts"
+  GROUP BY "posts"."user_id")
+SELECT "users"."username" as "username", "post_stats"."totalViews" as "totalViews", "post_stats"."postCount" as "postCount"
+FROM "users"
+LEFT JOIN "post_stats" ON "users"."id" = "post_stats"."userId"
+ORDER BY "username" ASC
+```
 
-## How a CTE's Columns Read Back
+Result: `[{ username: 'alice', totalViews: 250, postCount: 2 }, { username: 'bob', totalViews: 200, postCount: 1 }, { username: 'charlie', totalViews: undefined, postCount: undefined }]`
+— a LEFT JOIN miss reads the CTE's columns as `undefined`, not `null` (the keys are present; `JSON.stringify` drops them).
 
-A column of a CTE body reads back — through a join, at a CTE root, in a comparison — the way the body's
-own projection reads it:
+- `.with(cte)` is optional when the query joins the CTE: `db.users.innerJoin(stats.cte, …)` attaches a joined CTE
+  to the statement's `WITH` itself, and a CTE attached twice is declared once. The join works straight off the
+  table and after a `select()` (`db.users.select(…).innerJoin(cte, …)`).
+- The ON callback receives the CTE's columns as column refs; the selector receives them typed as values.
+- A `where()` after the join may filter on CTE columns: `.where(r => gt(r.totalViews, 150))` renders
+  `WHERE "post_stats"."totalViews" > $1`.
+- The terminals `count()`, `exists()`, `min()`, `max()` and `sum()` of such a query declare the `WITH` too:
+  `db.users.innerJoin(stats.cte, …).count()` renders
+  `WITH "post_stats" AS (…) SELECT COUNT(*) as count FROM "users" INNER JOIN "post_stats" AS "post_stats" ON …`
+  and returns `2`; the `leftJoin` form renders `LEFT JOIN` and returns `3`.
+- Entity-rooted queries join CTEs with INNER and LEFT joins only. For FULL OUTER, RIGHT or CROSS joins, root the
+  query on a CTE: [Join derived sets with FULL OUTER, RIGHT or CROSS joins](#join-derived-sets-with-full-outer-right-or-cross-joins).
 
-```typescript
-const times = cteBuilder.with('post_times', db.posts.select(p => ({
+> **Pitfall:** a CTE whose key repeats (several rows per `userId`) duplicates the entity rows it joins. Group the
+> body by the join key, or filter with `inSubquery()` / `exists()` instead of joining.
+
+## Choose the CTE body: any query a statement can run
+
+`with(name, query)` and `withAggregation(name, query, …)` take every query a statement can run:
+
+| Body | Example |
+|---|---|
+| entity query (projection, navigations, collection aggregates, its own `.with()`) | `db.users.select(u => ({ userId: u.id, postCount: u.posts!.count() }))` |
+| grouped query | `db.posts.select(…).groupBy(p => ({ userId: p.userId })).select(g => ({ … }))` |
+| union | `q1.union(q2)`, `q1.unionAll(q2)` |
+| CTE-rooted query (since 1.0.29) | `db.selectFromCte(a.cte).where(…).select(…)` |
+| set query (since 1.0.29) | `fromSet(unnest(names, 'text'), 'n').select(…)`, `db.selectFromSet(unnestZip({…}))` |
+| a locking query | `db.users.where(…).select(…).orderBy(…).forUpdate()` — see [Lock the rows a CTE reads](#lock-the-rows-a-cte-reads-forupdate-in-the-body) |
+
+A CTE-rooted body declares the CTEs it reads inside itself:
+
+```ts
+import { DbCteBuilder, gt } from 'linkgress-orm';
+
+const builder = new DbCteBuilder();
+const older = builder.with('older_users', db.users.where(u => gt(u.age, 30)).select(u => ({ id: u.id, age: u.age })));
+const oldest = builder.with('oldest', db.selectFromCte(older.cte).where(r => gt(r.age, 40)).select(r => ({ id: r.id })));
+
+const ids = await db.selectFromCte(oldest.cte).select(r => r.id).toList();   // [3]
+```
+
+```sql
+WITH "oldest" AS (WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+    FROM "users"
+    WHERE "users"."age" > $1)
+  SELECT "older_users"."id" as "id"
+  FROM "older_users"
+  WHERE "older_users"."age" > $2)
+SELECT "oldest"."id" as "value"
+FROM "oldest"
+-- params: [30, 40]
+```
+
+> **Efficiency:** a collection aggregate in an entity body (`u.posts!.count()`) renders one correlated subquery
+> per row of the body under the default `'lateral'` strategy —
+> `(SELECT COALESCE(COUNT(*), 0) FROM "posts" "lateral_0_posts" WHERE "lateral_0_posts"."user_id" = "users"."id")`.
+> For many parents, a grouped body over the child table (previous section) aggregates in one pass.
+
+A body that reads a data-modifying CTE reads it by name; every statement that declares the body's CTE declares
+the data-modifying one first (since 1.0.29). See [Order two writes in one statement](#order-two-writes-in-one-statement-aftermutation).
+
+## How a CTE's columns read back
+
+A column of a CTE body reads back — through a join, at a CTE root, in a comparison — the way the body's own
+projection reads it.
+
+```ts
+import { DbCteBuilder, and, eq } from 'linkgress-orm';
+
+const times = new DbCteBuilder().with('post_times', db.posts.select(p => ({
   postId: p.id,
-  time: p.publishTime,                 // a mapped column
-  meta: { title: p.title, views: p.views },
-  author: p.user,                      // a navigation row
-  kind: 'post',                        // a literal
+  time: p.publishTime,                       // a column with a custom mapper (HourMinute <-> smallint)
+  meta: { title: p.title, views: p.views },  // a nested object
+  author: p.user,                            // a navigation row
+  kind: 'post',                              // literals
   featured: true,
 })));
 
 const rows = await db.posts
-  .innerJoin(times.cte,
+  .innerJoin(
+    times.cte,
     (p, t) => and(eq(p.id, t.postId), eq(t.time, { hour: 9, minute: 30 }), eq(t.featured, true)),
-    (p, t) => ({ title: p.title, time: t.time, meta: t.meta, author: t.author!.username, kind: t.kind }))
-  .toList();
-```
-
-- **Mapped columns** read — and compare — through the body column's OWN mapper: `t.time` is
-  `{ hour, minute }`, and `eq(t.time, { hour: 9, minute: 30 })` converts the value like a comparison
-  with `p.publishTime` would. (A CTE's columns used to carry an expression's `mapWith` and nothing
-  else: a mapped column read through a CTE came back as its storage value; one named like a mapped
-  column of the READING table went through THAT column's mapper.)
-- **Text** stays text (`'01234'` used to read back as `1234`); a numeric column or an aggregate reads as
-  a number.
-- **Literals** render typed in the body — `CAST($1 AS boolean)`, an `integer` (a `bigint` beyond int4, a
-  `double precision` for a fraction), `text`, a `timestamptz` for a `Date`, `jsonb` for a list of
-  values — so the reading query compares them as their type (`gt(t.n, 5)` over a literal `42` used to
-  compare TEXT and match nothing) and reads them back as their values, a `bigint` as a `bigint`. A
-  grouped body's constants and a table subquery's literals render typed too.
-- **A nested object or a navigation row** of the body is the object of its flattened columns:
-  `t.meta` reads back as `{ title, views }`, `t.meta.views` and `t.author.username` are columns of their
-  own, in a selection or a condition. At the type level such a value is one `FieldRef` — it cannot be
-  told from a column whose mapped value is an object — so reach into it in a condition with a cast
-  (`eq((t.meta as any).title, 'x')`).
-
-A **table subquery** (`query.asSubquery('table')`, joined with an alias) reads its columns the same way.
-
-`withAggregation()` items read through the aggregated query's own mappers (they used to be looked up by
-NAME among the reading table's columns), nested objects and navigation rows key by key, literals as
-themselves; a grouping key reads through its column's mapper.
-
-## CTEs with Aggregations
-
-Create CTEs that include collection aggregations:
-
-```typescript
-const userStatsCte = cteBuilder.with(
-  'user_stats',
-  db.users.select(u => ({
-    userId: u.id,
-    username: u.username,
-    postCount: u.posts.count(),  // Aggregation works!
-    maxViews: u.posts.max(p => p.views),
-    totalViews: u.posts.sum(p => p.views),
-  }))
-);
-
-const result = await db.users
-  .with(userStatsCte.cte)
-  .leftJoin(
-    userStatsCte.cte,
-    (user, cte) => eq(user.id, cte.userId),
-    (user, cte) => ({
-      id: user.id,
-      postCount: cte.postCount,  // Type-safe: number
-      maxViews: cte.maxViews,    // Type-safe: number | null
-    })
+    (p, t) => ({ title: p.title, time: t.time, meta: t.meta, author: t.author!.username, kind: t.kind }),
   )
   .toList();
+// [{ title: 'Alice Post 1', time: { hour: 9, minute: 30 }, meta: { title: 'Alice Post 1', views: 100 }, author: 'alice', kind: 'post' }]
 ```
 
-## Every Query Builder as a CTE Body
-
-`with(name, query)` and `withAggregation(name, query, …)` take every query a statement can run (1.0.29): an
-entity query (projected, whole rows, with navigations, carrying a CTE of its own), a grouped query, a union, a
-CTE-rooted query — joined or not, `db.selectFromCte(a).where(…).select(…)` — and a set query, context-free or bound
-(`fromSet(unnest(names, 'text'), 'n').select(…)`, `db.selectFromSet(unnestZip({…}))`, filtered, ordered, limited;
-a union of sets). A set query used to throw `query._createMockRow is not a function`, a CTE-rooted one too. A
-CTE-rooted body declares the CTEs it reads inside itself (a data-modifying one is read by name — see
-[dependent data-modifying CTEs](#dependent-data-modifying-ctes-and-aftermutation)). The CTE's columns read the
-way the body reads them: a set column as the driver delivers it (`'0042'` stays text), a mapped column through
-its mapper.
-
-## Grouped / Aggregate CTE Bodies
-
-`with()` also accepts a **grouped** query body — a `.groupBy(...).select(...)` chain
-that emits `SUM` / `COUNT` / `MIN` / `MAX` aggregates and a `GROUP BY` clause. The
-result is a plain CTE with **one row per group** (this is distinct from
-[`withAggregation()`](#aggregation-ctes-with-withaggregation), which folds the whole
-group into a single JSONB array column):
-
-```typescript
-const spendByStatusCte = cteBuilder.with(
-  'spend_by_status',
-  db.orders
-    .where(o => eq(o.userId, userId))
-    .select(o => ({ status: o.status, totalPrice: o.totalAmount }))
-    .groupBy(o => ({ status: o.status }))
-    .select(g => ({
-      status: g.key.status,
-      totalPrice: g.sum(o => o.totalPrice),  // SUM(...) aggregate
-    }))
-);
-```
-
-**Generated CTE body:**
 ```sql
-SELECT "orders"."status" as "status",
-       CAST(SUM("orders"."total_amount") AS DOUBLE PRECISION) as "totalPrice"
-FROM "orders"
-WHERE "orders"."user_id" = $1
-GROUP BY "orders"."status"
+WITH "post_times" AS (SELECT "posts"."id" as "postId", "posts"."publish_time" as "time", "posts"."title" as "__nested__meta__title", "posts"."views" as "__nested__meta__views", "user"."id" as "__nested__author__id", "user"."username" as "__nested__author__username", "user"."email" as "__nested__author__email", "user"."age" as "__nested__author__age", "user"."is_active" as "__nested__author__isActive", "user"."created_at" as "__nested__author__createdAt", "user"."metadata" as "__nested__author__metadata", "user"."last_active_at" as "__nested__author__lastActiveAt", CAST($1 AS text) as "kind", CAST($2 AS boolean) as "featured"
+  FROM "posts"
+  INNER JOIN "users" AS "user" ON "posts"."user_id" = "user"."id")
+SELECT "posts"."title" as "title", "post_times"."time" as "time", "post_times"."__nested__meta__title" as "__nested__meta__title", "post_times"."__nested__meta__views" as "__nested__meta__views", "post_times"."__nested__author__username" as "author", "post_times"."kind" as "kind"
+FROM "posts"
+INNER JOIN "post_times" ON ("posts"."id" = "post_times"."postId" AND "post_times"."time" = $3 AND "post_times"."featured" = $4)
+-- params: ["post", true, 570, true]
 ```
 
-The resulting `spendByStatusCte.cte` carries one column per projected alias
-(`status`, `totalPrice`) and can be joined like any other CTE — including as the
-FROM root of a [CTE-rooted query](#querying-from-a-cte-full-outer--right--cross-joins).
+- **Mapped columns** read and compare through the body column's own mapper: `t.time` is `{ hour, minute }`, and
+  `eq(t.time, { hour: 9, minute: 30 })` binds `570`, as a comparison with `p.publishTime` would.
+- **Text** stays text: a `varchar` value `'01234'` reads as `'01234'`, not `1234`. A numeric column or an aggregate
+  reads as a number.
+- **Literals** render typed in the body, so readers compare and read them as their type: a string as `text`, a
+  boolean as `boolean`, an integer as `integer` (`bigint` beyond the int4 range), a fraction as
+  `double precision`, a `Date` as `timestamptz`, a JS `bigint` as `bigint` (read back as a `bigint`), a list of
+  values as `jsonb`.
+- **A nested object or a navigation row** renders as flattened `__nested__<key>__<leaf>` columns and reads back as
+  an object; `t.meta.views` and `t.author.username` are columns of their own. At the type level such a value is
+  one `FieldRef`, so reach into it in a condition with a cast: `eq((t.meta as any).title, 'x')`.
+- A table subquery (`query.asSubquery('table')`, joined with an alias) reads its columns the same way.
 
-## Aggregation CTEs with `withAggregation()`
+> **Efficiency:** a navigation row projected whole (`author: p.user`) renders every column of the target table
+> into the body. Project the columns you read (`authorName: p.user!.username`).
 
-Create CTEs that group rows into JSONB arrays:
+## Read a CTE as the FROM root: `db.selectFromCte()`
 
-```typescript
-const aggregatedPostsCte = cteBuilder.withAggregation(
-  'aggregated_posts',
-  db.posts.select(p => ({
-    id: p.id,
-    title: p.title,
-    views: p.views,
-    userId: p.userId,
-  })),
-  p => ({ userId: p.userId }),  // Group by userId
-  'posts'  // Aggregation column name
-);
+`db.selectFromCte(cte, alias?)` starts a query whose FROM root is the CTE. Use it to read a CTE's rows — the
+RETURNING rows of a data-modifying CTE, rank-filtered window results — or, nested with `.asSubquery()`, to read a
+statement's CTE from a subquery. Methods: `where()`, `select()`, `orderBy()`, `limit()`, `offset()`,
+`forUpdate()` (it locks no rows here, see [Lock the rows a CTE reads](#lock-the-rows-a-cte-reads-forupdate-in-the-body)),
+`withTimeout(ms)`, `expectedExecutionTime(ms)`, the joins of the next section, `union()` / `unionAll()`,
+`asSubquery()`; terminals `toList()`, `first()`, `toSql()`, `buildQuery()`.
 
-const result = await db.users
-  .with(aggregatedPostsCte)
-  .leftJoin(
-    aggregatedPostsCte,
-    (user, cte) => eq(user.id, cte.userId),
-    (user, cte) => ({
-      id: user.id,
-      username: user.username,
-      posts: cte.posts,  // Type-safe: Array<{ id, title, views, userId }>
-    })
-  )
-  .toList();
-```
+```ts
+import { DbCteBuilder, gt, lt } from 'linkgress-orm';
 
-### Custom Aggregation Column Name
+const older = new DbCteBuilder().with('older_users', db.users
+  .where(u => gt(u.age, 20))
+  .select(u => ({ id: u.id, username: u.username, age: u.age })));
 
-```typescript
-const aggregatedCte = cteBuilder.withAggregation(
-  'aggregated_orders',
-  db.orders.select(o => ({
-    orderId: o.id,
-    status: o.status,
-    totalAmount: o.totalAmount,
-    userId: o.userId,
-  })),
-  o => ({ userId: o.userId }),
-  'orderList'  // Custom name instead of default 'items'
-);
-
-// Access via cte.orderList
-```
-
-### Multiple Grouping Columns
-
-```typescript
-const aggregatedCte = cteBuilder.withAggregation(
-  'grouped_data',
-  db.posts.select(p => ({
-    postId: p.id,
-    title: p.title,
-    userId: p.userId,
-    status: p.status,
-  })),
-  p => ({
-    userId: p.userId,
-    status: p.status,  // Group by multiple columns
-  }),
-  'items'
-);
-```
-
-## Multiple CTEs
-
-Use multiple CTEs in a single query:
-
-```typescript
-const cteBuilder = new DbCteBuilder();
-
-// Create first CTE
-const userStatsCte = cteBuilder.with(
-  'user_stats',
-  db.users.select(u => ({
-    userId: u.id,
-    postCount: u.posts.count(),
-  }))
-);
-
-// Create second CTE
-const orderStatsCte = cteBuilder.with(
-  'order_stats',
-  db.users.select(u => ({
-    userId: u.id,
-    orderCount: u.orders.count(),
-    totalSpent: u.orders.sum(o => o.totalAmount),
-  }))
-);
-
-// Use both CTEs
-const result = await db.users
-  .with(...cteBuilder.getCtes())  // Spread all CTEs
-  .leftJoin(
-    userStatsCte.cte,
-    (user, cte) => eq(user.id, cte.userId),
-    (user, cte) => ({
-      id: user.id,
-      postCount: cte.postCount,
-    })
-  )
-  .toList();
-```
-
-### Combining CTEs from Multiple Builders
-
-```typescript
-const builder1 = new DbCteBuilder();
-const cte1 = builder1.with('cte1', query1);
-
-const builder2 = new DbCteBuilder();
-const cte2 = builder2.with('cte2', query2);
-
-// Combine CTEs from both builders
-const result = await db.users
-  .with(...builder1.getCtes(), ...builder2.getCtes())
-  .leftJoin(cte1.cte, ...)
-  .leftJoin(cte2.cte, ...)
-  .toList();
-```
-
-A builder numbers its CTEs' parameters as one block (`$1` for the first body, `$2`… after it). Each `DbCte`
-remembers where its body starts (`paramBase`), and every statement renumbers each body from where **its**
-parameters land: CTEs of several builders, a builder's second CTE on its own, or its CTEs in another order all
-bind their own values. (Before 1.0.9 a builder's second CTE used without the first kept `$2`, and bound the next
-value of the statement.)
-
-## Querying from a CTE (FULL OUTER / RIGHT / CROSS joins)
-
-The examples above attach a CTE to an **entity-rooted** query
-(`db.users.with(cte).leftJoin(cte, …)`) — there the FROM root must be a real table
-and joins are `INNER` / `LEFT` only.
-
-When the FROM root should itself be a CTE — and when you need join flavours the
-entity path cannot express (`FULL OUTER`, `RIGHT`, `CROSS`, or an `ON TRUE`
-predicate) — start the query with `db.selectFromCte(rootCte)`:
-
-```typescript
-const rows = await db
-  .selectFromCte(spend.cte)
-  .fullOuterJoin(tier.cte, onTrue())
-  .select((s, t) => ({
-    status: s.status,
-    totalPrice: s.totalPrice,
-    currentTierId: t.currentTierId,
-  }))
-  .toList();
-```
-
-### Join methods
-
-A CTE-rooted query exposes the full set of SQL join flavours, because both sides are
-already materialized relations (the CTE bodies):
-
-| Method | SQL |
-| --- | --- |
-| `.innerJoin(cte, condition)` | `INNER JOIN … ON …` |
-| `.leftJoin(cte, condition)` | `LEFT JOIN … ON …` |
-| `.rightJoin(cte, condition)` | `RIGHT JOIN … ON …` |
-| `.fullOuterJoin(cte, condition)` | `FULL OUTER JOIN … ON …` |
-| `.crossJoin(cte)` | `CROSS JOIN …` (no `ON`) |
-
-After joining, call `.select((root, joined) => ({ … }))` — the selector receives one
-FieldRef proxy per source, in FROM order (root first, then each joined CTE). You can
-also `.select(root => ({ … }))` with no join to project the root CTE directly.
-`.orderBy(...)`, `.limit(n)`, `.offset(n)`, `.toList()` and `.first()` round out the
-query (`orderBy` matches the column **output aliases**, e.g. `r => [[r.status, 'DESC']]`).
-
-The projection takes what a table's `select()` takes, and each value reads back as
-[a CTE's columns read back](#how-a-ctes-columns-read-back):
-
-```typescript
-db.selectFromCte(times.cte).select(t => ({
-  postId: t.postId,
-  kind: 'post',                                   // a string is a value, not a column name
-  meta: { time: t.time, loud: sql<string>`upper(${t.meta.title})` },   // flattened, rebuilt
-  comments: db.postComments.where(c => eq(c.postId, t.postId)).select(() => ({ n: sql<number>`count(*)` })).asSubquery('scalar'),
-}));
-
-db.selectFromCte(times.cte).select(t => t.postId).orderBy(id => id).toList();   // number[]
-```
-
-A selector returning one value (a column, an expression, a literal) reads as the list of that value, and
-`orderBy` orders by it. As a `table` subquery (`.asSubquery('table')`) the projection's literals render
-typed for the enclosing query. An array of columns is refused. (A string used to render as a column of
-that NAME, a nested object and a subquery were bound as parameters, and a one-value selector projected
-the ref's own keys.)
-
-### Filtering: `where()`
-
-`.where(predicate)` filters a CTE-rooted query. The predicate receives one column ref per source, in FROM
-order — the root CTE's row, then each joined CTE's — and renders as `WHERE <condition>` after the FROM and its
-joins, before the ORDER BY. Repeated calls combine with AND; its parameters follow the CTE bodies' and the ON
-predicates'. `where()` and `select()` can be called in either order.
-
-```typescript
-db.selectFromCte(older.cte)
-  .where(r => gt(r.age, 32))
+const page = await db.selectFromCte(older.cte)
+  .where(r => gt(r.age, 30))
   .where(r => lt(r.age, 100))
-  .select(r => ({ id: r.id }))
-  .orderBy(r => [[r.id, 'DESC']]);
+  .select(r => ({ id: r.id, name: r.username }))
+  .orderBy(r => [[r.id, 'DESC']])
+  .limit(10)
+  .offset(0)
+  .toList();
+// [{ id: 3, name: 'charlie' }, { id: 2, name: 'bob' }]
 ```
 
 ```sql
-WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age" FROM "users" WHERE "users"."age" > $1)
-SELECT "older_users"."id" as "id"
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."username" as "username", "users"."age" as "age"
+  FROM "users"
+  WHERE "users"."age" > $1)
+SELECT "older_users"."id" as "id", "older_users"."username" as "name"
 FROM "older_users"
 WHERE ("older_users"."age" > $2 AND "older_users"."age" < $3)
 ORDER BY "id" DESC
--- params: [31, 32, 100]
+LIMIT 10
+OFFSET 0
+-- params: [20, 30, 100]
 ```
 
-A ref of any other query correlates: nested as a subquery (`.asSubquery(...)`), the query renders in the
-enclosing statement's parameter sequence and reports the correlation, so the enclosing query joins the
-navigations it reads:
+- `select()` is required before a terminal. A selector returning one value reads as a list of values:
+  `select(r => r.id).orderBy(id => id).toList()` returns `[1, 2, 3]` and renders `SELECT "older_users"."id" as "value" … ORDER BY "value" ASC`.
+- `where()` calls combine with AND. Parameters are numbered CTE bodies first, then ON predicates, then the WHERE.
+  `where()` and `select()` can be called in either order: the predicate reads the root CTE's row (after a join,
+  every joined CTE's row too), whatever the projection holds.
+- `orderBy()` names output aliases (`ORDER BY "id" DESC`); `limit()` / `offset()` are inlined integers.
+- `first()` returns the first row or `null` and renders `LIMIT 1`.
+- There is no `count()`: `db.selectFromCte(older.cte).where(r => gt(r.age, 30)).select(() => agg.count()).first()`
+  renders `SELECT count(*) as "value" FROM "older_users" WHERE "older_users"."age" > $2 LIMIT 1` and returns `2`.
+- `toSql()` / `buildQuery()` (`{ sql, params }`) build the statement without a round trip.
+- A NULL column reads as `null` here; an entity projection reads it as `undefined`.
+- The projection takes what an entity `select()` takes: a string literal is a value (`$1 as "kind"`), a nested
+  object is flattened and rebuilt (`` { time: t.time, loud: sql`upper(${t.title})` } ``), a scalar subquery renders in
+  place (`comments: db.postComments.where(c => eq(c.postId, t.postId)).select(() => agg.count()).asSubquery('scalar')`
+  renders `(SELECT count(*) FROM "post_comments" WHERE "post_comments"."post_id" = "post_times"."postId") as "comments"`).
+  Nested as a subquery (`asSubquery()`), the projection's literals render typed for the enclosing query
+  (`CAST($2 AS text) as "kind"`).
+  An array of columns is refused: `selectFromCte().select(): "pair" is an array of columns or expressions, which has no single SQL value to select — …`.
 
-```typescript
-db.posts
-  .with(older.cte)
-  .select(p => ({
-    title: p.title,
-    authorOlderAge: db.selectFromCte(older.cte).where(r => eq(r.id, p.user!.id)).select(r => r.age).asSubquery('scalar'),
-  }));
-```
+> **Pitfall:** a CTE-rooted builder is mutable. `where()`, `orderBy()`, `limit()`, `offset()`, `forUpdate()`,
+> `withTimeout()` and `expectedExecutionTime()` change the builder and return it, and `first()` leaves `LIMIT 1`
+> on it: `const q = db.selectFromCte(c).select(…); await q.first(); await q.toList()` returns one row. Build a new
+> query for each use. (`select()` returns a new builder; set queries are immutable.)
 
-### Aliasing the root: `selectFromCte(cte, alias)`
+## Join derived sets with FULL OUTER, RIGHT or CROSS joins
 
-`db.selectFromCte(cte, 'o')` renders `FROM "<cte>" AS "o"`; the root row's columns render `"o"."<column>"`.
-A CTE-rooted subquery correlated to an enclosing query over the **same** CTE — another `selectFromCte(cte)`, or
-an entity query that joined the CTE — needs it: both rows would otherwise be named after the CTE, and inside the
-subquery the name reads its own row (`"older_users"."age" > "older_users"."age"`, true for every row). Such a
-correlation is refused (`… Give one of them a distinct alias: selectFromCte(cte, '<alias>')`):
+A CTE-rooted query joins further CTEs with every SQL join flavour. Use it when either side may be empty and both
+must survive, or when two independently computed sets are combined.
 
-```typescript
-db.selectFromCte(older.cte).select(o => ({
-  id: o.id,
-  olderCount: db.selectFromCte(older.cte, 'other')
-    .where(r => gt(r.age, o.age))
-    .select(() => sql<number>`count(*)`.mapWith(Number))
-    .asSubquery('scalar'),
-}));
-// … (SELECT count(*) as "value" FROM "older_users" AS "other" WHERE "other"."age" > "older_users"."age") …
-```
+| Method | SQL |
+|---|---|
+| `.innerJoin(cte, condition)` | `INNER JOIN "cte" ON …` |
+| `.leftJoin(cte, condition)` | `LEFT JOIN "cte" ON …` |
+| `.rightJoin(cte, condition)` | `RIGHT JOIN "cte" ON …` |
+| `.fullOuterJoin(cte, condition)` | `FULL OUTER JOIN "cte" ON …` |
+| `.crossJoin(cte)` | `CROSS JOIN "cte"` |
 
-The rows of a CTE-rooted query carry its identity: an entity query nested in its `where()` reads them as
-correlations, also when the CTE is named like one of that query's navigations (a CTE named `user` read by a
-`db.posts` query that has a `user` navigation).
+`condition` is a `Condition` value, not a callback: `onTrue()` (`ON TRUE`), `onFalse()` (`ON FALSE`, since 1.0.29),
+or a comparison of column refs made with `cte.as()`. PostgreSQL requires an `ON` clause on a `FULL OUTER JOIN` (a bare
+one is a syntax error): `onTrue()` is its cross-product form, which keeps every row of both sides. After a join,
+`select((root, joined) => …)` and `where((root, joined) => …)` receive one row per source in FROM order.
 
-### UNION of CTE-rooted queries
+Buyer spend beside the current tier — one row whatever side is empty:
 
-`db.selectFromCte(a).select(…).unionAll(…)` / `.union(…)` (1.0.29): a CTE-rooted query is a union leg — beside
-other CTE-rooted queries, entity queries and set queries projecting the same columns. Every leg's CTEs are
-declared ONCE at the top of the statement (a data-modifying one after the CTEs it reads), every leg reads them by
-name, and the union reads each row the way its FIRST leg's projection does: a column through its own mapper, a
-text column's `'0042'` as text, a literal — a leg's tag — from the row. The union is a `UnionQueryBuilder`:
-`orderBy()`, `limit()`, `count()`, `firstOrDefault()`, `asSubquery()` and a CTE body (`with(name, union)`).
+```ts
+import { DbCteBuilder, and, eq, onTrue } from 'linkgress-orm';
 
-### The `onTrue()` helper and `ON TRUE`
+const userId = 1;
+const builder = new DbCteBuilder();
+const spend = builder.with('spend', db.orders
+  .where(o => and(eq(o.userId, userId), eq(o.status, 'completed')))
+  .select(o => ({ status: o.status, totalPrice: o.totalAmount }))
+  .groupBy(o => ({ status: o.status }))
+  .select(g => ({ status: g.key.status, totalPrice: g.sum(o => o.totalPrice) })));
+const tier = builder.with('current_tier', db.users
+  .where(u => and(eq(u.id, userId), eq(u.isActive, true)))
+  .select(u => ({ currentTierId: u.id }))
+  .limit(1));
 
-PostgreSQL requires an `ON` / `USING` clause on a `FULL OUTER JOIN` (a bare one is a
-syntax error). Use the exported `onTrue()` helper for the cross-product
-(`ON TRUE`) form that keeps **every** row of both sides while pairing them up:
-
-```typescript
-import { onTrue } from 'linkgress-orm';
-
-db.selectFromCte(spend.cte)
-  .fullOuterJoin(tier.cte, onTrue())   // … FULL OUTER JOIN "current_tier" ON TRUE
-  .select((s, t) => ({ /* … */ }));
-```
-
-`onTrue()` simply renders the constant predicate `TRUE`; it can be passed to any of
-the joins that take a condition.
-
-
-`onFalse()` (1.0.29) renders a literal `FALSE`: `FULL OUTER JOIN … ON FALSE` keeps every row of both sides and
-pairs none — two relations side by side. A FULL JOIN is planned only on merge- or hash-joinable conditions: an
-equality between the two sides (beside which any other condition is fine), or constants. `IS NOT DISTINCT FROM`,
-an inequality, an OR or a condition on one side alone raise 0A000 "FULL JOIN is only supported with merge-joinable
-or hash-joinable join conditions" — on PostgreSQL and, since 1.0.29, in the in-memory database.
-
-### Worked example: buyer spend + current tier
-
-A complete, copy-pasteable example. Two CTEs are defined with the builder — a
-**grouped** `spend` total (one row per order status) and a single-row `current_tier`
-— then joined with `FULL OUTER JOIN … ON TRUE` so the result is preserved in all four
-cases: both sides present, spend-only (tier `NULL`), tier-only (spend `NULL`), or
-neither (zero rows).
-
-```typescript
-import { DbCteBuilder, eq, and, onTrue } from 'linkgress-orm';
-
-const cteBuilder = new DbCteBuilder();
-
-const spend = cteBuilder.with(
-  'spend',
-  db.orders
-    .where(o => and(eq(o.userId, userId), eq(o.status, 'completed')))
-    .select(o => ({ status: o.status, totalPrice: o.totalAmount }))
-    .groupBy(o => ({ status: o.status }))
-    .select(g => ({ status: g.key.status, totalPrice: g.sum(o => o.totalPrice) }))
-);
-
-const tier = cteBuilder.with(
-  'current_tier',
-  db.users
-    .where(u => and(eq(u.id, userId), eq(u.isActive, true)))
-    .select(u => ({ currentTierId: u.id }))
-    .limit(1)
-);
-
-const rows = await db
-  .selectFromCte(spend.cte)
+const rows = await db.selectFromCte(spend.cte)
   .fullOuterJoin(tier.cte, onTrue())
-  .select((s, t) => ({
-    status: s.status,            // string | null
-    totalPrice: s.totalPrice,    // number | null
-    currentTierId: t.currentTierId, // number | null
-  }))
+  .select((s, t) => ({ status: s.status, totalPrice: s.totalPrice, currentTierId: t.currentTierId }))
   .toList();
+// userId 1: [{ status: 'completed', totalPrice: 99.99, currentTierId: 1 }]
+// userId 2 (no completed order): [{ status: null, totalPrice: null, currentTierId: 2 }]
+// userId 3 (no completed order, inactive): []   — both sides empty
 ```
 
-**Generated SQL:**
 ```sql
-WITH "spend" AS (
-  SELECT "orders"."status" as "status",
-         CAST(SUM("orders"."total_amount") AS DOUBLE PRECISION) as "totalPrice"
+WITH "spend" AS (SELECT "orders"."status" as "status", CAST(SUM("orders"."total_amount") AS DOUBLE PRECISION) as "totalPrice"
   FROM "orders"
   WHERE ("orders"."user_id" = $1 AND "orders"."status" = $2)
-  GROUP BY "orders"."status"
-), "current_tier" AS (
-  SELECT "users"."id" as "currentTierId"
+  GROUP BY "orders"."status"), "current_tier" AS (SELECT "users"."id" as "currentTierId"
   FROM "users"
   WHERE ("users"."id" = $3 AND "users"."is_active" = $4)
-  LIMIT 1
-)
-SELECT "spend"."status" as "status",
-       "spend"."totalPrice" as "totalPrice",
-       "current_tier"."currentTierId" as "currentTierId"
+  LIMIT 1)
+SELECT "spend"."status" as "status", "spend"."totalPrice" as "totalPrice", "current_tier"."currentTierId" as "currentTierId"
 FROM "spend"
 FULL OUTER JOIN "current_tier" ON TRUE
+-- params: [1, "completed", 1, true]
 ```
 
-`-- params: [userId, 'completed', userId, true]`
+`rightJoin(tier.cte, onTrue())` renders `RIGHT JOIN "current_tier" ON TRUE`, `crossJoin(tier.cte)` renders
+`CROSS JOIN "current_tier"`, and `fullOuterJoin(tier.cte, onFalse())` renders `FULL OUTER JOIN "current_tier" ON FALSE`:
+every row of both sides, paired with none (two relations side by side).
 
-Every CTE body's parameters are emitted first, in `WITH` declaration order (root CTE,
-then each joined CTE), followed by any `ON`-predicate parameters — so the whole
-statement keeps a single, sequential `$1..$n` numbering.
+A column-to-column ON condition uses refs from `cte.as()` (they render `"<cte>"."<column>"`):
 
-> **Tip:** Call `.toSql()` (or `.buildQuery()` for `{ sql, params }`) on a CTE-rooted
-> query to inspect the generated SQL without executing it.
+```ts
+import { DbCteBuilder, eq, gt } from 'linkgress-orm';
 
-## CTEs Read from Nested Subqueries (statement-level declaration)
+const builder = new DbCteBuilder();
+const authors = builder.with('authors', db.users.select(u => ({ id: u.id, name: u.username })));
+const popular = builder.with('popular_posts', db.posts.where(p => gt(p.views, 120)).select(p => ({ authorId: p.userId, title: p.title })));
+const a = authors.cte.as();
+const p = popular.cte.as();
 
-A CTE attached to the executing query with `.with(cte)` — or the CTEs of a CTE-rooted query — is declared
-**once**, in the statement's `WITH`. Every nested build of that statement reads it **by name**: its WHERE, its
-projected subqueries and fragments, its ORDER BY expressions, its collections, a UNION leg, a subquery nested
-inside a subquery, a nested query that attaches the same CTE again. The body is not declared again and its
-parameters are bound once.
+const rows = await db.selectFromCte(authors.cte)
+  .fullOuterJoin(popular.cte, eq(a.id, p.authorId))
+  .select((au, po) => ({ name: au.name, title: po.title }))
+  .toList();
+// [{ name: 'alice', title: 'Alice Post 2' }, { name: 'bob', title: 'Bob Post' }, { name: 'charlie', title: null }]
+```
 
-```typescript
-const older = new DbCteBuilder().with(
-  'older_users',
-  db.users.where(u => gt(u.age, 31)).select(u => ({ id: u.id, age: u.age }))
-);
+```sql
+WITH "authors" AS (SELECT "users"."id" as "id", "users"."username" as "name"
+  FROM "users"), "popular_posts" AS (SELECT "posts"."user_id" as "authorId", "posts"."title" as "title"
+  FROM "posts"
+  WHERE "posts"."views" > $1)
+SELECT "authors"."name" as "name", "popular_posts"."title" as "title"
+FROM "authors"
+FULL OUTER JOIN "popular_posts" ON "authors"."id" = "popular_posts"."authorId"
+-- params: [120]
+```
 
-await db.users
-  .where(u => inSubquery(u.id, db.selectFromCte(older.cte).select(r => ({ id: r.id })).asSubquery('array')))
+- PostgreSQL plans a FULL JOIN only on merge- or hash-joinable conditions: an equality between the two sides
+  (other conditions may stand beside it) or constants. An inequality, `IS NOT DISTINCT FROM`, an OR or a condition
+  on one side alone fails with 0A000 "FULL JOIN is only supported with merge-joinable or hash-joinable join
+  conditions" — on PostgreSQL and in the in-memory database.
+- Joined CTEs render under their own names. Joining the root CTE to itself declares it twice and fails with 42712
+  "WITH query name "older_users" specified more than once", also when the root has an alias. Use a second CTE, or a
+  correlated `selectFromCte(cte, alias)` subquery (next section).
+- The selector of the first join is fully typed `(root, right)`; with 3 or more sources the extra rows arrive as
+  loosely typed rest arguments.
+
+## Read one CTE from several subqueries: declare it once
+
+Attach the CTE to the executing query with `.with(cte)`: the statement declares it once and every nested read —
+WHERE subqueries, projected subqueries, ORDER BY expressions, collections, union legs, subqueries of subqueries —
+reads it by name, with its parameters bound once.
+
+```ts
+import { DbCteBuilder, eq, gt, inSubquery } from 'linkgress-orm';
+
+const older = new DbCteBuilder().with('older_users', db.users
+  .where(u => gt(u.age, 30))
+  .select(u => ({ id: u.id, age: u.age })));
+
+const rows = await db.users
   .with(older.cte)
+  .where(u => inSubquery(u.id, db.selectFromCte(older.cte).select(r => r.id).asSubquery('array')))
   .select(u => ({
     name: u.username,
     olderAge: db.selectFromCte(older.cte).where(r => eq(r.id, u.id)).select(r => r.age).asSubquery('scalar'),
   }))
   .toList();
+// [{ name: 'bob', olderAge: 35 }, { name: 'charlie', olderAge: 45 }]
 ```
 
 ```sql
-WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age" FROM "users" WHERE "users"."age" > $1)
-SELECT "users"."username" as "name",
-       (SELECT "older_users"."age" as "value" FROM "older_users" WHERE "older_users"."id" = "users"."id") as "olderAge"
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+  FROM "users"
+  WHERE "users"."age" > $1)
+SELECT "users"."username" as "name", (SELECT "older_users"."age" as "value"
+  FROM "older_users"
+  WHERE "older_users"."id" = "users"."id") as "olderAge"
 FROM "users"
-WHERE "users"."id" IN (SELECT "older_users"."id" as "id" FROM "older_users")
--- params: [31]
+WHERE "users"."id" IN (SELECT "older_users"."id" as "value"
+  FROM "older_users")
+-- params: [30]
 ```
 
-Before 1.0.9 every nested `selectFromCte(...)` re-declared the CTE inside its parentheses —
-`IN (WITH "older_users" AS (… $2) SELECT …)` — and bound its body's parameters again.
+Without `.with(older.cte)` the same query runs, but each subquery declares its own copy and binds its own
+parameters:
 
-A subquery that attaches a CTE the executing statement does **not** declare still declares it inside itself,
-as `(WITH "cte" AS (…) SELECT …)`; the body's parameters are numbered after those the statement bound before
-it. A subquery whose CTEs are only partly declared by the statement reads those from there and declares the
-rest itself (a CTE-rooted subquery used to refuse that).
+```sql
+SELECT "users"."username" as "name", (WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+  FROM "users"
+  WHERE "users"."age" > $1)
+  SELECT "older_users"."age" as "value"
+  FROM "older_users"
+  WHERE "older_users"."id" = "users"."id") as "olderAge"
+FROM "users"
+WHERE "users"."id" IN (WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+  FROM "users"
+  WHERE "users"."age" > $2)
+  SELECT "older_users"."id" as "value"
+  FROM "older_users")
+-- params: [30, 30]
+```
 
-The statement's CTEs are matched by **content**, not by name: a nested query that attaches a CTE that is
-**different** under a name the statement declares is refused — `The CTE "<name>" a nested query attaches is not
-the CTE "<name>" its statement declares …` — because inside the statement that name reads the statement's CTE
-(the nested query used to read the other one's rows silently). "Different" means different by content: the
-same definition built twice — by a factory called for the statement and again for a nested query, also from
-builders at other parameter offsets — is the same CTE when its body (numbered from `$1`), its `MATERIALIZED`
-flag and its parameters **by value** are equal (a `Date` by its time, a `Buffer` / typed array by its bytes, an
-array element by element, a JSON document by its JSON text; any other object only as the same instance). The
-same rule decides whether two UNION legs attach one CTE. A data-modifying CTE (`withMutation`) is one execution
-of its statement: it is the same only as the same `DbCte` instance.
+> **Efficiency:** declared once and read in two places, the CTE is computed once (PostgreSQL inlines only a CTE
+> referenced once); undeclared, every reader carries its own copy, written, bound and computed separately. Measured
+> in changelog v0.4.61 on one production workload (a visibility gate read by two union legs, 60k junction rows):
+> the gate duplicated per leg took 9.97 ms and 3,720 shared buffers, one `MATERIALIZED` CTE read by both legs
+> 4.43 ms and 2,074. A data-modifying CTE is never copied: reading one that the executing query does not declare is
+> refused.
 
-`min()`, `max()` and `sum()` declare the query's `.with()` CTEs too (they used to drop them: a join to a CTE
-met `relation "<cte>" does not exist`), as `count()`, `exists()` and `toList()` do.
+- A query that joins a CTE and reads it from a subquery declares it once too.
+- A nested `selectFromCte()` that reads an outer navigation joins it in the enclosing query:
+  `db.posts.with(older.cte).select(p => ({ authorOlderAge: db.selectFromCte(older.cte).where(r => eq(r.id, p.user!.id)).select(r => r.age).asSubquery('scalar') }))`
+  renders `WHERE "older_users"."id" = "user"."id"` inside the subquery and `INNER JOIN "users" AS "user" ON "posts"."user_id" = "user"."id"` outside.
+  The rows of a CTE-rooted query carry its identity: an entity query nested in its `where()` reads them as
+  correlations, also when the CTE is named like one of that query's navigations.
+- The statement's CTEs are matched by content, not by name. A nested query that attaches a different CTE under a
+  declared name is refused: `The CTE "older_users" a nested query attaches is not the CTE "older_users" its
+  statement declares …`. The same definition built twice — by a factory called for the statement and again for a
+  nested query, also from builders at other parameter offsets — is one CTE when its body (numbered from `$1`), its
+  `MATERIALIZED` flag and its parameters by value are equal (a `Date` by its time, a `Buffer` or typed array by its
+  bytes, an array element by element, a JSON document by its JSON text; any other object only as the same
+  instance). The same rule decides whether two union legs attach one CTE. A data-modifying CTE is the same only as
+  the same `DbCte` instance.
+- A subquery that attaches a CTE the statement does not declare declares it inside itself,
+  `(WITH "cte" AS (…) SELECT …)`; a subquery whose CTEs are partly declared reads those by name and declares the
+  rest.
 
-## Data-Modifying CTEs: `withMutation()`
+A CTE-rooted subquery correlated to an enclosing query over the same CTE — another `selectFromCte(cte)`, or an
+entity query that joined the CTE — needs an alias on one side; `selectFromCte(cte, alias)` renders
+`FROM "<cte>" AS "<alias>"`:
 
-`DbCteBuilder.withMutation(name, statement)` attaches a compiled `UPDATE` / `DELETE` / `INSERT` — `.toStatement(selector)`
-on an update, a delete, or an `insert(...)` / `insertBulk(...)` — as a data-modifying CTE. The selector is the statement's `RETURNING` list, and it
-types the CTE's columns:
+```ts
+import { DbCteBuilder, agg, gt } from 'linkgress-orm';
 
-```typescript
-const gate = new DbCteBuilder().withMutation(
-  'gate',
-  db.users
-    .where(u => and(eq(u.id, userId), lt(u.age, 30)))     // a compare-and-set: the UPDATE matches 0 or 1 row
-    .update(u => ({ age: add(u.age, 1) }))
-    .toStatement(u => ({ id: u.id, age: u.age }))          // CompiledStatement<{ id: number; age: number }>
+const older = new DbCteBuilder().with('older_users', db.users
+  .where(u => gt(u.age, 30))
+  .select(u => ({ id: u.id, age: u.age })));
+
+const ranked = await db.selectFromCte(older.cte).select(o => ({
+  id: o.id,
+  olderCount: db.selectFromCte(older.cte, 'other')
+    .where(r => gt(r.age, o.age))
+    .select(() => agg.count())
+    .asSubquery('scalar'),
+})).toList();
+// [{ id: 2, olderCount: 1 }, { id: 3, olderCount: 0 }]
+```
+
+```sql
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+  FROM "users"
+  WHERE "users"."age" > $1)
+SELECT "older_users"."id" as "id", (SELECT count(*) as "value"
+  FROM "older_users" AS "other"
+  WHERE "other"."age" > "older_users"."age") as "olderCount"
+FROM "older_users"
+-- params: [30]
+```
+
+Without the alias both rows would be named `"older_users"` and the comparison would hold for every row; the
+build refuses it: `selectFromCte(): the query correlates to the enclosing row "older_users"."age" under the alias
+"older_users", which names its own CTE row too … Give one of them a distinct alias: selectFromCte(cte, '<alias>').`
+
+## Keep the top N rows per group: rank in a CTE
+
+PostgreSQL computes window functions after WHERE, so a rank cannot be filtered in the query that computes it.
+Compute it in the CTE body with `win.rowNumber()`, `win.rank()` or `win.denseRank()` (since 1.0.21) and filter
+where the CTE is read.
+
+```ts
+import { DbCteBuilder, lte, win } from 'linkgress-orm';
+
+const ranked = new DbCteBuilder().with('ranked_posts', db.posts.select(p => ({
+  id: p.id,
+  userId: p.userId,
+  title: p.title,
+  rank: win.rowNumber().over({ partitionBy: p.userId, orderBy: [[p.views, 'DESC'], p.id] }),
+})));
+
+const top = await db.selectFromCte(ranked.cte)
+  .where(r => lte(r.rank, 1))
+  .select(r => ({ userId: r.userId, title: r.title }))
+  .orderBy(r => r.userId)
+  .toList();
+// [{ userId: 1, title: 'Alice Post 2' }, { userId: 2, title: 'Bob Post' }]
+```
+
+```sql
+WITH "ranked_posts" AS (SELECT "posts"."id" as "id", "posts"."user_id" as "userId", "posts"."title" as "title", row_number() OVER (PARTITION BY "posts"."user_id" ORDER BY "posts"."views" DESC, "posts"."id" ASC) as "rank"
+  FROM "posts")
+SELECT "ranked_posts"."userId" as "userId", "ranked_posts"."title" as "title"
+FROM "ranked_posts"
+WHERE "ranked_posts"."rank" <= $1
+ORDER BY "userId" ASC
+-- params: [1]
+```
+
+To keep entity rows instead, filter them by the ranked ids:
+`db.posts.with(ranked.cte).where(p => inSubquery(p.id, db.selectFromCte(ranked.cte).where(r => eq(r.rank, 1)).select(r => r.id).asSubquery('array')))`
+renders `WHERE "posts"."id" IN (SELECT "ranked_posts"."id" as "value" FROM "ranked_posts" WHERE "ranked_posts"."rank" = $1)`.
+
+> **Pitfall:** `db.posts.select(p => ({ rank: win.rowNumber().over(…) })).where(r => eq(r.rank, 1))` throws a
+> `TypeError` before running: "`rank` is a window function value: PostgreSQL computes window functions after WHERE
+> and the joins, so it cannot be filtered in the query that computes it — compute it in a CTE …".
+
+## Drive a query from a candidate set: `joinFilter()` and `materialized: true`
+
+`joinFilter(cte, on, filter?)` is an INNER JOIN used only as a row filter: the query's projection stays as it is and
+the CTE is attached to the `WITH` by itself. `with(name, query, { materialized: true })` emits
+`AS MATERIALIZED`: PostgreSQL computes the CTE once as a separate relation instead of inlining it into the outer
+plan. Together they keep a candidate set the driving side of the plan.
+
+```ts
+import { DbCteBuilder, eq, gt } from 'linkgress-orm';
+
+const builder = new DbCteBuilder();
+const candidates = builder.with(
+  'candidates',
+  db.posts.where(p => gt(p.views, 120)).select(p => ({ id: p.userId }))
+    .union(db.orders.where(o => eq(o.status, 'pending')).select(o => ({ id: o.userId }))),
+  { materialized: true },
 );
 
 const rows = await db.users
-  .where(u => inSubquery(u.id, db.selectFromCte(gate.cte).select(g => ({ id: g.id })).asSubquery('array')))
-  .with(gate.cte)
+  .where(u => eq(u.isActive, true))
+  .select(u => ({ id: u.id, username: u.username }))
+  .joinFilter(candidates.cte, (u, c) => eq(u.id, c.id))
+  .orderBy(u => u.id)
+  .toList();
+// [{ id: 1, username: 'alice' }, { id: 2, username: 'bob' }]
+```
+
+```sql
+WITH "candidates" AS MATERIALIZED ((SELECT "posts"."user_id" as "id"
+    FROM "posts"
+    WHERE "posts"."views" > $1)
+  UNION
+  (SELECT "orders"."user_id" as "id"
+    FROM "orders"
+    WHERE "orders"."status" = $2))
+SELECT "users"."id" as "id", "users"."username" as "username"
+FROM "users"
+INNER JOIN "candidates" ON "users"."id" = "candidates"."id"
+WHERE "users"."is_active" = $3
+ORDER BY "id" ASC
+-- params: [120, "pending", true]
+```
+
+> **Efficiency:** measured on a production-sized dataset (changelog v0.4.53: a 122M-row table, the worst-case
+> candidate set): the same CTE inlined 6,400 ms, `MATERIALIZED` 161 ms; the semi-join spelling
+> `WHERE id IN (SELECT id FROM candidates)` 3,339 ms against the join's 161 ms. Without the fence, PostgreSQL 12+
+> inlines a CTE read once.
+
+> **Pitfall:** the fence also blocks predicate pushdown into the body: a reader's filter on the CTE's columns no
+> longer reaches the body's scan (no index on it can serve that filter). Use `materialized: true` where the candidate
+> set must drive the join order, not on every CTE.
+
+- `leftJoinFilter(cte, on, filter)` is the LEFT JOIN form; with an IS NULL filter it is an anti-join (rows without
+  a candidate). Its callbacks receive the CTE's columns typed as values, so build the IS NULL ref with `cte.as()`:
+
+  ```ts
+  // fragment: continues the example above (candidates); isNull is imported from 'linkgress-orm'
+  const c = candidates.cte.as();
+  const none = await db.users
+    .leftJoinFilter(candidates.cte, (u, cand) => eq(u.id, cand.id), () => isNull(c.id))
+    .select(u => ({ username: u.username }))
+    .toList();
+  // [{ username: 'charlie' }]
+  ```
+
+  ```sql
+  WITH "candidates" AS MATERIALIZED ((SELECT "posts"."user_id" as "id"
+      FROM "posts"
+      WHERE "posts"."views" > $1)
+    UNION
+    (SELECT "orders"."user_id" as "id"
+      FROM "orders"
+      WHERE "orders"."status" = $2))
+  SELECT "users"."username" as "username"
+  FROM "users"
+  LEFT JOIN "candidates" ON "users"."id" = "candidates"."id"
+  WHERE "candidates"."id" IS NULL
+  -- params: [120, "pending"]
+  ```
+
+- The right side of `on` / `filter` is the CTE's row. The left side is the entity row when `joinFilter()` is called
+  on the table, and the projection's row after a `select()` (typed so): compare only columns the projection holds
+  (`u.id` above). In untyped code a column outside the projection renders unqualified — `ON "id" = "ids"."id"` —
+  and the statement fails with `column reference "id" is ambiguous`.
+- `materialized` is an option of `with()` only (not of `withAggregation()` or `withMutation()`), and part of the
+  CTE's identity: the same body with another flag is a different CTE.
+
+> **Pitfall:** `joinFilter()` against a CTE that holds several rows per key returns each entity row once per match
+> (`alice` twice for a CTE of `posts.user_id`). Use `inSubquery()` or `exists()` for a semi-join there.
+
+## Attach child rows as a JSON array per key: `withAggregation()`
+
+`withAggregation(name, query, keySelector, alias = 'items')` groups the query's rows by the key columns and folds
+the other columns into one JSON array per key. It returns the `DbCte` itself (not `{ cte }`). Use it to attach
+child lists to parents that have no navigation for them; through a navigation, use a collection
+(`u.posts!.select(…).toList()`), which lets you choose the strategy.
+
+```ts
+import { DbCteBuilder, eq } from 'linkgress-orm';
+
+const postsByUser = new DbCteBuilder().withAggregation(
+  'posts_by_user',
+  db.posts.select(p => ({ id: p.id, title: p.title, views: p.views, userId: p.userId })),
+  p => ({ userId: p.userId }),
+  'posts',
+);
+
+const rows = await db.users
+  .leftJoin(postsByUser, (u, a) => eq(u.id, a.userId), (u, a) => ({ username: u.username, posts: a.posts }))
+  .orderBy(r => r.username)
+  .toList();
+// [{ username: 'alice', posts: [{ id: 1, title: 'Alice Post 1', views: 100 }, { id: 2, title: 'Alice Post 2', views: 150 }] },
+//  { username: 'bob', posts: [{ id: 3, title: 'Bob Post', views: 200 }] },
+//  { username: 'charlie', posts: [] }]
+```
+
+```sql
+WITH "posts_by_user" AS (SELECT "userId",
+    json_agg(json_build_object('id', "id", 'title', "title", 'views', "views")) as "posts"
+  FROM (SELECT "posts"."id" as "id", "posts"."title" as "title", "posts"."views" as "views", "posts"."user_id" as "userId"
+    FROM "posts") t
+  GROUP BY "userId")
+SELECT "users"."username" as "username", COALESCE("posts_by_user"."posts", '[]'::json) as "posts"
+FROM "users"
+LEFT JOIN "posts_by_user" ON "users"."id" = "posts_by_user"."userId"
+ORDER BY "username" ASC
+```
+
+- The items hold the query's columns minus the grouping keys: `{ id, title, views }`, no `userId`.
+- It aggregates with `json_agg` (JSON, not JSONB); a joined parent without rows reads `[]` (`COALESCE(…, '[]'::json)`).
+- Items read through the aggregated query's own mappers (a `publishTime` item reads `{ hour, minute }`), nested
+  objects and navigation rows key by key, literals as themselves; a grouping key reads through its column's mapper.
+- `keySelector` maps output names to inner columns. Several keys group by all of them:
+  `o => ({ userId: o.userId, status: o.status })` renders `GROUP BY "userId", "status"`. A renamed key
+  (`p => ({ authorId: p.userId })`) renders `SELECT "userId" AS "authorId", …`.
+- It aggregates the whole inner query: filter inside it (`db.orders.where(…).select(…)`), not on the join.
+
+> **Pitfall:** with a renamed key, the item type still lists the inner column (`posts[0].userId` type-checks), but
+> the items do not hold it at runtime (`undefined`). Keep the key's output name equal to the inner column name, or
+> do not read it from the items.
+
+## Read a CTE from a raw `sql` fragment: `cte.as(alias)`
+
+`cte.as(alias?)` returns a typed reference for `sql` templates: the reference renders `"<cte>" AS "<alias>"`, each of
+its columns `"<alias>"."<column>"`. Use it when a hand-written fragment must read a CTE the statement declares.
+
+```ts
+import { DbCteBuilder, sql } from 'linkgress-orm';
+
+const stats = new DbCteBuilder().with('post_stats', db.posts.select(p => ({ postId: p.id, views: p.views, authorId: p.userId })));
+const ps = stats.cte.as('ps');
+
+const rows = await db.users
+  .with(stats.cte)
   .select(u => ({
-    id: u.id,
-    loadedAge: u.age,                                                                  // the pre-update snapshot
-    newAge: db.selectFromCte(gate.cte).select(g => ({ age: g.age })).asSubquery('scalar'),   // RETURNING
+    username: u.username,
+    totalViews: sql<number>`(SELECT COALESCE(SUM(${ps.views}), 0) FROM ${ps} WHERE ${ps.authorId} = ${u.id})`,
   }))
   .toList();
+// [{ username: 'alice', totalViews: 250 }, { username: 'bob', totalViews: 200 }, { username: 'charlie', totalViews: 0 }]
+```
+
+```sql
+WITH "post_stats" AS (SELECT "posts"."id" as "postId", "posts"."views" as "views", "posts"."user_id" as "authorId"
+  FROM "posts")
+SELECT "users"."username" as "username", (SELECT COALESCE(SUM("ps"."views"), 0) FROM "post_stats" AS "ps" WHERE "ps"."authorId" = "users"."id") as "totalViews"
+FROM "users"
+```
+
+- The executing query must declare the CTE with `.with(cte)`: a raw fragment is not recognised as a CTE read.
+- Without an alias the reference renders the CTE's own name.
+- The fluent forms (`db.selectFromCte(cte)….asSubquery()`, joins, `joinFilter()`) are typed; prefer them where they fit.
+
+## Lock the rows a CTE reads: `.forUpdate()` in the body
+
+Put `.forUpdate()` (options `{ skipLocked: true }` or `{ noWait: true }`, mutually exclusive) on the query that is the
+CTE's body: the body locks the rows it reads when the statement evaluates it. This is the lock leg of a fused
+check-and-write statement — the check and the write in one round trip, without an application lock.
+
+```ts
+import { DbCteBuilder, eqAny } from 'linkgress-orm';
+
+const locked = new DbCteBuilder().with('locked', db.users
+  .where(u => eqAny(u.id, [1, 2]))
+  .select(u => ({ id: u.id, age: u.age }))
+  .orderBy(u => u.id)
+  .forUpdate());
+
+const rows = await db.selectFromCte(locked.cte).select(l => ({ id: l.id, age: l.age })).toList();
+// [{ id: 1, age: 25 }, { id: 2, age: 35 }]
+```
+
+```sql
+WITH "locked" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+  FROM "users"
+  WHERE ("users"."id" = ANY($1::integer[]))
+  ORDER BY "id" ASC
+  FOR UPDATE)
+SELECT "locked"."id" as "id", "locked"."age" as "age"
+FROM "locked"
+-- params: ["{1,2}"]
+```
+
+> **Pitfall:** `db.selectFromCte(cte).select(…).forUpdate()` appends `FOR UPDATE` to the outer SELECT, whose FROM
+> holds only CTEs. PostgreSQL's locking clause does not apply to the `WITH` queries the primary query references
+> (PostgreSQL manual, SELECT, "The Locking Clause"), so it locks no rows: while its transaction is open, another
+> session's `FOR UPDATE NOWAIT` of the same row succeeds; with `.forUpdate()` in the body that statement fails with
+> 55P03.
+> Lock in the body. (The method's own JSDoc says it locks the root CTE's rows; it does not.)
+
+> **Pitfall:** order the locked rows by a stable key (`orderBy(u => u.id)`) when a statement locks several rows:
+> two statements locking the same rows in different orders can deadlock.
+
+## Write and read back in one statement: `withMutation()`
+
+`builder.withMutation(name, statement)` attaches a compiled `UPDATE`, `DELETE` or `INSERT` as a data-modifying CTE.
+Compile the statement with `.toStatement(selector)`; the selector is its RETURNING list and types the CTE's
+columns. Sources of a compiled statement: `where(…).update(…)`, `where(…).delete()`, and (since 1.0.22)
+`insert(…)`, `insertBulk(…)`, `insertFrom(…)`. Use it to write and read the written rows in one round trip.
+
+A compare-and-set gate: the UPDATE matches 0 or 1 row, and the load returns rows only when it matched.
+
+```ts
+import { DbCteBuilder, add, and, eq, inSubquery, lt } from 'linkgress-orm';
+
+const userId = 1;
+const gate = new DbCteBuilder().withMutation('gate', db.users
+  .where(u => and(eq(u.id, userId), lt(u.age, 30)))
+  .update(u => ({ age: add(u.age, 1) }))
+  .toStatement(u => ({ id: u.id, age: u.age })));   // CompiledStatement<{ id: number; age: number }>
+
+const rows = await db.users
+  .with(gate.cte)
+  .where(u => inSubquery(u.id, db.selectFromCte(gate.cte).select(g => g.id).asSubquery('array')))
+  .select(u => ({
+    id: u.id,
+    loadedAge: u.age,                                                       // the statement's snapshot
+    newAge: db.selectFromCte(gate.cte).select(g => g.age).asSubquery('scalar'),  // RETURNING
+  }))
+  .toList();
+// [{ id: 1, loadedAge: 25, newAge: 26 }]
 ```
 
 ```sql
 WITH "gate" AS (UPDATE "users" SET "age" = ("users"."age" + $1) WHERE ("users"."id" = $2 AND "users"."age" < $3) RETURNING "id" AS "id", "age" AS "age")
-SELECT "users"."id" as "id", "users"."age" as "loadedAge", (SELECT "gate"."age" as "age" FROM "gate") as "newAge"
+SELECT "users"."id" as "id", "users"."age" as "loadedAge", (SELECT "gate"."age" as "value"
+  FROM "gate") as "newAge"
 FROM "users"
-WHERE "users"."id" IN (SELECT "gate"."id" as "id" FROM "gate")
+WHERE "users"."id" IN (SELECT "gate"."id" as "value"
+  FROM "gate")
+-- params: [1, 1, 30]
 ```
 
-The UPDATE runs **once**, whatever number of places read the CTE; when the compare-and-set loses, the gate is
-empty and so is the load.
+A DELETE read back from its RETURNING rows:
 
-- `toStatement(selector)` returns a `CompiledStatement<TRow>` — `{ sql, params }` typed by the RETURNING row.
-  `withMutation(name, statement)` returns `{ cte: DbCte<TRow> }`, so
-  `db.selectFromCte(gate.cte).select(g => ({ id: g.id }))` is typed — and each column reads the way its RETURNING
-  value does: a text column stays text (`'0042'`), a column with a custom mapper reads through it, an expression
-  as an expression. (The compiled statement carries its RETURNING selection as a non-enumerable property; a
-  hand-written `{ sql, params }` has none, and its columns read like expressions.) The
-  `withMutation(name, statement, columns)` overload keeps working.
-- The `'temptable'` collection strategy runs a query's collections as statements of their own, after the
-  statement that executes the mutation: a temp-table collection that READS the data-modifying CTE (through a
-  `selectFromCte(…)` subquery, in its WHERE, its item or a collection nested in it) is refused before anything
-  runs. Use the `'cte'` or `'lateral'` strategy for such a query (the UPDATE then runs once, in the one
-  statement). Temp-table collections that never read the CTE run as before: the UPDATE runs once, in the base
-  statement. (A raw `sql` fragment naming the CTE in such a collection is not recognised as a read: that
-  statement fails with `relation "<cte>" does not exist`, after the base statement has run, as it did before.)
-- **A data-modifying CTE is declared at statement level only**: attach it with `.with()` on the executing
-  query. Declared inside a nested subquery — a `selectFromCte(gate.cte)…asSubquery()` in a query that does not
-  carry it, a subquery that carries it itself — it is refused:
-  `CTE "gate" is data-modifying: a data-modifying CTE must be declared at statement level — attach it with
-  .with() on the executing query`. (PostgreSQL rejects a data-modifying `WITH` nested in a subquery; before
-  1.0.9 the query builder emitted one per reading subquery, i.e. one UPDATE per occurrence.) An `insertFrom()`
-  declares it through its `with` option — `insertFrom(source, map, { with: [ins.cte] })`, see
-  [the insert guide](./insert-update-guide.md#one-statement-a-bulk-insert-feeding-another-insert).
-- A body that executes nowhere itself — a CTE's (`with()`, `withAggregation()`) or a compiled statement
-  (`toStatement()`) — reads a data-modifying CTE by NAME instead, and every statement that declares the CTE
-  built over it declares that one first (1.0.29, next section).
+```ts
+import { DbCteBuilder, eq } from 'linkgress-orm';
 
-## Dependent Data-Modifying CTEs and `afterMutation()`
+const removed = new DbCteBuilder().withMutation('removed', db.postComments
+  .where(c => eq(c.postId, 3))
+  .delete()
+  .toStatement(c => ({ id: c.id, comment: c.comment })));
 
-A data-modifying statement compiled with `toStatement()` may read data-modifying CTEs created before it —
-through its source, its WHERE, a subquery of its values. It reads them by name, the CTE `withMutation()` makes of
-it records them (`DbCte.dependencies`), and every statement that declares that CTE declares them FIRST, each once
-— whichever of them it reads, in whatever order its `.with()` lists them. A plain CTE whose body reads one
-(`with(name, db.selectFromCte(closed.cte)…)`) works the same way.
-
-**Order is not implied.** PostgreSQL runs the sub-statements of a WITH on ONE snapshot and in no order it
-promises: a data-modifying CTE runs when the main query first reads it, the rest after the main query. They
-cannot see each other's writes — RETURNING is the only way to pass rows on. A unique index over a SCOPE (one
-current lease per unit) therefore sees a successor inserted BEFORE the close of its predecessor whenever the
-main query reads the open leg first: 23505 — or, with `ON CONFLICT DO NOTHING`, the open silently skipped and the
-unit left with no current lease. `afterMutation(cte)` orders the statement after `cte`: the condition
-`((SELECT count(*) FROM "<cte>") >= 0)` holds only once `cte` has run to completion, so the statement yields no
-row before (PostgreSQL plans it as a one-time filter evaluated before the first row; an `exists()` over the CTE
-is no barrier — it stops at the first row).
-
-```typescript
-const builder = new DbCteBuilder();
-const closed = builder.withMutation('closed', db.leases
-  .where(l => and(eqAny(l.unitId, units), eq(l.isCurrent, true),
-    notExists(fromRows(db.leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
-      .where(d => and(eq(d.unitId, l.unitId), eq(d.tenantId, l.tenantId))).select(() => ({ one: literal(1) })).asSubquery())))
-  .update({ validTo: now, isCurrent: false })
-  .toStatement(l => ({ id: l.id, unitId: l.unitId })));
-
-const opened = builder.withMutation('opened', db.leases.insertFrom(
-  fromRows(db.leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
-    .where(d => notExists(db.leases.where(c => and(eq(c.unitId, d.unitId), eq(c.tenantId, d.tenantId), eq(c.isCurrent, true)))
-      .select(c => ({ id: c.id })).asSubquery()))
-    .asSubquery('table'),
-  src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }),
-  { where: () => afterMutation(closed.cte), onConflictDoNothing: true },
-).toStatement(l => ({ id: l.id, unitId: l.unitId })));
-
-// ONE statement: both legs, read back tagged — the close leg declared first
-const rows = await db.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id, unitId: r.unitId }))
-  .unionAll(db.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id, unitId: r.unitId })))
-  .toList();
+const deleted = await db.selectFromCte(removed.cte).select(r => ({ id: r.id, comment: r.comment })).toList();
+// [{ id: 3, comment: 'My order update' }]
 ```
 
 ```sql
-WITH "closed" AS (UPDATE "leases" SET … WHERE … RETURNING "id" AS "id", "unit_id" AS "unitId"),
-     "opened" AS (INSERT INTO "leases" (…) SELECT … FROM (…) AS "src"
-                  WHERE ((SELECT count(*) FROM "closed") >= 0) ON CONFLICT DO NOTHING RETURNING …)
-(SELECT CAST($n AS text) as "leg", "opened"."id" as "id", … FROM "opened")
-UNION ALL
-(SELECT CAST($m AS text) as "leg", "closed"."id" as "id", … FROM "closed")
+WITH "removed" AS (DELETE FROM "post_comments" WHERE "post_comments"."post_id" = $1 RETURNING "id" AS "id", "comment" AS "comment")
+SELECT "removed"."id" as "id", "removed"."comment" as "comment"
+FROM "removed"
+-- params: [3]
 ```
 
-- The barrier orders what the statement WRITES, not what it SEES: the open leg's `notExists` still reads the
-  snapshot the statement started with, where the row the close leg retires is current. Decide what to close and
-  what to open on disjoint keys (as above), never on "is there a current row in the scope".
-- Read several legs back with a UNION of CTE-rooted queries (next sections), never with a FULL JOIN on a null-safe
-  key: PostgreSQL plans a FULL JOIN only on merge- or hash-joinable conditions (0A000).
-- A statement that reads a data-modifying CTE it does not declare (and is no CTE body) is refused as before; so
-  is `afterMutation()` there, and `afterMutation()` of a plain CTE. Two different CTEs under one name in one
-  statement are refused.
-- The in-memory database runs CTEs in the order the main query first reads them, as PostgreSQL does: a test
-  that reads the open leg first exercises the dangerous order on both engines.
+An insert feeding another insert (since 1.0.22): `insertFrom()` declares the CTE through its `with` option, since
+PostgreSQL allows a data-modifying CTE only at the top level.
 
-## On a Table: `<table>.selectFromCte()` and `<table>.selectFromSet()`
+```ts
+import { DbCteBuilder } from 'linkgress-orm';
 
-The query roots of a context are also every table's (1.0.30): `trx.leases.selectFromCte(cte)` and
-`trx.leases.selectFromSet(set)` run on the context the table belongs to — its client, its executor, its
-transaction. Code that is handed a TABLE rather than a context — a helper that writes versioned rows into whichever
-table it gets, `db.leases` or a caller's `trx.leases` — builds the legs on the table and executes and reads them back
-on it, in ONE statement:
+const newTags = new DbCteBuilder().withMutation('new_tags', db.tags
+  .insertBulk([{ name: 'Spring' }, { name: 'Autumn' }])
+  .toStatement(t => ({ id: t.id, name: t.name })));
 
-```typescript
-const foldLeases = async (leases: DbEntityTable<Lease>, units: number[], desired: DesiredLease[], now: Date) => {
-  const builder = new DbCteBuilder(leases.getClient());
-  const closed = builder.withMutation('closed', leases
-    .where(l => and(eqAny(l.unitId, units), eq(l.isCurrent, true),
-      notExists(fromRows(leases, desired, { columns: ['unitId', 'tenantId'], alias: 'k' })
-        .where(k => and(eq(k.unitId, l.unitId), eq(k.tenantId, l.tenantId))).select(() => ({ one: literal(1) })).asSubquery())))
-    .update({ validTo: now, isCurrent: false })
-    .toStatement(l => ({ id: l.id, unitId: l.unitId })));
-  const opened = builder.withMutation('opened', leases.insertFrom(
-    fromRows(leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
-      .where(d => notExists(leases.where(c => and(eq(c.unitId, d.unitId), eq(c.tenantId, d.tenantId), eq(c.isCurrent, true)))
-        .select(c => ({ id: c.id })).asSubquery()))
+await db.productTags.insertFrom(
+  db.selectFromCte(newTags.cte).select(r => ({ tagId: r.id })).asSubquery('table'),
+  src => ({ productId: 1, tagId: src.tagId, sortOrder: 9 }),
+  { with: [newTags.cte] },
+);
+```
+
+```sql
+WITH "new_tags" AS (INSERT INTO "tags" ("name") VALUES ($1), ($2) RETURNING "id" AS "id", "name" AS "name")
+INSERT INTO "product_tags" ("product_id", "tag_id", "sort_order") SELECT CAST($3 AS integer), "src"."tagId", CAST($4 AS integer) FROM (SELECT "new_tags"."id" as "tagId"
+  FROM "new_tags") AS "src"
+-- params: ["Spring", "Autumn", 1, 9]
+```
+
+Rules PostgreSQL and the builder enforce:
+
+- **One snapshot.** Every sub-statement and the main query read the snapshot the statement started with: the main
+  query does not see the CTE's writes (`loadedAge: 25` above). Read the changed rows from RETURNING.
+- **Exactly once.** A data-modifying CTE runs once per statement however often it is read — also when it is never
+  read. With `touch = builder.withMutation('touch', db.users.where(u => eq(u.id, 3)).update({ age: 46 }).toStatement(u => ({ id: u.id })))`,
+  `db.users.with(touch.cte).where(u => eq(u.id, 3)).select(u => ({ age: u.age }))` renders
+  `WITH "touch" AS (UPDATE "users" SET "age" = $1 WHERE "users"."id" = $2 RETURNING "id" AS "id") SELECT "users"."age" as "age" FROM "users" WHERE "users"."id" = $3`,
+  returns the old age `45`, and the row holds `46` afterwards.
+- **Statement level only.** Declare it on the executing query (`.with(cte)`, `insertFrom`'s `with`, or the root of
+  `db.selectFromCte(cte)`). Read from a subquery of a query that does not declare it, the build refuses it:
+  `CTE "g3" is data-modifying: a data-modifying CTE must be declared at statement level — attach it with .with() on the executing query`.
+- **Typed RETURNING.** `toStatement(selector)` returns `CompiledStatement<TRow>` (`{ sql, params }`); each CTE column
+  reads the way its RETURNING value does (a text column stays text, a mapped column goes through its mapper). A
+  navigation or a collection in the selector is refused: `toStatement(): navigation RETURNING is not supported in compiled UPDATE statements — select plain or fragment columns only.`
+  (`DELETE` and `INSERT` likewise). A hand-written `{ sql, params }` carries no RETURNING
+  selection, and the older `withMutation(name, { sql, params }, columns)` overload types every column by name: their
+  columns read like expressions.
+- **No `'temptable'` reads.** The `'temptable'` collection strategy runs collections as statements of their own,
+  after the one that executes the mutation. A query whose collection reads the CTE is refused before anything
+  runs: `… the temptable collection strategy runs the collections as statements of their own, after the one that executes it — run this query with the 'cte' or 'lateral' collection strategy`.
+  Temp-table collections that do not read the CTE run as usual (the mutation runs once, in the base statement). A
+  raw `sql` fragment naming the CTE inside such a collection is not recognised as a read: that collection statement
+  fails with 42P01 `relation "<cte>" does not exist`, after the base statement — and its write — has run.
+- `insertFrom(…, { onConflictDoNothing: true })` (since 1.0.29) compiles into `toStatement()` too: a data-modifying
+  CTE can insert-or-skip. See [Insert, update, delete](./insert-update-guide.md).
+
+## Order two writes in one statement: `afterMutation()`
+
+A statement compiled with `toStatement()` may read data-modifying CTEs created before it — in its source, its WHERE,
+a subquery of its values. It reads them by name, its own CTE records them (`DbCte.dependencies`), and every
+statement that declares it declares them first. PostgreSQL runs the sub-statements of a `WITH` in no promised
+order: a data-modifying CTE runs when the main query first reads it. `afterMutation(cte)` (since 1.0.29) renders
+`((SELECT count(*) FROM "<cte>") >= 0)`, a condition that holds only once `cte` has run to completion, so the
+statement it guards yields no row before.
+
+Close the current pending order of a user and insert its successor, both legs read back, tagged, in ONE statement:
+
+```ts
+import { DbCteBuilder, afterMutation, and, eq, fromRows } from 'linkgress-orm';
+
+const userId = 2;
+const builder = new DbCteBuilder();
+const closed = builder.withMutation('closed', db.orders
+  .where(o => and(eq(o.userId, userId), eq(o.status, 'pending')))
+  .update({ status: 'cancelled' })
+  .toStatement(o => ({ id: o.id, userId: o.userId })));
+const opened = builder.withMutation('opened', db.orders.insertFrom(
+  fromRows(db.orders, [{ userId, status: 'pending', totalAmount: 10.5 }], { columns: ['userId', 'status', 'totalAmount'], alias: 'd' })
+    .asSubquery('table'),
+  src => ({ userId: src.userId, status: src.status, totalAmount: src.totalAmount }),
+  { where: () => afterMutation(closed.cte) },
+).toStatement(o => ({ id: o.id, userId: o.userId })));
+
+const legs = await db.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id, userId: r.userId }))
+  .unionAll(db.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id, userId: r.userId })))
+  .toList();
+// [{ leg: 'opened', id: 3, userId: 2 }, { leg: 'closed', id: 2, userId: 2 }]
+```
+
+```sql
+WITH "closed" AS (UPDATE "orders" SET "status" = $1 WHERE ("orders"."user_id" = $2 AND "orders"."status" = $3) RETURNING "id" AS "id", "user_id" AS "userId"), "opened" AS (INSERT INTO "orders" ("user_id", "status", "total_amount") SELECT "src"."userId", "src"."status", "src"."totalAmount" FROM (SELECT "d"."userId" as "userId", "d"."status" as "status", "d"."totalAmount" as "totalAmount"
+  FROM unnest(CAST($4 AS integer[]), CAST($5 AS order_status[]), CAST($6 AS decimal(10, 2)[])) AS "d"("userId", "status", "totalAmount")) AS "src" WHERE ((SELECT count(*) FROM "closed") >= 0) RETURNING "id" AS "id", "user_id" AS "userId")
+(SELECT CAST($7 AS text) as "leg", "opened"."id" as "id", "opened"."userId" as "userId"
+  FROM "opened")
+UNION ALL
+(SELECT CAST($8 AS text) as "leg", "closed"."id" as "id", "closed"."userId" as "userId"
+  FROM "closed")
+-- params: ["cancelled", 2, "pending", "{2}", "{\"pending\"}", "{10.5}", "opened", "closed"]
+```
+
+- Under a unique index over the scope (one current row per key), without the barrier the insert may run first:
+  23505 — or, with `onConflictDoNothing`, a silently skipped insert that leaves the key without a current row.
+  PostgreSQL plans the barrier as a one-time filter evaluated before the first row. An `exists()` over the CTE is
+  no barrier: it stops at the first row.
+- The barrier orders what the statement writes, not what it sees: the insert still reads the snapshot in which the
+  closed row is current. Decide what to close and what to open on disjoint keys.
+- Reading only the open leg declares the close leg first: `db.selectFromCte(opened.cte).select(r => r.id).toList()`
+  renders `WITH "closed" AS (UPDATE …), "opened" AS (INSERT … WHERE ((SELECT count(*) FROM "closed") >= 0) …) SELECT "opened"."id" as "value" FROM "opened"`.
+- `union()` / `unionAll()` of CTE-rooted queries (since 1.0.29) take CTE-rooted, entity and set queries projecting
+  the same columns as legs. They declare every leg's CTEs once at the top of the statement (a data-modifying one
+  after the CTEs it reads) and read every row the way the FIRST leg's projection reads it; each leg's literal
+  (`leg`) is read from the row. The union is a `UnionQueryBuilder`: `orderBy()`, `limit()`, `count()`,
+  `firstOrDefault()`, `asSubquery()`, a CTE body.
+- `count()` of such a union keeps the data-modifying `WITH` at the top (fixed in 1.0.30; it failed with 0A000
+  before): `WITH "closed" AS (UPDATE …) SELECT COUNT(*) as count FROM ((…) UNION ALL (…)) as union_count`.
+- Read legs back with a union, not a FULL JOIN on a null-safe key: PostgreSQL plans a FULL JOIN only on merge- or
+  hash-joinable conditions (0A000).
+- `afterMutation()` of a plain CTE throws: `afterMutation(): "plain" is not a data-modifying CTE — a barrier orders a statement after a mutation`.
+  So does `afterMutation()` in a statement that neither declares the CTE nor is compiled as another CTE's body.
+- The in-memory database runs CTEs in the order the main query first reads them, as PostgreSQL does: a test that
+  reads the open leg first exercises the dangerous order on both engines.
+
+## Run CTE statements on a table's own connection: `<table>.selectFromCte()`
+
+Every table offers the query roots of its context (since 1.0.30): `<table>.selectFromCte(cte, alias?)`,
+`<table>.selectFromSet(set, alias?)`, plus `<table>.isInTransaction()` and `<table>.getClient()`. They run on the
+table's own client and executor — on `trx.orders`, inside that transaction. Use them in helpers that receive a
+table (`db.orders` or a caller's `trx.orders`) and must execute and read back the CTEs they build on it.
+
+```ts
+import { DbCteBuilder, afterMutation, and, eq, fromRows } from 'linkgress-orm';
+import type { DbEntityTable } from 'linkgress-orm';
+import type { Order } from './model/order';   // the entity class of db.orders
+
+const replacePendingOrder = async (orders: DbEntityTable<Order>, userId: number, totalAmount: number) => {
+  const builder = new DbCteBuilder(orders.getClient());
+  const closed = builder.withMutation('closed', orders
+    .where(o => and(eq(o.userId, userId), eq(o.status, 'pending')))
+    .update({ status: 'cancelled' })
+    .toStatement(o => ({ id: o.id })));
+  const opened = builder.withMutation('opened', orders.insertFrom(
+    fromRows(orders, [{ userId, status: 'pending', totalAmount }], { columns: ['userId', 'status', 'totalAmount'], alias: 'd' })
       .asSubquery('table'),
-    src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }),
+    src => ({ userId: src.userId, status: src.status, totalAmount: src.totalAmount }),
     { where: () => afterMutation(closed.cte) },
-  ).toStatement(l => ({ id: l.id, unitId: l.unitId })));
+  ).toStatement(o => ({ id: o.id })));
 
-  // ONE statement on the table's own connection — inside the caller's transaction when there is one
-  const rows = await leases.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id, unitId: r.unitId }))
-    .unionAll(leases.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id, unitId: r.unitId })))
+  // ONE statement on the table's connection: inside the caller's transaction when there is one
+  const rows = await orders.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id }))
+    .unionAll(orders.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id })))
     .toList();
 
-  // outside a caller's transaction the statement commits on its own: running it again after a deadlock or a
-  // serialization failure (40P01 / 40001) is this helper's call; inside one, the failure aborted the CALLER's transaction
-  return { rows, ownsUnitOfWork: !leases.isInTransaction() };
+  return { rows, ownsUnitOfWork: !orders.isInTransaction() };
 };
+
+const inTx = await db.transaction(async trx => replacePendingOrder(trx.orders, 2, 20));
+// { rows: [{ leg: 'opened', id: 3 }, { leg: 'closed', id: 2 }], ownsUnitOfWork: false }
+const outside = await replacePendingOrder(db.orders, 2, 30);
+// ownsUnitOfWork: true
 ```
 
-- Rooted on `db` instead, a transaction's legs ran on ANOTHER connection, outside the transaction: the statement
-  could not see the transaction's uncommitted rows — a foreign key to a parent the transaction had just inserted
-  failed with 23503 — and on a pool of one connection it waited for a second one forever (PGlite, one session,
-  refuses it at once).
+On `trx.orders` the statement goes through the transaction's connection:
+
+```sql
+WITH "closed" AS (UPDATE "orders" SET "status" = $1 WHERE ("orders"."user_id" = $2 AND "orders"."status" = $3) RETURNING "id" AS "id"), "opened" AS (INSERT INTO "orders" ("user_id", "status", "total_amount") SELECT "src"."userId", "src"."status", "src"."totalAmount" FROM (SELECT "d"."userId" as "userId", "d"."status" as "status", "d"."totalAmount" as "totalAmount"
+  FROM unnest(CAST($4 AS integer[]), CAST($5 AS order_status[]), CAST($6 AS decimal(10, 2)[])) AS "d"("userId", "status", "totalAmount")) AS "src" WHERE ((SELECT count(*) FROM "closed") >= 0) RETURNING "id" AS "id")
+(SELECT CAST($7 AS text) as "leg", "opened"."id" as "id"
+  FROM "opened")
+UNION ALL
+(SELECT CAST($8 AS text) as "leg", "closed"."id" as "id"
+  FROM "closed")
+-- params: ["cancelled", 2, "pending", "{2}", "{\"pending\"}", "{20}", "opened", "closed"]
+```
+
 - The same signatures, typings and SQL as `db.selectFromCte()` / `db.selectFromSet()`. A table derived with
-  `.withTimeout()`, `.withQueryOptions()`, `.withPreparedStatements()` or `.expectedExecutionTime()` runs them through
-  its own executor, as its other queries; a view (`DbViewTable`) has them too.
-- `isInTransaction()` — `true` on the tables of a transaction's context (also after it ended, when their statements
-  are refused with `TransactionEndedError`), `false` on the root's. There are no nested transactions; a SAVEPOINT
-  stays inside the transaction.
-- `getClient()` — the client of the table's context (the transaction's, on `trx.<table>`), for what takes a client:
-  `new DbCteBuilder(client)` renders the driver's array capability into the CTE bodies it builds.
+  `.withTimeout()`, `.withQueryOptions()`, `.withPreparedStatements()` or `.expectedExecutionTime()` runs them
+  through its derived executor. Views (`DbViewTable`) have the four methods too.
+- `isInTransaction()` is `true` on the tables of a transaction's context — also after it ended, when their statements
+  are refused with `TransactionEndedError` — and `false` on the root's. Outside a caller's transaction the statement
+  commits on its own and retrying it after 40P01 / 40001 is the helper's call; inside one, the failure aborts the
+  caller's transaction. There are no nested transactions; a SAVEPOINT stays inside the transaction.
+- `getClient()` returns the client of the table's context (the transaction's on `trx.<table>`).
+  `new DbCteBuilder(client)` builds bodies with the driver's capabilities: on a driver without binary array
+  results (BunClient in its default prepared mode), array aggregations in bodies emit `json_agg`.
 
-## Type Safety
+> **Pitfall:** inside `db.transaction(async trx => …)`, a statement rooted on `db` runs on another connection,
+> outside the transaction. It cannot see the transaction's uncommitted rows — an order inserted for a user that the
+> same transaction inserted before fails with 23503 (`insert or update on table "orders" violates foreign key constraint "FK_orders_users_user_id"`) —
+> and on a pool of one connection it waits for a second connection forever (`PGliteClient`, one session, refuses it
+> at once). Root it on `trx` or on the table you were given.
 
-Linkgress provides full TypeScript type inference for CTE columns:
+## Recursive queries: raw SQL
 
-```typescript
-const typedCte = cteBuilder.with(
-  'typed_cte',
-  db.users.select(u => ({
-    userId: u.id,      // number
-    username: u.username,  // string
-    email: u.email,    // string
-    isActive: u.isActive,  // boolean
-  }))
-);
+There is no `WITH RECURSIVE` builder. For a hierarchy (a parent id column) or a generated series, write the
+recursive CTE in raw SQL through `db.query()`; a `sql` template binds its interpolated values as parameters.
 
-const result = await db.users
-  .with(typedCte.cte)
+```ts
+import { sql } from 'linkgress-orm';
+
+const days = await db.query<{ n: number }>(sql`
+  WITH RECURSIVE days(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM days WHERE n < ${3}
+  )
+  SELECT n FROM days`);
+// [{ n: 1 }, { n: 2 }, { n: 3 }]
+```
+
+```sql
+WITH RECURSIVE days(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM days WHERE n < $1
+)
+SELECT n FROM days
+-- params: [3]
+```
+
+One level of parent/child needs no recursion: a collection navigation, or a correlated
+[aliased scope](./aliased-scopes.md) over the same table (`db.<table>.as(alias)`).
+
+## Combine CTEs of several builders: `getCtes()`, `clear()`
+
+A statement declares CTEs of any number of builders: `.with(...b1.getCtes(), ...b2.getCtes())`. A builder numbers
+its CTEs' parameters as one block (each `DbCte` records where its body starts: `paramBase`, `2` for a builder's
+second one-parameter CTE); every statement renumbers each body from where its parameters land, so a builder's
+second CTE used alone, or CTEs of several builders in one `WITH`, bind their own values.
+
+```ts
+import { DbCteBuilder, eq, gt } from 'linkgress-orm';
+
+const first = new DbCteBuilder();
+const active = first.with('active_users', db.users.where(u => eq(u.isActive, true)).select(u => ({ id: u.id, name: u.username })));
+const second = new DbCteBuilder();
+const busyPosts = second.with('busy_posts', db.posts.where(p => gt(p.views, 120)).select(p => ({ userId: p.userId, title: p.title })));
+
+const rows = await db.users
+  .with(...first.getCtes(), ...second.getCtes())
+  .innerJoin(active.cte, (u, a) => eq(u.id, a.id), (u, a) => ({ id: u.id, name: a.name }))
+  .innerJoin(busyPosts.cte, (r, b) => eq(r.id, b.userId), (r, b) => ({ name: r.name, title: b.title }))
+  .toList();
+// [{ name: 'alice', title: 'Alice Post 2' }, { name: 'bob', title: 'Bob Post' }]
+```
+
+```sql
+WITH "active_users" AS (SELECT "users"."id" as "id", "users"."username" as "name"
+  FROM "users"
+  WHERE "users"."is_active" = $1), "busy_posts" AS (SELECT "posts"."user_id" as "userId", "posts"."title" as "title"
+  FROM "posts"
+  WHERE "posts"."views" > $2)
+SELECT "active_users"."name" as "name", "busy_posts"."title" as "title"
+FROM "users"
+INNER JOIN "active_users" ON "users"."id" = "active_users"."id"
+INNER JOIN "busy_posts" ON "users"."id" = "busy_posts"."userId"
+-- params: [true, 120]
+```
+
+- `getCtes()` returns the builder's CTEs in creation order; `clear()` removes them and resets the parameter
+  numbering. A builder can be reused after `clear()`.
+
+## Type CTE columns
+
+The CTE's column types come from the body's projection. `InferCteColumns<typeof x.cte>` extracts them; `isCte(v)`
+tells a `DbCte` at runtime.
+
+```ts
+import { DbCteBuilder, eq } from 'linkgress-orm';
+import type { InferCteColumns } from 'linkgress-orm';
+
+const active = new DbCteBuilder().with('active_users', db.users
+  .where(u => eq(u.isActive, true))
+  .select(u => ({ userId: u.id, username: u.username, email: u.email })));
+
+type ActiveRow = InferCteColumns<typeof active.cte>;   // { userId: number; username: string; email: string }
+
+const rows = await db.users
   .leftJoin(
-    typedCte.cte,
-    (user, cte) => {
-      // TypeScript knows all column types:
-      const id: number = cte.userId;  // ✓
-      const name: string = cte.username;  // ✓
-      return eq(user.id, cte.userId);
-    },
-    (user, cte) => ({
-      id: user.id,
-      cteUsername: cte.username,  // Autocomplete works!
-      cteEmail: cte.email,
-      cteIsActive: cte.isActive,
-    })
+    active.cte,
+    (u, a) => eq(u.id, a.userId),                       // ON: a.userId is a column ref (FieldRef)
+    (u, a) => ({ id: u.id, activeName: a.username }),   // selector: a.username is typed string
   )
   .toList();
-
-// Result type is automatically inferred:
-// Array<{
-//   id: number;
-//   cteUsername: string;
-//   cteEmail: string;
-//   cteIsActive: boolean;
-// }>
+// Array<{ id: number; activeName: string }>; at runtime [{ id: 1, activeName: 'alice' }, { id: 2, activeName: 'bob' }, { id: 3, activeName: undefined }]
 ```
 
-## CTE Builder Management
-
-### Get All CTEs
-
-```typescript
-const allCtes = cteBuilder.getCtes();
-console.log(allCtes.length);  // Number of CTEs
-```
-
-### Clear the Builder
-
-```typescript
-cteBuilder.clear();  // Remove all CTEs
-```
-
-### Reuse the Builder
-
-```typescript
-const cteBuilder = new DbCteBuilder();
-
-// First query
-cteBuilder.with('cte1', query1);
-await db.users.with(...cteBuilder.getCtes()).toList();
-
-// Clear and reuse
-cteBuilder.clear();
-
-// Second query
-cteBuilder.with('cte2', query2);
-await db.posts.with(...cteBuilder.getCtes()).toList();
-```
-
-## Generated SQL
-
-CTEs generate optimized SQL with the `WITH` clause:
-
-```typescript
-const cte = cteBuilder.with(
-  'active_users',
-  db.users
-    .where(u => eq(u.isActive, true))
-    .select(u => ({ userId: u.id, username: u.username }))
-);
-
-const result = await db.users
-  .with(cte.cte)
-  .leftJoin(cte.cte, ...)
-  .toList();
-```
-
-**Generated SQL:**
 ```sql
-WITH "active_users" AS (
-  SELECT "users"."id" as "userId", "users"."username" as "username"
+WITH "active_users" AS (SELECT "users"."id" as "userId", "users"."username" as "username", "users"."email" as "email"
   FROM "users"
-  WHERE "users"."is_active" = $1
-)
-SELECT ...
+  WHERE "users"."is_active" = $1)
+SELECT "users"."id" as "id", "active_users"."username" as "activeName"
 FROM "users"
-LEFT JOIN "active_users" ON ...
+LEFT JOIN "active_users" ON "users"."id" = "active_users"."userId"
+-- params: [true]
 ```
 
-## Common Patterns
+- Inside the ON callback the CTE's columns are column refs: `const id: number = a.userId` there is a TypeScript
+  error. Values are typed in the selector.
+- A LEFT-joined CTE column is typed as non-optional, but a row without a match reads `undefined`
+  (`{ id: 3, activeName: undefined }`).
+- `withMutation(name, x.toStatement(sel))` types the CTE by the RETURNING selector.
 
-### 1. Filter Once, Use Multiple Times
+## Pitfalls
 
-```typescript
-const expensiveFilterCte = cteBuilder.with(
-  'filtered_data',
-  db.posts
-    .where(p => and(
-      gt(p.views, 1000),
-      like(p.title, '%important%')
-    ))
-    .select(p => ({ postId: p.id, title: p.title }))
-);
+- **Don't** read a CTE from subqueries without `.with(cte)` on the executing query → **Do** attach it there. Each
+  reader otherwise declares, binds and evaluates its own copy (`params: [30, 30]` instead of `[30]`).
+- **Don't** root a statement on `db` inside `db.transaction()` → **Do** root it on `trx` or on the table you were
+  handed (`trx.orders.selectFromCte(…)`). Rooted on `db` it runs on another connection: 23503 for a parent the
+  transaction inserted, a hang on a pool of one connection.
+- **Don't** expect the main query to see a data-modifying CTE's changes → **Do** read its RETURNING rows. All parts of
+  a statement share one snapshot.
+- **Don't** rely on the order of two data-modifying CTEs → **Do** guard the second with `afterMutation(first)`.
+  PostgreSQL promises no order between them.
+- **Don't** call `forUpdate()` on a CTE-rooted query to lock rows → **Do** put `.forUpdate()` on the CTE body. A
+  locking clause does not reach the WITH queries the main query reads.
+- **Don't** reuse a CTE-rooted builder after `first()`, `where()` or `limit()` → **Do** build a new query per use.
+  The builder is mutable; `first()` leaves `LIMIT 1` on it.
+- **Don't** `joinFilter()` a CTE with several rows per key when you want one row per entity → **Do** use
+  `inSubquery()` or `exists()`. The join returns each entity row once per match.
+- **Don't** join a CTE-rooted query's root CTE to itself → **Do** use a second CTE or a `selectFromCte(cte, alias)`
+  subquery. The statement would declare the name twice (42712).
+- **Don't** filter a window value in the query that computes it → **Do** compute it in a CTE and filter where the CTE
+  is read. The build throws a `TypeError`.
+- **Don't** run a query whose collection reads a data-modifying CTE on the `'temptable'` strategy → **Do** use
+  `'cte'` or `'lateral'`. It is refused before anything runs.
+- **Don't** put a whole navigation row in a CTE body when one column is read → **Do** project the column. A
+  navigation row renders every column of its table.
+- **Don't** expect `materialized: true` to speed up every CTE → **Do** use it for candidate sets that must drive the
+  plan. The fence blocks predicate pushdown into the body.
+- **Don't** put two different CTEs under one name in a statement → **Do** rename one. The build refuses it, since
+  the name would read the other one's rows.
+- **Don't** treat a LEFT-joined CTE column as always present → **Do** handle `undefined`. Its type is not optional,
+  but a row without a match reads `undefined` (not `null`).
+- **Don't** rename a `withAggregation()` key and then read it from the items → **Do** keep the output name equal to
+  the inner column. The items omit the inner key column although their type lists it.
 
-// Use the filtered data multiple times in different parts of the query
-```
+## See also
 
-### 2. Pre-aggregate Data
-
-```typescript
-const statsCte = cteBuilder.with(
-  'stats',
-  db.users.select(u => ({
-    userId: u.id,
-    totalPosts: u.posts.count(),
-    totalOrders: u.orders.count(),
-    avgOrderAmount: u.orders.avg(o => o.totalAmount),
-  }))
-);
-
-// Join with pre-aggregated statistics
-```
-
-### 3. Hierarchical Queries
-
-```typescript
-const parentCte = cteBuilder.with(
-  'parents',
-  db.categories
-    .where(c => isNull(c.parentId))
-    .select(c => ({ catId: c.id, name: c.name }))
-);
-
-const childrenCte = cteBuilder.with(
-  'children',
-  db.categories
-    .select(c => ({
-      catId: c.id,
-      name: c.name,
-      parentId: c.parentId,
-    }))
-);
-
-// Join hierarchical data
-```
-
-## Best Practices
-
-1. **Name CTEs Descriptively** - Use clear, meaningful names
-2. **Keep CTEs Focused** - Each CTE should have a single purpose
-3. **Reuse the Builder** - Create one builder and add multiple CTEs
-4. **Clear After Use** - Clear the builder between unrelated queries
-5. **Type Your Selections** - Explicit selections improve type safety
-
-## Performance Considerations
-
-- **PostgreSQL Optimization** - PostgreSQL can optimize CTE execution
-- **Materialization** - CTEs are materialized once, not re-executed
-- **Index Usage** - Ensure indexed columns are used in CTE joins
-- **CTE vs Subqueries** - CTEs are clearer but may have different optimization
-
-## Limitations
-
-- CTEs must be defined before being referenced
-- CTE names must be unique within a query
-- Recursive CTEs are not yet supported (coming soon)
-
-## Examples
-
-See [tests/queries/cte.test.ts](../../tests/queries/cte.test.ts) for comprehensive examples including:
-- Basic CTE creation and joining
-- Aggregation CTEs
-- Multiple CTEs
-- Type safety verification
-- Edge cases and error handling
-
-## Next Steps
-
-- **[Subquery Guide](./subquery-guide.md)** - Compare CTEs with subqueries
-- **[Querying Guide](./querying.md)** - Advanced query techniques
-- **[API Reference](../api/api-reference.md)** - Complete API documentation
+- [Subqueries](./subquery-guide.md) — a derived value or set read once, in one place: `asSubquery()`, `exists()`, `inSubquery()`.
+- [Set-returning functions](./set-returning-functions.md) — JS lists, JS rows and jsonb as relations: `unnest()`, `fromRows()`, `db.selectFromSet()`.
+- [Insert, update, delete](./insert-update-guide.md) — `toStatement()`, `insertFrom()` options, upserts, `MutationBatch`.
+- [Collection strategies](../collection-strategies.md) — the CTEs and LATERAL joins the ORM emits for collection navigations.
+- [Aliased scopes](./aliased-scopes.md) — correlated subqueries over the same table: `db.<table>.as(alias)`.
+- [SQL expressions](./sql-expressions.md) — `win`, `agg` and the other expression helpers used in CTE bodies.
+- [Choosing the right query](../choosing-the-right-query.md) — data need → API → SQL shape → round trips.
+- [API index](../api-index.md) — every public export and builder method, one line each.
+- Tests with more cases (repository only, not in the npm package): [tests/queries/cte.test.ts](https://github.com/brunolau/linkgress-orm/blob/main/tests/queries/cte.test.ts), [tests/queries/cte-statement-hoisting.test.ts](https://github.com/brunolau/linkgress-orm/blob/main/tests/queries/cte-statement-hoisting.test.ts), [tests/queries/cte-union-readback.test.ts](https://github.com/brunolau/linkgress-orm/blob/main/tests/queries/cte-union-readback.test.ts).

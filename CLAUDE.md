@@ -10,13 +10,14 @@ src/
   query/             # Query builder system (core of the ORM)
     strategies/      # Collection aggregation strategies (CTE, Lateral, TempTable)
   schema/            # Table schema builders, navigation metadata
-  migrations/        # Migration runner, journal, loader, scaffold
+  migration/         # Schema manager (ensureCreated/migrate), migration runner, journal, loader, scaffold
 tests/               # bun:test suite (runner: tests/run.ts, preload: tests/setup.ts)
   queries/           # Query-specific integration tests
   utils/             # Test helpers (test-database.ts, shared fixtures)
-debug/schema/        # Test entity definitions (AppDatabase, model classes)
-docs/                # Documentation
+debug/schema/        # Test entity definitions (AppDatabase, model classes) — the example model of every docs page
+docs/                # AI-first documentation; ships in the npm package (package.json "files")
   guides/            # User guides
+llms.txt             # llmstxt.org index of docs/ for agents; ships in the npm package
 changelog/           # Versioned changelog files (v0.3.0.md, v0.4.0.md, etc.)
 ```
 
@@ -45,6 +46,7 @@ an option):
 ## Conventions
 
 - **Changelogs**: Written to `changelog/` folder as versioned files (e.g., `v0.4.4.md`), never a single CHANGELOG.md
+- **Docs**: AI-first — the first reader is an agent picking a call. Page template: H1, a `> **For agents:**` block (question · Use this page when / Look elsewhere when · Key APIs · Round trips), task-named sections, SQL captured from a real run of the example (a `logger` with `logQueries`, or `future().getSql()`) and never hand-written (otherwise labeled `illustrative (not captured)`), `## Pitfalls` (Don't → Do), `## See also`. Adding or renaming a page means updating `llms.txt`, `docs/README.md` and `docs/api-index.md`; a new data-access API also goes into `docs/choosing-the-right-query.md`
 - **Tests**: Integration tests against a real PostgreSQL database. Use `withDatabase()` and `seedTestData()` from `tests/utils/test-database.ts`
 - **Test isolation**: Use unique timestamps/table names per test to avoid require cache conflicts. Use `createFreshClient()` for isolated schema tests, `getSharedDatabase()` for shared performance
 

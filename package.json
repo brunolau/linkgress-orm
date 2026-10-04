@@ -1,12 +1,14 @@
 {
 	"name": "linkgress-orm",
 	"version": "1.0.32",
-	"description": "A lightweight, type-safe ORM for PostgreSQL with LINQ-style queries and automatic type inference",
+	"description": "The ORM built for agents: an AI-first, type-safe PostgreSQL ORM for TypeScript with LINQ-style queries and automatic type inference",
 	"main": "dist/index.js",
 	"module": "dist/index.js",
 	"types": "dist/index.d.ts",
 	"files": [
 		"dist",
+		"docs",
+		"llms.txt",
 		"README.md",
 		"LICENSE"
 	],
@@ -49,7 +51,11 @@
 		"linq",
 		"query-builder",
 		"sql",
-		"database"
+		"database",
+		"ai",
+		"ai-first",
+		"ai-agents",
+		"llm"
 	],
 	"author": "",
 	"license": "MIT",
