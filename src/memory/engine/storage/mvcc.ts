@@ -488,11 +488,19 @@ export class UndoLog {
   }
 }
 
-/** Signal thrown by the executor when a statement must wait for another transaction and restart. */
+/**
+ * Signal thrown by the executor when a statement must wait for another transaction and restart.
+ * `keepSnapshot`: the restart reads with the snapshot the statement started with — a unique-index check that
+ * waited for an in-progress insert of its key: PostgreSQL waits inside the check and then judges the key against
+ * the outcome (committed: 23505, or the conflict ON CONFLICT handles; rolled back: no conflict) — the rest of the
+ * statement keeps reading its snapshot. Restarted with a new one, an INSERT … SELECT … WHERE NOT EXISTS saw the
+ * row it had collided with and skipped it instead of failing.
+ */
 export class WaitForTransaction {
   constructor(
     readonly xid: number,
-    readonly relationName?: string
+    readonly relationName?: string,
+    readonly keepSnapshot: boolean = false
   ) {}
 }
 

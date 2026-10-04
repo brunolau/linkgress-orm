@@ -73,10 +73,12 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Fluent API for update and delete (`.where().update()`, `.where().delete()`)
   - RETURNING clause support with selectors, and PostgreSQL 18's `old` row (`.returning((row, old) => …)`)
   - Bulk insert and update, with SET expressions (`bulkUpdate` `set` / `where`)
-  - INSERT … SELECT (`insertFrom`), with expected SQLSTATEs kept out of the failure log
+  - INSERT … SELECT (`insertFrom`), with `ON CONFLICT DO NOTHING`, expressions cast to the column's type, and
+    expected SQLSTATEs kept out of the failure log
   - Upsert (INSERT ... ON CONFLICT), with SET expressions (`updateSet` / `updateWhere`) and partial-index
     arbiters (`targetWhere`)
-  - Row-guarded inserts in a `MutationBatch` (`rowGuard`)
+  - Row-guarded inserts in a `MutationBatch` (`rowGuard`); an insert leg's `returning`; the statement's
+    parameter guard (`parameterCount`)
   - Advisory transaction locks
   - Type safety and performance tips
 
@@ -129,11 +131,14 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 - **[Set-Returning Functions](./guides/set-returning-functions.md)** - `unnest`, `unnestZip`, `jsonbArrayElements`, `jsonbEachText`
   - As projection values that multiply rows
   - As row sources: `fromSet()`, `db.selectFromSet()`, `crossJoinLateral()`
+  - Typed rows bound through a table's columns: `unnestRows()` / `fromRows()`
 
 - **[CTE Guide](./guides/cte-guide.md)** - Common Table Expressions
-  - CTE-rooted queries (`db.selectFromCte`) with every join flavour and `where()`
+  - CTE-rooted queries (`db.selectFromCte`) with every join flavour, `where()` and `union()` / `unionAll()`
+  - Every query builder as a CTE body (CTE-rooted and set queries included)
   - CTEs declared once per statement, read by name from nested subqueries
-  - Data-modifying CTEs (`withMutation`) with typed `toStatement()` rows
+  - Data-modifying CTEs (`withMutation`) with typed `toStatement()` rows; statements reading earlier ones, and
+    the `afterMutation()` barrier
 
 
 ## Quick Links

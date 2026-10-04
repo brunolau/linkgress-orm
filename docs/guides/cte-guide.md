@@ -144,6 +144,18 @@ const result = await db.users
   .toList();
 ```
 
+## Every Query Builder as a CTE Body
+
+`with(name, query)` and `withAggregation(name, query, …)` take every query a statement can run (1.0.29): an
+entity query (projected, whole rows, with navigations, carrying a CTE of its own), a grouped query, a union, a
+CTE-rooted query — joined or not, `db.selectFromCte(a).where(…).select(…)` — and a set query, context-free or bound
+(`fromSet(unnest(names, 'text'), 'n').select(…)`, `db.selectFromSet(unnestZip({…}))`, filtered, ordered, limited;
+a union of sets). A set query used to throw `query._createMockRow is not a function`, a CTE-rooted one too. A
+CTE-rooted body declares the CTEs it reads inside itself (a data-modifying one is read by name — see
+[dependent data-modifying CTEs](#dependent-data-modifying-ctes-and-aftermutation)). The CTE's columns read the
+way the body reads them: a set column as the driver delivers it (`'0042'` stays text), a mapped column through
+its mapper.
+
 ## Grouped / Aggregate CTE Bodies
 
 `with()` also accepts a **grouped** query body — a `.groupBy(...).select(...)` chain
@@ -431,6 +443,15 @@ The rows of a CTE-rooted query carry its identity: an entity query nested in its
 correlations, also when the CTE is named like one of that query's navigations (a CTE named `user` read by a
 `db.posts` query that has a `user` navigation).
 
+### UNION of CTE-rooted queries
+
+`db.selectFromCte(a).select(…).unionAll(…)` / `.union(…)` (1.0.29): a CTE-rooted query is a union leg — beside
+other CTE-rooted queries, entity queries and set queries projecting the same columns. Every leg's CTEs are
+declared ONCE at the top of the statement (a data-modifying one after the CTEs it reads), every leg reads them by
+name, and the union reads each row the way its FIRST leg's projection does: a column through its own mapper, a
+text column's `'0042'` as text, a literal — a leg's tag — from the row. The union is a `UnionQueryBuilder`:
+`orderBy()`, `limit()`, `count()`, `firstOrDefault()`, `asSubquery()` and a CTE body (`with(name, union)`).
+
 ### The `onTrue()` helper and `ON TRUE`
 
 PostgreSQL requires an `ON` / `USING` clause on a `FULL OUTER JOIN` (a bare one is a
@@ -447,6 +468,13 @@ db.selectFromCte(spend.cte)
 
 `onTrue()` simply renders the constant predicate `TRUE`; it can be passed to any of
 the joins that take a condition.
+
+
+`onFalse()` (1.0.29) renders a literal `FALSE`: `FULL OUTER JOIN … ON FALSE` keeps every row of both sides and
+pairs none — two relations side by side. A FULL JOIN is planned only on merge- or hash-joinable conditions: an
+equality between the two sides (beside which any other condition is fine), or constants. `IS NOT DISTINCT FROM`,
+an inequality, an OR or a condition on one side alone raise 0A000 "FULL JOIN is only supported with merge-joinable
+or hash-joinable join conditions" — on PostgreSQL and, since 1.0.29, in the in-memory database.
 
 ### Worked example: buyer spend + current tier
 
@@ -626,12 +654,77 @@ empty and so is the load.
   statement fails with `relation "<cte>" does not exist`, after the base statement has run, as it did before.)
 - **A data-modifying CTE is declared at statement level only**: attach it with `.with()` on the executing
   query. Declared inside a nested subquery — a `selectFromCte(gate.cte)…asSubquery()` in a query that does not
-  carry it, a subquery that carries it itself, a CTE body built over a query carrying it — it is refused:
+  carry it, a subquery that carries it itself — it is refused:
   `CTE "gate" is data-modifying: a data-modifying CTE must be declared at statement level — attach it with
   .with() on the executing query`. (PostgreSQL rejects a data-modifying `WITH` nested in a subquery; before
   1.0.9 the query builder emitted one per reading subquery, i.e. one UPDATE per occurrence.) An `insertFrom()`
   declares it through its `with` option — `insertFrom(source, map, { with: [ins.cte] })`, see
   [the insert guide](./insert-update-guide.md#one-statement-a-bulk-insert-feeding-another-insert).
+- A body that executes nowhere itself — a CTE's (`with()`, `withAggregation()`) or a compiled statement
+  (`toStatement()`) — reads a data-modifying CTE by NAME instead, and every statement that declares the CTE
+  built over it declares that one first (1.0.29, next section).
+
+## Dependent Data-Modifying CTEs and `afterMutation()`
+
+A data-modifying statement compiled with `toStatement()` may read data-modifying CTEs created before it —
+through its source, its WHERE, a subquery of its values. It reads them by name, the CTE `withMutation()` makes of
+it records them (`DbCte.dependencies`), and every statement that declares that CTE declares them FIRST, each once
+— whichever of them it reads, in whatever order its `.with()` lists them. A plain CTE whose body reads one
+(`with(name, db.selectFromCte(closed.cte)…)`) works the same way.
+
+**Order is not implied.** PostgreSQL runs the sub-statements of a WITH on ONE snapshot and in no order it
+promises: a data-modifying CTE runs when the main query first reads it, the rest after the main query. They
+cannot see each other's writes — RETURNING is the only way to pass rows on. A unique index over a SCOPE (one
+current lease per unit) therefore sees a successor inserted BEFORE the close of its predecessor whenever the
+main query reads the open leg first: 23505 — or, with `ON CONFLICT DO NOTHING`, the open silently skipped and the
+unit left with no current lease. `afterMutation(cte)` orders the statement after `cte`: the condition
+`((SELECT count(*) FROM "<cte>") >= 0)` holds only once `cte` has run to completion, so the statement yields no
+row before (PostgreSQL plans it as a one-time filter evaluated before the first row; an `exists()` over the CTE
+is no barrier — it stops at the first row).
+
+```typescript
+const builder = new DbCteBuilder();
+const closed = builder.withMutation('closed', db.leases
+  .where(l => and(eqAny(l.unitId, units), eq(l.isCurrent, true),
+    notExists(fromRows(db.leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
+      .where(d => and(eq(d.unitId, l.unitId), eq(d.tenantId, l.tenantId))).select(() => ({ one: literal(1) })).asSubquery())))
+  .update({ validTo: now, isCurrent: false })
+  .toStatement(l => ({ id: l.id, unitId: l.unitId })));
+
+const opened = builder.withMutation('opened', db.leases.insertFrom(
+  fromRows(db.leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
+    .where(d => notExists(db.leases.where(c => and(eq(c.unitId, d.unitId), eq(c.tenantId, d.tenantId), eq(c.isCurrent, true)))
+      .select(c => ({ id: c.id })).asSubquery()))
+    .asSubquery('table'),
+  src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }),
+  { where: () => afterMutation(closed.cte), onConflictDoNothing: true },
+).toStatement(l => ({ id: l.id, unitId: l.unitId })));
+
+// ONE statement: both legs, read back tagged — the close leg declared first
+const rows = await db.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id, unitId: r.unitId }))
+  .unionAll(db.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id, unitId: r.unitId })))
+  .toList();
+```
+
+```sql
+WITH "closed" AS (UPDATE "leases" SET … WHERE … RETURNING "id" AS "id", "unit_id" AS "unitId"),
+     "opened" AS (INSERT INTO "leases" (…) SELECT … FROM (…) AS "src"
+                  WHERE ((SELECT count(*) FROM "closed") >= 0) ON CONFLICT DO NOTHING RETURNING …)
+(SELECT CAST($n AS text) as "leg", "opened"."id" as "id", … FROM "opened")
+UNION ALL
+(SELECT CAST($m AS text) as "leg", "closed"."id" as "id", … FROM "closed")
+```
+
+- The barrier orders what the statement WRITES, not what it SEES: the open leg's `notExists` still reads the
+  snapshot the statement started with, where the row the close leg retires is current. Decide what to close and
+  what to open on disjoint keys (as above), never on "is there a current row in the scope".
+- Read several legs back with a UNION of CTE-rooted queries (next sections), never with a FULL JOIN on a null-safe
+  key: PostgreSQL plans a FULL JOIN only on merge- or hash-joinable conditions (0A000).
+- A statement that reads a data-modifying CTE it does not declare (and is no CTE body) is refused as before; so
+  is `afterMutation()` there, and `afterMutation()` of a plain CTE. Two different CTEs under one name in one
+  statement are refused.
+- The in-memory database runs CTEs in the order the main query first reads them, as PostgreSQL does: a test
+  that reads the open leg first exercises the dangerous order on both engines.
 
 ## Type Safety
 

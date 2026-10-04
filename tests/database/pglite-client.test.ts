@@ -182,6 +182,28 @@ describe('PGliteClient', () => {
 
     expect(error.code).toBe('42P01');
   });
+
+  test('a statement over 32 767 parameters is refused before it is sent — the session stays in sync', async () => {
+    // PGlite counts parameters in a signed 16-bit field: such a statement, and the ones after it, returned no rows
+    const statement = (count: number) => [
+      `SELECT array_length(ARRAY[${Array.from({ length: count }, (_, i) => `$${i + 1}::int`).join(', ')}], 1) AS n`,
+      Array.from({ length: count }, (_, i) => i),
+    ] as const;
+
+    expect(client.maxParameters()).toBe(32767);
+    expect((await client.query(...statement(32767))).rows).toEqual([{ n: 32767 }]);
+    await expectToReject(client.query(...statement(32768)), 'PGliteClient: the statement binds 32768 parameters — PGlite takes at most 32 767');
+    expect((await client.query('SELECT 1 AS one')).rows).toEqual([{ one: 1 }]);
+
+    await expectToReject(client.transaction(async query => query(...statement(32768))), 'PGlite takes at most 32 767');
+    const lease = await client.connect();
+    try {
+      await expectToReject(lease.query(...statement(32768)), 'PGlite takes at most 32 767');
+    } finally {
+      lease.release();
+    }
+    expect((await client.query('SELECT 2 AS two')).rows).toEqual([{ two: 2 }]);
+  });
 });
 
 describe('PGliteClient instance ownership', () => {

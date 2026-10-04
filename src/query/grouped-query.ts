@@ -20,9 +20,9 @@ import {
   projectionLiteralSql,
 } from './query-builder';
 import { DbCte, isCte, projectedValueRef } from './cte-builder';
-import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte } from './cte-builder';
+import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, withCteDependencies } from './cte-builder';
 import { formatJoinValue, NavigationAliasPlan } from './join-utils';
-import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
+import { projectedValueRoot, scalarSubqueryRead, selectorProjectingConditions } from './sql-functions';
 import { lateralSetJoinsSql, lateralSetRefs } from './set-returning';
 import type { LateralSetJoin } from './set-returning';
 import { flatRowBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, isCustomReadMapper } from './future-query';
@@ -816,24 +816,31 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     const enhancedMetadata: Record<string, any> = {};
 
     for (const [key, value] of Object.entries(mockResult as object)) {
-      // The MIN / MAX of a mapped column reads through the column's mapper
+      // The MIN / MAX of a column reads as the column: through its mapper, as a value of its SQL type
       if (isAggregateRef(value)) {
-        const mapper = value.__aggregateType === 'MIN' || value.__aggregateType === 'MAX'
-          ? this.extremeTypeOf(value, mockOriginalSelection).mapper
+        const extreme = value.__aggregateType === 'MIN' || value.__aggregateType === 'MAX'
+          ? this.extremeTypeOf(value, mockOriginalSelection)
           : undefined;
+        const mapper = extreme?.mapper;
+        const sqlType = extreme?.sqlType;
 
-        enhancedMetadata[key] = mapper ? { ...value, getMapper: () => mapper } : value;
+        enhancedMetadata[key] = mapper || sqlType !== undefined
+          ? { ...value, ...(sqlType !== undefined ? { __sqlType: sqlType } : {}), ...(mapper ? { getMapper: () => mapper } : {}) }
+          : value;
         continue;
       }
 
-      // A column hands its readers its SOURCE column's mapper (see columnReadMapperOf)
+      // A column hands its readers its SOURCE column's mapper (see columnReadMapperOf) and SQL type — a
+      // text key's digits-only value is no number to them
       if (typeof value === 'object' && value !== null && '__fieldName' in value) {
         const mapper = this.columnReadMapperOf(value);
+        const sqlType = (value as any).__sqlType ?? this.columnTypeOf(value).sqlType;
 
-        if (mapper) {
+        if (mapper || sqlType !== undefined) {
           enhancedMetadata[key] = {
             ...value,
-            getMapper: () => mapper,
+            ...(sqlType !== undefined ? { __sqlType: sqlType } : {}),
+            ...(mapper ? { getMapper: () => mapper } : {}),
           };
           continue;
         }
@@ -1048,8 +1055,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     // Get selection metadata with mappers for table subqueries
     const selectionMetadata = mode === 'table' ? this.getSelectionMetadata() : undefined;
+    // A scalar subquery of one key or aggregate reads like it (see scalarSubqueryRead)
+    const scalarRead = mode === 'scalar' ? scalarSubqueryRead(this.getSelectionMetadata()) : undefined;
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, undefined, scalarRead) as any;
   }
 
   /**
@@ -2652,8 +2661,10 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     const mockLeft = this.createLeftMock();
     const mockRight = this.createRightMock();
     const selectionMetadata = this.resultSelector(mockLeft, mockRight);
+    // A scalar subquery of one key, aggregate or joined column reads like it (see scalarSubqueryRead)
+    const scalarRead = mode === 'scalar' ? scalarSubqueryRead(selectionMetadata) : undefined;
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata as any) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata as any, undefined, scalarRead) as any;
   }
 
   /**
@@ -2723,9 +2734,17 @@ export class GroupedJoinedQueryBuilder<TSelection, TLeft, TRight> {
     // declares it already): its body renumbered from where its parameters land
     let cteClause = '';
     if (this.cte && !skipCteClause && !isStatementCte(context.hoistedCteNames, this.cte)) {
-      cteClause = `WITH ${cteDeclarationAt(this.cte, context.paramCounter)}\n`;
-      context.allParams.push(...this.cte.params);
-      context.paramCounter += this.cte.params.length;
+      // ... after the data-modifying CTEs it reads (see withCteDependencies)
+      const declarations = withCteDependencies([this.cte])
+        .filter(cte => cte === this.cte || !isStatementCte(context.hoistedCteNames, cte))
+        .map(cte => {
+          const declaration = cteDeclarationAt(cte, context.paramCounter);
+          context.allParams.push(...cte.params);
+          context.paramCounter += cte.params.length;
+
+          return declaration;
+        });
+      cteClause = `WITH ${declarations.join(', ')}\n`;
     }
 
     // Everything nested in the statement — the projection's subqueries, the grouped subquery, the ON

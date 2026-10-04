@@ -8,7 +8,8 @@ import { materializeMockSelection } from './query-builder';
 import { FutureQuery } from './future-query';
 import { Subquery } from './subquery';
 import type { DbCte } from './cte-builder';
-import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, sameCteDefinition } from './cte-builder';
+import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, sameCteDefinition, withCteDependencies } from './cte-builder';
+import { scalarSubqueryRead } from './sql-functions';
 
 /**
  * Union type: UNION removes duplicates, UNION ALL keeps all rows
@@ -44,6 +45,12 @@ export interface UnionLegBuilder {
    * @internal
    */
   _getOuterFieldRefs?(): FieldRef[];
+  /**
+   * The leg's projection — how its columns read (a column's mapper and type, an expression's) — when the
+   * leg is not an entity query (a CTE-rooted query, a set query): the union's columns read the way its FIRST
+   * leg's do, as a CTE body's and a scalar subquery's. @internal
+   */
+  _unionSelection?(): Record<string, any>;
 }
 
 /**
@@ -324,10 +331,12 @@ export class UnionQueryBuilder<TSelection> {
    * and the outer statement without placeholder collisions.
    * @internal
    */
-  buildCteQuery(queryContext: { paramCounter?: number; allParams?: unknown[] }): { sql: string } {
+  buildCteQuery(queryContext: { paramCounter?: number; allParams?: unknown[]; hoistedCteNames?: Set<string> }): { sql: string } {
     const context: SqlBuildContext = {
       paramCounter: queryContext.paramCounter ?? 1,
       params: (queryContext.allParams ?? []) as any[],
+      // A data-modifying CTE a leg reads is read by name in a CTE's body (see CteDependencies)
+      hoistedCteNames: queryContext.hoistedCteNames,
     };
     const sql = this.buildSql(context);
     queryContext.paramCounter = context.paramCounter;
@@ -341,11 +350,19 @@ export class UnionQueryBuilder<TSelection> {
    * @internal
    */
   getSelectionMetadata(): Record<string, any> {
+    return this.firstLegSelection() ?? {};
+  }
+
+  /** The first leg's projection (see getSelectionMetadata), or `undefined` for a leg that cannot tell. */
+  private firstLegSelection(): Record<string, any> | undefined {
     const firstLeg = this.components[0]?.ownerBuilder as any;
     if (firstLeg && typeof firstLeg._createMockRow === 'function' && typeof firstLeg.selector === 'function') {
       return materializeMockSelection(firstLeg.selector(firstLeg._createMockRow()));
     }
-    return {};
+    if (firstLeg && typeof firstLeg._unionSelection === 'function') {
+      return firstLeg._unionSelection();
+    }
+    return undefined;
   }
 
   /**
@@ -476,7 +493,8 @@ export class UnionQueryBuilder<TSelection> {
     // `WITH` entry for those names.
     const hoistedCtes: DbCte<any>[] = [];
     for (const component of this.components) {
-      const legCtes = component.ownerBuilder?._getAttachedCtes?.() ?? [];
+      // A leg's CTEs, each after the data-modifying CTEs it reads (see withCteDependencies)
+      const legCtes = withCteDependencies(component.ownerBuilder?._getAttachedCtes?.() ?? []);
       for (const cte of legCtes) {
         const declared = hoistedCtes.find(existing => existing.name === cte.name);
 
@@ -625,8 +643,10 @@ export class UnionQueryBuilder<TSelection> {
     // Every leg's correlations to the enclosing query, as a single SELECT's subquery reports its
     // own: a leg reading `outer.nav.col` needs the enclosing query to JOIN that navigation.
     const outerFieldRefs = this.components.flatMap(component => component.ownerBuilder?._getOuterFieldRefs?.() ?? []);
+    // A scalar union of one column reads like the first leg's column (see scalarSubqueryRead)
+    const scalarRead = mode === 'scalar' ? scalarSubqueryRead(this.firstLegSelection()) : undefined;
 
-    return new Subquery(sqlBuilder, mode, undefined, outerFieldRefs) as any;
+    return new Subquery(sqlBuilder, mode, undefined, outerFieldRefs, scalarRead) as any;
   }
 
   /**

@@ -37,8 +37,10 @@ import { renderViewDefinition } from '../migration/view-query-sql';
 import { DbSequence, SequenceConfig, renderSequenceOptions } from '../schema/sequence-builder';
 import type { DbCte, CompiledStatement } from '../query/cte-builder';
 import {
-  attachReturningSelection, cteDeclarationAt, declareStatementCtes, NestedDataModifyingCteError, projectedColumnRef,
+  attachReturningSelection, attachStatementDependencies, cteDeclarationAt, CteDependencies, declareStatementCtes, NestedDataModifyingCteError,
+  projectedColumnRef, withCteDependencies,
 } from '../query/cte-builder';
+import { columnCastType, isStringCastType } from '../query/column-cast-type';
 import { CteRootQueryBuilder } from '../query/cte-root-query';
 import { AliasedScope } from '../query/aliased-scope';
 import { SetQueryBuilder } from '../query/set-returning';
@@ -1239,8 +1241,10 @@ export interface FluentInsertMany<TEntity extends DbEntity> extends PromiseLike<
    *
    * A compiled statement is ONE statement: rows that execution would split into several chunks (the
    * `chunkSize` option, or the automatic one under PostgreSQL's 65 535-parameter limit) are refused, as
-   * are zero rows. On `insertFrom(...)`, a statement whose `with` declares a data-modifying CTE is
-   * refused (PostgreSQL allows those only at the top level).
+   * are zero rows. On `insertFrom(...)`, a data-modifying CTE the statement reads — its source, its `where`
+   * (`afterMutation(cte)`), a subquery of its values, its `with` — is read by name: PostgreSQL allows such a
+   * CTE only in the WITH of the statement that executes, and every statement that declares the CTE
+   * `withMutation` makes of this one declares it first.
    */
   toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult): import('../query/cte-builder').CompiledStatement<UnwrapSelection<TResult>>;
 }
@@ -1273,6 +1277,17 @@ export interface InsertFromOptions<TSource> {
    * only at the top level, so the source cannot declare it itself.
    */
   with?: readonly DbCte<any>[];
+  /**
+   * `ON CONFLICT DO NOTHING`: a source row whose key a unique index of the table (the primary key, a
+   * composite or a partial one) already holds — a committed row, a row the statement inserted before it, a
+   * row a concurrent transaction inserts and commits (the statement waits for it) — is skipped instead of
+   * failing the statement with 23505; RETURNING yields the rows inserted. Rendered after `where`, before
+   * RETURNING — in a compiled statement (`toStatement()`) too. No conflict target, as `insertBulk`'s option.
+   *
+   * A `where: src => notExists(…)` guard is not the same: it judges the statement's snapshot, so a row a
+   * concurrent transaction inserts passes it and then collides (23505).
+   */
+  onConflictDoNothing?: boolean;
   /**
    * SQLSTATEs the statement is expected to fail with (a unique violation a caller retries): still thrown,
    * not reported by the failed-query logger — see {@link StatementExecutionOptions.expectedErrorCodes}.
@@ -4830,7 +4845,8 @@ export class DbEntityTable<TEntity extends DbEntity> {
       ? { expectedErrorCodes: options.expectedErrorCodes }
       : undefined;
 
-    const build = () => table.buildInsertFromStatement(source, map, options?.where, options?.with);
+    const build = (dependencies?: CteDependencies) =>
+      table.buildInsertFromStatement(source, map, options?.where, options?.with, options?.onConflictDoNothing === true, dependencies);
     const executeInsertFrom = async <TResult>(
       returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
     ): Promise<any> => table.runInsertStatement(build(), returning, execution);
@@ -4854,17 +4870,10 @@ export class DbEntityTable<TEntity extends DbEntity> {
         };
       },
       toStatement<TResult>(selector?: (entity: EntityQuery<TEntity>) => TResult) {
-        const dataModifying = options?.with?.find(cte => cte.dataModifying);
+        // A CTE's body: a data-modifying CTE it reads is declared by the statement that executes (see CteDependencies)
+        const dependencies = new CteDependencies();
 
-        // As a CTE body the statement's own WITH would be nested — where PostgreSQL refuses a DML CTE
-        if (dataModifying) {
-          throw new Error(
-            `toStatement(): this insertFrom() declares the data-modifying CTE "${dataModifying.name}", which PostgreSQL allows only at `
-            + 'the top level of the statement that executes — execute it, or declare that CTE on the statement this one would be a CTE of.'
-          );
-        }
-
-        return table.compileInsertStatement(build(), selector);
+        return attachStatementDependencies(table.compileInsertStatement(build(dependencies), selector), dependencies);
       }
     };
   }
@@ -4873,13 +4882,16 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * The bare statement of {@link insertFrom} (no RETURNING): the INSERT, and the `with` CTEs as the
    * declarations its WITH carries (`prefixCtes` — a navigation RETURNING declares them before its own
    * mutation CTE). The parameters number in statement order: the CTEs', the source's, the SELECT list's,
-   * then `where`'s. @internal
+   * then `where`'s. `dependencies`: compiled (`toStatement()`) — the statement is a CTE's body, a
+   * data-modifying CTE it reads is recorded there and read by name. @internal
    */
   private buildInsertFromStatement<TSource extends Record<string, any>>(
     source: Subquery<TSource, 'table'>,
     map: (src: InsertFromSourceRow<TSource>) => InsertFromValues<TEntity>,
     where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined,
-    ctes: readonly DbCte<any>[] | undefined
+    ctes: readonly DbCte<any>[] | undefined,
+    onConflictDoNothing: boolean,
+    dependencies?: CteDependencies
   ): InsertStatement {
     const candidate = source as any;
 
@@ -4894,11 +4906,11 @@ export class DbEntityTable<TEntity extends DbEntity> {
       throw new TypeError('insertFrom: map must return an object of column values');
     }
 
-    const context: SqlBuildContext = { paramCounter: 1, params: [] };
-    const declarations = DbEntityTable.declareInsertFromCtes(ctes ?? [], context);
+    const context: SqlBuildContext = { paramCounter: 1, params: [], hoistedCteNames: dependencies?.scope() };
+    const declarations = DbEntityTable.declareInsertFromCtes(ctes ?? [], context, dependencies);
 
     try {
-      return { ...this.renderInsertFrom(source, src, values, where, context), prefixCtes: declarations };
+      return { ...this.renderInsertFrom(source, src, values, where, onConflictDoNothing, context), prefixCtes: declarations };
     } catch (error) {
       // A data-modifying CTE the statement reads but does not declare: the nested read was told to
       // `.with()` it on the executing query — here, that is insertFrom's own `with` option. Only the
@@ -4916,9 +4928,10 @@ export class DbEntityTable<TEntity extends DbEntity> {
    * The WITH entries of an insertFrom statement's `with` CTEs, their parameters first in `context` (each
    * body renumbered from where its parameters land), and the CTEs declared at statement level for every
    * nested build — read by name there, neither re-declared nor re-bound. A name declared twice by two
-   * different CTEs is refused. `undefined` without CTEs.
+   * different CTEs is refused. `undefined` without CTEs. Each CTE follows the data-modifying CTEs it reads;
+   * compiled (`dependencies`), those are the executing statement's to declare: recorded, read by name.
    */
-  private static declareInsertFromCtes(ctes: readonly DbCte<any>[], context: SqlBuildContext): string | undefined {
+  private static declareInsertFromCtes(ctes: readonly DbCte<any>[], context: SqlBuildContext, dependencies?: CteDependencies): string | undefined {
     if (ctes.length === 0) {
       return undefined;
     }
@@ -4926,7 +4939,12 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const declared = new Map<string, DbCte<any>>();
     const entries: string[] = [];
 
-    for (const cte of ctes) {
+    for (const cte of withCteDependencies(ctes)) {
+      if (dependencies !== undefined && cte.dataModifying) {
+        dependencies.record(cte);
+        continue;
+      }
+
       const previous = declared.get(cte.name);
 
       if (previous === cte) {
@@ -4943,17 +4961,18 @@ export class DbEntityTable<TEntity extends DbEntity> {
       context.paramCounter += cte.params.length;
     }
 
-    context.hoistedCteNames = declareStatementCtes(undefined, [...declared.values()]);
+    context.hoistedCteNames = declareStatementCtes(context.hoistedCteNames, [...declared.values()]);
 
-    return entries.join(',\n');
+    return entries.length > 0 ? entries.join(',\n') : undefined;
   }
 
-  /** The `INSERT … SELECT … FROM (<source>) AS "src" [WHERE …]` of {@link buildInsertFromStatement}. */
+  /** The `INSERT … SELECT … FROM (<source>) AS "src" [WHERE …] [ON CONFLICT DO NOTHING]` of {@link buildInsertFromStatement}. */
   private renderInsertFrom<TSource extends Record<string, any>>(
     source: Subquery<TSource, 'table'>,
     src: InsertFromSourceRow<TSource>,
     values: InsertFromValues<TEntity>,
     where: ((src: InsertFromSourceRow<TSource>) => Condition) | undefined,
+    onConflictDoNothing: boolean,
     context: SqlBuildContext
   ): { sql: string; params: any[] } {
     const schema = this._getSchema();
@@ -4985,6 +5004,10 @@ export class DbEntityTable<TEntity extends DbEntity> {
 
     if (where) {
       sql += ` WHERE ${where(src).buildSql(context)}`;
+    }
+
+    if (onConflictDoNothing) {
+      sql += ' ON CONFLICT DO NOTHING';
     }
 
     return { sql, params: context.params };
@@ -5020,12 +5043,18 @@ export class DbEntityTable<TEntity extends DbEntity> {
   }
 
   /**
-   * One SELECT-list value of {@link insertFrom}: a ref as the column it reads, an expression inline, a plain
-   * value bound through the column's mapper and cast to the column's type (a NULL as a typed NULL).
+   * One SELECT-list value of {@link insertFrom}: a ref as the column it reads; an expression cast to the
+   * column's type — the type PostgreSQL resolves for it is its own (a CASE of string values is text, which a
+   * timestamp, uuid, enum, number, jsonb or array column does not take: 42804) — unless the column is a string
+   * column, which takes any value as it is; a plain value bound through the column's mapper and cast to the
+   * column's type (a NULL as a typed NULL).
    */
   private static insertFromValueSql(value: unknown, config: any, context: SqlBuildContext): string {
     if (value instanceof WhereConditionBase) {
-      return value.buildSql(context);
+      const expression = value.buildSql(context);
+      const castType = DbEntityTable.valuesCastType(config.type);
+
+      return typeof castType !== 'string' || isStringCastType(castType) ? expression : `CAST(${expression} AS ${castType})`;
     }
 
     if (value !== null && typeof value === 'object' && '__dbColumnName' in (value as object)) {
@@ -7195,49 +7224,6 @@ RETURNING 1`;
     };
   }
 
-  /** Static type map for PostgreSQL type casting - computed once */
-  private static readonly PG_TYPE_MAP: Record<string, string> = {
-    'smallint': 'smallint',
-    'integer': 'integer',
-    'bigint': 'bigint',
-    'serial': 'integer',
-    'smallserial': 'smallint',
-    'bigserial': 'bigint',
-    'decimal': 'decimal',
-    'numeric': 'numeric',
-    'real': 'real',
-    'double precision': 'double precision',
-    'money': 'money',
-    'varchar': 'varchar',
-    'char': 'char',
-    'text': 'text',
-    'bytea': 'bytea',
-    'timestamp': 'timestamp',
-    'timestamptz': 'timestamptz',
-    'date': 'date',
-    'time': 'time',
-    'timetz': 'timetz',
-    'interval': 'interval',
-    'boolean': 'boolean',
-    'uuid': 'uuid',
-    'json': 'json',
-    'jsonb': 'jsonb',
-    'inet': 'inet',
-    'cidr': 'cidr',
-    'macaddr': 'macaddr',
-    'macaddr8': 'macaddr8',
-  };
-
-  /**
-   * Types whose bare name carries a typmod of 1 — `char` is `character(1)`, `bit` is `bit(1)` — mapped to their
-   * unbounded forms. An explicit cast to the bare name truncates SILENTLY (`CAST('ABCDEF' AS char)` is `'A'`).
-   */
-  private static readonly UNBOUNDED_CAST_TYPES = new Map<string, string>([
-    ['char', 'bpchar'],
-    ['character', 'bpchar'],
-    ['bit', 'varbit'],
-  ]);
-
   /**
    * The type a bound value is cast to for a column of type `columnType` — the `CAST($n AS <type>)` of an
    * `insertFrom` SELECT list and the `$n::<type>` cells of the cast-annotated VALUES (row-guarded / dependent-insert
@@ -7246,9 +7232,7 @@ RETURNING 1`;
    * @internal
    */
   private static valuesCastType(columnType: string): string {
-    const pgType = DbEntityTable.PG_TYPE_MAP[columnType] || columnType;
-
-    return DbEntityTable.UNBOUNDED_CAST_TYPES.get(pgType) ?? pgType;
+    return columnCastType(columnType);
   }
 
   /**

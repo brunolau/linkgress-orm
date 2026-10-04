@@ -1,6 +1,10 @@
 import type { DatabaseClient } from '../database/database-client.interface';
-import type { DbColumn } from '../entity/db-column';
-import type { QueryExecutor } from '../entity/db-context';
+import type { DbColumn, ExtractDbColumnKeys, UnwrapDbColumns } from '../entity/db-column';
+import type { DbEntityTable, QueryExecutor } from '../entity/db-context';
+import type { DbEntity } from '../entity/entity-base';
+import { toPgArrayLiteral } from '../types/custom-types';
+import { toLocalTimestampText } from '../types/local-timestamp-text';
+import { columnCastType } from './column-cast-type';
 import { assertExplicitAlias } from './aliased-scope';
 import {
   and,
@@ -20,7 +24,7 @@ import { buildSelectParts, isSingleValueSelection, SCALAR_SELECTION_COLUMN, tran
 import { holdsSqlValue, nextChainId } from './query-builder';
 import { forEachOrderByKey } from './query-utils';
 import type { SqlOperand } from './sql-functions';
-import { selectorProjectingConditions } from './sql-functions';
+import { scalarSubqueryRead, selectorProjectingConditions } from './sql-functions';
 import { Subquery } from './subquery';
 import { UnionQueryBuilder } from './union-builder';
 import type { UnionLegBuilder } from './union-builder';
@@ -66,6 +70,12 @@ export class SetReturningFunction<TRow extends Record<string, unknown> = Record<
   /** @internal The SQL type of each output column (when known) — how a column of it compares and reads. */
   readonly columnTypes: readonly (string | undefined)[];
 
+  /**
+   * @internal The mapper each output column reads and compares through — a typed rows source's columns
+   * (`unnestRows`) the table's; a column without one reads as the driver delivers it.
+   */
+  readonly columnMappers?: readonly (unknown | undefined)[];
+
   private readonly callParts: string[];
   private readonly callValues: unknown[];
   /** The SQL type the projected values read as (see {@link withReadType}). */
@@ -79,7 +89,8 @@ export class SetReturningFunction<TRow extends Record<string, unknown> = Record<
     columns: readonly string[],
     columnTypes: readonly (string | undefined)[],
     mapper: any = DRIVER_VALUE_MAPPER,
-    alias?: string
+    alias?: string,
+    columnMappers?: readonly (unknown | undefined)[]
   ) {
     super(parts, values, mapper, alias);
     this.functionName = functionName;
@@ -87,6 +98,7 @@ export class SetReturningFunction<TRow extends Record<string, unknown> = Record<
     this.callValues = values;
     this.columns = columns;
     this.columnTypes = columnTypes;
+    this.columnMappers = columnMappers;
   }
 
   /**
@@ -275,6 +287,177 @@ export function unnestZip<T extends Record<string, unknown>>(
   return new SetReturningFunction<T>('unnest', parts, values, names, types);
 }
 
+/** The value one cell of a typed rows source binds as, in its column's array (see {@link unnestRows}). */
+function rowsCellValue(driverValue: unknown, columnType: string, arrayColumn: boolean): unknown {
+  if (driverValue === null || driverValue === undefined) {
+    return null;
+  }
+
+  if (arrayColumn) {
+    // An array cell rides as the text of its array literal (the column's own mapper has made it one)
+    return Array.isArray(driverValue) ? toPgArrayLiteral(driverValue) : String(driverValue);
+  }
+
+  if (driverValue instanceof Date) {
+    // As a driver binds a Date parameter: its LOCAL time with the offset (a timestamp stores the wall time)
+    return toLocalTimestampText(driverValue);
+  }
+
+  if ((columnType === 'json' || columnType === 'jsonb') && typeof driverValue !== 'string') {
+    // As a driver binds an object for a json column: its JSON text
+    return JSON.stringify(driverValue);
+  }
+
+  return driverValue;
+}
+
+/**
+ * A typed rows source over an array column: unnest would flatten its arrays, so each rides as the text of its
+ * array literal and is cast back — `(SELECT "a"."code", CAST("a"."tags" AS integer[]) AS "tags" FROM unnest(…) AS
+ * "a"("code", "tags")) AS "a"`. The same columns under the same alias, so the rows read exactly as without one.
+ */
+class RowsSetFunction<TRow extends Record<string, unknown>> extends SetReturningFunction<TRow> {
+  constructor(
+    parts: string[],
+    values: unknown[],
+    columns: readonly string[],
+    columnTypes: readonly string[],
+    columnMappers: readonly (unknown | undefined)[],
+    private readonly arrayColumns: ReadonlySet<string>
+  ) {
+    super('unnest', parts, values, columns, columnTypes, DRIVER_VALUE_MAPPER, undefined, columnMappers);
+  }
+
+  override renderSource(alias: string, context: SqlBuildContext): string {
+    const call = super.renderSource(alias, context);
+
+    if (this.arrayColumns.size === 0) {
+      return call;
+    }
+
+    const projection = this.columns.map((column, index) => (this.arrayColumns.has(column)
+      ? `CAST("${alias}"."${column}" AS ${this.columnTypes[index]}) AS "${column}"`
+      : `"${alias}"."${column}"`));
+
+    return `(SELECT ${projection.join(', ')} FROM ${call}) AS "${alias}"`;
+  }
+}
+
+/**
+ * The rows `rows` as a set, typed by `table`'s columns — `unnest(CAST($1 AS <type>[]), …) AS "<alias>"(<columns>)`,
+ * ONE array parameter per column, every cell bound through its column's mapper (a Date as a driver binds it, a
+ * json value as its JSON text, an array cell as its array literal — cast back to the column's array type). The
+ * statement's text does not depend on the number of rows, so it can be prepared; zero rows are a legal empty
+ * set (never an empty VALUES). Its row reads, and compares in a condition, through the columns' mappers.
+ *
+ * `columns`: the columns of the set, in this order — by default the table's columns any row holds (all of
+ * them for no rows), in the table's order. Give them to keep the text the same whatever the rows hold. A row
+ * without a value for a column holds NULL there (not the column's default).
+ *
+ * A source like any set: `fromSet()` / {@link fromRows} (an insertFrom source, a correlated `notExists`),
+ * `db.selectFromSet()`, `crossJoinLateral()`.
+ *
+ * @example
+ * // the rows the statement inserts — the same text for 1 row and 500
+ * await db.leases.insertFrom(
+ *   fromRows(db.leases, desired, { columns: ['unitId', 'tenantId'] }).asSubquery('table'),
+ *   src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }),
+ * );
+ */
+export function unnestRows<TEntity extends DbEntity, K extends ExtractDbColumnKeys<TEntity> = ExtractDbColumnKeys<TEntity>>(
+  table: DbEntityTable<TEntity>,
+  rows: ReadonlyArray<Partial<UnwrapDbColumns<TEntity>>>,
+  columns?: readonly K[]
+): SetReturningFunction<Pick<UnwrapDbColumns<TEntity>, K>> {
+  const schema = table !== null && typeof table === 'object' && typeof (table as any)._getSchema === 'function'
+    ? (table as any)._getSchema()
+    : undefined;
+
+  if (schema === undefined || schema.columns === null || typeof schema.columns !== 'object') {
+    throw new TypeError('unnestRows(): expected an entity table — db.<table>');
+  }
+
+  if (!Array.isArray(rows)) {
+    throw new TypeError('unnestRows(): expected an array of rows');
+  }
+
+  const tableColumns = Object.keys(schema.columns);
+  let props: string[];
+
+  if (columns !== undefined) {
+    props = [...columns] as string[];
+
+    for (const prop of props) {
+      if (!tableColumns.includes(prop)) {
+        throw new Error(`unnestRows(): "${prop}" is not a column of "${schema.name}"`);
+      }
+    }
+  } else if (rows.length === 0) {
+    props = tableColumns;
+  } else {
+    const held = new Set(rows.flatMap(row => Object.keys(row)));
+    props = tableColumns.filter(prop => held.has(prop));
+  }
+
+  if (props.length === 0) {
+    throw new Error(`unnestRows(): the rows hold no column of "${schema.name}" — give the columns: unnestRows(table, rows, ['…'])`);
+  }
+
+  const parts = ['unnest('];
+  const values: unknown[] = [];
+  const types: string[] = [];
+  const mappers: Array<unknown | undefined> = [];
+  const arrayColumns = new Set<string>();
+
+  props.forEach((prop, index) => {
+    const config = (schema.columns[prop] as any).build();
+    const columnType = String(config.type);
+    // A numeric column's precision and scale too: its values read as the column's do ('12.50'), as rounded on insert
+    const castType = (columnType === 'numeric' || columnType === 'decimal') && config.precision
+      ? `${columnType}(${config.precision}${config.scale != null ? `, ${config.scale}` : ''})`
+      : columnCastType(columnType);
+    const arrayColumn = /\[\d*\]\s*$/.test(columnType);
+    const mapper = config.mapper;
+    const toDriver = mapper && typeof mapper.toDriver === 'function' ? (value: unknown) => mapper.toDriver(value) : (value: unknown) => value;
+
+    const cells = rows.map(row => {
+      const value = (row as Record<string, unknown>)[prop];
+      return rowsCellValue(toDriver(value === undefined ? null : value), columnType, arrayColumn);
+    });
+
+    if (arrayColumn) {
+      arrayColumns.add(prop);
+    }
+
+    values.push(castTo(cells, `${arrayColumn ? 'text' : castType}[]` as PgCastType));
+    types.push(castType);
+    mappers.push(mapper);
+    parts.push(index === props.length - 1 ? ')' : ', ');
+  });
+
+  return new RowsSetFunction<Pick<UnwrapDbColumns<TEntity>, K>>(parts, values, props, types, mappers, arrayColumns);
+}
+
+/**
+ * {@link unnestRows} as a query: `fromSet(unnestRows(table, rows, columns), alias)` — the alias `"rows"` unless
+ * given. Embed it with `.asSubquery('table')` (an insertFrom source), in an `exists` / `notExists` (correlated to
+ * the rows of an enclosing statement, a data-modifying CTE's too), or as a union leg.
+ *
+ * @example
+ * // close every current lease the list no longer holds
+ * db.leases
+ *   .where(l => and(eq(l.isCurrent, true), notExists(fromRows(db.leases, keep, { columns: ['unitId'], alias: 'k' })
+ *     .where(k => eq(k.unitId, l.unitId)).select(() => ({ one: literal(1) })).asSubquery())))
+ *   .update({ isCurrent: false })
+ */
+export function fromRows<TEntity extends DbEntity, K extends ExtractDbColumnKeys<TEntity> = ExtractDbColumnKeys<TEntity>>(
+  table: DbEntityTable<TEntity>,
+  rows: ReadonlyArray<Partial<UnwrapDbColumns<TEntity>>>,
+  options?: { columns?: readonly K[]; alias?: string }
+): SetQueryBuilder<Pick<UnwrapDbColumns<TEntity>, K>, Pick<UnwrapDbColumns<TEntity>, K>> {
+  return SetQueryBuilder.create(unnestRows(table, rows, options?.columns), options?.alias ?? 'rows');
+}
+
 /** A jsonb operand: a column or expression as is, a plain JS value serialized and cast. */
 function jsonbArgument(usage: string, target: unknown): unknown {
   assertBindable(usage, target, 'build the jsonb in SQL (sql`jsonb_build_object(…)` / sql`jsonb_build_array(…)`)');
@@ -328,7 +511,7 @@ export function createSetRow<TRow extends Record<string, unknown>>(set: SetRetur
       __tableAlias: alias,
       // Never the column of a table named like the reading query's (see compileFieldRead)
       __sourceTable: alias,
-      __mapper: DRIVER_VALUE_MAPPER,
+      __mapper: set.columnMappers?.[index] ?? DRIVER_VALUE_MAPPER,
       __sqlType: set.columnTypes[index],
       __setColumn: true,
       __chainId: chainId,
@@ -527,8 +710,32 @@ export class SetQueryBuilder<TRow extends Record<string, unknown>, TSelection = 
   ): Subquery<TMode extends 'scalar' ? SingleValue<TSelection> : TMode extends 'array' ? SingleValue<TSelection>[] : TSelection, TMode> {
     const sqlBuilder = (outerContext: SqlBuildContext): string => this.buildSelect(outerContext, true);
     const selectionMetadata = mode === 'table' ? this.evaluateSelection() : undefined;
+    // A scalar subquery of one column reads like that column (see scalarSubqueryRead)
+    const scalarRead = mode === 'scalar' && this.state.selector ? scalarSubqueryRead(this.state.selector(this.state.row)) : undefined;
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata, this.outerFieldRefs()) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, this.outerFieldRefs(), scalarRead) as any;
+  }
+
+  /**
+   * @internal This query as a CTE's body (`DbCteBuilder.with()`): its SELECT numbered from the builder's
+   * offset, its literals typed (the CTE's readers read them as columns); the CTE's columns read the way the
+   * projection does (a set column as the driver delivers it).
+   */
+  _buildCteBody(queryContext: { paramCounter: number; allParams: unknown[]; hoistedCteNames?: Set<string> }): { sql: string; selection: Record<string, any> } {
+    const context: SqlBuildContext = {
+      paramCounter: queryContext.paramCounter,
+      params: queryContext.allParams as any[],
+      hoistedCteNames: queryContext.hoistedCteNames,
+    };
+    const sql = this.buildSelect(context, true);
+    queryContext.paramCounter = context.paramCounter;
+
+    return { sql, selection: this.evaluateSelection() };
+  }
+
+  /** @internal UnionLegBuilder — the projection the union's columns read through when this leg is the first. */
+  _unionSelection(): Record<string, any> {
+    return this.evaluateSelection();
   }
 
   /** Run the query (`db.selectFromSet(...)` only) and read its rows. */
@@ -582,9 +789,9 @@ export class SetQueryBuilder<TRow extends Record<string, unknown>, TSelection = 
     return metadata;
   }
 
-  /** @internal UnionLegBuilder — a union's rows, read the way this first leg reads its own. */
+  /** @internal UnionLegBuilder — a union's rows, read the way this first leg reads its own; a literal from the row (each leg's tag). */
   _applyUnionPostProcessing(rows: any[], _metadata: { nestedPaths: Set<string>; selectionResult: any }): any[] {
-    return this.readRows(rows);
+    return this.readRows(rows, true);
   }
 
   /** The refs the query reads from an enclosing query: every ref of its function's argument, WHERE, projection and ORDER BY that is not a column of its row. */
@@ -638,8 +845,8 @@ export class SetQueryBuilder<TRow extends Record<string, unknown>, TSelection = 
     return this.state.selector !== undefined && isSingleValueSelection(this.state.selector(this.state.row));
   }
 
-  private readRows(rows: any[]): any[] {
-    const read = transformRows(rows, this.evaluateSelection());
+  private readRows(rows: any[], literalsFromRows = false): any[] {
+    const read = transformRows(rows, this.evaluateSelection(), literalsFromRows);
     return this.selectsSingleValue() ? read.map(row => row[SCALAR_SELECTION_COLUMN]) : read;
   }
 

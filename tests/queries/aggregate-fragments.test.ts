@@ -471,7 +471,7 @@ describe('agg — aggregate fragments', () => {
           joined: db.members.where(m => eq(m.clubId, c.id)).select(m => agg.max(m.joinedAt)).asSubquery('scalar'),
           score: db.members.where(m => eq(m.clubId, c.id)).select(m => ({ total: agg.sum(m.score) })).asSubquery('scalar'),
           typed: db.members.where(m => eq(m.clubId, c.id)).select(m => sql<string | null>`max(${m.nickname})`.withReadType('text')).asSubquery('scalar'),
-          // Any other scalar subquery reads as before: the generic conversion
+          // A scalar subquery of one column reads like the column (1.0.29: a text column's '007' used to read as 7)
           raw: db.members.where(m => eq(m.clubId, c.id)).select(m => m.nickname).asSubquery('scalar'),
         }))
         .toList();
@@ -480,7 +480,7 @@ describe('agg — aggregate fragments', () => {
       const total = (value: number | null) => value as unknown as { total: number | null };
 
       expect([...rows].sort((a, b) => a.id - b.id)).toEqual([
-        { id: 2, nick: '007', joined: JOINED.dee, score: total(3), typed: '007', raw: 7 as unknown as string },
+        { id: 2, nick: '007', joined: JOINED.dee, score: total(3), typed: '007', raw: '007' },
         { id: 3, nick: null, joined: null, score: total(null), typed: undefined as unknown as string, raw: undefined as unknown as string },
       ]);
     });

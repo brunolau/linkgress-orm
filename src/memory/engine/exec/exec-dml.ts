@@ -335,7 +335,7 @@ export class DmlExecutor {
       if (l === 'live') {
         return t;
       }
-      throw new WaitForTransaction(l.waitFor, this.st.catalog.getRelation(u.indexOid)?.name);
+      throw new WaitForTransaction(l.waitFor, this.st.catalog.getRelation(u.indexOid)?.name, true);
     }
     return null;
   }

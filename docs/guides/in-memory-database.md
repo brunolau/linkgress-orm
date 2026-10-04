@@ -201,6 +201,18 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
   position; `tests/memory/sql-parity.test.ts` holds a corpus of statements to that standard.
 - Not implemented (an error is raised instead): `COPY`, `EXCLUDE` constraints, `MERGE` into a view,
   `INSTEAD OF` triggers, `SELECT … INTO`.
+- A `FULL JOIN` is refused as PostgreSQL's planner refuses it (0A000 "FULL JOIN is only supported with merge-joinable
+  or hash-joinable join conditions") — no equality between the two sides and a condition that is neither one nor a
+  constant (`IS NOT DISTINCT FROM`, an inequality, an OR, a condition on one side alone, a volatile equality); a
+  WHERE that makes a side non-nullable turns it into another join first. The check runs when the join runs: a
+  FULL JOIN in a subquery that never runs is not refused (PostgreSQL plans it), one in an unreferenced CTE is not
+  refused on either.
+- Data-modifying CTEs run in the order the main query first reads them (the rest after it), on the statement's
+  snapshot. A statement that waits for a concurrent transaction at a unique check — an INSERT whose key a running
+  transaction inserted — reads, once that transaction has ended, the snapshot it started with: committed, the key
+  is a 23505 (or a row `ON CONFLICT DO NOTHING` skips); rolled back, the row is inserted — as in PostgreSQL. It
+  used to restart with a new snapshot, where an `INSERT … SELECT … WHERE NOT EXISTS` saw the committed row and
+  skipped it instead of failing.
 - Roles and privileges are not modelled. `CREATE ROLE`, `GRANT` / `REVOKE`, `SET ROLE` / `RESET ROLE`,
   `DROP OWNED` and the other role statements are accepted and do nothing. A session stays the user it
   connected as (`current_user` is `session_user`), every `has_*_privilege()` check answers true, and

@@ -1,5 +1,6 @@
 import { ConnectionReleasedError, DatabaseClient, PooledConnection, QueryResult, QueryExecutionOptions, TransactionEndedError } from './database-client.interface';
 import { withArrayTypes } from './typed-text';
+import { toLocalTimestampText } from '../types/local-timestamp-text';
 import type { TypedTextRead } from './database-client.interface';
 import type { PGliteClientOptions } from './types';
 
@@ -21,29 +22,6 @@ const DEFAULT_PARSERS: Record<number, (value: string) => any> = {
 
 if (typeof Buffer === 'function') {
   DEFAULT_PARSERS[17] = (value: string) => Buffer.from(value.slice(2), 'hex');
-}
-
-const pad = (value: number, digits: number): string => String(value).padStart(digits, '0');
-
-/**
- * A Date as `YYYY-MM-DDTHH:MM:SS.mmm+HH:MM` in LOCAL time — pg's formatting, BC years included.
- */
-function toLocalTimestampText(date: Date): string {
-  let year = date.getFullYear();
-  const isBC = year < 1;
-
-  if (isBC) {
-    // JS year 0 is 1 BC
-    year = Math.abs(year) + 1;
-  }
-
-  const offset = -date.getTimezoneOffset();
-  const text =
-    `${pad(year, 4)}-${pad(date.getMonth() + 1, 2)}-${pad(date.getDate(), 2)}` +
-    `T${pad(date.getHours(), 2)}:${pad(date.getMinutes(), 2)}:${pad(date.getSeconds(), 2)}.${pad(date.getMilliseconds(), 3)}` +
-    `${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60), 2)}:${pad(Math.abs(offset) % 60, 2)}`;
-
-  return isBC ? `${text} BC` : text;
 }
 
 function serializeDateParam(value: any): string {
@@ -201,6 +179,21 @@ const heldSessions: HeldSessionTracker | undefined = (() => {
  * lease refuses its queries with a {@link ConnectionReleasedError} — they would run on the
  * session outside the lock, under whoever holds it next.
  */
+/**
+ * PGlite counts a statement's parameters in a SIGNED 16-bit field: a statement binding more than 32 767 used
+ * to desynchronize the session — it, and the statements after it, returned no rows. Refused before it is sent.
+ */
+const PGLITE_MAX_PARAMETERS = 32767;
+
+function assertParameterCount(params: readonly unknown[] | undefined): void {
+  if (params !== undefined && params.length > PGLITE_MAX_PARAMETERS) {
+    throw new Error(
+      `PGliteClient: the statement binds ${params.length} parameters — PGlite takes at most 32 767 (it counts them in a signed `
+      + '16-bit field; more desynchronize its session): bind fewer — an array parameter, smaller chunks'
+    );
+  }
+}
+
 class PGlitePooledConnection implements PooledConnection {
   private released = false;
 
@@ -210,6 +203,8 @@ class PGlitePooledConnection implements PooledConnection {
     if (this.released) {
       throw new ConnectionReleasedError(sql);
     }
+
+    assertParameterCount(params);
 
     return toQueryResult<T>(await this.pglite.query(sql, params));
   }
@@ -292,6 +287,7 @@ export class PGliteClient extends DatabaseClient {
 
   async query<T = any>(sql: string, params?: any[], _options?: QueryExecutionOptions): Promise<QueryResult<T>> {
     this.assertSessionAvailable();
+    assertParameterCount(params);
 
     return await this.session.run(async () => toQueryResult<T>(await this.pglite.query(sql, params)));
   }
@@ -314,6 +310,11 @@ export class PGliteClient extends DatabaseClient {
     return 'pglite';
   }
 
+  /** 32 767: PGlite counts a statement's parameters in a signed 16-bit field (see DatabaseClient.maxParameters). */
+  maxParameters(): number {
+    return PGLITE_MAX_PARAMETERS;
+  }
+
   /**
    * Execute a callback within a transaction.
    * Uses PGlite's transaction(): BEGIN, then COMMIT — or ROLLBACK when the callback throws.
@@ -332,6 +333,7 @@ export class PGliteClient extends DatabaseClient {
             throw new TransactionEndedError(sql);
           }
 
+          assertParameterCount(params);
           return toQueryResult(await tx.query(sql, params));
         };
 

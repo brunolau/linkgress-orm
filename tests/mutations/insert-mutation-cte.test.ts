@@ -338,9 +338,13 @@ describe('insert as a data-modifying CTE feeding insertFrom (one statement)', ()
       expect(refusal).toBeInstanceOf(NestedDataModifyingCteError);
       expect((refusal as NestedDataModifyingCteError).cteName).toBe('ins');
 
-      // As a compiled statement it would be a CTE body, where PostgreSQL refuses a nested DML CTE
-      expect(() => db.audit.insertFrom(landed, map, { with: [ins.cte] }).toStatement(a => ({ id: a.id })))
-        .toThrow('toStatement(): this insertFrom() declares the data-modifying CTE "ins"');
+      // Compiled, the statement is a CTE's body: it reads the data-modifying CTE by name (it cannot declare it
+      // there), and the CTE built over it declares "ins" first wherever it is declared (1.0.29: it was refused)
+      const compiled = db.audit.insertFrom(landed, map, { with: [ins.cte] }).toStatement(a => ({ id: a.id }));
+      expect(compiled.sql).not.toContain('"ins" AS (');
+      expect(compiled.sql).toContain('FROM "ins") AS "src"');
+      const audited = new DbCteBuilder().withMutation('audited', compiled);
+      expect(audited.cte.dependencies).toEqual([ins.cte]);
 
       expect(await db.codes.count()).toBe(0);
     });

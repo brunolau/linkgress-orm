@@ -536,6 +536,8 @@ describe('1. every expression builder renders a self-delimited expression', () =
     eqAnySubquery: frag(() => eqAnySubquery(U, ids())),
     neAllSubquery: frag(() => neAllSubquery(U, ids())),
     onTrue: frag(() => Surface.onTrue()),
+    onFalse: frag(() => Surface.onFalse()),
+    fromRows: frag(() => Surface.fromRows(db.posts, [{ views: 1 }], { columns: ['views'] }).select((r: any) => r.views).limit(1).asSubquery('scalar').asExpression()),
     fromSet: frag(() => fromSet(unnest(A)).select((r: any) => r.value).limit(1).asSubquery('scalar').asExpression()),
     // classes whose members build fragments
     SqlFragment: frag(() => coalesce(N, 0).as('x'), () => coalesce(N, 0).mapWith(Number), () => jsonbPathText(J, 'a').withReadType('text'), () => jsonbPathText(J, 'a').castAsInt()),
@@ -552,6 +554,7 @@ describe('1. every expression builder renders a self-delimited expression', () =
     jsonbArrayElements: refused(() => jsonbArrayElements(J)),
     jsonbEachText: refused(() => jsonbEachText(J)),
     SetReturningFunction: refused(() => unnest(A).withReadType('text')),
+    unnestRows: refused(() => Surface.unnestRows(db.posts, [{ views: 1 }], ['views'])),
     // the caller's text
     sql: other("a raw template (sql``, sql.join) is the caller's text: composed as written; and() / or() parenthesize it"),
     RawSql: other('sql.raw(): verbatim caller text'),
@@ -574,6 +577,7 @@ describe('1. every expression builder renders a self-delimited expression', () =
     ['MockRowCache NavigationPathCache LateralSqlCache LinkgressConfig defaultLogger TimeTracer CollectionStrategyFactory', 'configuration / cache / logging'],
     ['FutureQuery FutureSingleQuery FutureCountQuery FutureQueryRunner isFutureQuery isFutureSingleQuery isFutureCountQuery QueryBatch MutationBatch PreparedQuery', 'statement execution / batching'],
     ['isSubquery DbCte DbCteBuilder isCte', 'subquery / CTE plumbing'],
+    ['afterMutation', 'a barrier over a data-modifying CTE: it renders only in a statement that declares the CTE (dependent-mutation-ctes.test.ts)'],
     ['DbEntity EntityMetadataStore DbColumn isDbColumn EntityConfigBuilder EntityPropertyBuilder EntityNavigationBuilder HasManyNavigationBuilder HasOneNavigationBuilder DbModelConfig ViewConfigBuilder DbContext DbEntityTable EntityInsertBuilder TypeAliases', 'model / context'],
     ['CustomTypeBuilder customType jsonType array enumType point vector interval createCustomType identityMapper applyToDriver applyFromDriver applyFromDriverArray', 'custom type / mapper'],
     ['DbSequence SequenceBuilder sequence DbSchemaManager IndexRepairError EnumMigrator MigrationRunner MigrationJournal MigrationLoader MigrationScaffold', 'sequences / migrations'],

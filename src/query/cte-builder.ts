@@ -1,6 +1,6 @@
 import { DatabaseClient } from '../database/database-client.interface';
 import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materializeMockSelection } from './query-builder';
-import { SqlBuildContext, FieldRef, UnwrapSelection } from './conditions';
+import { Condition, SqlBuildContext, FieldRef, UnwrapSelection, WhereConditionBase } from './conditions';
 import { pgTypeOfValue } from './sql-functions';
 import { renumberPlaceholders } from './query-batch';
 
@@ -147,10 +147,18 @@ export function projectedColumnRef(key: string, alias: string, metaValue: unknow
       // An expression — an `sql` fragment, a condition, a grouped query's aggregate, a collection
       fieldRef.__cteKind = 'expression';
 
-      // A fragment read as a column of its type (withReadType) reads so through the reader too
-      const readType = typeof meta.getReadType === 'function' ? meta.getReadType() : undefined;
+      // A fragment read as a column of its type (withReadType) reads so through the reader too — and the
+      // MIN / MAX of a grouped query's column as that column (its metadata carries the column's type)
+      const readType = typeof meta.getReadType === 'function' ? meta.getReadType() : meta.__isAggregate ? meta.__sqlType : undefined;
       if (readType !== undefined) {
         fieldRef.__sqlType = readType;
+      }
+
+      // A scalar subquery reads the way it reads where it is projected (see scalarSubqueryRead)
+      const scalarRead = typeof meta.getScalarRead === 'function' ? meta.getScalarRead() : undefined;
+      if (scalarRead !== undefined) {
+        fieldRef.__mapper = scalarRead.mapper;
+        fieldRef.__sqlType = scalarRead.readType;
       }
     }
   } else {
@@ -265,16 +273,62 @@ function returningSelectionOf(statement: { sql: string; params: any[] }): Record
  * (`SqlBuildContext.hoistedCteNames`) — carrying their definitions, so that a nested query attaching a
  * DIFFERENT CTE under a declared name is refused (see {@link isStatementCte}) instead of silently
  * reading the statement's. A plain `Set` of names (built elsewhere) is honoured by name alone.
+ *
+ * `dependencies`: the body being built is one that executes nowhere itself — a CTE's body, a compiled
+ * statement — so a data-modifying CTE it reads is read by name and recorded there, for the statement that
+ * executes to declare (see {@link CteDependencies}).
  */
 class StatementCteNames extends Set<string> {
-  constructor(readonly definitions: ReadonlyMap<string, DbCte<any> | undefined>) {
+  constructor(readonly definitions: ReadonlyMap<string, DbCte<any> | undefined>, readonly dependencies?: CteDependencies) {
     super(definitions.keys());
   }
 }
 
 /**
+ * The data-modifying CTEs a body reads that the body cannot declare itself: a CTE's body
+ * ({@link DbCteBuilder.with}, {@link DbCteBuilder.withAggregation}) or a statement compiled with `toStatement()`
+ * (a data-modifying CTE's body, see {@link DbCteBuilder.withMutation}). PostgreSQL allows a data-modifying CTE
+ * only in the WITH of the statement that executes — so the body reads it by name, and the CTE built over the
+ * body carries it (`DbCte.dependencies`): every statement that declares that CTE declares these before it
+ * (see {@link withCteDependencies}). A plain CTE the body reads is declared inside it, as before.
+ * @internal
+ */
+export class CteDependencies {
+  private readonly read: DbCte<any>[] = [];
+
+  /** Records a data-modifying CTE the body reads; a different CTE under a name already read is refused. */
+  record(cte: DbCte<any>): void {
+    const named = this.read.find(other => other.name === cte.name);
+
+    if (named === cte) {
+      return;
+    }
+
+    if (named !== undefined) {
+      throw new Error(
+        `The statement reads two different CTEs named "${cte.name}": a statement declares each name once, so one of `
+        + 'them would read the other one\'s rows. Rename one of them, or read the same DbCte.'
+      );
+    }
+
+    this.read.push(cte);
+  }
+
+  /** The data-modifying CTEs recorded, in the order the body first read them. */
+  get ctes(): readonly DbCte<any>[] {
+    return this.read;
+  }
+
+  /** The statement-level CTE set to build the body in: nothing declared yet, a data-modifying CTE it reads recorded here. */
+  scope(): Set<string> {
+    return new StatementCteNames(new Map(), this);
+  }
+}
+
+/**
  * The statement-level CTE set a builder hands to what it nests: the enclosing statement's (`inherited`)
- * plus `ctes` — an inherited name keeps the enclosing statement's definition. @internal
+ * plus `ctes` — an inherited name keeps the enclosing statement's definition, and a body that records the
+ * data-modifying CTEs it reads (see {@link CteDependencies}) keeps recording them. @internal
  */
 export function declareStatementCtes(inherited: ReadonlySet<string> | undefined, ctes: readonly DbCte<any>[]): Set<string> {
   const definitions = new Map<string, DbCte<any> | undefined>();
@@ -289,7 +343,71 @@ export function declareStatementCtes(inherited: ReadonlySet<string> | undefined,
     }
   }
 
-  return new StatementCteNames(definitions);
+  return new StatementCteNames(definitions, inherited instanceof StatementCteNames ? inherited.dependencies : undefined);
+}
+
+/**
+ * `ctes` preceded by the CTEs they read — every CTE after the data-modifying CTEs its body reads
+ * (`DbCte.dependencies`), each once — the order a statement declares them in: PostgreSQL lets a CTE read only
+ * the CTEs declared before it. `ctes` itself when none reads another. A CTE declared twice — the same object,
+ * or the same plain CTE by content — appears once; two different CTEs under one name are refused (a WITH
+ * declares each name once, so one would read the other's rows). @internal
+ */
+export function withCteDependencies(ctes: readonly DbCte<any>[]): DbCte<any>[] {
+  if (ctes.every(cte => cte.dependencies.length === 0)) {
+    return ctes as DbCte<any>[];
+  }
+
+  const ordered: DbCte<any>[] = [];
+
+  const visit = (cte: DbCte<any>): void => {
+    if (ordered.includes(cte)) {
+      return;
+    }
+
+    for (const dependency of cte.dependencies) {
+      visit(dependency);
+    }
+
+    const named = ordered.find(other => other.name === cte.name);
+
+    if (named !== undefined) {
+      if (sameCteDefinition(named, cte)) {
+        return;
+      }
+
+      throw new Error(
+        `The statement declares two different CTEs named "${cte.name}": a WITH declares each name once, so one of them `
+        + 'would read the other one\'s rows. Rename one of them, or use the same DbCte.'
+      );
+    }
+
+    ordered.push(cte);
+  };
+
+  ctes.forEach(visit);
+
+  return ordered;
+}
+
+/** Where a compiled statement keeps the data-modifying CTEs it reads (non-enumerable, like its RETURNING selection). */
+const STATEMENT_DEPENDENCIES = '__dependencies';
+
+/**
+ * Attaches the data-modifying CTEs a compiled statement reads (see {@link CteDependencies}) — how
+ * {@link DbCteBuilder.withMutation} learns what its CTE reads. @internal
+ */
+export function attachStatementDependencies<T extends { sql: string; params: any[] }>(statement: T, dependencies: CteDependencies): T {
+  if (dependencies.ctes.length > 0) {
+    Object.defineProperty(statement, STATEMENT_DEPENDENCIES, { value: [...dependencies.ctes], enumerable: false });
+  }
+
+  return statement;
+}
+
+/** The data-modifying CTEs attached by {@link attachStatementDependencies}, if any. */
+function statementDependenciesOf(statement: { sql: string; params: any[] }): readonly DbCte<any>[] {
+  return (statement as any)[STATEMENT_DEPENDENCIES] ?? [];
 }
 
 /**
@@ -377,6 +495,15 @@ function isPlainObject(value: object): boolean {
  */
 export function isStatementCte(hoisted: ReadonlySet<string> | undefined, cte: DbCte<any>): boolean {
   if (!hoisted?.has(cte.name)) {
+    // A body that executes nowhere itself (a CTE's, a compiled statement) reads a data-modifying CTE by
+    // name: the statement that executes declares it (see CteDependencies)
+    const dependencies = hoisted instanceof StatementCteNames ? hoisted.dependencies : undefined;
+
+    if (dependencies !== undefined && cte.dataModifying) {
+      dependencies.record(cte);
+      return true;
+    }
+
     return false;
   }
 
@@ -433,6 +560,71 @@ export function assertStatementLevelCtes(ctes: readonly DbCte<any>[], hoisted: R
   }
 }
 
+/** The condition {@link afterMutation} returns. */
+class MutationBarrier extends WhereConditionBase {
+  constructor(private readonly cte: DbCte<any>) {
+    super();
+  }
+
+  buildSql(context: SqlBuildContext): string {
+    // The statement must declare the CTE — or, compiled as another CTE's body, read it by name (it declares it then)
+    if (!isStatementCte(context.hoistedCteNames, this.cte)) {
+      throw new NestedDataModifyingCteError(this.cte.name);
+    }
+
+    // Self-delimited, as every condition helper renders: it is spliced into what it is an operand of
+    return `((SELECT count(*) FROM "${this.cte.name}") >= 0)`;
+  }
+}
+
+/**
+ * A condition that holds — once `cte`, a data-modifying CTE of the same statement, has run TO COMPLETION:
+ * `((SELECT count(*) FROM "<cte>") >= 0)`. Put in the WHERE of a statement that must not produce a row before
+ * `cte` has: the statement depends on `cte`'s every row (PostgreSQL plans it as a one-time filter over the
+ * count, evaluated before the first row).
+ *
+ * PostgreSQL runs the sub-statements of a WITH on one snapshot and in no order it promises — a data-modifying
+ * CTE runs when the main query first reads it, the rest after the main query. Close the current row and insert
+ * its successor in one statement, under a unique index over the SCOPE (one current lease per unit), and the
+ * insert collides with the row it replaces whenever it runs first (23505 — or, with ON CONFLICT DO NOTHING, it is
+ * skipped and the unit is left with no current lease). With the barrier the insert's source yields nothing before
+ * the close has run:
+ *
+ * ```typescript
+ * const builder = new DbCteBuilder();
+ * const closed = builder.withMutation('closed', db.leases
+ *   .where(l => and(eq(l.unitId, unitId), eq(l.isCurrent, true)))
+ *   .update({ isCurrent: false, validTo: now })
+ *   .toStatement(l => ({ id: l.id })));
+ * const opened = builder.withMutation('opened', db.leases
+ *   .insertFrom(source, src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }), {
+ *     where: () => afterMutation(closed.cte),
+ *   })
+ *   .toStatement(l => ({ id: l.id })));
+ *
+ * await db.selectFromCte(opened.cte).select(r => ({ id: r.id })).toList();
+ * // WITH "closed" AS (UPDATE …), "opened" AS (INSERT … WHERE ((SELECT count(*) FROM "closed") >= 0) …) SELECT …
+ * ```
+ *
+ * It does not change what the statement SEES: every sub-statement still reads the snapshot the statement
+ * started with (the row the close retired is still current to the insert's `notExists`); it orders what the
+ * statement WRITES. An `exists` over the CTE is no barrier — it stops at the first row.
+ *
+ * The statement must declare `cte` (`with: [cte]`, `.with(cte)`), or read it compiled as another data-modifying
+ * CTE's body (`toStatement()` — the statement that executes then declares it first).
+ */
+export function afterMutation(cte: DbCte<any>): Condition {
+  if (!(cte instanceof DbCte)) {
+    throw new TypeError('afterMutation(): expected a data-modifying CTE — DbCteBuilder.withMutation(name, statement).cte');
+  }
+
+  if (!cte.dataModifying) {
+    throw new Error(`afterMutation(): "${cte.name}" is not a data-modifying CTE — a barrier orders a statement after a mutation`);
+  }
+
+  return new MutationBarrier(cte);
+}
+
 /** Names that are never columns of a CTE: read by JS itself (`await`, JSON, coercion, inspection). */
 const NON_COLUMN_KEYS: ReadonlySet<string> = new Set(['then', 'toJSON', 'constructor', 'valueOf', 'toString', 'inspect', 'asymmetricMatch', 'nodeType', 'tagName']);
 
@@ -469,6 +661,14 @@ export class DbCte<TColumns> {
    */
   public readonly paramBase: number;
 
+  /**
+   * The data-modifying CTEs this CTE's body reads (by name — PostgreSQL allows them only in the WITH of the
+   * statement that executes): every statement that declares this CTE declares them first, each once (see
+   * {@link withCteDependencies}). A data-modifying CTE over a compiled statement that reads an earlier one —
+   * `afterMutation(closed)`, `db.selectFromCte(closed)…` — and a plain CTE over a query that reads one.
+   */
+  public readonly dependencies: readonly DbCte<any>[];
+
   constructor(
     public readonly name: string,
     public readonly query: string,
@@ -478,12 +678,20 @@ export class DbCte<TColumns> {
     aggregationColumns?: string[],
     materialized?: boolean,
     dataModifying?: boolean,
-    paramBase?: number
+    paramBase?: number,
+    dependencies?: readonly DbCte<any>[]
   ) {
     this.aggregationColumns = new Set(aggregationColumns || []);
     this.materialized = materialized ?? false;
     this.dataModifying = dataModifying ?? false;
     this.paramBase = paramBase ?? 1;
+    this.dependencies = dependencies ?? [];
+
+    const named = this.dependencies.find(dependency => dependency.name === name);
+
+    if (named !== undefined) {
+      throw new Error(`The CTE "${name}" reads a CTE of its own name — a statement declares each name once: rename one of them`);
+    }
   }
 
   /**
@@ -564,6 +772,19 @@ export class DbCte<TColumns> {
 }
 
 /**
+ * A query that renders itself as a CTE's body — a CTE-rooted query, a set query: its SQL in the statement's
+ * numbering (`paramCounter` / `allParams` advanced, nested builds reading `hoistedCteNames`), and the projection
+ * the CTE's columns read through. @internal
+ */
+export interface CteBodySource {
+  _buildCteBody(queryContext: { paramCounter: number; allParams: unknown[]; hoistedCteNames?: Set<string> }): { sql: string; selection: Record<string, any> };
+}
+
+function isCteBodySource(query: unknown): query is CteBodySource {
+  return query !== null && typeof query === 'object' && typeof (query as any)._buildCteBody === 'function';
+}
+
+/**
  * Builder for creating Common Table Expressions (CTEs)
  */
 export class DbCteBuilder {
@@ -608,10 +829,14 @@ export class DbCteBuilder {
       materialized?: boolean;
     }
   ): { cte: DbCte<TSelection> } {
-    // A CTE body is nested in the statement that declares it: a data-modifying CTE the query carries
-    // cannot be declared there
+    // A CTE body is nested in the statement that declares it: a data-modifying CTE it reads — one the
+    // query carries, or reads in a subquery — is read by name there, and declared by every statement that
+    // declares this CTE, before it (see CteDependencies)
+    const dependencies = new CteDependencies();
+    const hoistedCteNames = dependencies.scope();
+
     if (typeof (query as any)._getAttachedCtes === 'function') {
-      assertStatementLevelCtes((query as any)._getAttachedCtes(), undefined);
+      assertStatementLevelCtes((query as any)._getAttachedCtes(), hoistedCteNames);
     }
 
     const context: SqlBuildContext = {
@@ -627,6 +852,7 @@ export class DbCteBuilder {
       allParams: context.params,
       // The body's columns are read by other queries: its literals render typed
       typedLiterals: true,
+      hoistedCteNames,
     };
 
     let sql: string;
@@ -646,11 +872,18 @@ export class DbCteBuilder {
       selectionResult = typeof (query as any).getSelectionMetadata === 'function'
         ? (query as any).getSelectionMetadata()
         : {};
-    } else {
+    } else if (typeof (query as any)._createMockRow === 'function' && typeof (query as any).selector === 'function') {
       // Standard SelectQueryBuilder — render via mock row + selector.
       const mockRow = (query as any)._createMockRow();
       selectionResult = materializeMockSelection((query as any).selector(mockRow));
       sql = (query as any).buildQuery(selectionResult, queryContext).sql;
+    } else if (isCteBodySource(query)) {
+      // A CTE-rooted query, a set query: its body, read the way the query reads it
+      const body = query._buildCteBody(queryContext);
+      sql = body.sql;
+      selectionResult = body.selection;
+    } else {
+      throw new TypeError(`with("${cteName}"): expected a query — an entity query, a grouped query, a union, a CTE-rooted query or a set query`);
     }
 
     // Update parameter offset for next CTE
@@ -673,7 +906,8 @@ export class DbCteBuilder {
       undefined,
       options?.materialized,
       false,
-      paramBase
+      paramBase,
+      dependencies.ctes
     );
     this.ctes.push(cte);
 
@@ -697,6 +931,10 @@ export class DbCteBuilder {
    * every nested read of the statement reads the ONE statement-level declaration by name. A
    * data-modifying CTE declared anywhere else — inside a nested subquery, inside another CTE's body — is
    * refused: PostgreSQL rejects it there, and run naively it would execute once per occurrence.
+   *
+   * A statement compiled with `toStatement()` may READ data-modifying CTEs created before it — through its
+   * source, its WHERE (`afterMutation(cte)`: not before that CTE has run), a subquery of its values: it reads
+   * them by name, and every statement that declares this CTE declares them first, each once (`DbCte.dependencies`).
    *
    * @param cteName Name of the CTE (referenced from raw fragments as `"name"`).
    * @param statement Compiled DML — `{ sql, params }` with $1-based placeholders. A
@@ -738,7 +976,8 @@ export class DbCteBuilder {
       undefined,
       false,
       true,
-      paramBase
+      paramBase,
+      statementDependenciesOf(statement)
     );
     this.ctes.push(cte);
 
@@ -771,9 +1010,12 @@ export class DbCteBuilder {
     aggregationAlias?: TAlias
   ): DbCte<UnwrapSelection<TKey> & { [K in TAlias]: Array<AggregatedItemType<TSelection, TKey>> }> {
     const paramBase = this.paramOffset;
+    // The aggregated query is this CTE's body: a data-modifying CTE it reads is declared by the statement
+    const dependencies = new CteDependencies();
     const context: SqlBuildContext = {
       paramCounter: this.paramOffset,
       params: [],
+      hoistedCteNames: dependencies.scope(),
     };
 
     // Build the inner query - handle different query builder types
@@ -885,7 +1127,7 @@ export class DbCteBuilder {
     };
 
     // Pass the aggregation alias as an aggregation column so it can be COALESCE'd in LEFT JOINs
-    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, selectionMetadata, [finalAggregationAlias], false, false, paramBase);
+    const cte = new DbCte(cteName, aggregationSql, context.params, columnDefs, selectionMetadata, [finalAggregationAlias], false, false, paramBase, dependencies.ctes);
     this.ctes.push(cte);
 
     return cte;
@@ -904,6 +1146,7 @@ export class DbCteBuilder {
       allParams: context.params,
       // The aggregated rows' literals are typed like any CTE body's (they land in JSON typed)
       typedLiterals: true,
+      hoistedCteNames: context.hoistedCteNames,
     };
 
     // Extract referenced CTEs from the query and add them to this builder
@@ -938,6 +1181,12 @@ export class DbCteBuilder {
       context.paramCounter = queryContext.paramCounter;
       sql = result.sql;
       selectionMetadata = selectionResult;
+    } else if (isCteBodySource(query)) {
+      // A CTE-rooted query, a set query
+      const body = query._buildCteBody(queryContext);
+      context.paramCounter = queryContext.paramCounter;
+      sql = body.sql;
+      selectionMetadata = body.selection;
     } else {
       throw new Error('Unsupported query type for CTE. Query must be a SelectQueryBuilder, GroupedSelectQueryBuilder, or GroupedJoinedQueryBuilder.');
     }

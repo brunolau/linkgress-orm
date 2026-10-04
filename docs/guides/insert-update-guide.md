@@ -211,6 +211,13 @@ const minted = await db.badges
   silently) — so the assignment pads, or raises 22001 for an over-long value, exactly like
   `INSERT … VALUES`. `null` inserts a typed NULL; `undefined` leaves the column out (its default applies). A
   key that is no column, or a source column the subquery does not project, is refused.
+- An EXPRESSION is cast to the column's type too (1.0.29), unless the column is a string column (`text`,
+  `varchar`, `char` — they take any value as it is): the type PostgreSQL resolves for an expression is its own,
+  and a `caseWhen` of string values is `text`, which a `timestamp`, `uuid`, enum, number, `jsonb` or array
+  column does not take (42804 "column … is of type … but expression is of type text"):
+  `shippedAt: caseWhen(inArray(src.kind, shippedKinds), at).else(null)` renders
+  `CAST(CASE WHEN … THEN CAST($n AS text) ELSE NULL END AS timestamp)`. A source ref and a plain value render
+  as before.
 - Parameters number in build order: the source's, the SELECT list's, then `where`'s.
 - `.returning()` / `.returning(selector)` read the inserted rows as `insertBulk` does; awaiting the builder
   itself resolves `undefined`. Zero source rows — or a `where` that holds for none — insert nothing.
@@ -221,6 +228,14 @@ const minted = await db.badges
 - `with`: CTEs the statement declares at its top level — `WITH <ctes> INSERT INTO … SELECT …`, their
   parameters first. The source, the map's expressions and `where` read them by name. This is how a
   data-modifying CTE feeds the insert (see below).
+- `onConflictDoNothing: true` (1.0.29): `INSERT … SELECT … [WHERE …] ON CONFLICT DO NOTHING [RETURNING …]` — a
+  source row whose key a unique index of the table already holds (the primary key, a composite, a partial
+  one; a row the statement inserted before it; a row a concurrent transaction inserts — the statement waits for
+  it and skips the row once it commits) is skipped instead of failing the statement with 23505. RETURNING
+  yields the inserted rows only. It compiles into `toStatement()` too. A `where: src => notExists(…)` guard is
+  not the same: it judges the statement's snapshot, so a row a concurrent transaction inserts passes it and
+  then collides (23505). As with `insertBulk`'s option, a row ON CONFLICT skips has already drawn its serial
+  value.
 
 ### One statement: a bulk insert feeding another insert
 
@@ -265,7 +280,10 @@ await db.discountAuditLog.insertFrom(
   automatic chunk under PostgreSQL's 65 535-parameter limit) are refused, as are zero rows and a navigation
   or collection in the selector. Compile larger sets in batches.
 - A data-modifying CTE the source reads but `with` does not declare is refused with a message naming the
-  option; `insertFrom(..., { with: [dmlCte] }).toStatement()` is refused (it would nest the DML CTE).
+  option. Compiled with `toStatement()`, the statement is a CTE's body: a data-modifying CTE it reads — through
+  its source, its `where`, its `with` — is read by name, and every statement declaring the CTE built over it
+  declares that one first (1.0.29 — it was refused; see
+  [dependent data-modifying CTEs](./cte-guide.md#dependent-data-modifying-ctes-and-aftermutation)).
 
 ## Update Operations
 
@@ -635,6 +653,32 @@ if (batch.getAffectedCount(key!) !== rows.length) { /* some candidates were refu
   the leg's own rows, and it is not a cross-transaction arbiter — serialize concurrent writers first
   (an advisory lock, a row lock).
 - Not combinable with `onConflictDoNothing` / `overridingSystemValue`.
+
+## Reading Back What an Insert Leg Inserted (`returning`)
+
+`MutationBatch.addInsertBulk(table, rows, id, { returning: ['id', 'label'] })` reads back the rows the leg
+inserted — generated keys, defaults — in the batch's ONE statement; `batch.getLegRows(id)` returns them after
+`executeBatch()`. The contract is the upsert leg's `returning`: raw JSON values (a json_agg readback, no
+`fromDriver` pass — a numeric as a JSON number, a timestamp as its JSON text, a mapped column as its stored
+value), in no particular order, and only the rows inserted: a row `onConflictDoNothing` skipped or the
+`rowGuard` blocked is not among them. A leg registered without `returning` still throws on `getLegRows`; an
+unknown column is refused when the leg registers.
+
+```typescript
+const batch = new MutationBatch();
+batch.addInsertBulk(db.parcels, newParcels, 'parcels', { onConflictDoNothing: true, returning: ['id', 'route', 'label'] });
+batch.addBulkUpdate(db.routes, touchedRoutes, 'routes');
+await batch.executeBatch();
+track(batch.getLegRows('parcels'));   // [{ id: 41, route: 7, label: 'P-1' }, …]
+```
+
+**The statement's parameters.** Each leg is checked against its own budget when it registers; the batch's
+statement binds the SUM of its legs' parameters, which `batch.parameterCount` reports. `executeBatch()` refuses
+a statement over 65 535 parameters (PostgreSQL's limit — or the client's own when lower,
+`DatabaseClient.maxParameters()`: PGlite takes 32 767) before sending anything:
+`MutationBatch: the statement binds 70000 parameters — over PostgreSQL's 65 535: execute some of its legs in
+another batch ("a": 35000, "b": 35000)`. A caller that registers a leg only when it fits checks
+`parameterCount` first.
 
 ## Bulk Update with SET Expressions (`set` / `where`)
 

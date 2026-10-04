@@ -80,6 +80,13 @@ FROM users
 WHERE age > (SELECT AVG(age) FROM users)
 ```
 
+**How a projected scalar subquery reads.** One COLUMN — `.select(u => u.code)` or `.select(u => ({ code: u.code }))`,
+of a table, a navigation, a CTE, a set, a grouped query's key or MIN / MAX, a union's first leg — reads like that
+column (1.0.29): through its mapper, or as a value of its SQL type, so a text column's digits-only `'0042'` stays
+the string (it used to read as the number 42) while a numeric column reads as a number, as before. One aggregate
+reads like the aggregate; an expression reads raw (a numeric-looking string becomes a number) — type it with
+`.withReadType()` / `.mapWith()`.
+
 ### Array Subqueries
 
 Used for IN/NOT IN clauses:

@@ -239,6 +239,16 @@ export abstract class DatabaseClient {
   }
 
   /**
+   * The most parameters one statement may bind through this client: 65 535 — PostgreSQL's protocol counts
+   * them in an unsigned 16-bit field. PGlite counts them in a SIGNED one: 32 767 (more desynchronized its
+   * session — that statement and the next ones returned no rows; {@link PGliteClient} refuses them). A batch
+   * that fuses statements (MutationBatch) refuses a statement over it before sending anything.
+   */
+  maxParameters(): number {
+    return 65535;
+  }
+
+  /**
    * The value this client delivers, standalone, for a result column of the type `oid` whose PostgreSQL
    * TEXT form is `text` — through the parser its driver is configured with (the driver's defaults, or
    * the application's own). A QueryBatch sends a value its JSON envelope cannot carry as the driver
@@ -364,6 +374,10 @@ export class TransactionalClient extends DatabaseClient {
 
   losesNumericZeroScale(): boolean {
     return this.parentClient.losesNumericZeroScale();
+  }
+
+  maxParameters(): number {
+    return this.parentClient.maxParameters();
   }
 
   parseTypedText(oid: number, text: string, read?: TypedTextRead): unknown {

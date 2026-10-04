@@ -125,6 +125,37 @@ await db.selectFromSet(jsonbArrayElements<{ a: number }>([{ a: 1 }, { a: 2 }])).
 // → [{ a: 1 }, { a: 2 }]
 ```
 
+## `unnestRows(table, rows, columns?)` / `fromRows(table, rows, { columns?, alias? })` — typed rows
+
+JS rows as a set, typed by a TABLE's columns (1.0.29): ONE array parameter per column, every cell bound through
+its column's mapper — `unnest(CAST($1 AS varchar[]), CAST($2 AS integer[]), CAST($3 AS numeric(8, 2)[]), …) AS
+"rows"("code", "route", "weight", …)`. The statement's text does not depend on the number of rows (it can be
+prepared), zero rows are a legal empty set (never an empty `VALUES`), and the row reads — and compares, in a
+condition — through the columns' mappers (`eq(r.tier, 'gold')` binds the mapped value).
+
+```typescript
+// insert the rows a request sends — the same statement text for 1 row and 500
+await db.shipments.insertFrom(
+  fromRows(db.shipments, rows, { columns: ['code', 'route', 'tier'] }).asSubquery('table'),
+  src => ({ code: src.code, route: src.route, tier: src.tier }),
+  { onConflictDoNothing: true },
+);
+
+// delete what a list no longer holds — a set a notExists correlates to, in a data-modifying CTE too
+db.shipments.where(s => notExists(fromRows(db.shipments, keep, { columns: ['code'], alias: 'k' })
+  .where(k => eq(k.code, s.code)).select(() => ({ one: literal(1) })).asSubquery())).delete()
+```
+
+- `columns`: the set's columns, in this order — by default the columns any row holds (every column for no rows),
+  in the table's order. Give them to keep the text the same whatever the rows hold. A row without a value for a
+  column holds NULL there (not the column's default).
+- Cells bind as the drivers bind a value of the column: a Date in local time with its offset (a `timestamp` stores
+  the wall time), a json value as its JSON text, a numeric column's precision and scale applied. An array column —
+  which `unnest` would flatten — rides as the text of its array literal and is cast back:
+  `(SELECT "rows"."code", CAST("rows"."tags" AS integer[]) AS "tags" FROM unnest(…) AS "rows"("code", "tags")) AS "rows"`.
+- `unnestRows()` is the set itself (`db.selectFromSet()`, `crossJoinLateral()`); `fromRows()` is
+  `fromSet(unnestRows(…), alias)`, the alias `"rows"` by default. A column the table does not have is refused.
+
 ## `crossJoinLateral(source, selector, alias)` — a set per row of an entity query
 
 ```typescript

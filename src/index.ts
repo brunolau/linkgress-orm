@@ -359,6 +359,7 @@ export {
   DbCte,
   DbCteBuilder,
   isCte,
+  afterMutation,
 } from './query/cte-builder';
 
 export type {
@@ -371,6 +372,7 @@ export {
   CteRootQueryBuilder,
   CteJoinedQueryBuilder,
   onTrue,
+  onFalse,
 } from './query/cte-root-query';
 
 export type {
@@ -714,6 +716,8 @@ export {
   jsonbArrayElements,
   jsonbEachText,
   fromSet,
+  unnestRows,
+  fromRows,
 } from './query/set-returning';
 
 export type {

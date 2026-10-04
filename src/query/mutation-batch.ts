@@ -1,5 +1,6 @@
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { ColumnRow } from '../entity/column-row';
+import type { ExtractDbColumnKeys } from '../entity/db-column';
 import type { DbEntityTable } from '../entity/db-context';
 import type { DbEntity } from '../entity/entity-base';
 import type { Condition } from './conditions';
@@ -28,6 +29,12 @@ export interface InsertLegOptions<TEntity = any> {
   overridingSystemValue?: boolean;
   onConflictDoNothing?: boolean;
   rowGuard?: RowGuard<TEntity>;
+  /**
+   * The columns (property names) of the rows the leg inserts, read back by {@link MutationBatch.getLegRows}
+   * after the batch ran — raw JSON values, as an upsert leg's `returning`: only the rows inserted (not the
+   * ones ON CONFLICT DO NOTHING skipped, nor the ones the row guard blocked), in no particular order.
+   */
+  returning?: ReadonlyArray<0 extends (1 & TEntity) ? string : ExtractDbColumnKeys<TEntity>>;
 }
 
 /**
@@ -199,6 +206,12 @@ export class MutationBatch {
    * lock taken earlier in the same transaction) — the blocked transaction's
    * later statement then re-snapshots and the guard is effective. Mutually
    * exclusive with `onConflictDoNothing` / `overridingSystemValue`.
+   *
+   * `options.returning` (prop names) reads back the rows the leg inserted —
+   * generated keys, defaults — through {@link getLegRows}, in the batch's one
+   * statement: raw JSON values (json_agg readback, no fromDriver pass), the
+   * inserted rows only (a conflict skipped or a guard blocked is not among them),
+   * in no particular order.
    */
   addInsertBulk<TEntity extends DbEntity = any>(
     table: DbEntityTable<TEntity> | MutationCapableTable,
@@ -233,6 +246,9 @@ export class MutationBatch {
       throw new Error(`MutationBatch: leg "${id}" rowGuard contains a bare $N placeholder — guards take no parameters (values must come from v."col" or joins), and cross-leg renumbering would silently rebind it`);
     }
 
+    // Resolved first: an unknown column registers nothing
+    const returningCols = leg._resolveColumnDbNames([...(options?.returning ?? [])] as string[]);
+
     const built = rowGuard != null
       ? leg._buildGuardedInsertBulkStatement(rows, rowGuard as RowGuard, `MutationBatch: leg "${id}" rowGuard`)
       : leg._buildInsertBulkStatement(rows, options?.overridingSystemValue, options?.onConflictDoNothing);
@@ -241,7 +257,15 @@ export class MutationBatch {
       return null;
     }
 
-    this.legs.push({ id, sql: built.sql, params: built.params, client: leg._getClient(), executor: leg._getExecutor() });
+    this.legs.push({
+      id,
+      sql: built.sql,
+      params: built.params,
+      client: leg._getClient(),
+      executor: leg._getExecutor(),
+      returningSql: returningCols.length > 0 ? returningCols.map(c => `"${c.dbName}" AS "${c.prop}"`).join(', ') : undefined,
+      readRows: returningCols.length > 0,
+    });
 
     return { id };
   }
@@ -512,9 +536,21 @@ export class MutationBatch {
   }
 
   /**
+   * The parameters the batch's statement binds: every registered leg's. A statement binds at most 65 535
+   * (PostgreSQL's protocol limit; a client may take fewer, see `DatabaseClient.maxParameters()`) —
+   * {@link executeBatch} refuses more before sending anything; a caller that registers a leg only when it fits
+   * checks this first (each leg's own budget is checked when it registers).
+   */
+  get parameterCount(): number {
+    return this.legs.reduce((count, leg) => count + leg.params.length, 0);
+  }
+
+  /**
    * Execute every registered leg as ONE statement and store the per-leg
    * affected counts. A batch with zero legs resolves without touching the
-   * database. One-shot: a batch that already executed throws.
+   * database. One-shot: a batch that already executed throws. A statement
+   * binding more than 65 535 parameters (see {@link parameterCount}) is
+   * refused before it is sent — nothing runs.
    */
   async executeBatch(): Promise<void> {
     if (this.counts) {
@@ -529,6 +565,17 @@ export class MutationBatch {
     }
 
     const first = this.legs[0];
+    const parameterCount = this.parameterCount;
+    // PostgreSQL's limit — or the client's own, when lower (PGlite: 32 767)
+    const limit = Math.min(POSTGRES_MAX_PARAMS, typeof first.client.maxParameters === 'function' ? first.client.maxParameters() : POSTGRES_MAX_PARAMS);
+
+    if (parameterCount > limit) {
+      const over = limit === POSTGRES_MAX_PARAMS ? "PostgreSQL's 65 535" : `the ${limit.toLocaleString('en-US').replace(/,/g, ' ')} this client takes`;
+      throw new Error(
+        `MutationBatch: the statement binds ${parameterCount} parameters — over ${over}: execute some of its legs in another batch `
+        + `(${this.legs.map(leg => `"${leg.id}": ${leg.params.length}`).join(', ')})`
+      );
+    }
 
     for (const leg of this.legs) {
       if (leg.client !== first.client || leg.executor !== first.executor) {
@@ -610,9 +657,10 @@ export class MutationBatch {
   }
 
   /**
-   * The RETURNING rows of a leg registered with `returning` (currently the
-   * upsert leg). Raw JSON values — json_agg readback, no fromDriver pass.
-   * Only valid after executeBatch(); throws for legs without returning.
+   * The RETURNING rows of a leg registered with `returning` — an insert leg,
+   * an upsert leg — or `parentReturning` (an insertBulkWithChildren leg). Raw
+   * JSON values — json_agg readback, no fromDriver pass. Only valid after
+   * executeBatch(); throws for legs without returning.
    */
   getLegRows(key: MutationBatchKey | string): Record<string, unknown>[] {
     if (!this.rows) {

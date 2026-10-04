@@ -1218,6 +1218,9 @@ export class Executor implements SubqueryRunner {
   private executeJoin(plan: QueryPlan, ctx: EvalCtx, j: JoinNode, pushable: Conjunct[]): Row[] {
     const leftRels = joinTreeRelids(j.larg);
     const rightRels = joinTreeRelids(j.rarg);
+    if (j.joinType === 'FULL') {
+      this.assertFullJoinPlannable(j, pushable, leftRels, rightRels);
+    }
     const joinType = this.reducedJoinType(j, pushable, rightRels);
     // push filters into children when semantically safe
     const leftPush = pushable.filter((c) => (joinType === 'INNER' || joinType === 'CROSS' || joinType === 'LEFT') && [...c.relids].every((r) => leftRels.has(r)));
@@ -1564,6 +1567,54 @@ export class Executor implements SubqueryRunner {
     }
     matches.sort((a, b) => a.seq - b.seq || a.ri - b.ri);
     return matches.map((m) => m.row);
+  }
+
+  /**
+   * PostgreSQL plans a FULL JOIN as a merge join — every join clause a mergejoinable equality between the two
+   * inputs, or a constant — or as a hash join — at least one hashjoinable equality between the two inputs (any
+   * other clause is then checked per pair); a nested loop cannot do a full join. Neither possible: "FULL JOIN is
+   * only supported with merge-joinable or hash-joinable join conditions" (0A000) — `ON a.k IS NOT DISTINCT FROM
+   * b.k`, an inequality, an OR, a clause over one input alone, a volatile equality. A WHERE that rejects the NULLs
+   * one input's rows would carry turns the FULL JOIN into a LEFT, RIGHT or INNER join first (reduce_outer_joins),
+   * which any condition drives. (The check runs when the join runs: a query level PostgreSQL never plans — an
+   * unreferenced CTE — is never refused, as there.)
+   */
+  private assertFullJoinPlannable(j: JoinNode, pushable: Conjunct[], leftRels: Set<number>, rightRels: Set<number>): void {
+    const catalog = this.st.catalog;
+    const isStrict = (oid: number) => catalog.getProc(oid)?.strict ?? false;
+    for (const c of pushable) {
+      if (c.volatile) {
+        continue;
+      }
+      for (const r of nonNullableRels(c.expr, isStrict)) {
+        if (leftRels.has(r) || rightRels.has(r)) {
+          return;
+        }
+      }
+    }
+    const within = (s: Set<number>, rels: Set<number>) => s.size > 0 && [...s].every((r) => rels.has(r));
+    let equality = false;
+    let other = false;
+    for (const e of splitConjuncts(j.quals)) {
+      const relids = exprRelids(e);
+      const volatile = containsVolatile(e);
+      if (e.k === 'const' || (relids.size === 0 && !volatile)) {
+        // a constant (ON TRUE, ON FALSE, an expression that folds to one)
+        continue;
+      }
+      if (e.k === 'op' && e.opName === '=' && e.args.length === 2 && !volatile) {
+        const l = exprRelids(e.args[0]);
+        const r = exprRelids(e.args[1]);
+        if ((within(l, leftRels) && within(r, rightRels)) || (within(l, rightRels) && within(r, leftRels))) {
+          equality = true;
+          continue;
+        }
+      }
+      other = true;
+    }
+    if (other && !equality) {
+      throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'FULL JOIN is only supported with merge-joinable or hash-joinable join conditions');
+    }
   }
 
   /**

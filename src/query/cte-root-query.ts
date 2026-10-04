@@ -12,7 +12,7 @@ import {
   sql,
 } from './conditions';
 import { assertExplicitAlias } from './aliased-scope';
-import { assertStatementLevelCtes, cteBodyAt, DbCte, declareStatementCtes, isStatementCte, stampChainId } from './cte-builder';
+import { assertStatementLevelCtes, cteBodyAt, DbCte, declareStatementCtes, isStatementCte, stampChainId, withCteDependencies } from './cte-builder';
 import {
   BIGINT_LITERAL_READ,
   aggregatedItemReads,
@@ -27,9 +27,11 @@ import {
 } from './query-builder';
 import { parseOrderBy } from './query-utils';
 import { Subquery } from './subquery';
-import { projectedValueRoot, selectorProjectingConditions } from './sql-functions';
+import { projectedValueRoot, scalarSubqueryRead, selectorProjectingConditions } from './sql-functions';
 import { renderProjectedFragment } from './set-returning';
 import { forResultSet, valuesAt } from './shared-values';
+import { UnionQueryBuilder } from './union-builder';
+import type { UnionLegBuilder } from './union-builder';
 
 /**
  * Join types supported when a CTE is the FROM root.
@@ -85,6 +87,19 @@ const CTE_JOIN_SQL: Record<CteJoinType, string> = {
  */
 export function onTrue(): Condition {
   return sql<boolean>`TRUE`;
+}
+
+/**
+ * A constant `FALSE` join predicate: `… FULL OUTER JOIN … ON FALSE` keeps every row of both sides and pairs
+ * none of them — two relations stacked side by side, each row's other side NULL. A literal FALSE, never a bound
+ * boolean: PostgreSQL plans a FULL JOIN only on merge- or hash-joinable conditions, which a constant is (a
+ * linear Merge Full Join), and a parameter is not.
+ *
+ * @example
+ * db.selectFromCte(closed.cte).fullOuterJoin(opened.cte, onFalse()).select((c, o) => ({ closedId: c.id, openedId: o.id }))
+ */
+export function onFalse(): Condition {
+  return sql<boolean>`FALSE`;
 }
 
 /**
@@ -525,7 +540,8 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
    * builder, nor in the order it created them.
    */
   private collectCtes(): DbCte<any>[] {
-    return [this.rootCte, ...this.joinSteps.map(step => step.cte)];
+    // ... each after the data-modifying CTEs it reads (see withCteDependencies)
+    return withCteDependencies([this.rootCte, ...this.joinSteps.map(step => step.cte)]);
   }
 
   /**
@@ -744,8 +760,90 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
       this.buildNestedSql(outerContext);
 
     const selectionMetadata = mode === 'table' ? this.evaluateSelection() : undefined;
+    // A scalar subquery of one column reads like that column (see scalarSubqueryRead)
+    const scalarRead = mode === 'scalar' ? scalarSubqueryRead(this.evaluateSelector()) : undefined;
 
-    return new Subquery(sqlBuilder, mode, selectionMetadata, this.outerFieldRefs()) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, this.outerFieldRefs(), scalarRead) as any;
+  }
+
+  /**
+   * `(this) UNION (other)` — the rows of both, without duplicates; `other` a CTE-rooted query, an entity
+   * query or a set query projecting the same columns. Every leg's CTEs are declared ONCE at the top of the
+   * statement — a data-modifying one after the CTEs it reads — and every leg reads them by name. The union
+   * reads each row the way this FIRST leg's projection does (a column through its own mapper, a literal from
+   * the row: a leg's tag tells its rows apart). See {@link UnionQueryBuilder}.
+   *
+   * @example
+   * // the rows two data-modifying CTEs returned, tagged by leg, in ONE statement
+   * const rows = await db.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id }))
+   *   .unionAll(db.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id })))
+   *   .toList();
+   */
+  union(query: UnionLegBuilder): UnionQueryBuilder<TSelection> {
+    return new UnionQueryBuilder<TSelection>(this, this.client, this.executor).union(query);
+  }
+
+  /** `(this) UNION ALL (other)` — see {@link union}. */
+  unionAll(query: UnionLegBuilder): UnionQueryBuilder<TSelection> {
+    return new UnionQueryBuilder<TSelection>(this, this.client, this.executor).unionAll(query);
+  }
+
+  /** @internal Metadata of the last `buildUnionSql` (the union reads its rows through its first leg). */
+  private unionMetadata?: { nestedPaths: Set<string>; selectionResult: any };
+
+  /**
+   * @internal UnionLegBuilder — this query as a union leg (in parentheses, its ORDER BY / LIMIT kept): its CTEs
+   * are declared by the union (`_getAttachedCtes`), so it reads them by name.
+   */
+  buildUnionSql(context: SqlBuildContext): string {
+    this.unionMetadata = { nestedPaths: new Set(), selectionResult: this.evaluateSelection() };
+    return this.buildNestedSql(context);
+  }
+
+  /** @internal UnionLegBuilder */
+  _consumeUnionMetadata(): { nestedPaths: Set<string>; selectionResult: any } | undefined {
+    const metadata = this.unionMetadata;
+    this.unionMetadata = undefined;
+    return metadata;
+  }
+
+  /** @internal UnionLegBuilder — a union's rows, read the way this first leg reads its own; a literal from the row. */
+  _applyUnionPostProcessing(rows: any[], metadata: { nestedPaths: Set<string>; selectionResult: any }): any[] {
+    const read = transformRows(rows, metadata.selectionResult, true);
+
+    return this.selectsSingleValue() ? read.map(row => row[SCALAR_COLUMN]) : read;
+  }
+
+  /** @internal UnionLegBuilder — the CTEs this leg reads, for the union to declare at the top of the statement. */
+  _getAttachedCtes(): DbCte<any>[] {
+    return this.collectCtes();
+  }
+
+  /** @internal UnionLegBuilder */
+  _getOuterFieldRefs(): FieldRef[] {
+    return this.outerFieldRefs();
+  }
+
+  /** @internal UnionLegBuilder — the projection the union's columns read through when this leg is the first. */
+  _unionSelection(): Record<string, any> {
+    return this.evaluateSelection();
+  }
+
+  /**
+   * @internal This query as a CTE's body (`DbCteBuilder.with()`): self-contained — the CTEs it reads declared
+   * inside it, a data-modifying one read by name (the statement declaring the CTE declares it) — numbered from
+   * the builder's offset.
+   */
+  _buildCteBody(queryContext: { paramCounter: number; allParams: unknown[]; hoistedCteNames?: Set<string> }): { sql: string; selection: Record<string, any> } {
+    const context: SqlBuildContext = {
+      paramCounter: queryContext.paramCounter,
+      params: queryContext.allParams as any[],
+      hoistedCteNames: queryContext.hoistedCteNames,
+    };
+    const sqlText = this.buildNestedSql(context);
+    queryContext.paramCounter = context.paramCounter;
+
+    return { sql: sqlText, selection: this.evaluateSelection() };
   }
 
   /**
@@ -923,7 +1021,12 @@ interface CteFieldRead {
   itemReads?: Record<string, any>;
 }
 
-function compileRead(key: string, rowKey: string, value: any, rows: readonly any[]): CteFieldRead {
+function compileRead(key: string, rowKey: string, value: any, rows: readonly any[], literalsFromRows = false): CteFieldRead {
+  if (literalsFromRows && value !== undefined && isScalarLiteralSelection(value)) {
+    // A union's leg tags its rows with its own literal: read from the row, as the type it was rendered
+    return literalFromRow(key, rowKey, value, rows);
+  }
+
   if (value === undefined || isScalarLiteralSelection(value) || (Array.isArray(value) && !holdsSqlValue(value))) {
     // A literal reads back as itself (a parameter of unknown type comes back as text)
     return { key, rowKey, kind: 'literal', value };
@@ -936,13 +1039,24 @@ function compileRead(key: string, rowKey: string, value: any, rows: readonly any
       key,
       rowKey,
       kind: 'nested',
-      children: Object.keys(value).map(childKey => compileRead(childKey, `${prefix}__${childKey}`, value[childKey], rows)),
+      children: Object.keys(value).map(childKey => compileRead(childKey, `${prefix}__${childKey}`, value[childKey], rows, literalsFromRows)),
     };
   }
 
   if (value.__isAggregationArray) {
     // A withAggregation CTE's items, through the aggregated query's own mappers
     return { key, rowKey, kind: 'items', itemReads: aggregatedItemReads(value.__innerSelectionMetadata, () => valuesAt(rows, [rowKey])) };
+  }
+
+  if (value instanceof Subquery) {
+    // A scalar subquery of one column reads like the column, of one aggregate like the aggregate (see
+    // scalarSubqueryRead); any other, as a raw value
+    const read = value.getScalarRead();
+    const mapper = fromDriverMapper(read?.mapper);
+
+    return mapper
+      ? { key, rowKey, kind: 'mapper', mapper: forResultSet(mapper, rows.length) }
+      : { key, rowKey, kind: 'value', coerce: coercesNumericText(read?.readType) };
   }
 
   const literalColumn = value.__cteKind === 'literal';
@@ -960,6 +1074,23 @@ function compileRead(key: string, rowKey: string, value: any, rows: readonly any
   // (withReadType)
   const sqlType = value.__sqlType ?? (typeof value.getReadType === 'function' ? value.getReadType() : undefined);
   return { key, rowKey, kind: 'value', coerce: coercesNumericText(sqlType) };
+}
+
+/**
+ * A literal a UNION leg projected, read from the row (each leg's own): the type it rendered as comes back —
+ * a bigint as the bigint it was, a number from a numeric string, a boolean from its text when the union's
+ * column is text; NULL as null.
+ */
+function literalFromRow(key: string, rowKey: string, literal: unknown, rows: readonly any[]): CteFieldRead {
+  if (typeof literal === 'bigint') {
+    return { key, rowKey, kind: 'mapper', mapper: forResultSet(BIGINT_LITERAL_READ as any, rows.length) };
+  }
+
+  if (typeof literal === 'boolean') {
+    return { key, rowKey, kind: 'mapper', mapper: { fromDriver: (v: unknown) => (typeof v === 'string' ? v === 't' || v === 'true' : v) } };
+  }
+
+  return { key, rowKey, kind: 'value', coerce: typeof literal === 'number' };
 }
 
 function readValue(read: CteFieldRead, row: any): any {
@@ -1000,9 +1131,9 @@ function readValue(read: CteFieldRead, row: any): any {
  * within them, see forResultSet).
  * @internal
  */
-export function transformRows(rows: any[], selection: Record<string, any>): any[] {
+export function transformRows(rows: any[], selection: Record<string, any>, literalsFromRows = false): any[] {
   // Pre-analyze each selected field once.
-  const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key], rows));
+  const reads = Object.keys(selection).map(key => compileRead(key, key, selection[key], rows, literalsFromRows));
 
   return rows.map(row => {
     const out: any = {};

@@ -173,6 +173,11 @@ export class Session implements ExecSession, AnalyzerEnv {
    * sequence's currval, looked up when it is called. setval() never sets it.
    */
   private lastUsedSeqOid: number | null = null;
+
+  /** The snapshot the running top-level statement reads with (see WaitForTransaction.keepSnapshot). */
+  private statementSnapshot: Snapshot | undefined;
+  /** The snapshot a statement restarted after a wait reads with, instead of a new one. */
+  private restartSnapshot: Snapshot | undefined;
   /** currval() per sequence OID: set by nextval() and by setval(…, true), forgotten by DISCARD SEQUENCES / ALL. */
   readonly currvals = new Map<number, bigint>();
   readonly typeOps: TypeOps;
@@ -1802,7 +1807,9 @@ export class Session implements ExecSession, AnalyzerEnv {
           if (e instanceof WaitForTransaction) {
             undo.rollback();
             txn.cid = cidBefore;
+            const snapshot = this.statementSnapshot;
             await this.waitForXid(e.xid, started, timeoutSetting);
+            this.restartSnapshot = e.keepSnapshot ? snapshot : undefined;
             continue;
           }
           if (e instanceof SleepRequest) {
@@ -2110,7 +2117,12 @@ export class Session implements ExecSession, AnalyzerEnv {
       });
     }
     this.checkReadOnlyQuery(query, COMMAND_TAGS[stmt.kind] ?? 'SELECT');
-    const snapshot = this.takeSnapshot();
+    // A top-level statement restarted after a unique check waited reads its first snapshot (see WaitForTransaction)
+    const snapshot = parentSt === null && this.restartSnapshot !== undefined ? this.restartSnapshot : this.takeSnapshot();
+    if (parentSt === null) {
+      this.restartSnapshot = undefined;
+      this.statementSnapshot = snapshot;
+    }
     const st = new StatementState(this, this.catalog(), typedParams, an.paramTypes, snapshot);
     st.cid = txn.cid;
     st.undo = undo;

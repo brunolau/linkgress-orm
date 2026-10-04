@@ -1984,12 +1984,18 @@ export function holdsAggregateFragment(value: unknown, depth = 0): boolean {
 
 /**
  * How a SCALAR subquery's value reads, from its selection (the value itself, or an object of
- * exactly one value): an aggregate fragment through its mapper (`.as()` / `.mapWith()` of one
- * included), a read-typed fragment as its read type. `undefined` for anything else — a projected
- * scalar subquery otherwise reads raw, as it always did. @internal
+ * exactly one value): a COLUMN like that column — through its own mapper, or as a value of its SQL type
+ * (a text column's digits-only '0042' stays the string, a numeric column's value becomes a number as
+ * before); an aggregate fragment through its mapper (`.as()` / `.mapWith()` of one included), a
+ * read-typed fragment as its read type. `undefined` for anything else — a projected scalar subquery of an
+ * expression reads raw, as it always did. @internal
  */
 export function scalarSubqueryRead(selection: unknown): { mapper?: unknown; readType?: string } | undefined {
   const value = isPlainObject(selection) && Object.keys(selection).length === 1 ? Object.values(selection)[0] : selection;
+
+  if (value !== null && typeof value === 'object' && '__dbColumnName' in value && !(value instanceof WhereConditionBase)) {
+    return columnScalarRead(value as Record<string, any>);
+  }
 
   if (!(value instanceof SqlFragment)) {
     return undefined;
@@ -2003,6 +2009,30 @@ export function scalarSubqueryRead(selection: unknown): { mapper?: unknown; read
   const mapper = value.getMapper();
 
   return mapper !== undefined && projectedValueRoot(value) instanceof AggregateFragment ? { mapper } : undefined;
+}
+
+/**
+ * The read of a scalar subquery projecting ONE column ref — a table's, a navigation's, a CTE's or table
+ * subquery's, a set's: its own mapper when it has one (a set column's "as the driver delivers it" excepted:
+ * that one reads by its type, as before), its SQL type otherwise — the type decides whether a numeric string
+ * becomes a number (see coercesNumericText), so a digits-only text keeps its text and a numeric column reads
+ * as it always did. A literal a CTE body projected reads by its type. `undefined` when the ref carries neither.
+ */
+function columnScalarRead(ref: Record<string, any>): { mapper?: unknown; readType?: string } | undefined {
+  const readType = typeof ref.__sqlType === 'string' ? ref.__sqlType : undefined;
+  // The ref's own mapper, or the one a projection's metadata hands its readers (getMapper); a custom type's
+  // builder resolves to its mapper (as fromDriverMapper does)
+  const declared = ref.__mapper ?? (typeof ref.getMapper === 'function' ? ref.getMapper() : undefined);
+  const resolved = declared != null && typeof declared.getType === 'function' ? declared.getType() : declared;
+  const mapper = ref.__cteKind !== 'literal' && declared !== DRIVER_VALUE_MAPPER && resolved != null && typeof resolved.fromDriver === 'function'
+    ? declared
+    : undefined;
+
+  if (mapper === undefined && readType === undefined) {
+    return undefined;
+  }
+
+  return mapper !== undefined ? { mapper, readType } : { readType };
 }
 
 function aggregate<T>(

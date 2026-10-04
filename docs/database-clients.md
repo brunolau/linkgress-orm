@@ -138,6 +138,12 @@ The `PGliteClient` runs linkgress on [PGlite](https://pglite.dev): the PostgreSQ
 PGlite 0.5) compiled to WebAssembly, running inside your process — Node, Bun, Deno or a browser —
 with no server to install. It suits tests, local-first apps, CLIs and demos.
 
+**At most 32 767 parameters per statement.** PGlite counts a statement's parameters in a signed 16-bit field
+(PostgreSQL: unsigned, 65 535): a statement binding more desynchronized the session — it and the statements after
+it returned no rows. `PGliteClient` refuses one before sending it (1.0.29), and reports the limit through
+`maxParameters()` (`DatabaseClient.maxParameters()`: 65 535 elsewhere), which a `MutationBatch` honours. Bind a
+large list as one array parameter (`eqAny`, `unnest`, `fromRows`) or in smaller chunks.
+
 **Installation:**
 ```bash
 npm install @electric-sql/pglite

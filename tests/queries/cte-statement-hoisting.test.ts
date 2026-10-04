@@ -701,8 +701,14 @@ describe('data-modifying CTEs: typed rows, declared once, refused when nested', 
         refusal
       );
 
-      // A CTE body that carries it
-      expect(() => new DbCteBuilder().with('wrapped', db.users.with(gate.cte).select(u => ({ id: u.id })))).toThrow(refusal);
+      // A CTE body that carries it: the body reads it by name, and every statement that declares the CTE declares
+      // "gate" first (1.0.29: it was refused)
+      const wrapped = new DbCteBuilder().with('wrapped', db.users.with(gate.cte).select(u => ({ id: u.id })));
+      expect(wrapped.cte.dependencies).toEqual([gate.cte]);
+      expect(wrapped.cte.query).not.toContain('"gate" AS (');
+      const reading = db.selectFromCte(wrapped.cte).select(w => ({ id: w.id })).toSql();
+      expect(reading.indexOf('"gate" AS (')).toBeGreaterThan(-1);
+      expect(reading.indexOf('"gate" AS (')).toBeLessThan(reading.indexOf('"wrapped" AS ('));
 
       // Nothing ran
       expect(await db.users.where(u => eq(u.id, users.bob.id)).select(u => u.age).firstOrDefault()).toBe(35);

@@ -25,7 +25,8 @@ import { NavigationPathCache } from './navigation-path-cache';
 import { formatJoinValue, isLiteralKeyPart, buildCollectionCorrelationWhere, buildLiteralOnlyPredicates, NavigationAliasPlan, quoteTableReference, renderLateralNavigationJoin } from './join-utils';
 import type { NavigationPathNode } from './join-utils';
 import {
-  assertStatementLevelCtes, attachReturningSelection, cteDeclarationAt, declareStatementCtes, isStatementCte, NestedDataModifyingCteError, stampChainId,
+  assertStatementLevelCtes, attachReturningSelection, attachStatementDependencies, cteDeclarationAt, CteDependencies, declareStatementCtes,
+  isStatementCte, NestedDataModifyingCteError, stampChainId, withCteDependencies,
 } from './cte-builder';
 import { assertExplicitAlias } from './aliased-scope';
 import { createSetRow, holdsSetReturningValue, lateralSetJoinsSql, lateralSetRefs, renderProjectedFragment, SetReturningFunction } from './set-returning';
@@ -1797,7 +1798,8 @@ export class SelectQueryBuilder<TSelection> {
     this.joinCounter = joinCounter || 0;
     this.isDistinct = isDistinct || false;
     this.schemaRegistry = schemaRegistry;
-    this.ctes = ctes || [];
+    // Each attached CTE after the data-modifying CTEs it reads (see withCteDependencies)
+    this.ctes = withCteDependencies(ctes || []);
     this.collectionStrategy = collectionStrategy;
     this.lateralSets = lateralSets || [];
   }
@@ -1991,8 +1993,10 @@ export class SelectQueryBuilder<TSelection> {
       },
     ];
 
-    if (!this.ctes.some(existing => existing.name === cte.name)) {
-      this.ctes = [...this.ctes, cte as DbCte<any>];
+    for (const attached of withCteDependencies([cte as DbCte<any>])) {
+      if (!this.ctes.some(existing => existing.name === attached.name)) {
+        this.ctes = [...this.ctes, attached];
+      }
     }
 
     if (filter) {
@@ -2104,8 +2108,8 @@ export class SelectQueryBuilder<TSelection> {
    *   .toList();
    */
   with(...ctes: DbCte<any>[]): this {
-    // Add CTEs, avoiding duplicates by name
-    for (const cte of ctes) {
+    // Add CTEs, avoiding duplicates by name — each after the data-modifying CTEs it reads (see withCteDependencies)
+    for (const cte of withCteDependencies(ctes)) {
       if (!this.ctes.some(existing => existing.name === cte.name)) {
         this.ctes.push(cte);
       }
@@ -4801,7 +4805,7 @@ export class SelectQueryBuilder<TSelection> {
    * The WHERE of an UPDATE / DELETE: the joins of its navigations (rendered as `FROM` / `USING`) and
    * its SQL, built under ONE navigation plan so that both name the same aliases.
    */
-  private buildMutationWhere(startParam: number): {
+  private buildMutationWhere(startParam: number, hoistedCteNames?: Set<string>): {
     whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }>;
     whereSql: string;
     whereParams: any[];
@@ -4815,7 +4819,7 @@ export class SelectQueryBuilder<TSelection> {
       const whereJoins: Array<{ alias: string; targetTable: string; targetSchema?: string; foreignKeys: string[]; matches: string[]; isMandatory: boolean; sourceAlias?: string }> = [];
       this.detectAndAddJoinsFromCondition(this.whereCond, whereJoins);
 
-      const { sql, params } = new ConditionBuilder().build(this.whereCond!, startParam);
+      const { sql, params } = new ConditionBuilder().build(this.whereCond!, startParam, undefined, hoistedCteNames);
 
       return { whereJoins, whereSql: sql, whereParams: params };
     });
@@ -4937,7 +4941,9 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('Delete requires a WHERE condition. Use where() before delete().');
       }
 
-      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(1);
+      // A data-modifying CTE the statement reads is declared by the statement executing it (see CteDependencies)
+      const dependencies = new CteDependencies();
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(1, dependencies.scope());
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
 
@@ -4976,8 +4982,8 @@ export class SelectQueryBuilder<TSelection> {
         sql += ` RETURNING ${returningClause.sql}`;
       }
 
-      // How each RETURNING column reads — for a data-modifying CTE over the statement (withMutation)
-      return attachReturningSelection({ sql, params: whereParams }, returningClause?.selection);
+      // How each RETURNING column reads, and what it reads — for a data-modifying CTE over the statement (withMutation)
+      return attachStatementDependencies(attachReturningSelection({ sql, params: whereParams }, returningClause?.selection), dependencies);
     };
 
     return {
@@ -5198,6 +5204,9 @@ export class SelectQueryBuilder<TSelection> {
         ? (data as (row: TSelection) => Partial<Record<string, any>>)(queryBuilder._createMockRow() as TSelection)
         : data;
 
+      // A data-modifying CTE the statement reads is declared by the statement executing it (see CteDependencies)
+      const dependencies = new CteDependencies();
+      const hoistedCteNames = dependencies.scope();
       const setClauses: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
@@ -5211,6 +5220,7 @@ export class SelectQueryBuilder<TSelection> {
             const sqlBuildContext: SqlBuildContext = {
               paramCounter: paramIndex,
               params: values,
+              hoistedCteNames,
             };
             const fragmentSql = value.buildSql(sqlBuildContext);
             paramIndex = sqlBuildContext.paramCounter;
@@ -5227,7 +5237,7 @@ export class SelectQueryBuilder<TSelection> {
         throw new Error('No valid columns to update');
       }
 
-      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(paramIndex);
+      const { whereJoins, whereSql, whereParams } = queryBuilder.buildMutationWhere(paramIndex, hoistedCteNames);
       values.push(...whereParams);
 
       const qualifiedTableName = queryBuilder.getQualifiedTableName(queryBuilder.schema.name, queryBuilder.schema.schema);
@@ -5267,8 +5277,8 @@ export class SelectQueryBuilder<TSelection> {
         sql += ` RETURNING ${returningClause.sql}`;
       }
 
-      // How each RETURNING column reads — for a data-modifying CTE over the statement (withMutation)
-      return attachReturningSelection({ sql, params: values }, returningClause?.selection);
+      // How each RETURNING column reads, and what it reads — for a data-modifying CTE over the statement (withMutation)
+      return attachStatementDependencies(attachReturningSelection({ sql, params: values }, returningClause?.selection), dependencies);
     };
 
     return {
