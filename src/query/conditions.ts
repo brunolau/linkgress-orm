@@ -283,6 +283,29 @@ export function getValueMapper(value: any): any | undefined {
   return undefined;
 }
 
+/**
+ * The marker a column ref of a COLLECTION'S ITEM carries its column's mapper under (see
+ * CollectionQueryBuilder.buildMockItemDescriptors). Deliberately not `__mapper`: that one is inherited by
+ * every helper that takes the operand's mapper for its own — `coalesce`, arithmetic, GREATEST / LEAST / NULLIF,
+ * CASE, an aggregate fragment — which would bind their plain operands through `toDriver` and read their result
+ * through `fromDriver`. An expression over an item column binds and reads as it always did; only a DIRECT
+ * comparison of the column with a value ({@link getComparisonMapper}) and a collection's min() / max() of the
+ * bare column read this marker.
+ * @internal
+ */
+export const ITEM_COLUMN_MAPPER = '__itemMapper';
+
+/**
+ * The mapper a plain value compared DIRECTLY with `field` is bound through — `eq` / `ne` / `gt` / `gte` / `lt` /
+ * `lte` / `like` …, `between`, `inArray` / `notInArray`, `eqAny` / `neAll` and their `…Opt` forms: the field's
+ * own ({@link getValueMapper}), or — for a column of a collection's item — its column's
+ * ({@link ITEM_COLUMN_MAPPER}).
+ * @internal
+ */
+export function getComparisonMapper(field: any): any | undefined {
+  return getValueMapper(field) ?? (field && typeof field === 'object' ? field[ITEM_COLUMN_MAPPER] : undefined);
+}
+
 /** `mapper.toDriver(value)` when the mapper has one, else the value unchanged. @internal */
 export function applyToDriverMapper(value: any, mapper: any): any {
   return mapper && typeof mapper.toDriver === 'function'
@@ -436,7 +459,7 @@ export abstract class WhereConditionBase {
     } else {
       // Value is a literal, use a parameter
       // Apply toDriver mapper if the source field has one
-      const mappedValue = applyToDriverMapper(value, getValueMapper(sourceField));
+      const mappedValue = applyToDriverMapper(value, getComparisonMapper(sourceField));
       context.params.push(mappedValue);
       return `$${context.paramCounter++}`;
     }
@@ -722,7 +745,7 @@ export class InComparison<V = any> extends WhereComparisonBase<V> {
     const fieldName = this.getDbColumnName(this.field, context);
 
     // Apply toDriver mapper if the field has one
-    const mapper = getValueMapper(this.field);
+    const mapper = getComparisonMapper(this.field);
     const mappedValues = mapper
       ? this.values.map(v => applyToDriverMapper(v, mapper))
       : this.values;
@@ -758,7 +781,7 @@ export class NotInComparison<V = any> extends WhereComparisonBase<V> {
     const fieldName = this.getDbColumnName(this.field, context);
 
     // Apply toDriver mapper if the field has one
-    const mapper = getValueMapper(this.field);
+    const mapper = getComparisonMapper(this.field);
     const mappedValues = mapper
       ? this.values.map(v => applyToDriverMapper(v, mapper))
       : this.values;
@@ -1082,7 +1105,7 @@ function arrayElementCast(column: unknown): string {
  * applying the column's `toDriver` mapper per element first (as `inArray` does).
  */
 function toArrayParameter<V>(column: unknown, values: readonly V[]): string {
-  const mapper = getValueMapper(column);
+  const mapper = getComparisonMapper(column);
   return toPgArrayLiteral(
     mapper ? values.map(value => applyToDriverMapper(value, mapper)) : values
   );

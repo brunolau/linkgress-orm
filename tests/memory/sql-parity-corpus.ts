@@ -148,6 +148,12 @@ export const sqlParityCorpus: ParityCase[] = [
       "SELECT (ARRAY[1,2,3])[2], (ARRAY[1,2,3])[2:3], (ARRAY[1,2,3])[:2], (ARRAY[[1,2],[3,4]])[2][1], (ARRAY[[1,2],[3,4]])[1:1], (ARRAY[1,2,3])[5], ('{1,2,3}'::int[])[0]",
       'SELECT array_length(ARRAY[1,2,3], 1), cardinality(ARRAY[[1,2],[3,4]]), array_dims(ARRAY[[1,2],[3,4]]), array_lower(ARRAY[1], 1), array_upper(ARRAY[]::int[], 1), array_ndims(ARRAY[[1]])',
       'SELECT array_append(ARRAY[1], 2), array_prepend(0, ARRAY[1]), array_cat(ARRAY[1], ARRAY[2,3]), array_remove(ARRAY[1,2,1], 1), array_replace(ARRAY[1,2,1], 1, 9), array_position(ARRAY[5,6,7], 6), array_positions(ARRAY[1,2,1], 1)',
+      // Not strict (their element may be NULL): a NULL ARRAY is NULL, a NULL element is searched for
+      'SELECT array_remove(NULL::int[], 1), array_replace(NULL::int[], 1, 9), array_position(NULL::int[], 6), array_positions(NULL::int[], 1), array_append(NULL::int[], 1), array_prepend(1, NULL::int[])',
+      'SELECT array_remove(ARRAY[1,NULL,2,NULL], NULL), array_replace(ARRAY[1,NULL], NULL, 0), array_position(ARRAY[1,NULL], NULL), array_positions(ARRAY[NULL,1,NULL]::int[], NULL), array_remove(ARRAY[]::int[], 1)',
+      "SELECT CASE WHEN 3 = ANY(a) THEN a ELSE array_append(COALESCE(a, '{}'), 3) END FROM (VALUES (ARRAY[1,2]), (ARRAY[3]), (ARRAY[]::int[]), (NULL::int[])) AS t(a)",
+      // An unnamed CASE is named after its ELSE result when that names itself (a function, a column), else "case"
+      'SELECT CASE WHEN a > 1 THEN 0 ELSE abs(a) END, CASE WHEN a > 1 THEN 0 ELSE a END, CASE WHEN a > 1 THEN a ELSE 0 END, CASE WHEN a > 1 THEN a END, CASE WHEN a > 1 THEN 0 ELSE a::int8 END, CASE WHEN a > 1 THEN 0 ELSE 5::int8 END FROM (VALUES (1)) AS t(a)',
       'SELECT ARRAY[1,2] @> ARRAY[2], ARRAY[1,2] <@ ARRAY[1,2,3], ARRAY[1,2] && ARRAY[2,5], ARRAY[1,2] = ARRAY[1,2], ARRAY[1,2] < ARRAY[1,3], ARRAY[1,NULL] = ARRAY[1,NULL]',
       'SELECT 3 = ANY (ARRAY[1,2,3]), 3 > ALL (ARRAY[1,2]), 1 = ANY (ARRAY[]::int[]), 1 = ALL (ARRAY[]::int[]), NULL = ANY (ARRAY[1])',
       "SELECT * FROM unnest(ARRAY['a','b','c']) WITH ORDINALITY AS u(v, n)",
@@ -240,6 +246,45 @@ export const sqlParityCorpus: ParityCase[] = [
       'SELECT sum(x) FROM (VALUES (9223372036854775807), (1)) v(x)',
       'SELECT count(*) OVER (), region FROM sales GROUP BY region ORDER BY region COLLATE "C"',
       'SELECT any_value(region) IS NOT NULL, min(region COLLATE "C"), max(product COLLATE "C") FROM sales',
+    ],
+  },
+  {
+    // An aggregate of a correlated subquery belongs to that subquery as soon as ONE column of it is among the
+    // aggregate's arguments, its ORDER BY keys or its FILTER — whatever else of an outer query they read. (One
+    // that reads outer columns only is an aggregate of the outer query: the engine refuses those, see
+    // in-memory-database.test.ts — the differential test cannot hold them.)
+    name: 'aggregates that read an outer query beside their own',
+    statements: [
+      'CREATE TABLE agg_parent (id int PRIMARY KEY, n int, name text)',
+      'CREATE TABLE agg_child (id int PRIMARY KEY, parent_id int, n int)',
+      "INSERT INTO agg_parent VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')",
+      'INSERT INTO agg_child VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3)',
+      // the argument is the outer row's, an ORDER BY key the subquery's own
+      'SELECT p.id, (SELECT array_agg(p.n ORDER BY c.id) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      "SELECT p.id, (SELECT string_agg(p.name, ',' ORDER BY c.id DESC) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id",
+      'SELECT p.id, (SELECT json_agg(p.name ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id)::text AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT array_agg(p.n ORDER BY p.n, c.n DESC) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, s.v FROM agg_parent p, LATERAL (SELECT array_agg(p.n ORDER BY c.id) AS v FROM agg_child c WHERE c.parent_id = p.id) s ORDER BY p.id',
+      // ... or its FILTER, or the other way round
+      'SELECT p.id, (SELECT sum(p.n) FILTER (WHERE c.n > 1) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT sum(c.n) FILTER (WHERE p.n > 10) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // ... or the argument itself reads both, a whole row, or a subquery that reads the aggregate's query
+      'SELECT p.id, (SELECT sum(c.n + p.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT count(c) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      "SELECT p.id, (SELECT json_agg(json_build_object('c', c.id, 'n', p.n) ORDER BY c.id) FROM agg_child c WHERE c.parent_id = p.id)::text AS v FROM agg_parent p ORDER BY p.id",
+      'SELECT p.id, (SELECT sum((SELECT count(*) FROM agg_child x WHERE x.parent_id = c.parent_id AND x.id >= p.id)) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT (SELECT sum(x.n + p.n) FROM agg_child x WHERE x.parent_id = c.parent_id) FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      'WITH t AS (SELECT parent_id, sum(n)::int AS s FROM agg_child GROUP BY parent_id) SELECT p.id, (SELECT max(t.s + p.n) FROM t WHERE t.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // an aggregate that reads no column at all, and a window aggregate, are their own query's
+      'SELECT p.id, (SELECT count(*) FROM agg_child c WHERE c.parent_id = p.id) AS n, (SELECT sum(1) FROM agg_child c WHERE c.parent_id = p.id) AS s FROM agg_parent p ORDER BY p.id',
+      p('SELECT p.id, (SELECT sum($1::int) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id', 2),
+      'SELECT p.id, (SELECT sum(p.n) OVER () FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT count(p.n) OVER (PARTITION BY c.parent_id) FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      // an ordered-set aggregate is placed by its aggregated (WITHIN GROUP) arguments: a direct argument may be outer
+      'SELECT p.id, (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT percentile_disc(p.n / 40.0) WITHIN GROUP (ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // grouped by an outer column
+      'SELECT p.id, (SELECT sum(c.n) FROM agg_child c WHERE c.parent_id = p.id GROUP BY p.id) AS v FROM agg_parent p ORDER BY p.id',
     ],
   },
   {

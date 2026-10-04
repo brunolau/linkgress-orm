@@ -491,8 +491,12 @@ function figureColnameInternal(node: A.Expr): { name: string | null; strength: n
         default:
           return { name: null, strength: 0 };
       }
-    case 'CaseExpr':
-      return { name: 'case', strength: 1 };
+    case 'CaseExpr': {
+      // Named after its ELSE result when that names itself (a function, a column): "case" otherwise
+      const fallback = node.defresult === null ? null : figureColnameInternal(node.defresult);
+
+      return fallback !== null && fallback.strength > 1 ? fallback : { name: 'case', strength: 1 };
+    }
     case 'ArrayExpr':
       return { name: 'array', strength: 2 };
     case 'RowExpr':

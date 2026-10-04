@@ -26,6 +26,10 @@ export class MockRowCache {
 
   private static enabled = false;
   private static prototypes = new Map<string, object>();
+  /** The model each schema registry belongs to (see {@link registerModel}), as its id. */
+  private static registryModels = new WeakMap<object, number>();
+  private static modelIds = new WeakMap<object, number>();
+  private static nextModelId = 1;
 
   private constructor() {
     // static class — never instantiated
@@ -61,6 +65,33 @@ export class MockRowCache {
     }
 
     return cached;
+  }
+
+  /**
+   * Tells the cache which MODEL a context's schema registry holds: `model` is what identifies it — the
+   * context CLASS of an entity-first context (every instance configures the same entities). A cached prototype
+   * holds what its builder read of ITS model — the registry its navigations resolve their targets in, a
+   * navigation's column mappers, a collection item's — so the cache keys carry the model ({@link modelKey}): two
+   * entity-first models that name a table alike (two context classes in one process) each get prototypes of
+   * their own. Keyed by table name alone, the second model's rows read the first one's. A registry nobody
+   * registered — a schema-first context's, whose schema object may be made per instance — keeps the key it had:
+   * the table name alone (`m0`).
+   * @internal
+   */
+  static registerModel(registry: object, model: object): void {
+    let id = MockRowCache.modelIds.get(model);
+
+    if (id === undefined) {
+      id = MockRowCache.nextModelId++;
+      MockRowCache.modelIds.set(model, id);
+    }
+
+    MockRowCache.registryModels.set(registry, id);
+  }
+
+  /** The part of a cache key that tells models apart; `m0` for a builder without a registered registry. @internal */
+  static modelKey(registry: object | undefined): string {
+    return `m${(registry === undefined ? undefined : MockRowCache.registryModels.get(registry)) ?? 0}`;
   }
 
   /** Runtime visibility: switch state plus current/max signature-entry counts. */

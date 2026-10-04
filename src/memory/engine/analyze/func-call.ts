@@ -10,7 +10,7 @@ import { ParseState } from './parse-state';
 import { FuncCandidate, resolveFunction } from './resolve';
 import { findOrCreateWindowClause } from './select';
 import { isPolymorphic } from './typeutil';
-import { forEachChild } from './walk';
+import { containsVarsOfLevel, forEachChild } from './walk';
 
 const AGG_FORBIDDEN: Record<string, string> = {
   where: 'WHERE',
@@ -456,6 +456,29 @@ function makeAggregate(
   }
   if (node.aggStar && args.length > 0) {
     throw new PgError(SqlState.SYNTAX_ERROR, 'aggregate star with arguments');
+  }
+  // PostgreSQL places an aggregate in the query of the LOWEST-level column its aggregated arguments, its ORDER
+  // BY keys and its FILTER read (check_agg_arguments walks the argument list, which holds a plain aggregate's
+  // ORDER BY expressions, and the filter; an ordered-set aggregate's DIRECT arguments do not count): one that
+  // reads only columns of an OUTER query — `(SELECT sum(o.n) FROM t)` — is an aggregate of THAT query, grouped
+  // and evaluated there (the columns beside it must then be grouped: 42803). This engine evaluates every
+  // aggregate in the query it is written in, which is another number and no error: refused, so that a statement
+  // PostgreSQL reads differently never comes back with a silently different result. One column of its own
+  // query anywhere in those operands — `array_agg(o.n ORDER BY t.id)` — makes it an aggregate of that query,
+  // as it always was.
+  const operands = [...aggArgs, ...order.map((o) => o.expr), ...(filter === null ? [] : [filter])];
+  if (!operands.some((e) => containsVarsOfLevel(e, 0))) {
+    for (let level = 1, depth = pstate.depth(); level <= depth; level++) {
+      if (operands.some((e) => containsVarsOfLevel(e, level))) {
+        throw positioned(
+          new PgError(SqlState.FEATURE_NOT_SUPPORTED, `aggregate function ${proc.name}() reads only columns of an outer query: outer-level aggregates are not supported by the in-memory database`, {
+            detail: 'PostgreSQL evaluates such an aggregate in the outer query whose columns it reads, not in the subquery it is written in.',
+            hint: 'Make the aggregate read a column of its own query — for example join the table it means to read inside that subquery.',
+          }),
+          node.loc
+        );
+      }
+    }
   }
   const agg: AggNode = {
     k: 'agg',

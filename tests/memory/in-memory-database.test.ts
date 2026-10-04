@@ -300,4 +300,65 @@ describe('in-memory database API', () => {
     expect((e as { message?: string }).message).toBe('INTO specified more than once at or near "INTO"');
     await client.end();
   });
+
+  test('an aggregate that reads only an outer query\'s columns is refused, never evaluated in place', async () => {
+    // PostgreSQL places an aggregate in the query of the lowest-level column its aggregated arguments, its ORDER BY
+    // keys and its FILTER read: one reading only an OUTER query's columns is an aggregate of that query. The engine
+    // evaluates every aggregate in the query it is written in — another number, and no error. These cannot live in
+    // the differential corpus: PostgreSQL answers them (the comment on each says what with) and the engine refuses
+    // them. Every one is a statement the engine answered WRONGLY before it refused them: another result than
+    // PostgreSQL's, or a result where PostgreSQL raises 42803. The aggregates PostgreSQL places in their own
+    // query — one own column among the arguments, the ORDER BY keys or the FILTER — are in the corpus
+    // ('aggregates that read an outer query beside their own') and answer as PostgreSQL does.
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+    await client.query('create table agg_parent(id int primary key, n int, name text)');
+    await client.query('create table agg_child(id int primary key, parent_id int, n int)');
+    await client.query("insert into agg_parent values (1, 10, 'a'), (2, 20, 'b')");
+    await client.query('insert into agg_child values (1, 1, 1), (2, 1, 2), (3, 2, 3)');
+
+    const outerLevel = [
+      // PostgreSQL: 42803, `p.id` is not grouped in the query the aggregate belongs to. Before: a row per parent
+      'select p.id, (select sum(p.n) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      'select p.id, (select array_agg(p.n order by p.id) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      'select p.id, (select count(*) filter (where p.n > 10) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      // ... the shape a collection summand through a reference rendered
+      'select p.id, (select sum((select count(*) from agg_child x where x.parent_id = p.id)) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      // PostgreSQL: 42803 "aggregate functions are not allowed in FROM clause of their own query level"
+      'select p.id, s.v from agg_parent p, lateral (select sum(p.n) as v) s',
+      // PostgreSQL: ONE row, the aggregate over the outer rows (30). Before: a row per outer row (30, 60 / 10, 20)
+      'select (select sum(p.n) from agg_child c limit 1) from agg_parent p',
+      'select (select sum(p.n)) from agg_parent p',
+      'select (select sum(p.n) + (select count(*) from agg_child)) from agg_parent p',
+      'select (select percentile_disc(0.5) within group (order by p.n) from agg_child c limit 1) from agg_parent p',
+      // PostgreSQL: the outer query's aggregate per group. Before: 42803 "subquery uses ungrouped column"
+      'select p.name, (select max(p.n)) from agg_parent p group by p.name',
+      'select c.parent_id from agg_child c group by c.parent_id having (select sum(c.n)) > 2',
+    ];
+
+    for (const statement of outerLevel) {
+      const e = await expectToReject(client.query(statement));
+
+      expect({ statement, code: (e as { code?: string }).code }).toEqual({ statement, code: '0A000' });
+      expect((e as { message?: string }).message).toMatch(/reads only columns of an outer query: outer-level aggregates are not supported by the in-memory database/);
+    }
+
+    // One column of the aggregate's own query among its operands makes it that query's (the corpus has the rest)
+    const rows = (await client.query(
+      'select p.id, (select sum(c.n + p.n) from agg_child c where c.parent_id = p.id)::int as mixed, '
+      + '(select array_agg(p.n order by c.id) from agg_child c where c.parent_id = p.id) as ordered, '
+      + '(select sum(p.n) filter (where c.n > 1) from agg_child c where c.parent_id = p.id)::int as filtered, '
+      + '(select sum((select count(*) from agg_child x where x.parent_id = c.parent_id and x.id >= p.id)) from agg_child c where c.parent_id = p.id)::int as nested, '
+      + '(select count(*) from agg_child c where c.parent_id = p.id)::int as star, '
+      + '(select sum(1) from agg_child c where c.parent_id = p.id)::int as constant '
+      + 'from agg_parent p order by p.id'
+    )).rows;
+
+    expect(rows).toEqual([
+      { id: 1, mixed: 23, ordered: [10, 10], filtered: 10, nested: 4, star: 2, constant: 2 },
+      { id: 2, mixed: 23, ordered: [20], filtered: 20, nested: 1, star: 1, constant: 1 },
+    ]);
+    await client.end();
+  });
 });

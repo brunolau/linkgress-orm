@@ -634,6 +634,40 @@ db.users.select(u => ({
 (Such a selector used to throw "MAX requires an aggregate field".) An `sql` expression in a collection's
 items reads through its `mapWith`, as it does at the top level.
 
+**Mapped columns** (1.0.31). A column of a collection's item with a custom type binds and reads through its mapper
+in two places:
+
+```typescript
+db.products
+  .where(p => p.timeSlots!.where(s => and(lte(s.startsAt, now), gte(s.endsAt, now))).exists())   // `now`: the mapper's type
+  .select(p => ({ id: p.id, lastEnd: p.timeSlots!.max(s => s.endsAt) }));                        // read through the mapper
+```
+
+- a value compared DIRECTLY with the bare column in the collection's `where()` — `eq` / `ne` / `gt` / `gte` / `lt` /
+  `lte` / `like` …, `between`, `inArray` / `notInArray`, `eqAny` / `neAll` and the `…Opt` forms — is bound through
+  `toDriver` (pass the application value, never the stored one);
+- `min()` / `max()` of the bare column — the item's, or one reached through the item's navigation — read back
+  through `fromDriver`: as a value of a root projection, of a collection's items, of a mutation's RETURNING, and in
+  a QueryBatch. They are still typed `number | null`.
+
+That is all. An EXPRESSION over a mapped item column — `coalesce(p.at, …)`, `add` / `sub` / `mul` / `div`,
+`greatest` / `least` / `nullIf`, `caseOf`, `caseWhen`, an `sql` template — binds its plain operands as written and
+reads the stored value, in the collection's filter and in its projection alike; `min()` / `max()` of an expression,
+`sum()` and `count()` are numbers; and a `min()` / `max()` read as a COLUMN of a CTE or of a joined table subquery is
+the stored value. (The item's lists of a bare mapped column — `select(p => ({ at: p.at })).toList()` — read through
+the mapper, as they always did.) At the root, a mapped column's expressions DO inherit its mapper — a difference
+between the root and a collection's item that is older than this release and kept by it.
+
+**A count as the summand.** `sum()` also sums a count of a collection of the item — reached directly or through
+reference navigations of the item, with its own filter (1.0.31: through a reference; the hop used to render
+unjoined):
+
+```typescript
+db.campaigns.select(c => ({
+  usedPicks: c.links!.sum(l => l.discount!.codes!.where(code => gt(code.usedCount, 0)).count()),
+}));
+```
+
 ### Collections Reached Through Navigations
 
 A collection may hang off any chain of reference navigations — including one leading back to the
@@ -719,6 +753,31 @@ expression over it — `g.max(r => sql\`length(${r.title})\`)`, `g.sum(r => sql\
   through its mapper (a grouped CTE or subquery keeps that mapper), a numeric column as a number. Of
   an SQL expression, a number-looking value reads as a number, anything else as it is. (They all
   used to go through `Number()`: a text or timestamp extreme came back `NaN` / epoch milliseconds.)
+
+`arrayAgg()` and `countDistinct()` (1.0.31) aggregate a column or expression of the grouped row as a list and
+as a distinct count — the members of each group, where `agg.arrayAgg()` in a grouped select reads the key only:
+
+```typescript
+db.prices
+  .select(p => ({ id: p.id, slotId: p.slotId, optionIds: optionSignature(p), segmentIds: segmentSignature(p) }))
+  .groupBy(r => ({ optionIds: r.optionIds, segmentIds: r.segmentIds }))     // array-valued keys
+  .select(g => ({
+    ...g.key,
+    priceIds: g.arrayAgg(r => r.id, { orderBy: [[r => r.id, 'ASC']] }),     // number[]
+    slots: g.countDistinct(r => r.slotId),                                   // number
+    members: g.count(),
+  }))
+```
+
+- `g.arrayAgg(r => r.col, { distinct?, orderBy? })` — one element per row of the group, a NULL value too; each
+  element reads like the column (through its mapper). `orderBy` takes selectors over the grouped row, each alone
+  (ascending) or as `[selector, 'ASC' | 'DESC']`; without it the list is in no particular order. A group has at
+  least one row, so the list is never NULL. (postgres.js hands an unquoted NULL element of any native array to the
+  element's parser — `'NULL'`, `NaN` — where the other drivers read `null`: aggregate a nullable column on it only
+  when the NULLs are filtered out before grouping.)
+- `g.countDistinct(r => r.col)` — the distinct non-NULL values; a number.
+- Both work in `having()` too (`gt(g.countDistinct(r => r.slotId), 1)`), over plain and expression keys, in a CTE
+  body, a joined subquery and a QueryBatch.
 
 A projected value can also be an SQL expression over keys and aggregates, a constant, or `null`:
 
@@ -1511,8 +1570,11 @@ batch.getItem(userKey);        // the user, or null
 batch.getCount(commentsKey);   // number
 ```
 
-A select (`future()` / `futureFirstOrDefault()` / `futureCount()`), a union (`future()`), a grouped query and
-a grouped join (see [GROUP BY › In a QueryBatch](#in-a-querybatch)) join a batch. Every query of one batch
+A select, a union (`futureFirstOrDefault()` and `futureCount()` since 1.0.31), a grouped query and a grouped
+join (see [GROUP BY › In a QueryBatch](#in-a-querybatch)) join a batch through `future()` /
+`futureFirstOrDefault()` / `futureCount()`. A union's `futureCount()` is its `count()` — its own LIMIT / OFFSET
+counted — and it is refused, like its `futureFirstOrDefault()`, when its legs declare a data-modifying CTE: a batch
+reads every member as a subquery, where PostgreSQL allows no such `WITH`. Every query of one batch
 runs on one context — one client, or one transaction; a query with a `withTimeout()` of its own runs on its
 own executor and is refused. A batch is executed once.
 

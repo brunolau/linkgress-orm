@@ -145,8 +145,13 @@ export const ARRAY_FUNCS: Record<string, FnImpl> = {
       .join('');
   },
   array_cardinality: (a) => flat(a[0] as unknown[]).length,
+  // array_position / array_positions / array_remove / array_replace are not strict — the element they
+  // look for may be NULL — and answer NULL for a NULL array themselves
   array_position: (a, fc) => {
-    const arr = a[0] as unknown[];
+    const arr = a[0] as unknown[] | null;
+    if (arr === null) {
+      return null;
+    }
     if (arr.length > 0 && Array.isArray(arr[0])) {
       throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'searching for elements in multidimensional arrays is not supported');
     }
@@ -161,7 +166,10 @@ export const ARRAY_FUNCS: Record<string, FnImpl> = {
   },
   array_position_start: (a, fc) => ARRAY_FUNCS.array_position(a, fc),
   array_positions: (a, fc) => {
-    const arr = a[0] as unknown[];
+    const arr = a[0] as unknown[] | null;
+    if (arr === null) {
+      return null;
+    }
     const eq = equalsFn(fc, elemTypeOf(fc, 0));
     const out: number[] = [];
     arr.forEach((x, i) => {
@@ -172,7 +180,10 @@ export const ARRAY_FUNCS: Record<string, FnImpl> = {
     return out;
   },
   array_remove: (a, fc) => {
-    const arr = a[0] as unknown[];
+    const arr = a[0] as unknown[] | null;
+    if (arr === null) {
+      return null;
+    }
     if (arr.length > 0 && Array.isArray(arr[0])) {
       throw new PgError(SqlState.FEATURE_NOT_SUPPORTED, 'removing elements from multidimensional arrays is not supported');
     }
@@ -180,7 +191,10 @@ export const ARRAY_FUNCS: Record<string, FnImpl> = {
     return arr.filter((x) => !(a[1] === null ? x === null : eq(x, a[1])));
   },
   array_replace: (a, fc) => {
-    const arr = a[0] as unknown[];
+    const arr = a[0] as unknown[] | null;
+    if (arr === null) {
+      return null;
+    }
     const eq = equalsFn(fc, elemTypeOf(fc, 0));
     return arr.map((x) => ((a[1] === null ? x === null : eq(x, a[1])) ? a[2] : x));
   },
