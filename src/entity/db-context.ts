@@ -2450,44 +2450,105 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * });
    */
   async advisoryXactLockAll(classId: number, keys: readonly AdvisoryLockKey[]): Promise<void> {
-    this.assertAdvisoryTransaction('advisoryXactLockAll');
-    assertInt4('advisoryXactLockAll: classId', classId);
+    const keySet = this.advisoryKeySet('advisoryXactLockAll', classId, keys);
+
+    if (keySet === undefined) {
+      return;
+    }
+
+    await this.runLockStatement(
+      keySet.strings
+        ? 'SELECT pg_advisory_xact_lock($1, hashtext(t.k)) FROM unnest(CAST($2 AS text[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord'
+        : 'SELECT pg_advisory_xact_lock($1, t.k) FROM unnest(CAST($2 AS integer[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord',
+      [classId, keySet.literal]
+    );
+  }
+
+  /**
+   * Take the transaction-scoped advisory lock of every key WITHOUT waiting, in ONE statement: `true` when
+   * this transaction now holds them all, `false` when one of them is held by another session.
+   *
+   * The keys are tried in the order {@link advisoryXactLockAll} takes them (duplicates removed, numbers
+   * ascending / strings in code-unit order) and the statement STOPS at the first busy key: the keys after
+   * it are never tried. The locks taken before it stay held until the transaction ends — advisory locks
+   * cannot be given back one by one — so a caller that gets `false` ends its transaction (or carries on,
+   * knowing it holds a prefix of the keys). Same keys and transaction requirement as
+   * {@link advisoryXactLockAll}; an empty key list is `true` without a statement.
+   *
+   * It replaces a `tryAdvisoryXactLock()` per key: N round trips, the same locks, the same answer.
+   *
+   * The statement walks the keys with a recursive CTE — each step tries ONE key, and there is a next step
+   * only while the last try succeeded — rather than filtering `unnest(…)` on the failed try under a
+   * `LIMIT 1`: that a LIMIT stops the scan before the next row's try is evaluated is the executor's
+   * laziness, not a rule of SQL (the in-memory database evaluates every row before it applies the LIMIT,
+   * and took the keys after the busy one).
+   *
+   * @example
+   * await db.transaction(async tx => {
+   *   if (!await tx.tryAdvisoryXactLockAll(LockClass.Order, orderIds)) {
+   *     return 'busy';   // another transaction is settling one of them — nothing was waited for
+   *   }
+   *   // … every order is ours until COMMIT / ROLLBACK
+   * });
+   */
+  async tryAdvisoryXactLockAll(classId: number, keys: readonly AdvisoryLockKey[]): Promise<boolean> {
+    const keySet = this.advisoryKeySet('tryAdvisoryXactLockAll', classId, keys);
+
+    if (keySet === undefined) {
+      return true;
+    }
+
+    const list = `CAST($2 AS ${keySet.strings ? 'text' : 'integer'}[])`;
+    const tryKey = (position: string): string => keySet.strings
+      ? `pg_try_advisory_xact_lock($1, hashtext((${list})[${position}]))`
+      : `pg_try_advisory_xact_lock($1, (${list})[${position}])`;
+    const result = await this.runLockStatement(
+      `WITH RECURSIVE walk(ord, ok) AS (SELECT 1, ${tryKey('1')} UNION ALL `
+      + `SELECT walk.ord + 1, ${tryKey('walk.ord + 1')} FROM walk WHERE walk.ok AND walk.ord < cardinality(${list})) `
+      + 'SELECT bool_and(walk.ok) AS "acquired" FROM walk',
+      [classId, keySet.literal]
+    );
+
+    return result.rows[0]?.acquired === true;
+  }
+
+  /**
+   * The keys of an `…AdvisoryXactLockAll()` call, checked, as the statement binds them: without duplicates,
+   * numbers ascending / strings in code-unit order, as one array literal. `undefined` for an empty list.
+   */
+  private advisoryKeySet(method: string, classId: number, keys: readonly AdvisoryLockKey[]): { strings: boolean; literal: string } | undefined {
+    this.assertAdvisoryTransaction(method);
+    assertInt4(`${method}: classId`, classId);
 
     if (!Array.isArray(keys)) {
-      throw new TypeError('advisoryXactLockAll: keys must be an array');
+      throw new TypeError(`${method}: keys must be an array`);
     }
 
     if (keys.length === 0) {
-      return;
+      return undefined;
     }
 
     const allStrings = keys.every(key => typeof key === 'string');
     const allNumbers = keys.every(key => typeof key === 'number' || typeof key === 'bigint');
 
     if (!allStrings && !allNumbers) {
-      throw new TypeError('advisoryXactLockAll: keys must be all integers or all strings');
+      throw new TypeError(`${method}: keys must be all integers or all strings`);
     }
 
     if (allStrings) {
       const unique = Array.from(new Set(keys as string[])).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-      await this.runLockStatement(
-        'SELECT pg_advisory_xact_lock($1, hashtext(t.k)) FROM unnest(CAST($2 AS text[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord',
-        [classId, toPgArrayLiteral(unique)]
-      );
-      return;
+
+      return { strings: true, literal: toPgArrayLiteral(unique) };
     }
 
     const numbers = (keys as Array<number | bigint>).map((key) => {
       const value = Number(key);
-      assertInt4('advisoryXactLockAll: key', value);
+      assertInt4(`${method}: key`, value);
       return value;
     });
     const unique = Array.from(new Set(numbers)).sort((a, b) => a - b);
 
-    await this.runLockStatement(
-      'SELECT pg_advisory_xact_lock($1, t.k) FROM unnest(CAST($2 AS integer[])) WITH ORDINALITY AS t(k, ord) ORDER BY t.ord',
-      [classId, toPgArrayLiteral(unique)]
-    );
+    return { strings: false, literal: toPgArrayLiteral(unique) };
   }
 
   /** Run a lock statement through the context's executor (logging, slow-query hooks) when it has one. */

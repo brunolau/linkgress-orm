@@ -5,7 +5,7 @@ import { expectToReject } from '../utils/expect-rejects';
 
 /**
  * Transaction-scoped advisory locks: advisoryXactLock / tryAdvisoryXactLock /
- * advisoryXactLockAll. The concurrency cases run two real transactions on two pooled
+ * advisoryXactLockAll / tryAdvisoryXactLockAll. The concurrency cases run two real transactions on two pooled
  * connections: one holds a lock while the other probes or waits for it.
  *
  * PGlite runs ONE session: a second transaction waits for the first to end, so a lock can never be
@@ -267,6 +267,221 @@ describe('advisory transaction locks', () => {
 
       await first;
       await second;
+    });
+  });
+
+  /**
+   * `tryAdvisoryXactLockAll(classId, keys)` (1.0.31): every key tried without waiting, in ONE statement that
+   * stops at the first busy key. The two-session cases run on PostgreSQL and on the in-memory database
+   * (`concurrentSessions`); PGlite — one session — runs the single-session ones and reads what the statement
+   * took from `pg_locks`.
+   */
+  describe('tryAdvisoryXactLockAll', () => {
+    const TRY_ALL_INTEGERS = 'WITH RECURSIVE walk(ord, ok) AS (SELECT 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[1]) UNION ALL '
+      + 'SELECT walk.ord + 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[walk.ord + 1]) FROM walk WHERE walk.ok AND walk.ord < cardinality(CAST($2 AS integer[]))) '
+      + 'SELECT bool_and(walk.ok) AS "acquired" FROM walk';
+    const TRY_ALL_STRINGS = 'WITH RECURSIVE walk(ord, ok) AS (SELECT 1, pg_try_advisory_xact_lock($1, hashtext((CAST($2 AS text[]))[1])) UNION ALL '
+      + 'SELECT walk.ord + 1, pg_try_advisory_xact_lock($1, hashtext((CAST($2 AS text[]))[walk.ord + 1])) FROM walk WHERE walk.ok AND walk.ord < cardinality(CAST($2 AS text[]))) '
+      + 'SELECT bool_and(walk.ok) AS "acquired" FROM walk';
+
+    /** Which of `keys` another transaction could take right now — it takes and releases them. */
+    const freeForOthers = async (classId: number, keys: Array<number | string>): Promise<Array<number | string>> => {
+      const free: Array<number | string> = [];
+
+      for (const key of keys) {
+        if (await db.transaction(tx => tx.tryAdvisoryXactLock(classId, key))) {
+          free.push(key);
+        }
+      }
+
+      return free;
+    };
+
+    test('outside a transaction it refuses to run, and it validates its keys as advisoryXactLockAll does', async () => {
+      await expectToReject(db.tryAdvisoryXactLockAll(1, [1, 2]), /tryAdvisoryXactLockAll\(\) takes a TRANSACTION-scoped lock/);
+
+      await db.transaction(async (tx) => {
+        captured.length = 0;
+
+        await expectToReject(tx.tryAdvisoryXactLockAll(2 ** 31, [1]), /tryAdvisoryXactLockAll: classId must be an integer in the int4 range/);
+        await expectToReject(tx.tryAdvisoryXactLockAll(1, [1, 'a']), 'tryAdvisoryXactLockAll: keys must be all integers or all strings');
+        await expectToReject(tx.tryAdvisoryXactLockAll(1, [1, null as any]), /all integers or all strings/);
+        await expectToReject(tx.tryAdvisoryXactLockAll(1, [2 ** 40]), /tryAdvisoryXactLockAll: key must be an integer in the int4 range/);
+        await expectToReject(tx.tryAdvisoryXactLockAll(1, 5 as any), 'tryAdvisoryXactLockAll: keys must be an array');
+
+        // no statement ran for any of them
+        expect(captured.some(line => line.includes('pg_try_advisory'))).toBe(false);
+      });
+    });
+
+    test('takes every free key in one statement, sorted and deduplicated, and answers true', async () => {
+      captured.length = 0;
+
+      const acquired = await db.transaction(async (tx) => {
+        const result = await tx.tryAdvisoryXactLockAll(14, [3, 1, 2, 2, 3n]);
+
+        if (!concurrentSessions) {
+          // PGlite (one session): what the statement took, from the lock table
+          const held = await tx.query<{ objid: number }>('SELECT objid FROM pg_locks WHERE locktype = \'advisory\' AND classid = $1 ORDER BY objid', [14]);
+
+          expect(held.map(row => Number(row.objid))).toEqual([1, 2, 3]);
+        }
+
+        return result;
+      });
+
+      expect(acquired).toBe(true);
+
+      const lockStatements = captured.filter(line => line.includes('pg_try_advisory_xact_lock'));
+
+      expect(lockStatements).toEqual([TRY_ALL_INTEGERS]);
+      expect(captured.join('\n')).toContain('[Parameters] [14,"{1,2,3}"]');
+    });
+
+    test('string keys: hashtext of each, in code-unit order', async () => {
+      captured.length = 0;
+
+      expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(15, ['b:7', 'a:12', 'b:7']))).toBe(true);
+
+      expect(captured.filter(line => line.includes('pg_try_advisory_xact_lock'))).toEqual([TRY_ALL_STRINGS]);
+      expect(captured.join('\n')).toContain('[Parameters] [15,"{\\"a:12\\",\\"b:7\\"}"]');
+    });
+
+    test('an empty key list is true without a statement; a lock the transaction holds already is taken again', async () => {
+      captured.length = 0;
+      expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(1, []))).toBe(true);
+      expect(captured.some(line => line.includes('pg_try_advisory'))).toBe(false);
+
+      await db.transaction(async (tx) => {
+        await tx.advisoryXactLock(16, 2);
+        expect(await tx.tryAdvisoryXactLockAll(16, [1, 2, 3])).toBe(true);
+        expect(await tx.tryAdvisoryXactLockAll(16, [3, 2])).toBe(true);
+        expect(await tx.tryAdvisoryXactLockAll(16, [2])).toBe(true);
+      });
+    });
+
+    test.skipIf(!concurrentSessions)('two sessions: all keys free — true, and every key is held until the transaction ends', async () => {
+      let acquired: boolean | undefined;
+      const holder = holdInTransaction(async (tx) => {
+        acquired = await tx.tryAdvisoryXactLockAll(17, [30, 10, 20]);
+      });
+      await holder.ready;
+
+      try {
+        expect(acquired).toBe(true);
+        expect(await freeForOthers(17, [10, 20, 30, 40])).toEqual([40]);
+        // another transaction trying an overlapping set does not wait: it is told
+        expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(17, [40, 30]))).toBe(false);
+      } finally {
+        holder.release();
+        await holder.done;
+      }
+
+      expect(await freeForOthers(17, [10, 20, 30, 40])).toEqual([10, 20, 30, 40]);
+    });
+
+    test.skipIf(!concurrentSessions)('two sessions: it stops at the first busy key — the keys before it stay held, the keys after it are never tried', async () => {
+      // A holds 20. B tries {10, 20, 30} in one statement. C probes what B holds while B is still open.
+      const a = holdInTransaction(async (tx) => {
+        await tx.advisoryXactLock(18, 20);
+      });
+      await a.ready;
+
+      let acquired: boolean | undefined;
+      let statements: string[] = [];
+      const b = holdInTransaction(async (tx) => {
+        captured.length = 0;
+        acquired = await tx.tryAdvisoryXactLockAll(18, [30, 20, 10]);
+        statements = captured.filter(line => line.includes('pg_try_advisory_xact_lock'));
+      });
+
+      try {
+        await b.ready;
+
+        expect(acquired).toBe(false);
+        expect(statements).toEqual([TRY_ALL_INTEGERS]);
+        // 10 was taken by B before the busy key; 30 comes after it and was never tried
+        expect(await freeForOthers(18, [10, 20, 30])).toEqual([30]);
+      } finally {
+        b.release();
+        await b.done;
+      }
+
+      try {
+        // B ended: its prefix is released, A's key is still held
+        expect(await freeForOthers(18, [10, 20, 30])).toEqual([10, 30]);
+      } finally {
+        a.release();
+        await a.done;
+      }
+
+      expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(18, [10, 20, 30]))).toBe(true);
+    });
+
+    test.skipIf(!concurrentSessions)('two sessions: the FIRST key busy — false, and nothing is taken', async () => {
+      const a = holdInTransaction(async (tx) => {
+        await tx.advisoryXactLock(19, 1);
+      });
+      await a.ready;
+
+      let acquired: boolean | undefined;
+      const b = holdInTransaction(async (tx) => {
+        acquired = await tx.tryAdvisoryXactLockAll(19, [3, 2, 1]);
+      });
+
+      try {
+        await b.ready;
+
+        expect(acquired).toBe(false);
+        expect(await freeForOthers(19, [1, 2, 3])).toEqual([2, 3]);
+      } finally {
+        b.release();
+        await b.done;
+        a.release();
+        await a.done;
+      }
+    });
+
+    test.skipIf(!concurrentSessions)('two sessions: string keys stop at the first busy one in code-unit order', async () => {
+      const a = holdInTransaction(async (tx) => {
+        await tx.advisoryXactLock(20, 'order:b');
+      });
+      await a.ready;
+
+      let acquired: boolean | undefined;
+      const b = holdInTransaction(async (tx) => {
+        acquired = await tx.tryAdvisoryXactLockAll(20, ['order:c', 'order:a', 'order:b']);
+      });
+
+      try {
+        await b.ready;
+
+        expect(acquired).toBe(false);
+        expect(await freeForOthers(20, ['order:a', 'order:b', 'order:c'])).toEqual(['order:c']);
+      } finally {
+        b.release();
+        await b.done;
+        a.release();
+        await a.done;
+      }
+
+      expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(20, ['order:c', 'order:a', 'order:b']))).toBe(true);
+    });
+
+    test.skipIf(!concurrentSessions)('two sessions: overlapping sets tried in opposite input order never wait — one wins, or both step back', async () => {
+      const attempt = (keys: number[]) => db.transaction(async (tx) => {
+        const acquired = await tx.tryAdvisoryXactLockAll(21, keys);
+
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        return acquired;
+      });
+
+      const results = await Promise.all([attempt([1, 2, 3, 4]), attempt([4, 3, 2, 1])]);
+
+      // both take the keys ascending: whoever takes key 1 first takes them all, the other is refused at key 1
+      expect(results.filter(Boolean).length).toBeLessThanOrEqual(1);
+      expect(await db.transaction(tx => tx.tryAdvisoryXactLockAll(21, [1, 2, 3, 4]))).toBe(true);
     });
   });
 });
