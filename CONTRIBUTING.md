@@ -118,7 +118,7 @@ linkgress-orm/
 ├── docs/                # Documentation (ships in the npm package)
 │   └── guides/         # User guides
 ├── llms.txt             # Index of the docs for AI agents (ships in the npm package)
-└── changelog/           # One file per version (v1.0.30.md, ...)
+└── changelog/           # One file per version (v1.0.32.md, ...)
 ```
 
 ## Code Style

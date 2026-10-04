@@ -2,7 +2,7 @@
 
 > **For agents:** Which linkgress-orm call reads or writes the data a task needs in the fewest statements, and what SQL does it send?
 > **Use this page when:** you know what data a task needs but not which call gets or changes it; before writing a loop that awaits a query or a write per row; when reviewing data-access code for extra round trips. **Look elsewhere when:** you know the call and need all its options → the guide linked in each table row, or the [API index](./api-index.md); setting up a project → [Getting Started](./getting-started.md)
-> **Key APIs:** `select()`, `firstOrDefault()`, `exists()`, `count()`, `agg`, `groupBy()`, navigations (`p.user!.username`), collections (`u.posts!.select(…).toList()`), `joinFilter()`, `asSubquery()`, `QueryBatch`, `prepare()` / `preparedStatements`, `inArrayOpt()`, `eqAny()`, `insertBulk()`, `fromRows()`, `upsertBulk()` (`updateWhere`), `bulkUpdate()`, `.returning()`, `MutationBatch`, `db.transaction()` · **Round trips:** every call this page recommends is 1 statement; costs above that are named where they occur (`db.transaction()` adds BEGIN and COMMIT, the `temptable` collection strategy sends 1 + 5 statements per collection on `PgClient`)
+> **Key APIs:** `select()`, `firstOrDefault()`, `exists()`, `count()`, `agg`, `groupBy()` (`g.arrayAgg()`, `g.countDistinct()`), navigations (`p.user!.username`), collections (`u.posts!.select(…).toList()`), `joinFilter()`, `asSubquery()`, `QueryBatch`, `prepare()` / `preparedStatements`, `inArrayOpt()`, `eqAny()`, `insertBulk()`, `fromRows()`, `upsertBulk()` (`updateWhere`), `bulkUpdate()`, `arrayAppendUnique()`, `.returning()`, `MutationBatch` (`ifFits`), `db.transaction()` · **Round trips:** every call this page recommends is 1 statement; costs above that are named where they occur (`db.transaction()` adds BEGIN and COMMIT, the `temptable` collection strategy sends 1 + 5 statements per collection on `PgClient`)
 
 This page is the entry point for AI coding agents that read or write data with linkgress-orm. Start with the
 [golden rules](#golden-rules), look the need up in the [reading](#reading-data-decision-table) or
@@ -95,7 +95,8 @@ trips).
 10. **Read back what a write changed in the same statement.** `.returning(selector)` and `.affectedCount()` replace a
     SELECT after the write. Measured: 1 statement instead of 2, for an update and for an insert's generated key.
 11. **Send independent writes as one `MutationBatch`.** It replaces awaited writes, each a statement and a commit of its
-    own. Measured: an insert, a bulk update and a delete in 1 atomic statement instead of 3.
+    own. Measured: an insert, a bulk update and a delete in 1 atomic statement instead of 3. Register a leg whose size
+    depends on the data `ifFits` (since 1.0.32) and write it standalone when the call returns `null`.
 12. **Keep the default `lateral` collection strategy and index the foreign keys collections read.** It avoids the
     `temptable` strategy and child lookups without an index. Measured: one collection, 1 statement under `lateral` and
     `cte`, 6 under `temptable` on `PgClient`; `bench/versions` (1.0.17), 100 of 2,000 users with four collection
@@ -144,6 +145,7 @@ section with every option of the call.
 | [Many-to-many](./guides/querying.md#many-to-many-and-grandchildren-selectmany) | the join entity's navigation: `p.productTags!.select(pt => pt.tag!.name).toList()` | `FROM "product_tags" "lateral_0_productTags" LEFT JOIN "tags" "tag" …` inside a LATERAL · 1 | two queries joined in JS |
 | [Grandchildren, flattened](./guides/querying.md#many-to-many-and-grandchildren-selectmany) | `u.posts!.selectMany(p => p.postComments!).count()` | `INNER JOIN "posts" "posts__bridge1" ON …` inside one subquery · 1 | nested lists flattened in JS |
 | [A count, sum, min or max per parent](./guides/querying.md#count-sum-min-and-max-per-parent) | `u.posts!.count()`, `.sum(p => p.views)`, `.min(…)`, `.max(…)`, `.exists()` | `lateral`: `(SELECT COALESCE(COUNT(*), 0) FROM "posts" "lateral_0_posts" WHERE "lateral_0_posts"."user_id" = "users"."id")`, one subquery per aggregate · 1 | a `count()` per parent (1 + N); loading lists to count them; a collection `avg()` (it does not exist) |
+| [Children filtered or aggregated by a mapped column (a custom mapper)](./guides/querying.md#compare-and-aggregate-the-items-mapped-columns) | the application value in the collection's `where()`: `u.posts!.where(p => gte(p.publishTime, { hour: 12, minute: 0 })).count()`; `u.posts!.min(p => p.publishTime)` reads `{ hour: 9, minute: 30 }` (since 1.0.31; [recipe](#aggregate-per-parent-row-collection-count-and-sum)) | `"lateral_0_posts"."publish_time" >= $1` with `720` bound through `toDriver`; `MIN("lateral_1_posts"."publish_time")` read through `fromDriver` · 1 | the stored value passed by hand (`eq(p.publishTime, 570)` fails: `invalid input syntax for type smallint: "NaN"`); mapping a raw `min()` / `max()` by hand; an expression over the column, `sum()` or a CTE column (they read the stored value) |
 | [Several aggregates per parent, for many or all parents](./guides/querying.md#join-per-key-aggregates-computed-once) | one grouped subquery joined once: `leftJoin(grouped.asSubquery('table'), on, select, 'stats')` | `LEFT JOIN (SELECT … GROUP BY "posts"."user_id") AS "stats" ON "users"."id" = "stats"."userId"` · 1 | one correlated subquery per aggregate, each reading the children again |
 | [Columns of an unmodeled relation](./guides/querying.md#join-tables-without-a-navigation-innerjoin-leftjoin) | `innerJoin(db.posts, on, select)` / `leftJoin(…)` | `INNER JOIN "posts" AS "posts_0" ON "users"."id" = "posts_0"."user_id"` · 1 | a 1:N join where one row per parent is wanted (it repeats the parent per match) |
 | [One value per row from a table no navigation reaches](./guides/subquery-guide.md#project-a-per-row-value-a-scalar-subquery-in-select) | a scalar subquery in `select()`: `product: db.products.where(p => eq(p.id, ci.productId)).select(p => p.name).asSubquery('scalar')` (`cartItems.productId` has no navigation); inside `coalesce()`, arithmetic or an order key: `.asSubquery('scalar').asExpression<T>()` | `(SELECT "products"."name" FROM "products" WHERE "products"."id" = "cart_items"."product_id") as "product"` · 1 | a lookup per row (1 + N); a subquery that can return 2+ rows (fails with 21000: aggregate, or `orderBy()` + `limit(1)`); a hand-built subquery where a navigation or a collection aggregate exists |
@@ -158,7 +160,8 @@ section with every option of the call.
 | [Only the groups that pass a condition](./guides/querying.md#filter-groups-having) | `.having(g => gt(g.count(), 1))` | `HAVING COUNT(*) > $1` · 1 | filtering groups in JS; row conditions in `having()` (put them in `where()` before `select()`) |
 | [Statistics per day, month or another expression](./guides/querying.md#group-by-a-column-a-navigation-or-an-expression) | `.groupBy(r => ({ day: dateTrunc('day', r.publishedAt) }))` | `FROM (SELECT date_trunc('day', "posts"."published_at") as "day", "posts"."views" as "__arg0" FROM "posts") "q1" GROUP BY "day"` · 1 | loading the rows and bucketing them in JS |
 | [A conditional count or sum per group](./guides/querying.md#aggregates-per-group) | `g.sum(r => caseWhen(eq(r.status, 'completed'), 1).else(0))` | `SUM(CASE WHEN "orders"."status" = $1 THEN CAST($2 AS integer) ELSE CAST($3 AS integer) END)` · 1 | one grouped query per status; `agg.*` over a non-key column inside a grouped select (only `g.key` is readable there) |
-| [A list of child rows per key](./guides/cte-guide.md#attach-child-rows-as-a-json-array-per-key-withaggregation) | through a navigation: a collection (`u.posts!.select(…).toList()`); without one: `new DbCteBuilder().withAggregation(name, query, keySelector, 'posts')`, read with `db.selectFromCte(cte)` or joined with `leftJoin(cte, …)` | `WITH "posts_by_user" AS (SELECT "userId", json_agg(json_build_object('id', "id", 'title', "title")) as "posts" … GROUP BY "userId")` · 1 | a query per key; `agg.arrayAgg()` of a non-key column in a grouped select (the group exposes only `g.key` and `count()` / `sum()` / `avg()` / `min()` / `max()`) |
+| [A list of child rows per key](./guides/cte-guide.md#attach-child-rows-as-a-json-array-per-key-withaggregation) | through a navigation: a collection (`u.posts!.select(…).toList()`); without one: `new DbCteBuilder().withAggregation(name, query, keySelector, 'posts')`, read with `db.selectFromCte(cte)` or joined with `leftJoin(cte, …)` | `WITH "posts_by_user" AS (SELECT "userId", json_agg(json_build_object('id', "id", 'title', "title")) as "posts" … GROUP BY "userId")` · 1 | a query per key; `agg.arrayAgg()` in a grouped select (it reads the grouping key only: one value per member is `g.arrayAgg()`, next row) |
+| [Each group's members as a list of values, a count of distinct values per group](./guides/querying.md#list-a-groups-members-and-count-distinct-values-garrayagg-gcountdistinct) | `g.arrayAgg(r => r.id, { orderBy: [[r => r.views, 'DESC']] })`, `g.countDistinct(r => r.category)` in the grouped `select()` or `having()` (since 1.0.31; [recipe](#compute-statistics-per-key-groupby-and-having)) | `array_agg("posts"."id" ORDER BY "posts"."views" DESC) as "postIds", count(DISTINCT "posts"."category") as "categories" … GROUP BY "posts"."user_id"` · 1 | every row read and folded per key in JS (every row travels); `agg.arrayAgg()` / `agg.countDistinct()` there (they read the grouping key only) |
 | [Row numbers or ranks](./guides/querying.md#number-and-rank-rows-window-functions) | `win.rowNumber()`, `win.rank()`, `win.denseRank()` with `.over({ partitionBy, orderBy })` (since 1.0.21) | `row_number() OVER (PARTITION BY "posts"."user_id" ORDER BY …)` · 1 | numbering rows in JS |
 | [The top N rows of each group, as flat rows](./guides/cte-guide.md#keep-the-top-n-rows-per-group-rank-in-a-cte) | a window value in a CTE body, filtered where the CTE is read | `WITH "ranked_posts" AS (… row_number() OVER (…) as "rank" …) SELECT … WHERE "ranked_posts"."rank" <= $1` · 1 | `where()` on the window value in the query that computes it (throws before sending) |
 
@@ -186,6 +189,7 @@ section with every option of the call.
 | Need | Use | SQL shape · round trips | Avoid |
 |---|---|---|---|
 | [Several independent reads (a screen, an endpoint)](./guides/batching-and-prepared-queries.md#read-several-independent-results-in-one-round-trip-querybatch) | `QueryBatch` | one `UNION ALL` of per-read JSON envelopes · 1 for any number of reads | sequential `await`s (N); `Promise.all` (N statements on up to N pooled connections); `FutureQueryRunner.runAsync()`, which is 1 round trip only for parameter-free futures on `PostgresClient` / `BunClient` / `PGliteClient` outside a transaction |
+| [A union's count or first row next to other reads](./guides/batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch) | `batch.addCount(union, id)` / `batch.addFirstOrDefault(union.orderBy(…), id)` (since 1.0.31; [recipe](#read-several-independent-results-in-one-round-trip-querybatch)) | `SELECT COUNT(*) as count FROM ((SELECT …) UNION (SELECT …)) as union_count` and the union with `LIMIT 1`, legs of the batch's `UNION ALL` · 1 | `union.count()` / `union.firstOrDefault()` awaited beside the batch (a statement each: 3 instead of 1); a paged union for the total (its count counts its own `LIMIT` / `OFFSET`); a union whose legs declare a data-modifying CTE (refused as a count or first row) |
 | [Independent lists of thousands of rows each, free pool connections](./guides/batching-and-prepared-queries.md#choose-the-right-tool) | `Promise.all` of `toList()` | N statements, run concurrently · N | `QueryBatch`: `bench/querybatch`, 10 lists of 2,000 rows on a local server, 16 ms with `Promise.all`, 24 ms as one statement |
 | [Run one query shape many times with new values (a hot path)](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client) | by client ([recipe](#run-one-query-shape-many-times-pick-the-tool-by-client)): on `PostgresClient` the ordinary builder on a context with `preparedStatements: true`, plus `MockRowCache.setEnabled(true)` once at startup; on `PgClient`, `BunClient`, `PGliteClient` `prepare(name)` with `sql.placeholder(name)`, then `execute(values)` | the same text on every call · 1 statement per call; on `PostgresClient` the named statement costs 2 network round trips on its first use per connection, then 1 (unnamed with parameters: 2 every time) | `prepare()` on `PostgresClient` (never named: 2 network round trips per call) or wherever the query needs logging, a timeout or slow-query reports (it bypasses the executor); texts that vary per call (`inArray()` lengths, `limit()` / `offset()` values) under `preparedStatements` |
 | [Less query-build CPU on a hot path with many query shapes](./guides/configuration.md#cut-query-build-cpu-mockrowcache) | `MockRowCache.setEnabled(true)` once at startup; keep the ordinary builders | unchanged SQL · unchanged round trips | `prepare()` when the query also needs logging or a timeout; the switch in a process that builds mostly one-off shapes (it retains memory: up to 2,000 mock-row and 2,000 lateral-SQL entries, 5,000 navigation paths) |
@@ -206,6 +210,7 @@ section with every option of the call.
 | [Lock the rows you read before writing them](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate) | `tx.users.where(…).select(…).forUpdate().firstOrDefault()` | `… LIMIT 1 FOR UPDATE` · 1 | `forUpdate()` outside a transaction (the lock ends with the statement) |
 | [Claim work-queue rows other workers have not locked](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate) | `.orderBy(t => t.id).limit(n).forUpdate({ skipLocked: true })` | `ORDER BY "id" ASC LIMIT 5 FOR UPDATE SKIP LOCKED` · 1 | an unordered claim (two workers can deadlock); `skipLocked` with `noWait` (throws); `forUpdate()` on a CTE-rooted query (`db.selectFromCte(…)`): it locks no rows, put it on the CTE body |
 | [Serialize check-then-write on a key that is not a row (an import per partner, a number series)](./guides/insert-update-guide.md#serialize-check-then-write-on-a-key-that-is-not-a-row-advisory-locks) | `tx.advisoryXactLock(classId, key)` (waits), `tx.tryAdvisoryXactLock(key)` (`true` / `false`), `tx.advisoryXactLockAll(classId, keys)` | `SELECT pg_advisory_xact_lock($1, $2)` · 1; released at COMMIT or ROLLBACK | a lock table; `forUpdate()` (rows that do not exist yet cannot be locked); calling it on `db` (throws: the lock would end with the statement); a lock where a unique index plus `ON CONFLICT` already decides |
+| [Take many keys without waiting, or leave the work to whoever holds one](./guides/insert-update-guide.md#try-many-keys-without-waiting-tryadvisoryxactlockall-since-1031) | `if (!await tx.tryAdvisoryXactLockAll(classId, keys)) return …` (since 1.0.31) | `WITH RECURSIVE walk(ord, ok) AS (SELECT 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[1]) UNION ALL …) SELECT bool_and(walk.ok) AS "acquired" FROM walk` · 1 | `tryAdvisoryXactLock()` per key (3 keys: 3 statements instead of 1); going on after `false` (the keys tried before the busy one stay held until the transaction ends) |
 | [Several reads inside the transaction in one round trip](./guides/batching-and-prepared-queries.md#batch-inside-a-transaction-or-under-a-timeout) | a `QueryBatch` whose legs all start from `tx` | one `UNION ALL` statement on the transaction's connection · 1 | legs from `db` and `tx` in one batch (refused before sending) |
 
 ## Writing data: decision table
@@ -219,8 +224,8 @@ Promises instead: they send when called
 |---|---|---|---|
 | [One row](./guides/insert-update-guide.md#insert-one-row-insert) | `insert(row)` | `INSERT INTO "tags" ("name") VALUES ($1)` · 1 | `const t = await db.tags.insert(row)` expecting the row (it is `undefined`) |
 | [One row and its generated key](./guides/insert-update-guide.md#insert-one-row-insert) | `insert(row).returning(t => ({ id: t.id }))` | `INSERT INTO "tags" ("name") VALUES ($1) RETURNING "id" AS "id"` · 1 | insert, then a SELECT for the key (2) |
-| [Many rows](./guides/insert-update-guide.md#insert-many-rows-in-one-statement-insertbulk) | `insertBulk(rows)` | `INSERT INTO "tags" ("name") VALUES ($1), ($2), ($3)` · 1 per chunk of `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows | an awaited `insert()` per row (n) |
-| [Generated keys of many rows](./guides/insert-update-guide.md#insert-many-rows-in-one-statement-insertbulk) | `insertBulk(rows).returning(t => ({ id: t.id, name: t.name }))`; return a natural key with the id (the order of RETURNING rows is not guaranteed) | `… RETURNING "id" AS "id", "name" AS "name"` · 1 up to one chunk (39,321 rows of 1 column, 13,107 of 3; 10,000 one-column rows measured: 1 statement), then 1 per chunk | `insert().returning()` per row (n) |
+| [Many rows](./guides/insert-update-guide.md#insert-many-rows-in-one-statement-insertbulk) | `insertBulk(rows)` | `INSERT INTO "tags" ("name") VALUES ($1), ($2), ($3)` · 1 per chunk of `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds (PGlite: `floor(32 767 ÷ keys)`; [chunks](./guides/insert-update-guide.md#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | an awaited `insert()` per row (n); a hand-made `chunkSize` for PGlite (used as given, refused over 32,767 parameters) |
+| [Generated keys of many rows](./guides/insert-update-guide.md#insert-many-rows-in-one-statement-insertbulk) | `insertBulk(rows).returning(t => ({ id: t.id, name: t.name }))`; return a natural key with the id (the order of RETURNING rows is not guaranteed) | `… RETURNING "id" AS "id", "name" AS "name"` · 1 up to one chunk (39,321 rows of 1 column, 13,107 of 3; on PGlite 32,767 and 10,922; 10,000 one-column rows measured: 1 statement), then 1 per chunk | `insert().returning()` per row (n) |
 | [More rows than one chunk, or one statement text for any row count](./guides/insert-update-guide.md#insert-a-large-or-variable-size-set-in-one-fixed-statement-fromrows) | `insertFrom(fromRows(table, rows, { columns }).asSubquery('table'), map)` (since 1.0.29), `.returning(t => ({ id: t.id, name: t.name }))` for the keys | `INSERT INTO "tags" ("name") SELECT "src"."name" FROM (… unnest(CAST($1 AS varchar[])) …) AS "src" RETURNING "id" AS "id", "name" AS "name"`: 1 parameter per column · 1 (40,000 rows with RETURNING measured: 1) | `insertBulk()` of 70,000 rows: 2 statements, 70,000 parameters, a text that changes with the row count |
 | [Insert the new rows, skip the rest](./guides/insert-update-guide.md#insert-the-rows-that-are-new-and-skip-the-rest) | `insertBulk(rows, { onConflictDoNothing: true })` (any unique index) | `… VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING` · 1 per chunk | `exists()`, then `insert()`, per row (2 per new row, racy: 23505) |
 | [Insert-or-skip on ONE key (or a partial unique index)](./guides/insert-update-guide.md#insert-the-rows-that-are-new-and-skip-the-rest) | `upsertBulk(rows, { primaryKey: 'username', updateColumnFilter: () => false })` (+ `targetWhere` for a partial index) | `… VALUES ($1, $2), ($3, $4) ON CONFLICT ("username") DO NOTHING` · 1 per chunk | `onConflictDoNothing`, which skips a conflict on ANY unique index |
@@ -232,12 +237,15 @@ Promises instead: they send when called
 | [Insert or update without a unique index](./guides/insert-update-guide.md#insert-or-update-without-a-unique-index-mergebulk) | `mergeBulk(rows, { on })` (PostgreSQL 15+) | `MERGE INTO "registry_items" AS t USING (VALUES …) AS s (…) ON t."crm_id" = s."crm_id" WHEN MATCHED … WHEN NOT MATCHED …` · 1 per chunk | `mergeBulk()` with concurrent writers of the same keys (no speculative insertion: duplicates or 23505) |
 | [The same change to every matching row](./guides/insert-update-guide.md#update-the-rows-that-match-a-condition-whereupdate) | `where(cond).update(values)`; values may be expressions over the row | `UPDATE "posts" SET "views" = "posts"."views" + $1 WHERE "posts"."user_id" = $2` · 1 | an update per row |
 | [Update or delete by a list of ids](./guides/insert-update-guide.md#update-the-rows-that-match-a-condition-whereupdate) | `where(r => eqAny(r.id, ids)).update(…)` / `.delete()` | `UPDATE "users" SET "is_active" = $1 WHERE ("users"."id" = ANY($2::integer[]))` · 1 | an update per id (n); `inArray()` (one statement text per list length) |
+| [Add one value to an array column, or remove one, without reading it](./guides/insert-update-guide.md#add-or-remove-one-value-of-an-array-column-arrayappendunique-arrayremove-since-1031) | `where(b => eqAny(b.id, ids)).update(b => ({ tags: arrayAppendUnique(b.tags, 'classic') }))`; `arrayRemove(b.tags, 'novel')` (since 1.0.31; the `books` table of [SQL Expression Helpers](./guides/sql-expressions.md#change-an-array-in-place-arrayappendunique-arrayremove-since-1031)) | `UPDATE "books" SET "tags" = (CASE WHEN CAST($1 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), CAST($2 AS text)) END) WHERE ("books"."id" = ANY($3::integer[]))` · 1 | a SELECT of the array, a change in JS and an UPDATE of the whole array (2 per row; a change another writer made in between is lost) |
 | [Many rows, each with its own values](./guides/insert-update-guide.md#update-many-rows-each-with-its-own-values-bulkupdate) | `bulkUpdate(rows)`; a row may carry only the columns it changes | `UPDATE "users" AS t SET "age" = CASE WHEN v."age__provided" THEN v."age" ELSE t."age" END, … FROM (VALUES …) AS v(…) WHERE t."id" = v."id"` · 1 per chunk | `where(id).update()` per row (n) |
 | [Delete by a condition](./guides/insert-update-guide.md#delete-rows-wheredelete) | `where(cond).delete()` | `DELETE FROM "post_comments" WHERE "post_comments"."id" > $1` · 1 | a delete per id; `db.<table>.delete()` without `where()` (it deletes every row) |
 | [Rows computed from data in the database](./guides/insert-update-guide.md#insert-rows-computed-from-the-database-insertfrom) | `insertFrom(query.asSubquery('table'), map)` | `INSERT INTO "order_task" (…) SELECT … FROM (SELECT (COALESCE(MAX(…), $2) + $3) as "next" …) AS "src"` · 1 | read, compute in JS, insert (2; the value can be stale when it is written) |
 | [A parent and children that need its key](./guides/insert-update-guide.md#insert-a-parent-and-its-children-in-one-statement-insertwithchildren) | `insertWithChildren({ row, children, returning })` | `WITH "__iwc_parent__" AS (INSERT … RETURNING *), "__mutation__" AS (INSERT INTO "posts" … SELECT p."id", …) SELECT …` · 1; 2 when the parent selector reads a navigation or a collection (read back by a SELECT after the statement) | insert the parent, read its id, insert the children (2, not atomic) |
 | [Several independent writes in one round trip](./guides/insert-update-guide.md#run-independent-writes-in-one-round-trip-mutationbatch) | `MutationBatch`: `addInsertBulk()`, `addBulkUpdate()`, `addUpsertBulk()`, `addDeleteWhereIn()`, `addUpdateWhereIn()`, then `executeBatch()` | `WITH "__mb_0" AS (INSERT …), "__mb_1" AS (UPDATE …), … SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", …` · 1, atomic | awaited writes one by one (n statements, n commits); legs that depend on each other's rows (they share one snapshot) |
 | [Generated keys of a batch's insert leg](./guides/insert-update-guide.md#read-back-the-rows-an-insert-leg-wrote-returning-and-getlegrows) | `addInsertBulk(table, rows, id, { returning: ['id', 'name'] })`, then `getLegRows(id)` (since 1.0.29) | `… RETURNING "id" AS "id", "name" AS "name"` and `(SELECT COALESCE(json_agg(row_to_json("__mb_0")), '[]'::json) FROM "__mb_0") AS "0__rows"` · 1 | a SELECT after the batch |
+| [A batch leg whose size depends on the data (it may not fit the one statement)](./guides/insert-update-guide.md#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032) | `const key = batch.addInsertBulk(table, rows, id, { ifFits: true })` (any leg but `addDependentInsert`, since 1.0.32); `key === null`: `table.insertBulk(rows)` standalone ([recipe](#write-several-independent-changes-in-one-round-trip-mutationbatch)) | the leg's own SQL when it fits · 1; declined: the batch, then the standalone write's chunks (40,000 one-column rows: 1 + 2) | `batch.parameterCount + rows × columns <= maxParameters()` (it misses the leg's own row budget: 39,322 one-column rows throw at registration); a large leg without `ifFits` (thrown at registration, or the statement refused by `executeBatch()`) |
+| [One constant change over a key list, only where the rows are still in a given state, in a batch](./guides/insert-update-guide.md#update-a-key-list-only-where-a-guard-holds-addupdatewherein-with-where-since-1032) | `batch.addUpdateWhereIn(db.orders, 'id', ids, { status: 'cancelled' }, 'cancel', { where: o => eq(o.status, 'pending') })` (since 1.0.32); outside a batch `where(o => and(eqAny(o.id, ids), eq(o.status, 'pending'))).update(…)` | `UPDATE "orders" AS t SET "status" = $1 WHERE "id" IN ($2, $3) AND ("t"."status" = $4)` in the batch's statement · 1 | `addBulkUpdate()` with a VALUES row per key repeating the same value (2 parameters per key); the change without the guard (it overwrites a row that moved on: an order completed meanwhile) |
 | [The rows a write changed](./guides/insert-update-guide.md#read-back-what-a-write-changed-returningselector) | `.returning(selector)` | `UPDATE … RETURNING "id" AS "id", "age" AS "age"` · 1 | a SELECT after the write (2) |
 | [How many rows changed](./guides/insert-update-guide.md#update-the-rows-that-match-a-condition-whereupdate) | `.affectedCount()` on `where().update()` / `where().delete()` | no RETURNING; the driver's row count · 1 | `.returning()` and `.length` |
 | [The value a row had before the update](./guides/insert-update-guide.md#read-the-row-as-it-was-before-the-update-old-postgresql-18) | `.returning((row, old) => ({ id: row.id, status: row.status, previous: old.status }))` (PostgreSQL 18) | `RETURNING "id" AS "id", "status" AS "status", old."status" AS "previous"` · 1 | `SELECT … FOR UPDATE`, then `UPDATE` (2) |
@@ -583,8 +591,44 @@ ORDER BY "username" ASC
 > **Pitfall:** a collection has no `avg()`; use `g.avg()` in a grouped subquery or a correlated `agg.avg()` scalar
 > subquery. A user without a group reads the joined columns as `undefined` (`views` above); wrap counts in `coalesce()`.
 
+A child column with a custom mapper (`Post.publishTime`, `{ hour, minute }` stored as minutes) goes through it in a
+collection (since 1.0.31): compare it with the application value, and `min()` / `max()` read the mapped value.
+
+```ts
+import { gte } from 'linkgress-orm';
+
+const schedule = await db.users
+  .orderBy(u => u.id)
+  .select(u => ({
+    username: u.username,
+    afternoonPosts: u.posts!.where(p => gte(p.publishTime, { hour: 12, minute: 0 })).count(),   // binds 720
+    firstSlot: u.posts!.min(p => p.publishTime),   // the mapped value; typed number | null
+  }))
+  .toList();
+// [{ username: 'alice', afternoonPosts: 1, firstSlot: { hour: 9, minute: 30 } },
+//  { username: 'bob', afternoonPosts: 1, firstSlot: { hour: 18, minute: 45 } },
+//  { username: 'charlie', afternoonPosts: 0, firstSlot: null }]
+```
+
+```sql
+SELECT "users"."username" as "username", (SELECT COALESCE(COUNT(*), 0)
+FROM "posts" "lateral_0_posts"
+WHERE "lateral_0_posts"."user_id" = "users"."id" AND "lateral_0_posts"."publish_time" >= $1) as "afternoonPosts", (SELECT COALESCE(MIN("lateral_1_posts"."publish_time"), null)
+FROM "posts" "lateral_1_posts"
+WHERE "lateral_1_posts"."user_id" = "users"."id") as "firstSlot"
+FROM "users"
+ORDER BY "users"."id" ASC
+-- params: [ 720 ]
+```
+
+The workaround older code used, the stored value passed by hand
+(`exists(u.posts!.where(p => eq(p.publishTime, 570)))`), goes through `toDriver` too and fails:
+`invalid input syntax for type smallint: "NaN"`. An expression over the column, `sum()`, and a `min()` / `max()` read
+back as a CTE or joined-subquery column read the stored value.
+
 Guides: [Count, sum, min and max per parent](./guides/querying.md#count-sum-min-and-max-per-parent),
-[Join per-key aggregates computed once](./guides/querying.md#join-per-key-aggregates-computed-once).
+[Join per-key aggregates computed once](./guides/querying.md#join-per-key-aggregates-computed-once),
+[Compare and aggregate the items' mapped columns](./guides/querying.md#compare-and-aggregate-the-items-mapped-columns).
 
 ### Compute statistics per key: `groupBy()` and `having()`
 
@@ -638,7 +682,35 @@ FROM "posts"
 > **Pitfall:** `groupBy()` exists only after `select()`, and its callbacks see the projection: project every key and
 > every aggregate argument first. `COUNT` reads as a number, `SUM` and `AVG` are cast to `DOUBLE PRECISION`.
 
-Guide: [Group rows](./guides/querying.md#group-rows-groupby).
+A group's members as a list of values, and the number of distinct values per group, are `g.arrayAgg()` and
+`g.countDistinct()` (since 1.0.31), in the grouped `select()` or in `having()`:
+
+```ts
+const perAuthor = await db.posts
+  .select(p => ({ userId: p.userId, id: p.id, views: p.views, category: p.category }))
+  .groupBy(r => ({ userId: r.userId }))
+  .select(g => ({
+    userId: g.key.userId,
+    postIds: g.arrayAgg(r => r.id, { orderBy: [[r => r.views, 'DESC']] }),   // number[]
+    categories: g.countDistinct(r => r.category),                            // number
+  }))
+  .orderBy(r => r.userId)
+  .toList();
+// [{ userId: 1, postIds: [2, 1], categories: 1 }, { userId: 2, postIds: [3], categories: 1 }]
+```
+
+```sql
+SELECT "posts"."user_id" as "userId", array_agg("posts"."id" ORDER BY "posts"."views" DESC) as "postIds", count(DISTINCT "posts"."category") as "categories"
+FROM "posts"
+GROUP BY "posts"."user_id"
+ORDER BY "userId" ASC
+```
+
+Reading the rows and folding them per key in JS is 1 statement too, but every row travels (3 rows of 4 columns here,
+against 2 group rows). `agg.arrayAgg()` in a grouped select reads the grouping key only.
+
+Guides: [Group rows](./guides/querying.md#group-rows-groupby),
+[List a group's members and count distinct values](./guides/querying.md#list-a-groups-members-and-count-distinct-values-garrayagg-gcountdistinct).
 
 ### Read a page and its total in one statement
 
@@ -820,7 +892,62 @@ WHERE "orders"."user_id" = $1
 > `db`, is refused before anything is sent; inside a transaction, build every leg from `tx`. Reads that depend on
 > each other's results belong in one query with navigations or collections, not in a batch.
 
-Guide: [Read several independent results in one round trip](./guides/batching-and-prepared-queries.md#read-several-independent-results-in-one-round-trip-querybatch).
+A union's count and its first row are batch legs too (since 1.0.31): `addCount(union)` and
+`addFirstOrDefault(union)`. Awaited beside the batch, `union.count()` and `union.firstOrDefault()` cost a statement each
+(the same three reads below took 3 statements):
+
+```ts
+import { eq, QueryBatch } from 'linkgress-orm';
+
+// users who wrote a post or placed an order, once each
+const participants = () => db.posts
+  .select(p => ({ userId: p.userId }))
+  .union(db.orders.select(o => ({ userId: o.userId })));
+
+const unionBatch = new QueryBatch();
+const totalKey = unionBatch.addCount(participants(), 'participants');
+const lastKey = unionBatch.addFirstOrDefault(participants().orderBy(r => [[r.userId, 'DESC']]), 'last');
+const bobKey = unionBatch.addFirstOrDefault(db.users.where(u => eq(u.id, 2)).select(u => ({ id: u.id, username: u.username })), 'user');
+await unionBatch.executeBatch();
+unionBatch.getCount(totalKey);   // 2
+unionBatch.getItem(lastKey);     // { userId: 2 }
+unionBatch.getItem(bobKey);      // { id: 2, username: 'bob' }
+```
+
+```sql
+SELECT 0 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+SELECT COUNT(*) as count FROM ((SELECT "posts"."user_id" as "userId"
+FROM "posts")
+UNION
+(SELECT "orders"."user_id" as "userId"
+FROM "orders")) as union_count
+) __batch_q
+UNION ALL
+SELECT 1 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+(SELECT "posts"."user_id" as "userId"
+FROM "posts")
+UNION
+(SELECT "orders"."user_id" as "userId"
+FROM "orders")
+ORDER BY "userId" DESC
+LIMIT 1
+) __batch_q
+UNION ALL
+SELECT 2 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+SELECT "users"."id" as "id", "users"."username" as "username"
+FROM "users"
+WHERE "users"."id" = $1
+LIMIT 1
+) __batch_q
+-- params: [ 2 ]
+```
+
+A union's count counts its own `LIMIT` / `OFFSET` (a select's count leg drops them): register the union without paging
+for its total. A union whose legs declare a data-modifying CTE is refused as a count or a first row; run its `count()`
+on its own.
+
+Guides: [Read several independent results in one round trip](./guides/batching-and-prepared-queries.md#read-several-independent-results-in-one-round-trip-querybatch),
+[Count a union or read its first row in a batch](./guides/batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch).
 
 ### Run one query shape many times: pick the tool by client
 
@@ -1230,7 +1357,9 @@ FROM unnest(CAST($1 AS varchar[])) AS "rows"("name")) AS "src"
 
 When to switch from `insertBulk()` to `fromRows()`: `insertBulk()` stays ONE statement up to one chunk of
 `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows: 39,321 rows of 1 column, 13,107 rows of 3 (measured:
-10,000 one-column rows with `.returning()` were 1 statement, 13,108 three-column rows 2). Above one chunk, or when the
+10,000 one-column rows with `.returning()` were 1 statement, 13,108 three-column rows 2). On PGlite a chunk binds at
+most 32,767 parameters (since 1.0.32): 32,767 rows of 1 column, 10,922 of 3 (measured: 10,922 three-column rows were 1
+statement, 11,000 were 2). Above one chunk, or when the
 statement text must not depend on the row count (prepared statements), use `insertFrom(fromRows(…))`; it reads the
 generated keys with `.returning()` too (40,000 rows with `.returning()` measured: 1 statement):
 
@@ -1722,7 +1851,48 @@ DELETE FROM "post_comments" WHERE "post_comments"."id" = $1
 > ([Feed one write into another](./guides/insert-update-guide.md#feed-one-write-into-another-in-one-statement-data-modifying-ctes)).
 > `getLegRows()` returns raw JSON values, without column mappers, in no particular order.
 
-Guide: [Run independent writes in one round trip](./guides/insert-update-guide.md#run-independent-writes-in-one-round-trip-mutationbatch).
+A leg whose size depends on the data registers `ifFits` (since 1.0.32): it rides the statement when the statement can
+carry it, and the call returns `null`, registering nothing, when it cannot; write those rows standalone. A constant
+change over a key list that must apply only to the rows still in a given state takes `where` on `addUpdateWhereIn`
+(since 1.0.32). Register the legs that must ride the statement first:
+
+```ts
+import { eq, MutationBatch } from 'linkgress-orm';
+
+const newTags = [{ name: 'Winter sale' }, { name: 'Gift' }];   // any number of rows
+const fitBatch = new MutationBatch();
+const cancelled = fitBatch.addUpdateWhereIn(db.orders, 'id', [1, 2], { status: 'cancelled' }, 'cancel', {
+  where: o => eq(o.status, 'pending'),   // only the orders still pending
+});
+const tags = fitBatch.addInsertBulk(db.tags, newTags, 'tags', { returning: ['id', 'name'], ifFits: true });
+await fitBatch.executeBatch();
+const written = tags != null
+  ? fitBatch.getLegRows(tags)                                                         // in the statement
+  : await db.tags.insertBulk(newTags).returning(t => ({ id: t.id, name: t.name }));  // declined: standalone, chunked
+fitBatch.getAffectedCount(cancelled!);   // 1: order 1 is completed and keeps its status
+```
+
+```sql
+WITH "__mb_0" AS (
+UPDATE "orders" AS t SET "status" = $1 WHERE "id" IN ($2, $3) AND ("t"."status" = $4)
+RETURNING 1
+),
+"__mb_1" AS (
+INSERT INTO "tags" ("name") VALUES ($5), ($6)
+RETURNING "id" AS "id", "name" AS "name"
+)
+SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "__mb_1") AS "1", (SELECT COALESCE(json_agg(row_to_json("__mb_1")), '[]'::json) FROM "__mb_1") AS "1__rows"
+-- params: [ "cancelled", 1, 2, "pending", "Winter sale", "Gift" ]
+```
+
+With 40,000 tags the same code sent 3 statements: the batch with the update leg alone (4 parameters), then
+`insertBulk()` in 2 chunks (39,321 + 679 parameters). Checking `parameterCount` first is not enough: a leg also has a
+row budget of its own (39,321 one-column rows), and 39,322 one-column rows throw at registration on an empty batch,
+far below 65,535 parameters.
+
+Guides: [Run independent writes in one round trip](./guides/insert-update-guide.md#run-independent-writes-in-one-round-trip-mutationbatch),
+[Register a leg only when the statement can carry it](./guides/insert-update-guide.md#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032),
+[Update a key list only where a guard holds](./guides/insert-update-guide.md#update-a-key-list-only-where-a-guard-holds-addupdatewherein-with-where-since-1032).
 
 ### Read and write inside a transaction: `tx.<table>`
 
@@ -2025,6 +2195,21 @@ Details and the SQL of every shape: [Collection strategies](./collection-strateg
   statement instead of 2.
 - **Don't** await independent writes one by one → **Do** send them as one `MutationBatch`: 1 atomic statement instead
   of n.
+- **Don't** decide whether a `MutationBatch` leg fits with `parameterCount + rows × columns` → **Do** register it
+  `ifFits: true` and write the rows standalone when it returns `null`: the count misses the leg's own row budget (39,322
+  one-column rows threw at registration on an empty batch).
+- **Don't** give `addBulkUpdate()` a VALUES row per key that repeats the same value → **Do** `addUpdateWhereIn(…, { where })`:
+  one parameter per key, and the guard skips the rows that moved on.
+- **Don't** read an array column, change it in JS and write it back → **Do** `arrayAppendUnique()` / `arrayRemove()` in
+  `update(r => …)`: 1 statement on the row's current array instead of 2, and no lost update.
+- **Don't** fold grouped rows into lists or distinct counts in JS → **Do** `g.arrayAgg()` / `g.countDistinct()` in the
+  grouped `select()`: one row per group travels instead of every row.
+- **Don't** await `union.count()` or `union.firstOrDefault()` next to a `QueryBatch` → **Do** `addCount(union)` /
+  `addFirstOrDefault(union)`: 1 statement instead of 3 for the reads of the recipe.
+- **Don't** compare a mapped column of a collection's item with its stored value (`eq(p.publishTime, 570)`) → **Do**
+  pass the application value (`{ hour: 9, minute: 30 }`): it is bound through `toDriver`, and the stored value fails.
+- **Don't** call `tryAdvisoryXactLock()` once per key → **Do** `tryAdvisoryXactLockAll(classId, keys)`: 1 statement
+  instead of one per key; on `false` end the transaction (the keys tried before the busy one stay held).
 - **Don't** give `upsertBulk()` rows with different column sets → **Do** keep one column set per call, or use
   `bulkUpdate()` for partial rows: a missing column is written as NULL and overwrites the stored value on conflict.
 - **Don't** use `db.<table>` inside `db.transaction()` → **Do** use `tx.<table>`: `db` runs on another connection, which

@@ -238,8 +238,9 @@ How the two differ: [In-Memory Database](./guides/in-memory-database.md) and
 
 `insert(row)` sends one `INSERT`; chain `.returning(selector)` to read server-generated values in the
 same statement. `insertBulk(rows)` writes many rows in one statement per chunk: by default a chunk
-is as many rows as fit 60 % of PostgreSQL's 65 535 parameters (13 107 rows of 3 columns);
-`insertBulk(rows, { chunkSize })` sets it.
+is as many rows as fit 60 % of PostgreSQL's 65 535 parameters (13 107 rows of 3 columns), and never
+more than the client binds in one statement (PGlite: 32 767 parameters, so 10 922 rows of 3 columns;
+since 1.0.32); `insertBulk(rows, { chunkSize })` sets it.
 
 ```ts
 const alice = await db.users

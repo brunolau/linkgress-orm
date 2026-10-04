@@ -2,7 +2,7 @@
 
 > **For agents:** Which write API changes the rows you need in the fewest statements, and what SQL does each one send?
 > **Use this page when:** inserting, upserting, merging, updating or deleting rows; reading back generated keys or the written rows; replacing a per-row loop with one set-based statement; making several writes atomic. **Look elsewhere when:** reading rows → [Querying](./querying.md); data-modifying CTEs in depth → [CTE Guide](./cte-guide.md); unique indexes, partial indexes and sequences → [Schema Configuration](./schema-configuration.md)
-> **Key APIs:** `insert` · `insertBulk` · `insertFrom` · `fromRows` · `upsertBulk` · `mergeBulk` · `where().update()` · `bulkUpdate` · `where().delete()` · `.returning()` · `.affectedCount()` · `insertWithChildren` · `MutationBatch` · `toStatement()` · `db.transaction()` · **Round trips:** 1 per statement; `insertBulk`, `upsertBulk`, `mergeBulk` and `bulkUpdate` send 1 statement per chunk (a chunk is `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows: 39 321 for one column); `insertFrom(fromRows(…))` and a `MutationBatch` are 1 for any row count; `db.transaction()` adds BEGIN and COMMIT
+> **Key APIs:** `insert` · `insertBulk` · `insertFrom` · `fromRows` · `upsertBulk` · `mergeBulk` · `where().update()` · `bulkUpdate` · `where().delete()` · `.returning()` · `.affectedCount()` · `insertWithChildren` · `MutationBatch` (legs `ifFits`, `addUpdateWhereIn` `where`) · `toStatement()` · `db.transaction()` · **Round trips:** 1 per statement; `insertBulk`, `upsertBulk`, `mergeBulk` and `bulkUpdate` send 1 statement per chunk (a chunk is `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, 39 321 for one column, and at most the rows the client binds: `floor(32 767 ÷ keys)` on PGlite); `insertFrom(fromRows(…))` and a `MutationBatch` are 1 for any row count; `db.transaction()` adds BEGIN and COMMIT
 
 The examples use the test model `AppDatabase` ([Example Model and Seed Data](../example-model.md)), seeded with the
 users `alice`, `bob` and `charlie` and their posts, orders and tasks. Three features need a table the test model lacks:
@@ -68,6 +68,8 @@ pattern the **Use** column replaces; the linked sections show the SQL of both wh
 | The value a row had before the update | [`.returning((row, old) => …)`](#read-the-row-as-it-was-before-the-update-old-postgresql-18) (PostgreSQL 18) | `RETURNING … old."status" AS "previous"` · 1 | `SELECT … FOR UPDATE`, then `UPDATE` (2) |
 | A parent and children that need its key | [`insertWithChildren()` / `insertBulkWithChildren()`](#insert-a-parent-and-its-children-in-one-statement-insertwithchildren) | `WITH "__iwc_parent__" AS (INSERT … RETURNING *), "__mutation__" AS (INSERT INTO "posts" … SELECT p."id", … ) SELECT …` · 1 | insert the parent, read its id, insert the children (2, not atomic) |
 | Several independent writes in one round trip | [`MutationBatch`](#run-independent-writes-in-one-round-trip-mutationbatch) | `WITH "__mb_0" AS (…), "__mb_1" AS (…) SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", …` · 1, atomic | sequential awaits (n round trips, n commits) |
+| A batch leg whose size depends on the data | [`addInsertBulk(table, rows, id, { ifFits: true })`, the standalone write when it returns `null`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032) (since 1.0.32) | the leg's statement inside the batch when it fits · 1; declined: the batch, then the standalone write's chunks (40 000 one-column rows: 1 + 2) | `parameterCount` checked by hand (it misses the leg's own row budget: 39 322 one-column rows throw at registration) |
+| One constant change over a key list, only on the rows still in a given state, inside a batch | [`addUpdateWhereIn(db.orders, 'id', ids, { status: 'cancelled' }, id, { where: o => eq(o.status, 'pending') })`](#update-a-key-list-only-where-a-guard-holds-addupdatewherein-with-where-since-1032) (since 1.0.32) | `UPDATE "orders" AS t SET "status" = $1 WHERE "id" IN ($2, $3) AND ("t"."status" = $4)` · 1 (the batch's statement) | `addBulkUpdate` with a VALUES row per key repeating the value (2 parameters per key) |
 | A write whose RETURNING feeds a read or another write | [`toStatement()` + `DbCteBuilder.withMutation()`](#feed-one-write-into-another-in-one-statement-data-modifying-ctes) | `WITH "claimed" AS (UPDATE … RETURNING …) SELECT …` · 1 | 2 or more statements with a race between them |
 | Sequence numbers for many rows | [``sql`nextval('seq')` `` as a value of `insertBulk` / `insertFrom`](#number-many-rows-from-a-sequence-in-one-statement) | `VALUES ((nextval('invoice_number_seq')), $1), …` · 1 | `nextValue()` per row, then the insert (n + 1) |
 | Several dependent statements, all or nothing | [`db.transaction(async tx => …)`](#make-several-statements-atomic-dbtransaction) with `tx.<table>` | the statements, plus BEGIN and COMMIT | `db.<table>` inside the callback (another connection) |
@@ -268,7 +270,7 @@ key with the id (`username` above).
 
 | Option | Default | Effect |
 |---|---|---|
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows | rows per statement; more rows are sent as further statements |
+| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement; more rows are sent as further statements |
 | `onConflictDoNothing` | `false` | `ON CONFLICT DO NOTHING`: rows any unique index rejects are skipped |
 | `overridingSystemValue` | `false` | sends identity columns (otherwise left out) with `OVERRIDING SYSTEM VALUE` |
 
@@ -329,9 +331,38 @@ INSERT INTO "users" ("username", "email") VALUES ($1, $2)
 ```
 
 > **Efficiency:** n rows cost `ceil(n ÷ chunk)` round trips instead of n. A statement binds rows × columns parameters,
-> and its text changes with the row count (see [Keep the statement text stable](#keep-the-statement-text-stable)).
-> PGlite refuses a statement over 32 767 parameters, but the default chunk follows PostgreSQL's 65 535 and binds up to
-> 39 321 whatever the row width: on PGlite pass a `chunkSize` with rows × columns ≤ 32 767, or use `fromRows()`.
+> and its text changes with the row count (see [Keep the statement text stable](#keep-the-statement-text-stable)). The
+> default chunk stays within the client's parameter limit, so the same call runs on PGlite
+> ([below](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)).
+
+### How many rows one statement carries: chunks within the client's parameter limit (since 1.0.32)
+
+`insertBulk`, `upsertBulk`, `bulkUpdate` and `mergeBulk` split a large input into statements of
+`floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, and never into a chunk that binds more parameters than the
+client takes (`DatabaseClient.maxParameters()`: 65 535; `PGliteClient` 32 767). On PGlite a chunk is therefore at most
+`floor(32 767 ÷ keys)` rows; on PostgreSQL and the in-memory database the chunks are the ones 1.0.31 sent. Before
+1.0.32 the chunk followed PostgreSQL's limit alone, and PGlite refused every chunk binding more than 32 767 parameters.
+Measured with the same inputs on `PgClient` (the in-memory database) and on `PGliteClient`:
+
+| Call | Rows × keys | `PgClient` (65 535) | `PGliteClient` (32 767) |
+|---|---|---|---|
+| `db.tags.insertBulk(rows)` | 40 000 × 1 | 2 statements: 39 321 + 679 parameters | 2: 32 767 + 7 233 |
+| `db.posts.insertBulk(rows)` | 7 864 × 5 | 1: 39 320 | 2: 32 765 + 6 555 |
+| `db.users.bulkUpdate(rows)` (`id`, `age`) | 16 384 × 2 | 1: 32 768 | 2: 32 766 + 2 |
+| `db.tags.upsertBulk(rows)` (`id`, `name`) | 16 384 × 2 | 1: 32 768 | 2: 32 766 + 2 |
+| `db.posts.insertBulk(rows).toStatement()` | 8 192 × 4 | compiled: 32 768 parameters | throws (below) |
+
+- `chunkSize` is used as given, whatever the client takes (`{ chunkSize: 4 }` sent 10 one-column rows as 4 + 4 + 2
+  parameters): on PGlite keep its rows × keys at most 32 767, or leave it out. 11 000 rows of 3 keys went as 2
+  statements (32 766 + 234 parameters) by default; with `{ chunkSize: 11000 }` PGlite refused the first one:
+  `PGliteClient: the statement binds 33000 parameters — PGlite takes at most 32 767 …`.
+- `insertBulk(…).toStatement()` compiles at most one such chunk. On PGlite 8 191 rows of 4 keys compiled (32 764
+  parameters) and 8 192 threw `toStatement(): 8192 rows exceed the 8191-row chunk of one insert into "posts" —
+  insertBulk() would execute them as 2 statements, a compiled statement is one. Compile the rows in batches of at most
+  that many.`
+- Not chunked: `insertWithChildren` / `insertBulkWithChildren` (one statement, a row budget of their own), `values()`
+  (the whole input is one statement) and a `MutationBatch` statement (refused over the client's limit; register a leg
+  that may not fit [`ifFits`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032)).
 
 ## Insert a large or variable-size set in one fixed statement: `fromRows()`
 
@@ -378,7 +409,8 @@ Measured with 70 000 one-column rows (`db.tags`):
 | `insertFrom(fromRows(db.tags, rows, { columns: ['name'] }).asSubquery('table'), map)` | 1 | 1 | 147 characters |
 
 When to switch from `insertBulk()`: it is ONE statement up to one chunk (39 321 rows of one column, 13 107 of three;
-measured: 10 000 one-column rows with `.returning()` in 1 statement, 13 108 three-column rows in 2). Above one chunk,
+on PGlite 32 767 and 10 922; measured: 10 000 one-column rows with `.returning()` in 1 statement, 13 108 three-column
+rows in 2). Above one chunk,
 or when the statement text must not depend on the row count (prepared statements), use `fromRows()`. It reads the
 generated keys with `.returning()` too (40 000 rows with `.returning()`: 1 statement); return a natural key with the id,
 as the order of RETURNING rows is not guaranteed:
@@ -733,7 +765,7 @@ INSERT INTO "users" ("username", "email", "age") VALUES ($1, $2, $3), ($4, $5, $
 | `updateWhere` | — | `(existing, excluded) => condition`: the `DO UPDATE … WHERE` |
 | `setWhere` | — | the same condition as raw SQL; ANDed with `updateWhere` |
 | `targetWhere` | — | the arbiter predicate of a partial unique index ([below](#upsert-onto-a-partial-unique-index-targetwhere)) |
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows | rows per statement |
+| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
 | `overridingSystemValue` | `true` when the first row (or `referenceItem`) carries an identity primary key | `OVERRIDING SYSTEM VALUE` |
 | `referenceItem` | the first row | the row whose keys decide `overridingSystemValue` |
 
@@ -1028,7 +1060,7 @@ MERGE INTO "products" AS t USING (VALUES ($1::varchar, $2::boolean), ($3, $4)) A
 | `matchWhere` | — | raw SQL ANDed into the match; the target row is `t`, the source row `s` |
 | `updateColumns` | every column the rows carry except `on` | the `WHEN MATCHED THEN UPDATE SET` list; `[]` renders `WHEN MATCHED THEN DO NOTHING` (insert only the unmatched) |
 | `updateColumnFilter` | — | `(property) => boolean` over the rows' columns |
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows | rows per statement |
+| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
 
 - A target row may be matched by only one source row: two input rows with the same `on` key fail with 21000
   `MERGE command cannot affect row a second time`. Deduplicate the input by `on`.
@@ -1335,7 +1367,9 @@ WHERE t."id" = v."id"
   Rows with only the key and no `set` throw `No columns to update (only primary keys provided)`.
 - RETURNING columns are qualified `t."col"`. A navigation or collection in the selector runs the UPDATE in a
   `"__mutation__"` CTE.
-- Chunking follows the `insertBulk` rule (keys of the first row); `chunkSize` overrides it.
+- Chunking follows the `insertBulk` rule (keys of the first row, within the client's parameter limit:
+  [chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)); `chunkSize`
+  overrides it.
 - `MutationBatch.addBulkUpdate` takes the same `primaryKey` / `set` / `where`.
 
 > **Efficiency:** 1 statement per chunk instead of n. Every cell is cast and every non-key cell carries a provided
@@ -1748,7 +1782,9 @@ ORDER BY "id" ASC
 into ONE data-modifying-CTE statement: one round trip, atomic, with a count per leg. Use it for the writes of one unit
 of work that do not depend on each other. Writes that must see each other's rows need
 [`addDependentInsert()`](#write-an-audit-row-only-when-a-value-really-changed-adddependentinsert) or a
-[CTE chain](#feed-one-write-into-another-in-one-statement-data-modifying-ctes).
+[CTE chain](#feed-one-write-into-another-in-one-statement-data-modifying-ctes). A leg whose size depends on the data
+registers [`ifFits`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032) (since 1.0.32) and is
+written standalone when the statement cannot carry it.
 
 The sequence it replaces, 3 round trips and 3 commits:
 
@@ -1816,13 +1852,18 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT COALESCE(json_agg(ro
 
 | Leg | Signature | Statement |
 |---|---|---|
-| insert | `addInsertBulk(table, rows, id, { onConflictDoNothing?, overridingSystemValue?, rowGuard?, returning? })` | `INSERT … VALUES …` |
-| bulk update | `addBulkUpdate(table, rows, id, { primaryKey?, set?, where? })` | `UPDATE … FROM (VALUES …)` |
-| upsert | `addUpsertBulk(table, rows, { primaryKey, updateColumns?, updateSet?, updateWhere?, targetWhere? }, id, { returning? })` | `INSERT … ON CONFLICT …` |
-| delete by list | `addDeleteWhereIn(table, property, values, id)` | `DELETE FROM … WHERE "col" IN (…)` |
-| update by list | `addUpdateWhereIn(table, property, values, set, id, { exposeColumns?, exposeOldColumns? })` | `UPDATE … SET … WHERE "col" IN (…)` |
+| insert | `addInsertBulk(table, rows, id, { onConflictDoNothing?, overridingSystemValue?, rowGuard?, returning?, ifFits? })` | `INSERT … VALUES …` |
+| bulk update | `addBulkUpdate(table, rows, id, { primaryKey?, set?, where?, ifFits? })` | `UPDATE … FROM (VALUES …)` |
+| upsert | `addUpsertBulk(table, rows, { primaryKey, updateColumns?, updateSet?, updateWhere?, targetWhere? }, id, { returning?, ifFits? })` | `INSERT … ON CONFLICT …` |
+| delete by list | `addDeleteWhereIn(table, property, values, id, { ifFits? })` | `DELETE FROM … WHERE "col" IN (…)` |
+| update by list | `addUpdateWhereIn(table, property, values, set, id, { exposeColumns?, exposeOldColumns?, where?, ifFits? })` | `UPDATE … SET … WHERE "col" IN (…)`; with `where`: `UPDATE … AS t … AND (<guard>)` |
 | dependent insert | `addDependentInsert(table, row, { onLeg, whereColumn, whereNotEquals }, id)` | `INSERT … SELECT … FROM "<parent leg>" WHERE "<col>" <> $n` |
-| parents with children | `addInsertBulkWithChildren(table, { rows, children }, id, { parentReturning? })` | three CTEs |
+| parents with children | `addInsertBulkWithChildren(table, { rows, children }, id, { parentReturning?, ifFits? })` | three CTEs |
+
+`ifFits` ([below](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032)) and `addUpdateWhereIn`'s
+`where` ([below](#update-a-key-list-only-where-a-guard-holds-addupdatewherein-with-where-since-1032)) are since 1.0.32;
+the option types are exported as `InsertLegOptions`, `BulkUpdateLegConfig`, `UpsertLegConfig`, `LegFitOptions` and
+`UpdateWhereInLegOptions<TEntity>`.
 
 Members: `size` (registered legs), `parameterCount` (since 1.0.29; the statement's parameters), `executeBatch()`,
 `getAffectedCount(key)` and `getLegRows(key)` (both only after `executeBatch()`).
@@ -1838,10 +1879,14 @@ Members: `size` (registered legs), `parameterCount` (since 1.0.29; the statement
 - Every leg must come from the same context: legs of `db` and of a transaction's `tx` in one batch are refused
   (`MutationBatch: leg "tx" uses a different database client or transaction than the rest of the batch …`). Inside a
   transaction, build every leg from `tx.<table>`.
-- A leg above `floor(floor(65 535 ÷ columns) × 0.6)` rows throws at registration: run it standalone (it needs chunking).
+- A leg above its own budget, `floor(floor(65 535 ÷ columns of its first row) × 0.6)` rows (a list leg's values, a
+  children leg's parents and children), throws at registration: `MutationBatch: leg "tags" carries 39322 rows, above
+  the ~39321-row single statement budget for 1 columns — execute this mutation standalone (it needs chunking)`.
   `executeBatch()` refuses a statement over 65 535 parameters (the client's `maxParameters()` when lower: PGlite 32 767)
-  before sending: `MutationBatch: the statement binds 70000 parameters — over PostgreSQL's 65 535: execute some of its
-  legs in another batch ("a": 35000, "b": 35000)`. Check `parameterCount` before adding an optional leg.
+  before sending: `MutationBatch: the statement binds 69000 parameters — over PostgreSQL's 65 535: execute some of its
+  legs in another batch ("comments": 39000, "tags": 30000)`. A leg that may not fit: register it
+  [`ifFits`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032), which checks both; `parameterCount`
+  alone misses the first.
 - Delete legs for a parent and its children work when the child's foreign key is NO ACTION (PostgreSQL's default,
   checked at the end of the statement); a RESTRICT key rejects the parent leg, so keep such pairs in separate
   statements.
@@ -1869,6 +1914,80 @@ RETURNING 1
 SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "__mb_1") AS "1"
 -- params: [ "Fresh", "Renamed", "Fresh" ]
 ```
+
+### Register a leg only when the statement can carry it: `ifFits` (since 1.0.32)
+
+A leg whose size depends on the data (the rows a fan-out produces) can ride the batch's statement when it is small and
+must be written standalone when it is not. `ifFits: true` makes that decision as the leg registers: the leg is
+registered when the statement can carry it, and the call returns `null`, registering nothing, when it cannot. Every leg
+kind takes it except `addDependentInsert`: `addInsertBulk`, `addUpsertBulk`, `addBulkUpdate` (in its config),
+`addDeleteWhereIn` (a fifth argument), `addUpdateWhereIn` and `addInsertBulkWithChildren`.
+
+```ts
+import { MutationBatch } from 'linkgress-orm';
+
+const newTags = [{ name: 'Winter sale' }, { name: 'Gift' }];   // any number of rows
+const batch = new MutationBatch();
+batch.addBulkUpdate(db.products, [{ id: 2, name: 'Lift Ticket (day)' }], 'products');
+const tags = batch.addInsertBulk(db.tags, newTags, 'tags', { returning: ['id', 'name'], ifFits: true });
+await batch.executeBatch();
+const written = tags != null
+  ? batch.getLegRows(tags)                                                            // in the statement
+  : await db.tags.insertBulk(newTags).returning(t => ({ id: t.id, name: t.name }));  // declined: standalone, chunked
+// [{ id: 4, name: 'Winter sale' }, { id: 5, name: 'Gift' }]
+```
+
+```sql
+WITH "__mb_0" AS (
+UPDATE "products" AS t
+SET "name" = CASE WHEN v."name__provided" THEN v."name" ELSE t."name" END
+FROM (VALUES ($1::integer, $2::varchar, true)) AS v("id", "name", "name__provided")
+WHERE t."id" = v."id"
+RETURNING 1
+),
+"__mb_1" AS (
+INSERT INTO "tags" ("name") VALUES ($3), ($4)
+RETURNING "id" AS "id", "name" AS "name"
+)
+SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "__mb_1") AS "1", (SELECT COALESCE(json_agg(row_to_json("__mb_1")), '[]'::json) FROM "__mb_1") AS "1__rows"
+-- params: [ 2, "Lift Ticket (day)", "Winter sale", "Gift" ]
+```
+
+With 40 000 tags the same code sent 3 statements: the batch with the products leg alone (2 parameters), then
+`insertBulk()` in 2 chunks (39 321 + 679 parameters). The verdict is the rule a leg registered WITHOUT `ifFits` is held
+to, returned as `null` instead of an error:
+
+| Check | Limit | Without `ifFits` | Measured with `ifFits` |
+|---|---|---|---|
+| the leg's own rows (a list leg's values; a children leg's parents and children) | its budget, `floor(floor(65 535 ÷ columns of its first row) × 0.6)` rows: what a standalone write sends in one chunk on PostgreSQL | throws at registration | 39 321 one-column rows: registered; 39 322: `null` |
+| the parameters of the leg plus those of every leg registered before it | the client's `maxParameters()`: 65 535; PGlite 32 767 | `executeBatch()` refuses the statement | 39 000 ids registered, then 30 000 tags: `null` (69 000 > 65 535); on `PGliteClient`, 33 000 one-column rows: `null`, 32 767: registered |
+
+- Checking `parameterCount` is not enough: on an empty batch 39 322 one-column rows are within 65 535 parameters and
+  still over the leg's own budget.
+- The leg is counted as compiled: an `sql` fragment cell binds nothing; a typed row guard and an update leg's `where`
+  bind their own parameters.
+- A leg that fits compiles to the statement it compiles to without `ifFits`. Empty input returns `null` either way; a
+  duplicate identifier and an executed batch still throw.
+- A declined leg registers nothing: its identifier stays free (a smaller leg registered under it afterwards), and a leg
+  declined for its row count is not compiled; the standalone write validates that input.
+- Register the legs that must ride the statement first: the verdict counts the legs registered so far, and a leg
+  registered after an `ifFits` leg without the option is held to the limit by `executeBatch()` alone.
+
+What to write instead of a declined leg:
+
+| Leg | Standalone |
+|---|---|
+| `addInsertBulk` | `insertBulk(rows)`, `.returning(…)` for the readback: chunked |
+| `addUpsertBulk` | `upsertBulk(rows, config)`: chunked |
+| `addBulkUpdate` | `bulkUpdate(rows, config)`: chunked |
+| `addDeleteWhereIn` | `where(r => eqAny(r.col, values)).delete()`: one array parameter |
+| `addUpdateWhereIn` | `where(r => and(eqAny(r.col, values), guard(r))).update(set)`: one array parameter ([example](#update-a-key-list-only-where-a-guard-holds-addupdatewherein-with-where-since-1032)) |
+| `addInsertBulkWithChildren` | `insertBulkWithChildren(…)`: ONE statement under a row budget of its own, every parent with a child; split a larger input |
+| `addInsertBulk` with `rowGuard` | no standalone form: register it `ifFits` in a batch of its own, its rows split in parts until each registers |
+
+The chunked writes keep every chunk within the client's limit
+([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)), so the fallback
+runs on PGlite too.
 
 ### Insert only the rows that pass a per-row check: `rowGuard`
 
@@ -1915,6 +2034,117 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0"
   cross-transaction arbiter. Serialize concurrent writers first (an advisory or row lock earlier in the transaction), or
   use a unique index with `onConflictDoNothing`.
 - Not combinable with `onConflictDoNothing` or `overridingSystemValue` (thrown at registration).
+
+### Update a key list only where a guard holds: `addUpdateWhereIn` with `where` (since 1.0.32)
+
+`addUpdateWhereIn(table, property, values, set, id, { where })` sets CONSTANT values on the rows whose `property` is in
+`values`. `where` is a typed condition over the target row, ANDed into the leg's WHERE: the update applies only to the
+rows still in the state it was decided for.
+
+```ts
+import { MutationBatch, eq } from 'linkgress-orm';
+
+const failed = [1, 2];   // decided when both orders were pending; order 1 has completed since
+const batch = new MutationBatch();
+const cancelled = batch.addUpdateWhereIn(db.orders, 'id', failed, { status: 'cancelled' }, 'cancel', {
+  where: o => eq(o.status, 'pending'),   // only the orders still pending
+});
+batch.addInsertBulk(db.postComments, [{ postId: 3, orderId: 2, comment: 'Payment failed' }], 'note');
+await batch.executeBatch();
+batch.getAffectedCount(cancelled!);   // 1: order 2; order 1 stays 'completed'
+```
+
+```sql
+WITH "__mb_0" AS (
+UPDATE "orders" AS t SET "status" = $1 WHERE "id" IN ($2, $3) AND ("t"."status" = $4)
+RETURNING 1
+),
+"__mb_1" AS (
+INSERT INTO "post_comments" ("post_id", "order_id", "comment") VALUES ($5, $6, $7)
+RETURNING 1
+)
+SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "__mb_1") AS "1"
+-- params: [ "cancelled", 1, 2, "pending", 3, 2, "Payment failed" ]
+```
+
+Before 1.0.32 a guarded constant change took `addBulkUpdate` with a VALUES row per key repeating the same value: 2
+parameters per key instead of 1, plus a provided flag per cell:
+
+```ts
+const viaValues = new MutationBatch();
+viaValues.addBulkUpdate(db.orders, failed.map(id => ({ id, status: 'cancelled' })), 'cancel', {
+  where: t => eq(t.status, 'pending'),
+});
+await viaValues.executeBatch();   // cancel: 1
+```
+
+```sql
+WITH "__mb_0" AS (
+UPDATE "orders" AS t
+SET "status" = CASE WHEN v."status__provided" THEN v."status" ELSE t."status" END
+FROM (VALUES ($1::integer, $2::order_status, true), ($3::integer, $4::order_status, true)) AS v("id", "status", "status__provided")
+WHERE t."id" = v."id" AND ("t"."status" = $5)
+RETURNING 1
+)
+SELECT (SELECT count(*)::int FROM "__mb_0") AS "0"
+-- params: [ 1, "cancelled", 2, "cancelled", "pending" ]
+```
+
+- The guard takes the shape `addBulkUpdate`'s `where` takes, without the VALUES row: a condition over the column row
+  `t`, whose columns render `"t"."<column>"` and bind through their mappers. A navigation does not compile on a typed
+  table and is refused at registration, nothing registered: `addUpdateWhereIn where: navigation "user" is not
+  available — only the row's own columns are in scope`.
+- A subquery correlated to `t` is in scope, also one over the SAME table, which the standalone `where()` refuses
+  (`Correlated standalone subquery over table "orders" references the same table from the outer query. …`):
+
+```ts
+import { and, eq, notExists } from 'linkgress-orm';
+
+const guarded = new MutationBatch();
+guarded.addUpdateWhereIn(db.orders, 'id', [1, 2], { status: 'cancelled' }, 'cancel', {
+  // not the orders of a customer who has an order in processing
+  where: o => and(
+    eq(o.status, 'pending'),
+    notExists(db.orders.where(x => and(eq(x.userId, o.userId), eq(x.status, 'processing'))).select(x => ({ id: x.id })).asSubquery()),
+  ),
+});
+await guarded.executeBatch();   // cancel: 1
+```
+
+```sql
+WITH "__mb_0" AS (
+UPDATE "orders" AS t SET "status" = $1 WHERE "id" IN ($2, $3) AND (("t"."status" = $4 AND (NOT EXISTS (SELECT "orders"."id" as "id"
+FROM "orders"
+WHERE ("orders"."user_id" = "t"."user_id" AND "orders"."status" = $5)))))
+RETURNING 1
+)
+SELECT (SELECT count(*)::int FROM "__mb_0") AS "0"
+-- params: [ "cancelled", 1, 2, "pending", "processing" ]
+```
+
+- `getAffectedCount()` counts the rows the guard let through, and `exposeColumns` / `exposeOldColumns` publish only
+  those to dependent legs: with `exposeOldColumns: ['status']` and an `addDependentInsert` on `old__status`, the audit
+  leg inserted 1 row for the 1 cancelled order.
+- Its parameters are the leg's (`parameterCount`, `ifFits`): one per SET value and per key, then the guard's.
+- Without `where` the leg compiles to the statement of 1.0.31:
+  `UPDATE "orders" SET "status" = $1 WHERE "id" IN ($2, $3)`. With it the target is aliased `t`: the column refs of a
+  function SET still render unqualified (`` o => ({ totalAmount: sql<number>`${o.totalAmount} * 0` }) `` renders
+  `SET "total_amount" = "total_amount" * 0`), but raw SQL text in a SET value that names the table must name it `t`.
+- Declined (`ifFits`), or outside a batch, the same update is one standalone statement with one array parameter:
+
+```ts
+import { and, eq, eqAny } from 'linkgress-orm';
+
+const n = await db.orders
+  .where(o => and(eqAny(o.id, failed), eq(o.status, 'pending')))
+  .update({ status: 'cancelled' })
+  .affectedCount();   // 1
+```
+
+```sql
+UPDATE "orders" SET "status" = $1 WHERE (("orders"."id" = ANY($2::integer[])) AND "orders"."status" = $3)
+-- params: [ "cancelled", "{1,2}", "pending" ]
+```
 
 ### Read back the rows an insert leg wrote: `returning` and `getLegRows()`
 
@@ -2118,9 +2348,11 @@ FROM "ins") AS "src"
   only at the top level of the statement — pass it in insertFrom's options: { with: [updCte] }`.
 - The parts of one statement share one snapshot and cannot see each other's writes; pass rows only through RETURNING.
   The other parts do not see the CTE's rows in the TABLE: read them from the CTE.
-- `toStatement()` compiles ONE statement: zero rows, rows above one chunk, and a navigation, collection or single-value
-  selector are refused (`toStatement(): 2 rows exceed the 1-row chunk of one insert into "users" — …`). For a set larger
-  than one chunk compile `insertFrom(fromRows(…))`: one statement with one parameter per column (70 000 rows captured).
+- `toStatement()` compiles ONE statement: zero rows, rows above one chunk (the client's chunk: 8 191 rows of 4 keys on
+  PGlite, [chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)), and a
+  navigation, collection or single-value selector are refused
+  (`toStatement(): 2 rows exceed the 1-row chunk of one insert into "users" — …`). For a set larger than one chunk
+  compile `insertFrom(fromRows(…))`: one statement with one parameter per column (70 000 rows captured).
 - A compiled statement may read a data-modifying CTE created before it, through its source, `where` or `with` (since
   1.0.29): it reads it by name, and every statement that declares the later CTE declares the earlier one first, also
   when it reads only the later one. The `afterMutation()` example below relies on it.
@@ -2595,6 +2827,11 @@ Verified with `tsc --strict` against the source:
 | `upsert(rows, { conflictTarget: [...], update: [...] })` | no: the keys are `primaryKey` and `updateColumns` |
 | `.affectedCount()` | `number` |
 | `insert(row).returning(sel)` / `insertBulk(rows).returning(sel)` / `where().delete().returning(sel)` | one row / an array / an array |
+| `batch.addUpdateWhereIn(db.orders, 'id', ids, set, 'cancel', { where: o => eq(o.status, 'pending') })` | yes: `o` is the table's column row (`ColumnRow<Order>`) |
+| `where: o => eq(o.user!.username, 'alice')` (a navigation) | no: `Property 'user' does not exist on type 'ColumnRow<Order>'` |
+| `where: o => o.status` (not a condition), `where: (o, v) => …` (two arguments) | no |
+| `{ ifFits: true }` on `addInsertBulk`, `addUpsertBulk`, `addBulkUpdate`, `addDeleteWhereIn`, `addUpdateWhereIn`, `addInsertBulkWithChildren` | yes |
+| `addDependentInsert(table, row, dependency, id, { ifFits: true })` | no: `Expected 4 arguments, but got 5` |
 
 ## Pitfalls
 
@@ -2630,6 +2867,14 @@ Verified with `tsc --strict` against the source:
   predicate is refused (a generic plan could not infer the arbiter).
 - **Don't** make one `MutationBatch` leg depend on another leg's rows → **Do** `addDependentInsert`, a CTE chain, or
   separate statements: legs share one snapshot (the update leg matched 0 rows).
+- **Don't** check `batch.parameterCount + rows × columns` before adding a `MutationBatch` leg whose size depends on the
+  data → **Do** register it `{ ifFits: true }` and write the input standalone when it returns `null`: the count misses
+  the leg's own row budget (39 322 one-column rows threw at registration on an empty batch).
+- **Don't** give `addBulkUpdate` a VALUES row per key that repeats the same values → **Do**
+  `addUpdateWhereIn(table, property, keys, set, id, { where })`: one parameter per key, and the guard keeps the change
+  to the rows still in the state it was decided for.
+- **Don't** compute a `chunkSize` for PGlite by hand → **Do** leave it out: the default chunk stays within the
+  client's parameter limit, and a given `chunkSize` is used as given (`{ chunkSize: 11000 }` with 3 keys was refused).
 - **Don't** use `mergeBulk` with concurrent writers of the same keys → **Do** `upsertBulk` on a unique index: MERGE has
   no speculative insertion, so both writers can take the insert arm (duplicate rows, or 23505 when a unique index
   exists).

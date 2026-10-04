@@ -38,6 +38,7 @@ table row links for every option, the [API Index](./api-index.md) to confirm a m
 | run one query shape many times with new values (a hot path) | [Batching and Prepared Queries: pick the tool by client](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client) (`prepare()` or `preparedStatements`) |
 | insert, upsert, update or delete rows, or replace a per-row write loop | [Inserts, Updates, Upserts and Deletes](./guides/insert-update-guide.md#choose-a-write) |
 | read back what a write changed in the same statement | [Inserts, Updates, Upserts and Deletes: `.returning()`](./guides/insert-update-guide.md#read-back-what-a-write-changed-returningselector) |
+| send several independent writes in one round trip, with legs that may not fit the statement | [Inserts, Updates, Upserts and Deletes: `MutationBatch`](./guides/insert-update-guide.md#run-independent-writes-in-one-round-trip-mutationbatch), [`ifFits`](./guides/insert-update-guide.md#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032) |
 | make several statements atomic, or lock the rows I read | [Inserts, Updates, Upserts and Deletes: transactions](./guides/insert-update-guide.md#make-several-statements-atomic-dbtransaction) |
 | run SQL no builder expresses | [Querying: `sql`](./guides/querying.md#write-sql-the-helpers-do-not-cover-sql) |
 | see the SQL a query sends, without running it or while it runs | [Choosing the Right Query: see the SQL](./choosing-the-right-query.md#see-the-sql-a-query-emits) |
@@ -57,19 +58,19 @@ table row links for every option, the [API Index](./api-index.md) to confirm a m
 
 ## Reading data
 
-- [Querying](./guides/querying.md) — terminals, projections, `where()` and NULL semantics, list matching, text search, ordering, paging, navigations, collections, joins, `agg`, `groupBy()`, window functions, unions, row locks, raw SQL.
-- [Batching and Prepared Queries](./guides/batching-and-prepared-queries.md) — `QueryBatch` (several reads, or a page and its total, in one round trip), `future()`, `FutureQueryRunner`, `prepare()` with `sql.placeholder()`.
+- [Querying](./guides/querying.md) — terminals, projections, `where()` and NULL semantics, list matching, text search, ordering, paging, navigations, collections (a mapped column compared and aggregated through its mapper), joins, `agg`, `groupBy()` (a group's members and distinct counts: `g.arrayAgg()`, `g.countDistinct()`), window functions, unions, row locks, raw SQL.
+- [Batching and Prepared Queries](./guides/batching-and-prepared-queries.md) — `QueryBatch` (several reads, a page and its total, or a union's count and first row, in one round trip), `future()`, `FutureQueryRunner`, `prepare()` with `sql.placeholder()`.
 - [Collection Strategies](./collection-strategies.md) — how collections render under `lateral` (default), `cte` and `temptable`: SQL, round trips per driver, measurements, foreign-key indexes.
 - [Lateral Navigation Joins](./guides/lateral-navigation-joins.md) — `lateralJoin()` (since 1.0.23): one reference navigation as a per-row key probe instead of a plain join.
 - [Subqueries](./guides/subquery-guide.md) — `exists()` / `notExists()`, `inSubquery()`, `eqAnySubquery()`, scalar subqueries, derived-table joins, and when a join, a collection or a CTE fits better.
 - [Aliased Subquery Scopes](./guides/aliased-scopes.md) — `db.<table>.as(alias)`: correlated subqueries over the row's own table, with joins, ORDER BY and LIMIT, usable wherever a fragment goes.
 - [CTEs (WITH queries)](./guides/cte-guide.md) — derived sets joined, read as a FROM root or from several subqueries; top N per group; data-modifying CTEs with typed RETURNING; recursive queries in raw SQL.
 - [Set-returning Functions](./guides/set-returning-functions.md) — JS lists, JS rows and jsonb as relations: `unnest()`, `unnestZip()`, `unnestRows()` / `fromRows()`, `jsonbArrayElements()`, `crossJoinLateral()`.
-- [SQL Expression Helpers](./guides/sql-expressions.md) — casts, literals and parameters, CASE, NULL handling, string, math, date/time, JSONB and array-column helpers, `agg`, `win`, the `sql` template.
+- [SQL Expression Helpers](./guides/sql-expressions.md) — casts, literals and parameters, CASE, NULL handling, string, math, date/time, JSONB and array-column helpers (an array changed in place: `arrayAppendUnique()`, `arrayRemove()`), `agg`, `win`, the `sql` template.
 
 ## Writing data
 
-- [Inserts, Updates, Upserts and Deletes](./guides/insert-update-guide.md) — every write API with its SQL and round trips: `insert()`, `insertBulk()`, `fromRows()`, `insertFrom()`, `upsertBulk()`, `mergeBulk()`, `where().update()`, `bulkUpdate()`, `where().delete()`, `.returning()`, `insertWithChildren()`, `MutationBatch`, data-modifying CTEs, sequences, transactions and locks.
+- [Inserts, Updates, Upserts and Deletes](./guides/insert-update-guide.md) — every write API with its SQL and round trips: `insert()`, `insertBulk()` (chunked within the client's parameter limit), `fromRows()`, `insertFrom()`, `upsertBulk()`, `mergeBulk()`, `where().update()`, `bulkUpdate()`, array changes in place, `where().delete()`, `.returning()`, `insertWithChildren()`, `MutationBatch` (a leg registered only when it fits: `ifFits`; a guarded update over a key list: `addUpdateWhereIn` with `where`), data-modifying CTEs, sequences, transactions, advisory locks (one key or many, waiting or `try…`).
 
 ## Schema and migrations
 

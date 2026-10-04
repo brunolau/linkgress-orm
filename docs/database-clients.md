@@ -394,9 +394,11 @@ PGlite yourself there) or to share one instance between clients. `getPGlite()` r
 session; `PGliteClient` now refuses it before sending: `PGliteClient: the statement binds 32768
 parameters — PGlite takes at most 32 767 …`. `maxParameters()` reports the limit and `MutationBatch`
 honors it. Bind a large list as one array parameter (`eqAny`, `unnest`, `fromRows`) or in smaller
-chunks. `insertBulk()` still chunks by PostgreSQL's limit (60 % of 65 535 parameters per statement):
-11 000 rows of 3 columns (33 000 parameters) were refused; pass `chunkSize` so that rows × columns
-stays at most 32 767 (`insertBulk(rows, { chunkSize: 10000 })` inserted them).
+chunks. The standalone bulk writes (`insertBulk()`, `upsertBulk()`, `bulkUpdate()`, `mergeBulk()`)
+size their default chunk within the client's limit too (since 1.0.32): at most ⌊32 767 / columns⌋
+rows per statement on PGlite, so 11 000 rows of 3 columns go as 2 statements (32 766 + 234
+parameters). From 1.0.29 to 1.0.31 they chunked by PostgreSQL's limit and that input was refused. A
+`chunkSize` you pass is used as given: `{ chunkSize: 11000 }` with 3 columns is still refused.
 
 **Values.** An instance the client creates follows `pg` wherever `pg` and postgres.js agree:
 
@@ -770,7 +772,7 @@ Observed: one `firstOrDefault()` plus a transaction with one `update()` counted 
 | `supportsBinaryProtocol()` | `false` | no built-in client returns `true` |
 | `supportsBinaryArrayResults()` | `true` | `false`: collections aggregate with `json_agg` so no native array reaches the driver |
 | `losesNumericZeroScale()` | `false` | `true`: the driver reads a scaled numeric zero as `"0"`; the builders restore declared scales |
-| `maxParameters()` | 65 535 | parameters per statement; `MutationBatch` refuses a statement over it before sending |
+| `maxParameters()` | 65 535 | parameters per statement; `MutationBatch` refuses a statement over it before sending, measures `ifFits` legs against it, and the standalone bulk writes size their chunks within it (since 1.0.32) |
 | `parseTypedText(oid, text, read?)` | node-postgres's default parsing | the value the client delivers for a column of type `oid` whose wire text is `text` (`read.parameterized`: whether the statement binds parameters) |
 | `customParsedTypeOids()` | `[]` | types the application parses with its own parsers; a `QueryBatch` sends their values as text |
 
