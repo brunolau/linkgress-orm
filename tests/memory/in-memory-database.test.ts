@@ -300,4 +300,50 @@ describe('in-memory database API', () => {
     expect((e as { message?: string }).message).toBe('INTO specified more than once at or near "INTO"');
     await client.end();
   });
+
+  test('an aggregate that reads only an outer query\'s columns is refused, never evaluated in place', async () => {
+    // PostgreSQL places an aggregate in the query of the lowest-level column its arguments read: one reading only
+    // an OUTER query's columns is an aggregate of that query. The engine evaluates every aggregate in the query it
+    // is written in — another number, and no error. It cannot live in the differential corpus: PostgreSQL answers
+    // these statements (or raises 42803), and the engine refuses them.
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+    await client.query('create table agg_parent(id int primary key, n int)');
+    await client.query('create table agg_child(id int primary key, parent_id int, n int)');
+    await client.query('insert into agg_parent values (1, 10), (2, 20)');
+    await client.query('insert into agg_child values (1, 1, 1), (2, 1, 2), (3, 2, 3)');
+
+    const outerLevel = [
+      // the aggregate's argument is the outer row's column
+      'select p.id, (select sum(p.n) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      // ... or a subquery that reads nothing of the aggregate's own query (the shape a collection summand rendered)
+      'select p.id, (select sum((select count(*) from agg_child x where x.parent_id = p.id)) from agg_child c where c.parent_id = p.id) from agg_parent p',
+      // ... or only its FILTER does
+      'select p.id, (select count(*) filter (where p.n > 10) from agg_child c where c.parent_id = p.id) from agg_parent p',
+    ];
+
+    for (const statement of outerLevel) {
+      const e = await expectToReject(client.query(statement));
+
+      expect((e as { code?: string }).code).toBe('0A000');
+      expect((e as { message?: string }).message).toMatch(/reads only columns of an outer query: outer-level aggregates are not supported by the in-memory database/);
+    }
+
+    // An argument that reads the aggregate's own query — also beside outer columns, also through a subquery — is
+    // an aggregate of that query, as it always was
+    const rows = (await client.query(
+      'select p.id, (select sum(c.n + p.n) from agg_child c where c.parent_id = p.id)::int as mixed, '
+      + '(select sum((select count(*) from agg_child x where x.parent_id = c.parent_id and x.id >= p.id)) from agg_child c where c.parent_id = p.id)::int as nested, '
+      + '(select count(*) from agg_child c where c.parent_id = p.id)::int as star, '
+      + '(select sum(1) from agg_child c where c.parent_id = p.id)::int as constant '
+      + 'from agg_parent p order by p.id'
+    )).rows;
+
+    expect(rows).toEqual([
+      { id: 1, mixed: 23, nested: 4, star: 2, constant: 2 },
+      { id: 2, mixed: 23, nested: 1, star: 1, constant: 1 },
+    ]);
+    await client.end();
+  });
 });
