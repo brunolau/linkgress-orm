@@ -7,10 +7,13 @@ import { AppDatabase } from '../../debug/schema/appDatabase';
 import type { HourMinute } from '../../debug/types/hour-minute';
 
 /**
- * The columns of a collection's ITEM carry their type mapper (1.0.31).
+ * The mapped columns of a collection's ITEM bind and read through their mapper (1.0.31) — in exactly two
+ * places: a value compared DIRECTLY with the bare column inside the collection's `where()`, and `min()` /
+ * `max()` of the bare column. An EXPRESSION over such a column (coalesce, arithmetic, CASE, …) binds and reads
+ * as it did on 1.0.30: see collection-item-mapper-scope.test.ts.
  *
- * `CollectionQueryBuilder` minted its item's column refs without `__mapper` — the root's columns and a
- * reference navigation's have always carried it. Two symptoms, one cause:
+ * `CollectionQueryBuilder` minted its item's column refs without any mapper — the root's columns and a
+ * reference navigation's have always carried `__mapper`. Two symptoms, one cause:
  *
  *   - WHERE side: a value compared with a mapped column inside a collection's `.where()` was bound as it was
  *     written, never through `toDriver`: `u.posts.where(p => eq(p.publishTime, { hour: 9, minute: 30 }))` bound
@@ -254,20 +257,21 @@ describe('type mappers on the columns of a collection item', () => {
     });
   }
 
-  test('the item\'s column refs carry the column\'s mapper — and only a mapped column\'s', async () => {
+  test('the item\'s column refs carry the column\'s mapper under their own marker — never under __mapper, which expressions inherit', async () => {
     await withDatabase(async (db) => {
-      const seen: Record<string, unknown> = {};
+      const seen: Record<string, any> = {};
 
       await db.users.where(u => u.posts!.where((p: any) => {
-        seen.mapped = p.publishTime.__mapper;
-        seen.unmappedHasKey = '__mapper' in p.title;
+        seen.mapped = p.publishTime;
+        seen.unmapped = p.title;
 
         return eq(p.views, 1);
       }).exists()).select(u => ({ id: u.id })).toList();
 
-      expect(typeof (seen.mapped as any)?.toDriver).toBe('function');
-      expect((seen.mapped as any).toDriver(at(9, 30))).toBe(570);
-      expect(seen.unmappedHasKey).toBe(false);
+      expect(seen.mapped.__itemMapper.toDriver(at(9, 30))).toBe(570);
+      expect('__mapper' in seen.mapped).toBe(false);
+      expect('__itemMapper' in seen.unmapped).toBe(false);
+      expect('__mapper' in seen.unmapped).toBe(false);
     });
   });
 

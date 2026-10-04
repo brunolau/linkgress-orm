@@ -28,6 +28,7 @@ import {
 } from '../query/query-builder';
 import { NavigationAliasPlan, type NavigationPathNode } from '../query/join-utils';
 import { renumberPlaceholders } from '../query/sql-utils';
+import { MockRowCache } from '../query/mock-row-cache';
 import { numericZeroScaleMapper, toPgArrayLiteral } from '../types/custom-types';
 import { PreparedQuery } from '../query/prepared-query';
 import { InferRowType } from '../schema/row-type';
@@ -2294,6 +2295,13 @@ export class DataContext<TSchema extends ContextSchema = any> {
     this.client = client;
     this.rootClient = client;
     this.queryOptions = queryOptions;
+    // What tells this context's model from another's for the mock-row cache: an entity-first context's CLASS
+    // (every instance of it configures the same entities, and builds its schema anew). A schema-first context
+    // registers none — its schema object may be made per instance, which would give every instance a model of its
+    // own and the cache nothing to share: it shares by table name, as it always did.
+    if (this instanceof DatabaseContext) {
+      MockRowCache.registerModel(this.schemaRegistry, this.constructor);
+    }
 
     // Create executor if logging is enabled
     if (QueryExecutor.isNeeded(queryOptions)) {

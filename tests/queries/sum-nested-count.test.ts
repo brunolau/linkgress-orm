@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt } from '../../src';
+import { agg, eq, gt } from '../../src';
 
 const STRATEGIES = ['lateral', 'cte'] as const;
 
@@ -174,4 +174,36 @@ describe('sum() over a nested count whose summand goes through a reference hop',
       });
     });
   }
+});
+
+/**
+ * The other side of the in-memory database's refusal of outer-level aggregates: an aggregate whose ARGUMENT is
+ * the outer row's column but whose ORDER BY key (or FILTER) is its own query's is an aggregate of its own query
+ * to PostgreSQL — which walks the ORDER BY keys too — and answers as it did on 1.0.30, in memory as well.
+ */
+describe('an aggregate fragment over an outer column, ordered or filtered by its own query', () => {
+  test('agg.arrayAgg(outer column, { orderBy: [own column] }) in a scalar subquery', async () => {
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const rows = await db.users
+        .select(u => ({
+          username: u.username,
+          perPost: db.posts.where(p => eq(p.userId, u.id))
+            .select(p => agg.arrayAgg(u.username, { orderBy: [[p.id, 'ASC']] }))
+            .asSubquery('scalar'),
+          popular: db.posts.where(p => eq(p.userId, u.id))
+            .select(p => agg.count(u.id).filter(gt(p.views, 100)))
+            .asSubquery('scalar'),
+        }))
+        .orderBy(u => u.username)
+        .toList();
+
+      expect<unknown>(rows).toEqual([
+        { username: 'alice', perPost: ['alice', 'alice'], popular: 1 },
+        { username: 'bob', perPost: ['bob'], popular: 1 },
+        { username: 'charlie', perPost: null, popular: 0 },
+      ]);
+    });
+  });
 });

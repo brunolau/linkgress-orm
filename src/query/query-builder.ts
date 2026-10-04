@@ -1,4 +1,4 @@
-import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo } from './conditions';
+import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo, ITEM_COLUMN_MAPPER } from './conditions';
 import type { EnclosingCollectionScope } from './conditions';
 import { pgTypeOfValue, selectingOnlyColumns, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
 import { holdsAggregateFragment, holdsWindowFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
@@ -1284,7 +1284,7 @@ export class QueryBuilder<TSchema extends TableSchema, TRow = any> {
     // per row (the pre-0.4.70 behaviour). Consumers must not probe mock rows with
     // OWN-property APIs (`Object.keys`, `{...row}`) — see `isReferenceMockRow`.
     const prototype = MockRowCache.getOrBuild(
-      `select|${this.schema.name}`,
+      `select|${MockRowCache.modelKey(this.schemaRegistry)}|${this.schema.name}`,
       () => Object.defineProperties({}, this.buildRootMockDescriptors()),
     );
 
@@ -5948,7 +5948,7 @@ ${joinClauses.join('\n')}`;
       .join('+');
 
     const prototype = MockRowCache.getOrBuild(
-      `qb|${this.schema.name}|${joinSig}`,
+      `qb|${MockRowCache.modelKey(this.schemaRegistry)}|${this.schema.name}|${joinSig}`,
       () => Object.defineProperties({}, this.buildRootMockDescriptors()),
     );
 
@@ -10152,7 +10152,7 @@ export class ReferenceQueryBuilder<TItem = any> {
       if (prototype === undefined) {
         prototype = MockRowCache.getOrBuild(
           enabled
-            ? `${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`
+            ? `${MockRowCache.modelKey(this.schemaRegistry)}|${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`
               + (this.explicitAlias !== undefined ? `|@${this.explicitAlias}` : '')
             : '',
           () => Object.defineProperties({}, this.buildMockRowDescriptors()),
@@ -11094,7 +11094,7 @@ export class CollectionQueryBuilder<TItem = any> {
       // `.where()`/`.select()`/`.orderBy()` call. Opt-in via the same static switch; OFF
       // = fresh prototype per item (the pre-0.4.70 behaviour).
       const prototype = MockRowCache.getOrBuild(
-        `citem|${this.targetTable}`,
+        `citem|${MockRowCache.modelKey(this.schemaRegistry)}|${this.targetTable}`,
         () => Object.defineProperties({}, this.buildMockItemDescriptors()),
       );
 
@@ -11126,10 +11126,14 @@ export class CollectionQueryBuilder<TItem = any> {
     // when both target the same table (e.g., post.user.posts where both are "posts" table)
     const tableAlias = `__collection_${this.targetTable}__`;
 
-    // A mapped column's ref carries its mapper, as the root's and a reference navigation's do (see
-    // ReferenceQueryBuilder.buildMockRowDescriptors): a value compared with it in the collection's filter is
-    // bound through `toDriver` — it used to be bound as it was written — and a min() / max() of it reads back
-    // through `fromDriver` (see getAggregateReadMapper). An unmapped column's ref is as it always was.
+    // A mapped column's ref carries its mapper under ITEM_COLUMN_MAPPER — NOT under `__mapper`, which the
+    // root's and a reference navigation's refs carry: every expression helper inherits `__mapper` from its
+    // operand (coalesce, arithmetic, GREATEST / LEAST / NULLIF, CASE, …), binding its plain operands through
+    // `toDriver` and reading its result through `fromDriver`, and an expression over an item column binds
+    // and reads as it always did. Only two things read the marker: a value compared DIRECTLY with the column
+    // in the collection's filter is bound through `toDriver` (getComparisonMapper) — it used to be bound as
+    // it was written — and a min() / max() of the bare column reads back through `fromDriver`
+    // (getAggregateReadMapper). An unmapped column's ref is as it always was.
     const columnMeta = getSchemaColumnMeta(this.targetTableSchema!);
 
     const descriptors: PropertyDescriptorMap = {};
@@ -11148,7 +11152,7 @@ export class CollectionQueryBuilder<TItem = any> {
               __chainId: slots[MOCK_ROW_CHAIN_ID],  // This collection's identity — see chainId
             };
             if (mapper) {
-              cached.__mapper = mapper;  // toDriver for the values it is compared with, fromDriver for its min() / max()
+              cached[ITEM_COLUMN_MAPPER] = mapper;  // read by a direct comparison and by min() / max() only
             }
           }
           return cached;
@@ -11946,11 +11950,13 @@ export class CollectionQueryBuilder<TItem = any> {
   }
 
   /**
-   * The mapper a `min()` / `max()` of this collection reads back through: the aggregated COLUMN's — an
-   * item's, or one reached through the item's navigations. Its smallest / greatest value is one of the
-   * column's values, and it used to read back as the driver sent it: the stored smallint of a column mapped
-   * to `{ hour, minute }`, the text of a mapped timestamp. `undefined` for every other aggregate (a count, a
-   * sum, an existence is not a value of the column), for an aggregated expression and for an unmapped column.
+   * The mapper a `min()` / `max()` of this collection reads back through: that of the BARE column it
+   * aggregates — an item's (ITEM_COLUMN_MAPPER), or one reached through the item's navigations (`__mapper`).
+   * Its smallest / greatest value is one of the column's values, and it used to read back as the driver sent
+   * it: the stored smallint of a column mapped to `{ hour, minute }`, the text of a mapped timestamp.
+   * `undefined` for every other aggregate (a count, a sum, an existence is not a value of the column), for an
+   * aggregated EXPRESSION — `max(p => coalesce(p.at, …))`, `max(p => sql\`${p.at}\`)`: it reads as it always
+   * did — and for an unmapped column.
    * @internal
    */
   getAggregateReadMapper(): { fromDriver(value: any): any } | undefined {
@@ -11961,7 +11967,7 @@ export class CollectionQueryBuilder<TItem = any> {
     const aggregated = this.evaluateSelector();
 
     return aggregated !== null && typeof aggregated === 'object' && '__dbColumnName' in aggregated
-      ? fromDriverMapper((aggregated as any).__mapper)
+      ? fromDriverMapper((aggregated as any).__mapper ?? (aggregated as any)[ITEM_COLUMN_MAPPER])
       : undefined;
   }
 
@@ -14319,6 +14325,8 @@ export class CollectionQueryBuilder<TItem = any> {
     let aggregateExpression: string | undefined;
     let arrayField: string | undefined;
     let defaultValue: string;
+    // A collection summand that joins the path it hangs off inside its own subquery (see buildCTE's `joinOwnPath`)
+    let summandJoinsOwnPath = false;
 
     if (this.aggregationType) {
       // Scalar aggregations: count, min, max, sum, exists
@@ -14346,7 +14354,8 @@ export class CollectionQueryBuilder<TItem = any> {
           // lateral) then wrap this expression with the aggregate function via
           // config.aggregateExpression.
           const nestedCtx: QueryContext = { ...context, collectionStrategy: 'lateral', collectionScope: projectionScope };
-          const nestedResult = selectedField.buildCTE(nestedCtx, client, undefined, CollectionQueryBuilder.pathRenamedIn(selectedField, this.navigationPlan, this.targetTable));
+          summandJoinsOwnPath = CollectionQueryBuilder.pathRenamedIn(selectedField, this.navigationPlan, this.targetTable);
+          const nestedResult = selectedField.buildCTE(nestedCtx, client, undefined, summandJoinsOwnPath);
           context.cteCounter = nestedCtx.cteCounter;
           context.paramCounter = nestedCtx.paramCounter;
           aggregateExpression = nestedResult.selectExpression || nestedResult.sql;
@@ -14408,14 +14417,14 @@ export class CollectionQueryBuilder<TItem = any> {
       // OUR FROM. They used to be skipped here — the walk would have read the builder's own properties as
       // fields — so the hop rendered unjoined: `missing FROM-clause entry` (42P01), or, where an enclosing
       // query had a join of that name, bound to THAT row — an aggregate of the enclosing query to
-      // PostgreSQL (42803), and a wrong sum where the statement was accepted.
-      this.detectNavigationJoins(
-        selectorResult instanceof CollectionQueryBuilder ? { summand: selectorResult } : selectorResult,
-        navigationJoins,
-        this.targetTable,
-        this.targetTableSchema,
-        nestedCorrelationRefs
-      );
+      // PostgreSQL (42803), and a wrong sum where the statement was accepted. The one summand that needs
+      // nothing of our FROM is the one that joins its path inside its own subquery (the hop's name was taken
+      // by an enclosing row): it rendered, and renders, the statement it always did.
+      if (!(selectorResult instanceof CollectionQueryBuilder)) {
+        this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema, nestedCorrelationRefs);
+      } else if (!summandJoinsOwnPath) {
+        this.detectNavigationJoins({ summand: selectorResult }, navigationJoins, this.targetTable, this.targetTableSchema, nestedCorrelationRefs);
+      }
     }
 
     // The selector says nothing about the collection's own WHERE, so a navigation used only
