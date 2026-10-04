@@ -227,9 +227,9 @@ describe('Basic Query Operations (Fixed)', () => {
       await withDatabase(async (db) => {
         await seedTestData(db);
 
-        const user = await db.users
+        const user = (await db.users
           .orderBy(u => u.username)
-          .first();
+          .first())!;
 
         expect(user).toBeDefined();
         // Type assertions

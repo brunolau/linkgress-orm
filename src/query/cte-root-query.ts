@@ -197,7 +197,6 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   private orderByFields: Array<{ table: string; field: string; direction: OrderDirection }> = [];
   private limitValue?: number;
   private offsetValue?: number;
-  private lockClause?: string;
   /** The where() conditions, combined with AND. */
   protected whereConds: Condition[] = [];
   /** `FROM "<cte>" AS "<rootAlias>"` — see `DbContext.selectFromCte(cte, alias)`; the CTE's name when undefined. */
@@ -382,28 +381,25 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
   }
 
   /**
-   * Append `FOR UPDATE` (optionally `SKIP LOCKED` / `NOWAIT`) to this CTE-rooted
-   * SELECT. Locks the rows the ROOT CTE's body read (the join legs are CTEs and
-   * lock nothing themselves). This is the atomic guard leg of the
-   * fused-conditional-INSERT pattern: put `FOR UPDATE` on the leg that reads the
-   * guard rows (e.g. `capacity_group`), then a data-modifying leg conditioned on
-   * it — check + write in one statement, no app-level lock, no TOCTOU.
+   * Refused (1.0.33): a `FOR UPDATE` here locks no rows. PostgreSQL applies a `FOR UPDATE`
+   * without `OF` to the plain tables of its own FROM only, and skips the WITH queries the
+   * FROM reads — this query's FROM holds only CTEs, so the clause it used to append held no
+   * lock at all (verified with a second session's `FOR UPDATE NOWAIT`).
    *
-   * Pair with `.orderBy(...)` on a stable key (ascending id) when locking
-   * multiple rows, so concurrent fused statements cannot deadlock each other.
+   * Lock in the CTE body instead: `.forUpdate()` on the builder the CTE is made of
+   * (`new DbCteBuilder().with('guard', db.<table>.where(…).select(…).orderBy(…).forUpdate())`)
+   * puts the clause inside the WITH query, where it locks the rows the body reads — the guard
+   * leg of a check-then-write in one statement.
+   *
+   * @deprecated Throws: call `.forUpdate()` on the builder that forms the CTE body.
    */
-  forUpdate(options?: { skipLocked?: boolean; noWait?: boolean }): this {
-    if (options?.skipLocked && options?.noWait) {
-      throw new Error('forUpdate: skipLocked and noWait are mutually exclusive');
-    }
-
-    this.lockClause = options?.skipLocked
-      ? 'FOR UPDATE SKIP LOCKED'
-      : options?.noWait
-        ? 'FOR UPDATE NOWAIT'
-        : 'FOR UPDATE';
-
-    return this;
+  forUpdate(_options?: { skipLocked?: boolean; noWait?: boolean }): this {
+    throw new Error(
+      'forUpdate() on a CTE-rooted query locks no rows: PostgreSQL applies FOR UPDATE to the plain tables of '
+      + 'its own FROM only, and this query reads only CTEs. Call .forUpdate() on the builder that forms the CTE body '
+      + "instead (new DbCteBuilder().with('x', db.<table>.where(…).select(…).forUpdate())): its FOR UPDATE locks "
+      + 'the rows the body reads.'
+    );
   }
 
   private addJoin<TRight extends Record<string, any>>(
@@ -499,12 +495,9 @@ export class CteRootQueryBuilder<TRootColumns extends Record<string, any>, TSele
       limitClause += `\nOFFSET ${this.offsetValue}`;
     }
 
-    // Row-level lock clause (forUpdate) — after LIMIT/OFFSET per SQL grammar.
-    const lockClause = this.lockClause ? `\n${this.lockClause}` : '';
-
     const sqlText =
       `WITH ${cteDecls.join(', ')}\n` +
-      `SELECT ${selectParts.join(', ')}\n${fromClause}${whereClause}${orderByClause}${limitClause}${lockClause}`;
+      `SELECT ${selectParts.join(', ')}\n${fromClause}${whereClause}${orderByClause}${limitClause}`;
 
     return { sql: sqlText, params: ctx.params };
   }

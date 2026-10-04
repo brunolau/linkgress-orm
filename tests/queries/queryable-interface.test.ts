@@ -123,7 +123,7 @@ describe('IEntityQueryable Interface', () => {
         let query: IEntityQueryable<User> = db.users;
         query = query.where(u => eq(u.username, 'alice'));
 
-        const user = await query.first();
+        const user = (await query.first())!;
         expect(user.username).toBe('alice');
 
         // Test firstOrDefault with no match

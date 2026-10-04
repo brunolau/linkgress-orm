@@ -1,7 +1,7 @@
 import { Condition, ConditionBuilder, SqlFragment, SqlBuildContext, FieldRef, UnwrapSelection, and as andCondition, Placeholder, WhereConditionBase, castTo, ITEM_COLUMN_MAPPER } from './conditions';
 import type { EnclosingCollectionScope } from './conditions';
 import { pgTypeOfValue, selectingOnlyColumns, selectorProjectingConditions, SELECTS_ONLY_COLUMNS } from './sql-functions';
-import { holdsAggregateFragment, holdsWindowFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
+import { agg, holdsAggregateFragment, holdsWindowFragment, isNumberResultMapper, projectedValueRoot, scalarSubqueryRead } from './sql-functions';
 import { numericZeroScaleMapper } from '../types/custom-types';
 import { collectionMarkerPattern } from './query-utils';
 import { PreparedQuery } from './prepared-query';
@@ -2982,7 +2982,7 @@ export class SelectQueryBuilder<TSelection> {
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
-    return result.rows[0]?.result ?? null;
+    return this.readAggregationResult('MIN', fieldToAggregate, result.rows);
   }
 
   /**
@@ -3018,7 +3018,7 @@ export class SelectQueryBuilder<TSelection> {
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
-    return result.rows[0]?.result ?? null;
+    return this.readAggregationResult('MAX', fieldToAggregate, result.rows);
   }
 
   /**
@@ -3054,7 +3054,37 @@ export class SelectQueryBuilder<TSelection> {
       ? await this.executor.query(sql, params)
       : await this.client.query(sql, params);
 
-    return result.rows[0]?.result ?? null;
+    return this.readAggregationResult('SUM', fieldToAggregate, result.rows);
+  }
+
+  /**
+   * The one value a {@link min} / {@link max} / {@link sum} statement returns, read the way the same aggregate reads
+   * in a projection (`agg.min()` / `agg.max()` / `agg.sum()`): `sum()` a number, `min()` / `max()` like the column —
+   * through its mapper, a numeric as a number. (It used to be the driver's value: SUM of an int column as the string
+   * '450', MAX of a mapped column as its stored value.) `rawResult` keeps the driver's value; NULL stays `null`.
+   */
+  private readAggregationResult(aggregation: 'MIN' | 'MAX' | 'SUM', fieldToAggregate: any, rows: any[]): any {
+    const raw = rows[0]?.result;
+
+    if (raw === null || raw === undefined) {
+      return null;
+    }
+
+    const options = this.executor?.getOptions();
+
+    // A column given by name only (no ref to read it by) reads as the driver hands it, as before
+    if (options?.rawResult || typeof fieldToAggregate !== 'object' || fieldToAggregate === null) {
+      return raw;
+    }
+
+    const fragment = aggregation === 'SUM'
+      ? agg.sum(fieldToAggregate)
+      : aggregation === 'MIN'
+        ? agg.min(fieldToAggregate)
+        : agg.max(fieldToAggregate);
+    const read = this.compileFieldRead('result', fragment, options?.disableMappers ?? false, false, false, rows, ['result']);
+
+    return this.readField(read, raw, false);
   }
 
   /**
@@ -4773,7 +4803,9 @@ export class SelectQueryBuilder<TSelection> {
       transformFn,
       name,
       // Every value the build bound (literals, param(), CTE parameters) — the placeholders fill the rest
-      [...context.allParams]
+      [...context.allParams],
+      // Executions run through this query's executor: logging, timeouts, prepared statements, slow-query detection
+      this.executor
     );
   }
 
