@@ -22,7 +22,7 @@ import {
 import { DbCte, isCte, projectedValueRef } from './cte-builder';
 import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, withCteDependencies } from './cte-builder';
 import { formatJoinValue, NavigationAliasPlan } from './join-utils';
-import { projectedValueRoot, scalarSubqueryRead, selectorProjectingConditions } from './sql-functions';
+import { agg, AggregateFragment, projectedValueRoot, scalarSubqueryRead, selectorProjectingConditions } from './sql-functions';
 import { lateralSetJoinsSql, lateralSetRefs } from './set-returning';
 import type { LateralSetJoin } from './set-returning';
 import { flatRowBatchMeta, FutureCountQuery, FutureQuery, FutureSingleQuery, isCustomReadMapper } from './future-query';
@@ -170,6 +170,51 @@ export interface GroupedItem<TGroupingKey, TOriginalRow> {
    * Accepts undefined since SQL AVG ignores NULL values
    */
   avg(selector: (item: TOriginalRow) => FieldRef<any, number | undefined> | number | undefined): number;
+
+  /**
+   * `array_agg([DISTINCT] value [ORDER BY …])` — the values of a column or expression of the grouped row
+   * across the group's rows, as a list: one element per row (a NULL value is an element too), each read
+   * like the column (through its mapper). A group has at least one row, so the list is never NULL.
+   *
+   * `orderBy` orders the elements: selectors over the grouped row, each with its direction — a list is in
+   * no particular order without it. With `distinct`, PostgreSQL accepts only the aggregated value as a key.
+   *
+   * @example
+   * db.prices
+   *   .select(p => ({ id: p.id, productId: p.productId, slotId: p.slotId }))
+   *   .groupBy(r => ({ productId: r.productId }))
+   *   .select(g => ({
+   *     productId: g.key.productId,
+   *     priceIds: g.arrayAgg(r => r.id, { orderBy: [[r => r.id, 'ASC']] }),   // number[]
+   *     slots: g.countDistinct(r => r.slotId),                                // number
+   *   }))
+   */
+  arrayAgg<TField>(
+    selector: (item: TOriginalRow) => TField,
+    options?: GroupedListAggregateOptions<TOriginalRow>
+  ): SqlFragment<Array<GroupedAggregateValue<TField>>>;
+
+  /**
+   * `COUNT(DISTINCT value)` — the distinct non-NULL values of a column or expression of the grouped row
+   * across the group's rows; a number (0 when every value is NULL).
+   */
+  countDistinct<TField>(selector: (item: TOriginalRow) => TField): SqlFragment<number>;
+}
+
+/** The value a selector over the grouped row selects: a column's, an expression's, or the value itself. */
+type GroupedAggregateValue<TField> = TField extends FieldRef<any, infer V> ? V : TField extends SqlFragment<infer V> ? V : TField;
+
+/** One ORDER BY key of {@link GroupedItem.arrayAgg}: a selector over the grouped row (ascending), or `[selector, direction]`. */
+export type GroupedAggregateOrderKey<TOriginalRow> =
+  | ((item: TOriginalRow) => unknown)
+  | readonly [(item: TOriginalRow) => unknown, 'ASC' | 'DESC'];
+
+/** Options of {@link GroupedItem.arrayAgg}. */
+export interface GroupedListAggregateOptions<TOriginalRow> {
+  /** `DISTINCT` — each distinct value once (NULL is a value here, like in PostgreSQL). */
+  distinct?: boolean;
+  /** `ORDER BY` inside the aggregate: the order of the list's elements. */
+  orderBy?: ReadonlyArray<GroupedAggregateOrderKey<TOriginalRow>>;
 }
 
 /** Column types whose values a MIN / MAX reads back as a JS number (as COUNT / SUM / AVG do). */
@@ -227,6 +272,15 @@ export interface HavingGroupedItem<TGroupingKey, TOriginalRow> {
 
   /** `AVG(...)` of a column or expression of the grouped row. */
   avg(selector: (item: TOriginalRow) => FieldRef<any, number | undefined> | number | undefined): FieldRef<string, number>;
+
+  /** `array_agg(...)` of a column or expression of the grouped row (see {@link GroupedItem.arrayAgg}). */
+  arrayAgg<TField>(
+    selector: (item: TOriginalRow) => TField,
+    options?: GroupedListAggregateOptions<TOriginalRow>
+  ): SqlFragment<Array<GroupedAggregateValue<TField>>>;
+
+  /** `COUNT(DISTINCT ...)` of a column or expression of the grouped row: `gt(g.countDistinct(r => r.slotId), 1)`. */
+  countDistinct<TField>(selector: (item: TOriginalRow) => TField): SqlFragment<number>;
 }
 
 /** A `having()` callback: the condition a group must meet, over its key and aggregates. */
@@ -297,6 +351,12 @@ interface GroupedBuildState {
   havingCond?: Condition;
   /** Each aggregate's argument — a column or an expression of the grouped row. */
   aggregateArguments: Map<AggregateFieldRef, unknown>;
+  /**
+   * What the list / distinct aggregates of the group (`g.arrayAgg()`, `g.countDistinct()`) aggregate and
+   * order by: columns and expressions of the grouped row, rendered where they are interpolated the way an
+   * aggregate's argument is (see GroupedRenderer.argument).
+   */
+  rowOperands: Set<unknown>;
 }
 
 /**
@@ -1264,6 +1324,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     // Create mock grouped item using the SAME grouping key (not a fresh one)
     // This ensures SqlFragment instances are shared between GROUP BY and SELECT
+    const rowOperands = new Set<unknown>();
     const mockGroup: GroupedItem<TGroupingKey, TOriginalRow> = {
       key: mockGroupingKey as any,
       count: () => createAggregateFieldRef<number>('COUNT') as any,
@@ -1271,6 +1332,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       min: (selector: any) => createAggregateFieldRef('MIN', selector) as any,
       max: (selector: any) => createAggregateFieldRef('MAX', selector) as any,
       avg: (selector: any) => createAggregateFieldRef<number>('AVG', selector) as any,
+      ...this.listAggregatesOver(mockOriginalSelection, rowOperands),
     };
     const mockResult = this.resultSelector(mockGroup);
 
@@ -1299,13 +1361,72 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       value => value instanceof WhereConditionBase
     );
 
-    const state: GroupedBuildState = { mockOriginalSelection, mockGroupingKey, mockResult, havingCond, aggregateArguments };
+    const state: GroupedBuildState = { mockOriginalSelection, mockGroupingKey, mockResult, havingCond, aggregateArguments, rowOperands };
 
     return this.withNavigationPlan(
-      [mockOriginalSelection, mockGroupingKey, ...aggregateArguments.values(), ...lateralSetRefs(this.lateralSets)],
+      [mockOriginalSelection, mockGroupingKey, ...aggregateArguments.values(), ...rowOperands, ...lateralSetRefs(this.lateralSets)],
       havingCond,
       () => this.buildQueryBody(context, state, hasSqlFragmentInGroupBy)
     );
+  }
+
+  /**
+   * The list / distinct aggregates of a group over the grouped row `row` — `g.arrayAgg()`, `g.countDistinct()`:
+   * the aggregates of {@link agg} over what the selectors select of the row. A column reads as its SOURCE
+   * column declares (see {@link columnTypeOf}): the list's elements go through its mapper. `operands`
+   * collects what they aggregate and order by, for the build that renders them (see
+   * GroupedBuildState.rowOperands); a read of the projection's shape passes none.
+   */
+  private listAggregatesOver(row: any, operands?: Set<unknown>): Pick<GroupedItem<TGroupingKey, TOriginalRow>, 'arrayAgg' | 'countDistinct'> {
+    // One operand per column of the row: an argument and its ORDER BY key are the same expression
+    const typedRefs = new Map<object, object>();
+    const operandOf = (name: string, selector: unknown): unknown => {
+      if (typeof selector !== 'function') {
+        throw new TypeError(`${name}: expected a selector of the grouped row (r => r.column), got ${describeGroupedValue(selector)}`);
+      }
+
+      let operand: unknown = selector(row);
+
+      if (isAggregateRef(operand) || operand instanceof AggregateFragment) {
+        throw new Error(`${name}: the selector returned an aggregate — aggregate function calls cannot be nested.`);
+      }
+
+      if (isFieldRefValue(operand)) {
+        // The column as its table declares it: its mapper reads the elements, its type their transport
+        const { mapper, sqlType } = this.columnTypeOf(operand);
+        const ref = operand as any;
+
+        if ((mapper != null && ref.__mapper == null) || (sqlType !== undefined && ref.__sqlType === undefined)) {
+          const typed: object = typedRefs.get(ref) ?? { ...ref, __mapper: ref.__mapper ?? mapper, __sqlType: ref.__sqlType ?? sqlType };
+
+          typedRefs.set(ref, typed);
+          operand = typed;
+        }
+      } else if (!(operand instanceof WhereConditionBase)) {
+        throw new Error(`${name}: the selector returned ${describeGroupedValue(operand)} — it must return a column or an sql expression of the grouped row.`);
+      }
+
+      operands?.add(operand);
+
+      return operand;
+    };
+
+    return {
+      arrayAgg: (selector: any, options?: GroupedListAggregateOptions<any>) => {
+        const orderBy = (options?.orderBy ?? []).map((entry): readonly [any, 'ASC' | 'DESC'] => {
+          const [keySelector, direction] = Array.isArray(entry) ? entry : [entry, 'ASC'];
+
+          if (direction !== 'ASC' && direction !== 'DESC') {
+            throw new TypeError(`g.arrayAgg(): an ORDER BY direction is 'ASC' or 'DESC', got ${JSON.stringify(direction)}`);
+          }
+
+          return [operandOf('g.arrayAgg(): an ORDER BY key', keySelector), direction];
+        });
+
+        return agg.arrayAgg(operandOf('g.arrayAgg()', selector) as any, { distinct: options?.distinct === true, orderBy }) as any;
+      },
+      countDistinct: (selector: any) => agg.countDistinct(operandOf('g.countDistinct()', selector) as any) as any,
+    };
   }
 
   /** The HAVING condition of `group`: every having() callback's, combined with AND. */
@@ -1391,7 +1512,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     // ... and from the aggregates' arguments, which can reach a navigation the grouped row does not
     // project (an expression written inside g.sum(...), a column of an entity row)
-    this.detectAndAddJoinsFromSelection([...state.aggregateArguments.values()], navigationJoins);
+    this.detectAndAddJoinsFromSelection([...state.aggregateArguments.values(), ...state.rowOperands], navigationJoins);
 
     // ... and from the lateral sets' function arguments (crossJoinLateral before groupBy)
     this.detectAndAddJoinsFromSelection(lateralSetRefs(this.lateralSets), navigationJoins);
@@ -1801,9 +1922,12 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
   /** Runs `render` with the grouped substitutions on: aggregate refs render as aggregates, keys as keys. */
   private withSubstitutions(state: GroupedBuildState, renderer: GroupedRenderer, buildContext: SqlBuildContext, render: () => void): void {
     const previous = buildContext.substitute;
+    // An operand of a list / distinct aggregate (g.arrayAgg, g.countDistinct) is read where the aggregates'
+    // arguments are: off the joined rows, or as a column of the subquery that computes the keys — interpolated
+    // as it is, it named a table the outer query does not have (42P01)
     buildContext.substitute = value => isAggregateRef(value)
       ? this.aggregateSql(value, state, renderer, false)
-      : renderer.key(value);
+      : renderer.key(value) ?? (state.rowOperands.has(value) ? renderer.argument(value, undefined) : undefined);
 
     try {
       render();
@@ -1984,6 +2108,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
       avg: (selector: any) => {
         return createAggregateFieldRef<number>('AVG', selector) as any;
       },
+      ...this.listAggregatesOver(mockOriginalSelection),
     };
   }
 
