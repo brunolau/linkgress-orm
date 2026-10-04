@@ -91,7 +91,7 @@ query = `IEntityQueryable` (from `where()`, `orderBy()`, `limit()`, `offset()`, 
 | `exists()`, `countOver()` | yes | yes | yes | no | no | no | no |
 | `min()`, `max()`, `sum()` | no | no | yes | no | no | no | no |
 | `groupBy()` | no | no | yes | no | no | no | no |
-| `forUpdate()` | no | no | yes | no | yes, but locks no row¹ | no | no |
+| `forUpdate()` | no | no | yes | no | throws¹ | no | no |
 | `asSubquery()` | no | no | yes | yes | yes | yes | yes |
 | `union()`, `unionAll()` | no | no | yes | no | yes | yes | yes |
 | `future()` | yes | yes | yes | yes | no | no | yes |
@@ -103,8 +103,9 @@ query = `IEntityQueryable` (from `where()`, `orderBy()`, `limit()`, `offset()`, 
 | `withPreparedStatements()` | yes | yes | yes | no | no | no | no |
 | `toSql()` | no | no | no | no | yes | yes | yes |
 
-¹ A CTE-rooted query's `forUpdate()` appends `FOR UPDATE` to an outer SELECT whose FROM holds only CTEs, and
-PostgreSQL's locking clause does not reach the `WITH` queries: no row is locked. Lock in the CTE body
+¹ Since 1.0.33 a CTE-rooted query's `forUpdate()` throws `forUpdate() on a CTE-rooted query locks no rows: …` and
+is `@deprecated`: a `FOR UPDATE` on an outer SELECT whose FROM holds only CTEs does not reach the `WITH` queries, so
+before 1.0.33 it locked no row. Lock in the CTE body
 (`builder.with('locked', db.users.where(…).select(…).forUpdate())`), see
 [Lock the rows a CTE reads](./guides/cte-guide.md#lock-the-rows-a-cte-reads-forupdate-in-the-body).
 
@@ -139,10 +140,10 @@ A terminal sends 1 statement unless noted; the `temptable` collection strategy a
 `PostgresClient` add statements. The terminals of grouped, CTE-rooted, set and union builders are listed with
 those builders.
 
-- `db.<table>.toList(): Promise<T[]>` — every row with every column, no WHERE and no ORDER BY; ignores the result options of `withQueryOptions()` (`disableMappers`, `rawResult`, `traceTime`). [guide](./guides/querying.md#read-whole-rows-tolist)
+- `db.<table>.toList(): Promise<T[]>` — every row with every column, no WHERE and no ORDER BY; since 1.0.33 it honours `rawResult` (the driver's rows, keyed by the database column names) and `disableMappers` (stored values) as `first()` and `firstOrDefault()` do, never `traceTime` (before 1.0.33 it ignored all three). [guide](./guides/querying.md#read-whole-rows-tolist)
 - `q.toList(): Promise<S[]>` — the rows of the query in the projection's shape; the order is unspecified without `orderBy()`. [guide](./guides/querying.md#read-whole-rows-tolist)
 - `db.<table>.first(): Promise<T>` — `LIMIT 1` without WHERE or ORDER BY; throws `Sequence contains no elements` on an empty table. [guide](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first)
-- `q.first(): Promise<S>` — on a query or select builder: resolves `null` when no row matches although typed non-null; sets `LIMIT 1` on the builder itself. [guide](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first)
+- `q.first(): Promise<S | null>` — on a query or select builder: the first row, or `null` when no row matches, as `firstOrDefault()`; typed `S | null` since 1.0.33 (before, typed `S`); sets `LIMIT 1` on the builder itself. [guide](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first)
 - `firstOrDefault(): Promise<S | null>` — the first row or `null` (`LIMIT 1`); add `orderBy()` for a defined row; on a query, select or grouped builder it leaves `LIMIT 1` set (a union restores its own limit). [guide](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first)
 - `firstOrThrow(): Promise<S>` — select builders and grouped selects only (call `select()` first); throws `No results found` when no row matches, and also when a one-value projection's first value is falsy (`0`, `''`, `false`, NULL). [guide](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first)
 - `count(): Promise<number>` — `SELECT COUNT(*) as count`; ignores `orderBy()`, `limit()`, `offset()` and `selectDistinct()`. [guide](./guides/querying.md#count-rows-without-loading-them-count)
@@ -286,7 +287,7 @@ A helper renders one operand of the statement that uses it and sends nothing on 
 - `agg.arrayAgg(v, { distinct?, orderBy? })` / `agg.jsonAgg(v, …)` / `agg.jsonbAgg(v, …)` — the values as one array; NULL over no rows (`coalesce(…, literal('{}', 'integer[]'))` for `[]`); in a grouped select it reads the grouping key only (the members: `g.arrayAgg()`). [guide](./guides/sql-expressions.md#aggregate-inside-an-expression-agg)
 - `aggregate.filter(condition)` — `FILTER (WHERE …)`; a second call is ANDed; call it before `.mapWith()` or `.as()`. [guide](./guides/sql-expressions.md#aggregate-inside-an-expression-agg)
 - `class AggregateFragment<T>` — what `agg.*` returns. [guide](./guides/sql-expressions.md#aggregate-inside-an-expression-agg)
-- `select.min(sel?)` / `select.max(sel?)` / `select.sum(sel?): Promise<R | null>` — one statement per call returning the raw driver value (SUM of an integer column is the string `'450'`); a column selector only; no `avg()`; several aggregates in one statement: an `agg.*` select. [guide](./guides/querying.md#aggregate-the-whole-set-in-one-statement-agg)
+- `select.min(sel?)` / `select.max(sel?)` / `select.sum(sel?): Promise<R | null>` — one statement per call; since 1.0.33 the value reads as `agg.sum()` / `agg.min()` / `agg.max()` read it (`sum()` a number, `450`; `min()` / `max()` through the column's mapper; NULL over no rows; `rawResult` keeps the driver's value), before 1.0.33 the driver's value (`'450'`); a column selector only; no `avg()`; several aggregates in one statement: an `agg.*` select. [guide](./guides/querying.md#aggregate-the-whole-set-in-one-statement-agg)
 - `select.groupBy(r => key): GroupedQueryBuilder` — only after `select()`; group keys and aggregate arguments must be in that projection. [guide](./guides/querying.md#group-rows-groupby)
 - `grouped.select(g => S): GroupedSelectQueryBuilder` — one row per group from `g.key.<k>`, `g.count()`, `g.sum(r => …)`, `g.avg(r => …)`, `g.min(r => …)`, `g.max(r => …)`, `g.arrayAgg(r => …)`, `g.countDistinct(r => …)`. [guide](./guides/querying.md#aggregates-per-group)
 - `GroupedItem<K, Row>` — `key`, `count()` (integer), `sum()` / `avg()` (cast to double precision), `min()` / `max()` (read through the column's mapper), `arrayAgg()` / `countDistinct()` (since 1.0.31). [guide](./guides/querying.md#aggregates-per-group)
@@ -381,7 +382,7 @@ Joins of grouped selects are under [Aggregates and windows](#aggregates-and-wind
 - `db.<table>.selectFromCte(cte, alias?)` — the same on the table's context and connection (inside the transaction on `tx.<table>`). (since 1.0.30) [guide](./guides/cte-guide.md#run-cte-statements-on-a-tables-own-connection-tableselectfromcte)
 - `cteRoot.select(root => S)` / `cteRoot.where(root => condition)` / `.orderBy(…)` / `.limit(n)` / `.offset(n)` — `select()` is required before any terminal and returns a new builder; `where()`, `orderBy()`, `limit()` and `offset()` change the builder; `orderBy()` names output aliases. [guide](./guides/cte-guide.md#read-a-cte-as-the-from-root-dbselectfromcte)
 - `cteRoot.toList()` / `cteRoot.first(): Promise<S | null>` — run it (after `select()`); there is no `count()` or `firstOrDefault()` (`select(() => agg.count()).first()` resolves the number). [guide](./guides/cte-guide.md#read-a-cte-as-the-from-root-dbselectfromcte)
-- `cteRoot.forUpdate({ skipLocked?, noWait? })` — appends `FOR UPDATE` to the outer SELECT, whose FROM holds only CTEs: PostgreSQL locks NO rows there (its JSDoc says otherwise). To lock, put `.forUpdate()` on the query that is the CTE's body. [guide](./guides/cte-guide.md#lock-the-rows-a-cte-reads-forupdate-in-the-body)
+- `cteRoot.forUpdate({ skipLocked?, noWait? })` — `@deprecated`; since 1.0.33 it throws `forUpdate() on a CTE-rooted query locks no rows: …` and sends nothing. Before 1.0.33 it appended `FOR UPDATE` to the outer SELECT, whose FROM holds only CTEs, and PostgreSQL locked NO rows. To lock, put `.forUpdate()` on the query that is the CTE's body. [guide](./guides/cte-guide.md#lock-the-rows-a-cte-reads-forupdate-in-the-body)
 - `cteRoot.toSql()` / `cteRoot.asSubquery(mode?)` / `cteRoot.withTimeout(ms)` / `cteRoot.expectedExecutionTime(ms)` — text, embedding and per-query overrides. [guide](./guides/cte-guide.md#read-a-cte-as-the-from-root-dbselectfromcte)
 - `cteRoot.union(q)` / `cteRoot.unionAll(q)` — a CTE-rooted query as a union leg, beside entity and set queries: the typed readback of several data-modifying CTEs. (since 1.0.29) [guide](./guides/cte-guide.md#order-two-writes-in-one-statement-aftermutation)
 - `cteRoot.innerJoin(cte, condition)` / `.leftJoin` / `.rightJoin` / `.fullOuterJoin(cte, condition)` / `.crossJoin(cte)`: `CteJoinedQueryBuilder` — joins between CTEs; its `select((root, right) => …)` and `where((root, right) => …)` receive one row per source. [guide](./guides/cte-guide.md#join-derived-sets-with-full-outer-right-or-cross-joins)
@@ -415,8 +416,8 @@ Joins of grouped selects are under [Aggregates and windows](#aggregates-and-wind
 - `future.getSql()` / `future.getParams()` — the statement text and its parameters, without running it. [guide](./guides/configuration.md#see-the-sql-a-query-sends)
 - `FutureQueryRunner.runAsync([…] as const)` — run futures of one context: one multi-statement message only on `PostgresClient`, `BunClient` and `PGliteClient` at the root with futures that bind no parameter, otherwise one statement per future. [guide](./guides/batching-and-prepared-queries.md#run-several-futures-together-futurequeryrunnerrunasync)
 - `isFutureQuery(value)` / `isFutureSingleQuery(value)` / `isFutureCountQuery(value)` — guards. [guide](./guides/batching-and-prepared-queries.md#build-a-read-now-and-run-it-later-future)
-- `q.prepare<P>(name): PreparedQuery<S, P>` — build the SQL once; each execution fills the `sql.placeholder()` values; the hot-path choice on `PgClient`, `BunClient` and `PGliteClient` (on `PostgresClient` use the ordinary builder with `preparedStatements: true`: [pick by client](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client)). [guide](./guides/batching-and-prepared-queries.md#build-a-query-once-and-execute-it-many-times-prepare)
-- `prepared.execute(params: P): Promise<S[]>` — 1 statement; a missing placeholder throws `Missing parameter: <name>`; bypasses the executor (unnamed, unlogged, no timeout). [guide](./guides/batching-and-prepared-queries.md#know-what-execute-checks-and-what-it-skips)
+- `q.prepare<P>(name): PreparedQuery<S, P>` — build the SQL once; each execution fills the `sql.placeholder()` values; the hot-path choice on every client, on `PostgresClient` from a `preparedStatements: true` context ([Run one query shape many times](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-prepare-and-preparedstatements)); per-query overrides (`withTimeout()`, `withPreparedStatements()`, `expectedExecutionTime()`) go before it. [guide](./guides/batching-and-prepared-queries.md#build-a-query-once-and-execute-it-many-times-prepare)
+- `prepared.execute(params: P): Promise<S[]>` — 1 statement; a missing placeholder throws `Missing parameter: <name>`; since 1.0.33 it runs through the executor of the query it was prepared from (logged, timed, named under `preparedStatements`, time-limited by its `withTimeout()`); before 1.0.33 it bypassed the executor (unnamed, unlogged, no timeout). [guide](./guides/batching-and-prepared-queries.md#know-what-execute-checks-and-what-it-skips)
 - `prepared.getSql()` / `prepared.getPlaceholderNames()` / `prepared.name` — inspect it. [guide](./guides/batching-and-prepared-queries.md#inspect-a-prepared-query)
 
 Independent writes in one statement (`MutationBatch`) are under [Writing](#writing).
@@ -470,7 +471,7 @@ awaited twice runs twice. `insertWithChildren()` and `insertBulkWithChildren()` 
 - `tx.tryAdvisoryXactLock(key)` / `tx.tryAdvisoryXactLock(classId, key): Promise<boolean>` — take the lock when it is free. [guide](./guides/insert-update-guide.md#serialize-check-then-write-on-a-key-that-is-not-a-row-advisory-locks)
 - `tx.advisoryXactLockAll(classId, keys)` — every key in one statement in a fixed order (no deadlock between overlapping sets); all integers or all strings. [guide](./guides/insert-update-guide.md#serialize-check-then-write-on-a-key-that-is-not-a-row-advisory-locks)
 - `tx.tryAdvisoryXactLockAll(classId, keys): Promise<boolean>` — try every key in one statement without waiting, in `advisoryXactLockAll`'s order: `true` when the transaction holds them all, `false` at the first key another session holds (the keys tried before it stay held until the transaction ends; the rest are never tried); an empty list returns `true` and sends nothing; outside a transaction it throws. (since 1.0.31) [guide](./guides/insert-update-guide.md#try-many-keys-without-waiting-tryadvisoryxactlockall-since-1031)
-- `forUpdate({ skipLocked?, noWait? })` — on select builders, including a select builder that is a CTE's body: `FOR UPDATE [SKIP LOCKED | NOWAIT]`; holds the lock only inside a transaction. A CTE-rooted query's `forUpdate()` (`db.selectFromCte(cte).select(…).forUpdate()`) locks nothing. [guide](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate)
+- `forUpdate({ skipLocked?, noWait? })` — on select builders, including a select builder that is a CTE's body: `FOR UPDATE [SKIP LOCKED | NOWAIT]`; holds the lock only inside a transaction. A CTE-rooted query's `forUpdate()` (`db.selectFromCte(cte).select(…).forUpdate()`) throws since 1.0.33 (before, it locked nothing). [guide](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate)
 - `db.<table>.isInTransaction(): boolean` — whether the table belongs to a transaction's context (still `true` after that transaction ended). (since 1.0.30) [guide](./guides/cte-guide.md#run-cte-statements-on-a-tables-own-connection-tableselectfromcte)
 - `client.isInTransaction()` / `client.transaction(query => …)` — the same check on a client / a driver-level transaction handing a raw query function. [guide](./database-clients.md#run-a-transaction)
 
@@ -604,12 +605,13 @@ Column builders are called inside `setupModel()` (`src/index.ts` marks them "for
 ### Context options: `QueryOptions`
 
 The second constructor argument. An "executor duty" is one of `logQueries`, `logFailedQueries`,
-`logExecutionTime`, `onQueryTakingTooLong`, `preparedStatements`; `disableMappers`, `rawResult` and `traceTime`
-take effect only next to one. [guide](./guides/configuration.md#configure-a-context-queryoptions)
+`logExecutionTime`, `onQueryTakingTooLong`, `preparedStatements` and, since 1.0.33, `disableMappers`, `rawResult`,
+`traceTime`, `useBinaryProtocol`: each creates the executor. Before 1.0.33 the last four did not, and
+`disableMappers`, `rawResult` and `traceTime` took effect only next to one of the first five. [guide](./guides/configuration.md#configure-a-context-queryoptions)
 
 | Key | Default | Effect |
 |---|---|---|
-| `logQueries` | `false` | log every statement the executor sends (section `'sql'`); `db.query()`, `PreparedQuery.execute()` and `FutureQueryRunner`'s multi-statement message bypass the executor |
+| `logQueries` | `false` | log every statement the executor sends (section `'sql'`), a `prepare()`d query's executions included since 1.0.33; `db.query()` and `FutureQueryRunner`'s multi-statement message bypass the executor |
 | `logParameters` | `false` | add the parameters to the logged statements and failures |
 | `logExecutionTime` | `false` | log each statement's duration (section `'timing'`) |
 | `logFailedQueries` | the value of `logQueries` | log failed statements (section `'error'`) |
@@ -622,10 +624,10 @@ take effect only next to one. [guide](./guides/configuration.md#configure-a-cont
 | `inArrayOptThreshold` | `8` | writes `LinkgressConfig.inArrayOptThreshold` for the whole process at construction |
 | `inArrayPadBuckets` | `null` | writes `LinkgressConfig.inArrayPadBuckets` for the whole process |
 | `inArrayUsesOpt` | `false` | writes `LinkgressConfig.inArrayUsesOpt` for the whole process |
-| `disableMappers` | `false` | builder reads skip `fromDriver` (bound values still go through `toDriver`) |
-| `rawResult` | `false` | builder terminals return the driver's rows |
-| `traceTime` | `false` | per-phase timing (section `'timing'`) |
-| `useBinaryProtocol` | `false` | no effect: no shipped client has a binary protocol |
+| `disableMappers` | `false` | builder reads and (since 1.0.33) a table's own reads skip `fromDriver` (bound values still go through `toDriver`); on its own since 1.0.33 |
+| `rawResult` | `false` | builder terminals and (since 1.0.33) a table's own reads return the driver's rows; on its own since 1.0.33 |
+| `traceTime` | `false` | per-phase timing (section `'timing'`); on its own since 1.0.33 |
+| `useBinaryProtocol` | `false` | no effect: no shipped client has a binary protocol (since 1.0.33 it creates the executor) |
 
 ### Per table and per query
 
@@ -669,6 +671,7 @@ Messages of plain `Error`s, as thrown:
 | `Cannot use <operator> operator with undefined value on field <f>` | `gt()`, `gte()`, `lt()`, `lte()`, `like()` and the other non-equality operators with `undefined` | leave the condition out when the value is unset |
 | `Alias is required when joining a subquery` | `innerJoin()` / `leftJoin()` of a subquery | pass the alias as the 4th argument |
 | `forUpdate: skipLocked and noWait are mutually exclusive` | `forUpdate({ skipLocked: true, noWait: true })` | one of the two |
+| `forUpdate() on a CTE-rooted query locks no rows` | `db.selectFromCte(…).forUpdate()` (since 1.0.33) | `.forUpdate()` on the builder that forms the CTE body: `new DbCteBuilder().with('x', db.<table>.where(…).select(…).forUpdate())` |
 | `Nested transactions are not supported` | `tx.transaction()` | `tx.query('SAVEPOINT …')` |
 | `Cannot get a new connection while in a transaction` | `tx.getClient().connect()` | the transaction's own statements |
 | `QueryBatch: query "<id>" uses a different database client or transaction than the rest of the batch` | `QueryBatch.executeBatch()` | build every leg from one context (or one derived table) |

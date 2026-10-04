@@ -2785,9 +2785,9 @@ FOR UPDATE SKIP LOCKED
 - Outside a transaction the lock ends with the statement, and nothing refuses the call.
 - `forUpdate()` exists after `select()` (not on the `where()` result), including on a select builder that is a CTE's
   body. `skipLocked` and `noWait` together throw. It mutates the builder (returns `this`).
-- A CTE-rooted query also has `forUpdate()` (`db.selectFromCte(cte).select(…).forUpdate()`), but it locks NO rows:
-  it appends `FOR UPDATE` to an outer SELECT whose FROM holds only CTEs, which PostgreSQL's locking clause does not
-  reach. Put `.forUpdate()` on the CTE body instead
+- A CTE-rooted query's `forUpdate()` (`db.selectFromCte(cte).select(…).forUpdate()`) throws since 1.0.33
+  (`forUpdate() on a CTE-rooted query locks no rows: …`): a `FOR UPDATE` on an outer SELECT whose FROM holds only
+  CTEs does not reach them, so before 1.0.33 it locked NO rows. Put `.forUpdate()` on the CTE body instead
   ([Lock the rows a CTE reads](./cte-guide.md#lock-the-rows-a-cte-reads-forupdate-in-the-body)).
 - Lock several rows in a stable order (`orderBy` a key) so two transactions cannot deadlock.
 

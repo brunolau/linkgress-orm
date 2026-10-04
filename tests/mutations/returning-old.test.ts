@@ -146,14 +146,14 @@ describe('RETURNING old (PostgreSQL 18)', () => {
   });
 
   test('a mapped timestamp column reads through its own mapper on both sides', async () => {
-    const before = await db.tasks.where(t => eq(t.id, taskId)).select(t => ({ finishedAt: t.finishedAt })).first();
+    const before = (await db.tasks.where(t => eq(t.id, taskId)).select(t => ({ finishedAt: t.finishedAt })).first())!;
 
     const [row] = await db.tasks
       .where(t => eq(t.id, taskId))
       .update({ finishedAt: new WallClock('2024-06-30 18:45:10') })
       .returning((t, old) => ({ before: old.finishedAt, after: t.finishedAt }));
 
-    const after = await db.tasks.where(t => eq(t.id, taskId)).select(t => ({ finishedAt: t.finishedAt })).first();
+    const after = (await db.tasks.where(t => eq(t.id, taskId)).select(t => ({ finishedAt: t.finishedAt })).first())!;
 
     expect(row.before).toBeInstanceOf(WallClock);
     expect(row.after).toBeInstanceOf(WallClock);

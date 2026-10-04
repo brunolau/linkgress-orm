@@ -113,8 +113,10 @@ WHERE "users"."is_active" = $1
 > same statement through a [navigation](#read-a-related-rows-columns-navigations) or a
 > [collection](#load-each-rows-children-in-the-same-statement-collections) in `select()`.
 
-> **Pitfall:** the table-level `toList()`, `first()` and `firstOrDefault()` build their own statement and
-> ignore the result options `disableMappers`, `rawResult` and `traceTime` of `withQueryOptions()`.
+> **Pitfall:** the table-level `toList()`, `first()` and `firstOrDefault()` build their own statement. Since
+> 1.0.33 they honour `rawResult`, whose rows carry the database column names (`publish_time`, not `publishTime`),
+> and `disableMappers` (stored values under the property names); they never report `traceTime`. Before 1.0.33
+> they ignored all three.
 
 <a id="selecting-specific-columns"></a>
 
@@ -317,8 +319,8 @@ All three add `LIMIT 1`. Pick by what a missing row means to the caller.
 |---|---|---|---|
 | A row or `null` | `firstOrDefault()` | `null` | on tables, queries and select builders |
 | A row, an error when missing | `select(…).firstOrThrow()` | throws `Error('No results found')` | only after `select()` or a join |
-| — | `first()` on a query or select builder | `null`, typed non-null | behaves as `firstOrDefault()` |
-| — | `db.<table>.first()` | throws `Error('Sequence contains no elements')` | no WHERE, no ORDER BY |
+| — | `first()` on a query or select builder | `null`, typed `T \| null` (since 1.0.33) | the same as `firstOrDefault()` |
+| — | `db.<table>.first()` | throws `Error('Sequence contains no elements')` | typed `T`; no WHERE, no ORDER BY |
 | Exactly one row (uniqueness) | `limit(2).toList()` and a length check | `[]` | there is no `single()` |
 
 ```ts
@@ -376,6 +378,11 @@ LIMIT 2
 > **Pitfall:** `first()`, `firstOrDefault()` and `firstOrThrow()` call `limit(1)` on the builder they are called
 > on: a later `toList()` of the same builder also renders `LIMIT 1` and returns one row. Build the query in a
 > function when it runs more than once.
+
+> **Pitfall:** since 1.0.33 `first()` on a query or select builder is typed `T | null`, as it always resolved:
+> code that reads its result without a `null` check (`(await q.first()).id`) no longer compiles. Check for
+> `null`, or call `firstOrThrow()` after `select()`. `db.<table>.first()` stays typed `T` and throws on an empty
+> table.
 
 > **Pitfall:** `firstOrThrow()` tests the value, not the row count: a one-value select whose value is `false`,
 > `0`, `''` or `null` throws `No results found` although a row exists (verified with
@@ -2527,7 +2534,7 @@ in one scan, `FILTER (WHERE …)` for conditional ones.
 | Need | Use | SQL · round trips | Reads as |
 |---|---|---|---|
 | Several aggregates of one set | `select(p => ({ n: agg.count(), total: agg.sum(p.views) })).firstOrDefault()` | one row · 1 | numbers (count, sum, avg via `Number()`); `min` / `max` through the column's mapper |
-| One `SUM` / `MIN` / `MAX` where the raw driver value is fine | `select(p => ({ v: p.views })).sum(r => r.v)` | `SELECT SUM(…) as result` · 1 per call | the raw driver value: `SUM(integer)` is `'450'` |
+| One `SUM`, `MIN` or `MAX` | `select(p => ({ v: p.views })).sum(r => r.v)` | `SELECT SUM(…) as result` · 1 per call | as `agg.sum()` / `agg.min()` / `agg.max()` read (since 1.0.33): `SUM(integer)` is `450`; before 1.0.33 the driver's value (`'450'`) |
 | Aggregates per key | [`groupBy()`](#group-rows-groupby) | `GROUP BY` · 1 | |
 | Aggregates per parent row | collection [`count()` / `sum()` / …](#count-sum-min-and-max-per-parent) | correlated subquery · 1 | |
 
@@ -2559,17 +2566,17 @@ LIMIT 1
 -- params: [ 120, 0 ]
 ```
 
-The select builder's `sum()`, `min()` and `max()` run one statement each and return the raw driver value
-whatever the declared type; a table has none of them, and no `avg()` exists anywhere but `agg.avg()` and
-`g.avg()`:
+The select builder's `sum()`, `min()` and `max()` run one statement each. Since 1.0.33 they read their value as
+`agg.sum()`, `agg.min()` and `agg.max()` read it in a projection: `sum()` is a number, `min()` / `max()` read like
+the column (through its custom mapper; a `decimal` as a number). A table has none of them, and no `avg()` exists
+anywhere but `agg.avg()` and `g.avg()`:
 
 ```ts
-const total = await db.posts.select(p => ({ views: p.views })).sum(r => r.views);          // '450' (a string)
+const total = await db.posts.select(p => ({ views: p.views })).sum(r => r.views);          // 450
 const min = await db.posts.select(p => ({ views: p.views })).min(r => r.views);            // 100
 const maxTitle = await db.posts.select(p => p.title).max();                                // 'Bob Post'
-const revenue = await db.orders.select(o => ({ amount: o.totalAmount })).sum(r => r.amount);   // '249.98'
-const revenueTyped = await db.orders.select(o => ({ revenue: agg.sum(o.totalAmount) })).firstOrDefault();
-// { revenue: 249.98 } (a number)
+const revenue = await db.orders.select(o => ({ amount: o.totalAmount })).sum(r => r.amount);   // 249.98
+const latest = await db.posts.select(p => ({ at: p.publishTime })).max(r => r.at);        // { hour: 18, minute: 45 }
 ```
 
 ```sql
@@ -2585,16 +2592,16 @@ FROM "posts"
 SELECT SUM("orders"."total_amount") as result
 FROM "orders"
 
-SELECT sum("orders"."total_amount") as "revenue"
-FROM "orders"
-LIMIT 1
+SELECT MAX("posts"."publish_time") as result
+FROM "posts"
 ```
 
 - The select builder's `sum()` / `min()` / `max()` ignore `orderBy()`, `limit()`, `offset()` and DISTINCT
-  (`.orderBy(…).limit(1).sum(…)` still summed all three posts: `'450'`) but honour `where()`. Their selector must
-  return a column: an `sql` expression throws `Aggregation selector must return a field reference`. A mapped
-  column's MAX comes back unmapped (`db.posts.select(p => ({ t: p.publishTime })).max(r => r.t)` read `1125`, still
-  on 1.0.31), unlike a collection's `max()`, which reads through the mapper since 1.0.31.
+  (`.orderBy(…).limit(1).sum(…)` still summed all three posts: `450`) but honour `where()`. Their selector must
+  return a column: an `sql` expression throws `Aggregation selector must return a field reference`. No matching
+  row reads `null`. `disableMappers` keeps the stored value (`1125` for `latest`), `rawResult` the driver's value
+  (`'450'` for `total`). The statement is the one they sent before 1.0.33, when they returned the driver's value
+  whatever the options: `'450'`, `'249.98'` and `1125` above.
 - Project only aggregates and constants: a plain column next to them fails in PostgreSQL
   (`column "posts.user_id" must appear in the GROUP BY clause or be used in an aggregate function`). Group by
   it instead.
@@ -3202,7 +3209,8 @@ FOR UPDATE SKIP LOCKED
 
 > **Pitfall:** `skipLocked` and `noWait` together throw `forUpdate: skipLocked and noWait are mutually exclusive`.
 > Union and collection legs drop the lock. Order locked rows by a stable key to avoid deadlocks between
-> concurrent lockers. A CTE-rooted query's `forUpdate()` locks no rows; put it on the CTE body
+> concurrent lockers. A CTE-rooted query's `forUpdate()` (`db.selectFromCte(…)`) throws since 1.0.33 (before, it
+> appended a `FOR UPDATE` that locked no rows); put it on the CTE body
 > ([CTE guide](./cte-guide.md#lock-the-rows-a-cte-reads-forupdate-in-the-body)).
 
 <a id="subqueries"></a><a id="scalar-subquery"></a><a id="in-subquery"></a><a id="exists-subquery"></a>
@@ -3714,9 +3722,9 @@ run the `ANALYZE` form inside a transaction you roll back.
 
 To see every statement while it runs, construct the context with
 `{ logQueries: true, logParameters: true, logger: (message, section) => … }` (sections `'sql'`, `'params'`,
-`'timing'`, …). Logging misses `db.query()`, `PreparedQuery.execute()` and `FutureQueryRunner`'s
-multi-statement path, which bypass the executor. A `QueryBatch`, the `temptable` strategy and a `withTimeout()`
-wrap send other statements than one query's `getSql()`. Options: [Configuration](./configuration.md).
+`'timing'`, …). Logging misses `db.query()` and `FutureQueryRunner`'s multi-statement path, which bypass the
+executor; a `prepare()`d query's executions are logged since 1.0.33. A `QueryBatch`, the `temptable` strategy and
+a `withTimeout()` wrap send other statements than one query's `getSql()`. Options: [Configuration](./configuration.md).
 
 ## Tune execution per query
 
@@ -3742,10 +3750,11 @@ await db.users.withQueryOptions({ collectionStrategy: 'cte' }).select(u => ({ n:
 | `withPreparedStatements(bool)` | tables, `where()` chains, select builders and join results; on a grouped chain before `groupBy()`; on a union, its first leg | named statement (PostgresClient only; others ignore it); covers every terminal of that builder |
 | `withTimeout(ms)` | tables, queries, select, grouped, union and CTE-root builders | PostgresClient only: `BEGIN; SET LOCAL statement_timeout = …; …; COMMIT` at the root, `SHOW` / `SET LOCAL` / restoring `SET LOCAL` inside a transaction (3 extra round trips either way); PgClient, BunClient and PGlite ignore it — set `statement_timeout` on the pool or use `db.transaction(fn, { timeoutMs })` (PGlite cannot cancel a statement at all) |
 | `expectedExecutionTime(ms)` | tables and builders | only the `onQueryTakingTooLong` threshold |
-| `withQueryOptions(options)` | `db.<table>` only (the start of a chain) | `collectionStrategy` always applies; logging and result options (`traceTime`, `rawResult`, `disableMappers`) apply only when the context or these options give the query an executor (`logQueries`, `logFailedQueries`, `logExecutionTime`, `onQueryTakingTooLong` or `preparedStatements`) |
+| `withQueryOptions(options)` | `db.<table>` only (the start of a chain) | `collectionStrategy` always applies; the logging options and (since 1.0.33 on their own) the result options `traceTime`, `rawResult` and `disableMappers` give the derived table an executor of its own. Before 1.0.33 the result options applied only next to `logQueries`, `logFailedQueries`, `logExecutionTime`, `onQueryTakingTooLong` or `preparedStatements` |
 
 Builder overrides change the builder they are called on and give the query its own executor: such a query
-cannot share a `QueryBatch` with plain legs. Defaults and trade-offs: [Configuration](./configuration.md).
+cannot share a `QueryBatch` with plain legs. A `prepare()` after them keeps them: since 1.0.33 its executions run
+through that executor. Defaults and trade-offs: [Configuration](./configuration.md).
 
 <a id="performance-tips"></a><a id="keep-statement-text-stable"></a><a id="use-select-projections"></a><a id="index-foreign-keys"></a><a id="use-collection-strategies-wisely"></a><a id="limit-collection-results"></a>
 
@@ -3757,7 +3766,7 @@ cannot share a `QueryBatch` with plain legs. Defaults and trade-offs: [Configura
 | Read related rows in the same statement: navigations and collections in `select()` | 1 statement for any number of navigations and collections (default `lateral`) | a query per parent row (N+1) |
 | Test existence with `exists()` | `SELECT EXISTS(SELECT 1 …)` stops at the first match and returns one boolean | `count() > 0`, fetching a row |
 | Count with `count()` | `SELECT COUNT(*)`: no projection; only the joins the WHERE needs | `(await toList()).length` |
-| Read several totals with one `agg` select | any number of aggregates and `FILTER` counts in 1 statement, read as numbers | builder `sum()` / `min()` / `max()`: 1 statement each, raw driver values |
+| Read several totals with one `agg` select | any number of aggregates and `FILTER` counts in 1 statement, read as numbers | builder `sum()` / `min()` / `max()`: 1 statement each |
 | Batch independent reads with `QueryBatch` | 1 statement; `bench/querybatch` S (12 queries, ~31 ms round trip, median): 62 ms vs 743 ms sequential and 110 ms with `Promise.all` on a pool of 10 | sequential `await`s |
 | Read a page and the total with `countOver()` or a `QueryBatch` | 1 statement | `Promise.all([toList(), count()])`: 2 statements on 2 connections |
 | Match data-driven lists with `inArrayOpt()`, long lists with `eqAny()` | at most 8 `IN` texts plus 1 array text per column; `eqAny` is 1 parameter (IN is capped at 65,535 parameters, 32,767 on PGlite) | `inArray()` with lists of varying length |
@@ -3794,8 +3803,9 @@ db.users.select(u => ({ x: u.invalidColumn }));
 ```
 
 The types do not cover everything the runtime does: an unmatched `leftJoin()` column and a missing optional
-navigation column read as `undefined` though typed non-null, builder `first()` returns `null` though typed
-non-null, and top-level `decimal` / `bigint` columns typed `number` arrive as strings.
+navigation column read as `undefined` though typed non-null, and top-level `decimal` / `bigint` columns typed
+`number` arrive as strings. (Before 1.0.33 a builder's `first()`, which resolves `null` when no row matches, was
+typed non-null; it is typed `T | null` now.)
 
 <a id="examples"></a><a id="dashboard-statistics"></a>
 
@@ -3930,10 +3940,11 @@ WHERE "orders"."user_id" = $3
 
 `.prepare(name)` with `sql.placeholder(name)` values builds the SQL once in your process; each
 `execute(params)` sends it with the placeholder values (every other value keeps the value it had at
-`prepare()` time). It bypasses the context's executor: no logging, slow-query callback or timeout, and it is
-always sent UNNAMED, even on a `preparedStatements: true` context — server-side named statements come from that
-option and `withPreparedStatements()` on ordinary builders. Placeholders in collections and subqueries, the
-`PreparedQuery` utilities and the trade-offs:
+`prepare()` time). Since 1.0.33 each execution runs through the executor of the query it was prepared from, like
+any other statement of the context: it is logged, reported when slow, limited by a `withTimeout()` set before
+`prepare()`, and sent as a named statement on `PostgresClient` under `preparedStatements: true` or
+`.withPreparedStatements(true)`. Before 1.0.33 it went to the client directly: unlogged, without a timeout and
+always unnamed. Placeholders in collections and subqueries, the `PreparedQuery` utilities and the trade-offs:
 [Build a query once and execute it many times](./batching-and-prepared-queries.md#build-a-query-once-and-execute-it-many-times-prepare).
 
 ```ts
@@ -3989,7 +4000,8 @@ WHERE "users"."id" = $1
 - **Don't** compare an optional navigation's column expecting rows without the related row → **Do** add
   `or(…, isNull(fk))`. NULL matches nothing, so those rows drop out.
 - **Don't** expect `decimal` / `numeric` / `bigint` columns as numbers at the top level → **Do** convert them or
-  use `agg.sum()`. node-postgres delivers `'99.99'`; the builder's `sum()` returns `'450'`.
+  use `agg.sum()`. node-postgres delivers `'99.99'`. (The select builder's `sum()`, `min()` and `max()` read
+  numbers since 1.0.33; before, `sum()` returned `'450'`.)
 - **Don't** list union legs' keys in different orders → **Do** write every leg in the same order. Legs match by
   position and silently swap same-typed values.
 - **Don't** register one paged union for both `addList()` and `addCount()` of a `QueryBatch` expecting the total →

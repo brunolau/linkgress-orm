@@ -20,8 +20,8 @@
 - [Build a read now and run it later: `future()`](#build-a-read-now-and-run-it-later-future)
 - [Run several futures together: `FutureQueryRunner.runAsync()`](#run-several-futures-together-futurequeryrunnerrunasync)
 - [Build a query once and execute it many times: `prepare()`](#build-a-query-once-and-execute-it-many-times-prepare)
-- [Keep server-side prepared statements apart from `prepare()`](#keep-server-side-prepared-statements-apart-from-prepare)
-- [Run one query shape many times: pick the tool by client](#run-one-query-shape-many-times-pick-the-tool-by-client)
+- [Combine `prepare()` with server-side prepared statements](#combine-prepare-with-server-side-prepared-statements)
+- [Run one query shape many times: `prepare()` and `preparedStatements`](#run-one-query-shape-many-times-prepare-and-preparedstatements)
 - [Write several independent changes in one statement: `MutationBatch`](#write-several-independent-changes-in-one-statement-mutationbatch)
 - [Pitfalls](#pitfalls)
 - [See also](#see-also)
@@ -36,17 +36,17 @@
 | The count or the first row of a union next to other reads | `addCount(union)` / `addFirstOrDefault(union)` (since 1.0.31) | `SELECT COUNT(*) as count FROM (<union>) as union_count` leg, or the union with `LIMIT 1` · 1 | `union.count()` beside the batch (a second round trip); `addList(union)` and `.length` in JS (ships every row) |
 | One read needs another read's result | one query with navigations or collections ([Querying guide](./querying.md)) | one statement with joins / `LATERAL` / CTEs · 1 under the default `lateral` or the `cte` strategy (`temptable` sends several) | a chain of `await`s feeding ids into the next query |
 | Independent lists of thousands of rows each, pool has free connections | `Promise.all` of `toList()` | N statements, run concurrently · N | `QueryBatch`: aggregating 20 000 rows into JSON cost more than the round trips it saved (see [Measured](#read-several-independent-results-in-one-round-trip-querybatch)) |
-| The same query shape many times with different values | by client ([pick the tool by client](#run-one-query-shape-many-times-pick-the-tool-by-client)): `PgClient`, `BunClient`, `PGliteClient`: `prepare(name)` + `sql.placeholder(name)`, then `execute(values)`; `PostgresClient`: the ordinary builder on a `preparedStatements: true` context, plus `MockRowCache.setEnabled(true)` | the same text on every call · 1 per call | `prepare()` on `PostgresClient` (never named: 2 network round trips per call); rebuilding the builder per call on a hot path without `MockRowCache`; a placeholder in a query run with `toList()` (the server refuses it) or in a batch leg (it can take another leg's value) |
+| The same query shape many times with different values | `prepare(name)` + `sql.placeholder(name)`, then `execute(values)`, on every client; on `PostgresClient` prepared from a `preparedStatements: true` context, whose executions are named since 1.0.33 ([Run one query shape many times](#run-one-query-shape-many-times-prepare-and-preparedstatements)) | the same text on every call · 1 per call | rebuilding the builder per call on a hot path without `MockRowCache`; a placeholder in a query run with `toList()` (the server refuses it) or in a batch leg (it can take another leg's value); before 1.0.33, `prepare()` on `PostgresClient` (never named: 2 network round trips per call) |
 | Parameter-free reads as a typed tuple on `PostgresClient` / `BunClient` / `PGliteClient` | `FutureQueryRunner.runAsync([...] as const)` | one simple-protocol message with several statements · 1 | expecting 1 round trip when any future binds a value, on `PgClient`, or inside a transaction (N statements) |
 | A read's SQL and parameters without running it | `future().getSql()` / `future().getParams()` | nothing sent · 0 | `logQueries` (it runs the query); `toSql()` on select builders (does not exist) |
 | Several independent writes | `MutationBatch` ([Inserts, updates, upserts and deletes](./insert-update-guide.md#run-independent-writes-in-one-round-trip-mutationbatch)) | one statement of data-modifying CTEs · 1 | N awaited writes |
-| The server reuses a parsed statement between executions | `preparedStatements: true` or `.withPreparedStatements(true)`, `PostgresClient` only ([Configuration](./configuration.md#send-statements-named-on-the-server-preparedstatements)) | same statement count; after its first run on a connection a named statement skips parse and postgres.js's describe step, and PostgreSQL may switch it to a reused generic plan after 5 executions | expecting `prepare()` to name the statement (it never asks for that) |
+| The server reuses a parsed statement between executions | `preparedStatements: true` or `.withPreparedStatements(true)`, `PostgresClient` only ([Configuration](./configuration.md#send-statements-named-on-the-server-preparedstatements)) | same statement count; after its first run on a connection a named statement skips parse and postgres.js's describe step, and PostgreSQL may switch it to a reused generic plan after 5 executions | texts that vary per call (`inArray()` lengths, `limit()` / `offset()` values): one named statement per text and connection; before 1.0.33, expecting `prepare()` to name its statement (it never asked for that) |
 
 Rules that hold across this page:
 
 1. Independent reads go into one `QueryBatch`, not into N `await`s. The exception is lists of thousands of rows each (see the table above).
 2. Reads that share a parent row can also be one projection: `db.users.where(...).select(u => ({ ..., posts: u.posts!.select(...).toList('posts'), orders: u.orders!.count() }))` is one statement without a batch under the default `lateral` or the `cte` strategy ([Querying guide](./querying.md)); under `temptable` it sends several (11 on `PgClient` for a username, that collection and that count). Use a batch for reads with different roots or filters.
-3. `prepare()` saves query-build CPU, not round trips. Server-side statement reuse (named statements) is `preparedStatements` on `PostgresClient`, a separate switch. For a hot path the client decides which one to use: [Run one query shape many times](#run-one-query-shape-many-times-pick-the-tool-by-client).
+3. `prepare()` saves query-build CPU, not round trips. Server-side statement reuse (named statements) is `preparedStatements` on `PostgresClient`; since 1.0.33 it applies to a prepared query's executions too, so a hot path uses both: [Run one query shape many times](#run-one-query-shape-many-times-prepare-and-preparedstatements).
 
 ## Read several independent results in one round trip: `QueryBatch`
 
@@ -634,9 +634,9 @@ Every refusal throws before anything is sent.
 | A getter before `executeBatch()` | `QueryBatch results are not available — call executeBatch() first` | await `executeBatch()` first |
 | An id never registered | `QueryBatch: unknown identifier "nope"` | use the key `add*()` returned |
 | The wrong getter (`getList()` on a count leg) | `QueryBatch: "users" was registered as count, not list` | the getter of the adder |
-| Legs of two contexts (`db` and `tx`), or a leg with its own executor: `withTimeout()`, `withPreparedStatements()`, `expectedExecutionTime()`, a `withQueryOptions()` that sets an executor option (`logQueries`, `logFailedQueries`, `logExecutionTime`, `onQueryTakingTooLong`, `preparedStatements`), or any `withQueryOptions()` on a context that has one | `QueryBatch: query "posts" uses a different database client or transaction than the rest of the batch — all queries must share one connection context` | build every leg from one context; for a timeout use the transaction's `timeoutMs` |
+| Legs of two contexts (`db` and `tx`), or a leg with its own executor: `withTimeout()`, `withPreparedStatements()`, `expectedExecutionTime()`, a `withQueryOptions()` that sets an executor option (`logQueries`, `logFailedQueries`, `logExecutionTime`, `onQueryTakingTooLong`, `preparedStatements`; since 1.0.33 also `disableMappers`, `rawResult`, `traceTime`, `useBinaryProtocol`), or any `withQueryOptions()` on a context that has one | `QueryBatch: query "posts" uses a different database client or transaction than the rest of the batch — all queries must share one connection context` | build every leg from one context; for a timeout use the transaction's `timeoutMs` |
 
-Legs built from ONE derived table share its executor and mix (`const posts = db.posts.withTimeout(5000)`, above). A `withQueryOptions({ collectionStrategy: 'cte' })` leg also mixes with plain legs on a context without executor options, because then that option creates no executor; on a context with `logQueries: true` the same leg was refused (both verified).
+Legs built from ONE derived table share its executor and mix (`const posts = db.posts.withTimeout(5000)`, above). A `withQueryOptions({ collectionStrategy: 'cte' })` leg also mixes with plain legs on a context without executor options, because then that option creates no executor; on a context with `logQueries: true` the same leg was refused (both verified). Since 1.0.33 `disableMappers`, `rawResult`, `traceTime` and `useBinaryProtocol` create an executor on their own, so a `db.posts.withQueryOptions({ rawResult: true })` leg next to a plain `db.users` leg was refused with the message above; before 1.0.33 it mixed and the option was ignored.
 
 `QueryBatch` does not check the parameter total before sending: PostgreSQL accepts at most 65 535 bound parameters per statement, and `PGliteClient` refuses more than 32 767 before sending (since 1.0.29).
 
@@ -877,7 +877,7 @@ FROM "tags"
 
 ## Build a query once and execute it many times: `prepare()`
 
-`prepare(name)` builds the SQL once, in your process, and returns a `PreparedQuery`; each `execute(values)` binds the values of the `sql.placeholder(name)` slots and sends that same text. Use it on a hot path that re-runs one query shape where query-build CPU matters. It does not save round trips (one statement per `execute()`), and it never asks for a named server-side statement: `PostgresClient`, `PgClient` and `PGliteClient` send it unnamed (on `BunClient`, Bun.SQL's own `prepare` option decides, as for every statement).
+`prepare(name)` builds the SQL once, in your process, and returns a `PreparedQuery`; each `execute(values)` binds the values of the `sql.placeholder(name)` slots and sends that same text. Use it on a hot path that re-runs one query shape where query-build CPU matters. It does not save round trips (one statement per `execute()`). Since 1.0.33 every execution runs through the executor of the query it was prepared from, like any statement of the context: `logQueries` / `logParameters`, `logFailedQueries`, `onQueryTakingTooLong`, an `expectedExecutionTime()` or `withTimeout()` set before `prepare()`, and `preparedStatements` / `.withPreparedStatements(true)` apply, so on `PostgresClient` it can be a named statement ([combine it with server-side prepared statements](#combine-prepare-with-server-side-prepared-statements)). Before 1.0.33 `execute()` called the client directly: none of them applied, and the statement was always unnamed. (On `BunClient` Bun.SQL's own `prepare` option decides the naming, as for every statement.)
 
 ```ts
 import { eq, sql } from 'linkgress-orm';
@@ -1091,10 +1091,11 @@ prepared.getSql();
 | A placeholder value is missing | throws `Missing parameter: userId`; nothing sent |
 | An extra key | ignored |
 | A placeholder compared with a column that has a custom mapper (`gt(u.lastActiveAt, sql.placeholder('since'))`, an integer column mapped to `Date`) | the raw JS value is bound, without the mapper's `toDriver`: the server refuses it (`invalid input syntax for type integer`). Pass the value the column stores, or use a plain value (`gt(u.lastActiveAt, date)` binds the converted integer) |
-| The context logs (`logQueries`, `logFailedQueries`) or reports slow statements (`onQueryTakingTooLong`) | `execute()` is not logged or timed: it calls the client directly (no logger line, while the same query through `toList()` logged two) |
-| The builder had `.withTimeout(5000)` | ignored: no `SET LOCAL statement_timeout` (captured on `PostgresClient`) |
-| The context has `preparedStatements: true` | the statement is still sent unnamed on `PostgresClient` (no `pg_prepared_statements` entry) |
-| The context has `rawResult: true` with an executor duty such as `logFailedQueries: true` | honored: raw driver rows (`publishTime: 570` instead of `{ hour: 9, minute: 30 }`) |
+| The context logs (`logQueries`, `logFailedQueries`) or reports slow statements (`onQueryTakingTooLong`) | since 1.0.33 every execution is logged and timed like `toList()`: two executions logged `[SQL Query]`, the text and `[Parameters] ["alice"]` / `["bob"]`; a failed one logged `[SQL Error] invalid input syntax for type integer: "not a number"`; `longRunningQueryThreshold: 0` reported it. Before 1.0.33 `execute()` called the client directly: no logger line, no report |
+| The builder had `.expectedExecutionTime(ms)` or `.withTimeout(5000)` before `prepare()` | since 1.0.33 applied to every execution: `.expectedExecutionTime(0)` on a context with a 60 s threshold reported the execution with `thresholdMs: 0`; the executor hands the client `timeoutMs: 5000`, which `PostgresClient` wraps in `SET LOCAL statement_timeout` (`tests/queries/query-timeout.test.ts`: a `pg_sleep(5)` under `.withTimeout(400)` rejected with `QueryTimeoutError`). Before 1.0.33 both were ignored |
+| The context has `preparedStatements: true`, or the builder had `.withPreparedStatements(true)` before `prepare()` | since 1.0.33 each execution asks for a named statement, which `PostgresClient` sends named (`tests/database/prepared-statements.test.ts`: one `pg_prepared_statements` entry after two executions). Before 1.0.33 always unnamed |
+| The context has `rawResult: true` or `disableMappers: true` (since 1.0.33 on its own; before, only next to an executor option such as `logFailedQueries: true`) | honored: `publishTime: 570` instead of `{ hour: 9, minute: 30 }` (`rawResult`: the driver's rows) |
+| The context has `traceTime: true` | not applied: an execution prints no phase summary |
 | Built on `db`, executed inside `db.transaction()` | runs outside the transaction (it did not see the transaction's uncommitted row; the same query prepared from `tx` did) |
 | Built on `tx`, executed after the transaction | throws `TransactionEndedError`; nothing sent |
 
@@ -1147,55 +1148,55 @@ ORDER BY "username" ASC
 -- params: [50, 30, 40, "a%"]
 ```
 
-## Keep server-side prepared statements apart from `prepare()`
+<a id="keep-server-side-prepared-statements-apart-from-prepare"></a>
 
-Two different mechanisms carry the word "prepared". They do not combine: `PreparedQuery.execute()` never asks for a named statement, whatever `preparedStatements` says. (On `BunClient` neither mechanism decides naming: Bun.SQL's own `prepare` constructor option, default `true`, applies to every statement it sends.)
+## Combine `prepare()` with server-side prepared statements
+
+Two different mechanisms carry the word "prepared": `prepare()` saves the query build in your process, `preparedStatements` the parse on the server. Since 1.0.33 they combine: `PreparedQuery.execute()` runs through the executor of the query it was prepared from, so the context's `preparedStatements` and a `.withPreparedStatements(true)` set on the builder before `prepare()` name its statement on `PostgresClient`. Before 1.0.33 they did not combine: `execute()` never asked for a named statement. (On `BunClient` neither mechanism decides naming: Bun.SQL's own `prepare` constructor option, default `true`, applies to every statement it sends.)
 
 | | `prepare()` + `sql.placeholder()` | `preparedStatements: true` / `.withPreparedStatements(true)` |
 |---|---|---|
 | What it saves | client-side query build per call | server-side parse per call (the plan too, once PostgreSQL switches the statement to a generic plan), and postgres.js's describe round trip |
 | Clients | all | `PostgresClient` only (others ignore it) |
-| On the wire | unnamed statement, every call (`PostgresClient`, `PgClient`, `PGliteClient`) | named statement, created once per distinct text per pooled connection |
-| Applies to | `PreparedQuery.execute()` | builder terminals, `future().execute()`, `QueryBatch` (verified named) |
-| Never applies to | builder terminals, futures, batches | `PreparedQuery.execute()`, `db.query()`, `FutureQueryRunner`'s multi-statement message, `MutationBatch`, statements without parameters |
-| Configure in | the query | the context, a table, a builder or a batch ([Configuration](./configuration.md#send-statements-named-on-the-server-preparedstatements)) |
+| On the wire | the same text on every call: named where `preparedStatements` applies (since 1.0.33), else unnamed | named statement, created once per distinct text per pooled connection |
+| Applies to | `PreparedQuery.execute()` | builder terminals, `future().execute()`, `QueryBatch` (verified named), `PreparedQuery.execute()` (since 1.0.33) |
+| Never applies to | builder terminals, futures, batches | `db.query()`, `FutureQueryRunner`'s multi-statement message, `MutationBatch`, statements without parameters; before 1.0.33 also `PreparedQuery.execute()` |
+| Configure in | the query | the context, a table, a builder (before `prepare()`) or a batch ([Configuration](./configuration.md#send-statements-named-on-the-server-preparedstatements)) |
 
-To get named statements and a cheaper build on `PostgresClient`, use the ordinary builder on a context with `preparedStatements: true` and reduce its build cost with the query-build caches (`MockRowCache.setEnabled(true)`, see [Configuration](./configuration.md#cut-query-build-cpu-mockrowcache)); the caches shorten each build, `prepare()` skips it, and only the builder's statements can be named.
+The query-build caches (`MockRowCache.setEnabled(true)`, see [Configuration](./configuration.md#cut-query-build-cpu-mockrowcache)) shorten the build of the ordinary builders, for the shapes `prepare()` cannot fix in advance; `prepare()` skips the build.
 
-## Run one query shape many times: pick the tool by client
+<a id="run-one-query-shape-many-times-pick-the-tool-by-client"></a>
 
-For one query shape run thousands of times with new values, the client decides between the two mechanisms above. Each call is 1 statement either way; what differs is the build in your process, the parse on the server and, on postgres.js, the network round trips per statement.
+## Run one query shape many times: `prepare()` and `preparedStatements`
 
-| Client | Use | Network round trips per call | Why |
-|---|---|---|---|
-| `PostgresClient` | the ordinary builder on a context with `preparedStatements: true`, plus `MockRowCache.setEnabled(true)` once at startup | 2 on the first use of the text per pooled connection, then 1 | `prepare()` sends an unnamed statement: Parse/Describe, then Bind/Execute, 2 network round trips on EVERY call, and no logging or timeout |
-| `PgClient` | `prepare(name)` + `sql.placeholder(name)`, then `execute(values)` | 1 | node-postgres sends an unnamed statement in one round trip; it ignores `preparedStatements` |
-| `BunClient` | `prepare(name)` + `sql.placeholder(name)` | 1 statement; Bun.SQL decides how it prepares it | Bun.SQL names statements itself (its `prepare` option, default `true`), so `prepare()` only has to save the build |
-| `PGliteClient` | `prepare(name)` + `sql.placeholder(name)` | none: in-process | it ignores `preparedStatements` |
+For one query shape run thousands of times with new values, `prepare()` the query once and `execute()` it per call, on every client. On `PostgresClient` prepare it from a context with `preparedStatements: true` (or call `.withPreparedStatements(true)` before `prepare()`): since 1.0.33 every execution is then the named statement. Each call is 1 statement; what differs per client is how it travels.
 
-On every client, keep the ordinary builder with `MockRowCache` when the query needs what `PreparedQuery.execute()` skips: logging, `onQueryTakingTooLong` reports, `.withTimeout()` (`PostgresClient`), or a value bound through a column's custom mapper (a placeholder value skips `toDriver`).
+| Client | `execute()` sends | Network round trips per call |
+|---|---|---|
+| `PostgresClient`, `preparedStatements: true` | a named statement (since 1.0.33) | 2 on the first use of the text per pooled connection, then 1 |
+| `PostgresClient` without it | an unnamed statement: Parse/Describe, then Bind/Execute | 2 on EVERY call |
+| `PgClient` | an unnamed statement in one round trip; `preparedStatements` is ignored | 1 |
+| `BunClient` | what Bun.SQL's own `prepare` option decides (default `true`: named) | 1 statement; Bun.SQL decides how it prepares it |
+| `PGliteClient` | an in-process statement; `preparedStatements` is ignored | none: in-process |
+
+Keep the ordinary builder with `MockRowCache` when the shape varies per call (optional filters change the text) or a value is bound through a column's custom mapper (a placeholder value skips `toDriver`). Before 1.0.33 `prepare()` skipped the executor (never named, no logging, no `.withTimeout()`), and on `PostgresClient` the hot-path form was the ordinary builder on a `preparedStatements: true` context with `MockRowCache.setEnabled(true)`.
 
 ```ts
-import { gt, MockRowCache, sql } from 'linkgress-orm';
+import { gt, sql } from 'linkgress-orm';
 
-// PgClient, BunClient, PGliteClient: build once, execute many times
-const byMinViews = db.posts
+// once, at startup: preparedStatements names the statement on PostgresClient; the other clients ignore it
+const appDb = new AppDatabase(client, { preparedStatements: true });
+const byMinViews = appDb.posts
   .where(p => gt(p.views, sql.placeholder('minViews')))
   .select(p => ({ id: p.id, title: p.title }))
   .prepare<{ minViews: number }>('byMinViews');
+
+// per call: no build, the same text, one statement
 await byMinViews.execute({ minViews: 100 });   // [{ id: 2, title: 'Alice Post 2' }, { id: 3, title: 'Bob Post' }]
 await byMinViews.execute({ minViews: 160 });   // [{ id: 3, title: 'Bob Post' }]
-
-// PostgresClient: the ordinary builder, named on the server, cheaper to build
-MockRowCache.setEnabled(true);                                   // once at startup
-const preparedDb = new AppDatabase(client, { preparedStatements: true });
-const popular = (minViews: number) =>
-  preparedDb.posts.where(p => gt(p.views, minViews)).select(p => ({ id: p.id, title: p.title })).toList();
-await popular(100);
-await popular(160);
 ```
 
-Both forms send this text, with `[100]` and then `[160]` (captured on `PgClient`, which names nothing; on `PostgresClient` the second form's text is a named statement, created once per pooled connection):
+Both executions send this text, with `[100]` and then `[160]` (captured on `PgClient`, which names nothing; the executor asked the client for a named statement both times, which `PostgresClient` creates once per pooled connection: `tests/database/prepared-statements.test.ts` counts one `pg_prepared_statements` entry after two executions):
 
 ```sql
 SELECT "posts"."id" as "id", "posts"."title" as "title"
@@ -1249,7 +1250,7 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "
 - **Don't** `await` independent reads one after another. **Do** register them in one `QueryBatch`: three reads went from three statements to one, and across a 31 ms network 12 reads went from 743 ms to 62 ms.
 - **Don't** treat `Promise.all` as a batch. **Do** use `QueryBatch` when latency or pool pressure matters: `Promise.all` sends N statements on up to N pooled connections, and inside a transaction they queue on one connection. Keep `Promise.all` for independent lists of thousands of rows on a server with free connections.
 - **Don't** batch reads where one needs another's result. **Do** write one query with navigations or collections; a batch only runs queries whose inputs are known before it is sent.
-- **Don't** mix legs from `db` and `tx`, or add a leg with its own `withTimeout()` / `withPreparedStatements()` / `expectedExecutionTime()`, or a `withQueryOptions()` leg that gets an executor of its own (an executor option, or any `withQueryOptions()` on a context with logging, slow-query detection or `preparedStatements`). **Do** build every leg from one context; bound the batch with `db.transaction(fn, { timeoutMs })`. Mixed legs throw before anything is sent.
+- **Don't** mix legs from `db` and `tx`, or add a leg with its own `withTimeout()` / `withPreparedStatements()` / `expectedExecutionTime()`, or a `withQueryOptions()` leg that gets an executor of its own (an executor option, since 1.0.33 `disableMappers`, `rawResult` and `traceTime` included, or any `withQueryOptions()` on a context with logging, slow-query detection or `preparedStatements`). **Do** build every leg from one context; bound the batch with `db.transaction(fn, { timeoutMs })`. Mixed legs throw before anything is sent.
 - **Don't** reuse a `QueryBatch` after `executeBatch()`. **Do** create a new batch per round: the second call throws.
 - **Don't** use `countOver()` when a requested page can lie past the end. **Do** batch `addList(page)` + `addCount(page)`: `countOver()` read `totalCount: 0` for `OFFSET 10` while 3 rows matched.
 - **Don't** register a paged union for `addCount()` expecting its total. **Do** count the union without `limit()` / `offset()`: a union's count (since 1.0.31) counts its own paging (`limit(1)` counted 1 of 2 rows), unlike a select's.
@@ -1257,7 +1258,7 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "
 - **Don't** expect `FutureQueryRunner.runAsync()` to be one round trip for parameterised futures, on `PgClient` or in a transaction. **Do** use `QueryBatch`, which is one statement with parameters on every client.
 - **Don't** call `runAsync([...])` without `as const`. **Do** pass the array `as const` so each result keeps its own type.
 - **Don't** put `sql.placeholder()` in a query run with `toList()`, `future()` or a batch: the statement is sent and refused (`there is no parameter $1`, or `bind message supplies … parameters` when the query binds other values), and in a batch whose later leg binds a value the placeholder silently takes that value. **Do** `prepare()` it and `execute()` it with values; in a batch, use plain values.
-- **Don't** rely on `prepare()` for logging, timeouts or named server-side statements. **Do** use the ordinary builder with the context's options when they matter; `PreparedQuery.execute()` bypasses the executor.
+- **Don't** call `withTimeout()`, `withPreparedStatements()` or `expectedExecutionTime()` on a builder after `prepare()` expecting the prepared query to follow. **Do** set them before `prepare()`: since 1.0.33 its executions run through the executor the builder had then (`PreparedQuery` has no overrides of its own). Before 1.0.33 `execute()` bypassed the executor: no logging, timeout or named statement.
 - **Don't** compare a placeholder with a custom-mapped column. **Do** pass the stored value yourself or use a plain value, which goes through `toDriver`.
 - **Don't** build a future or a `PreparedQuery` on `db` and execute it inside `db.transaction()`. **Do** build it from `tx`: the `db` one runs outside the transaction and misses its uncommitted rows.
 - **Don't** batch a leg that depends on the client's own parsers for declared `timestamp` / `timestamptz` / `date` / `bytea` columns. **Do** run it on its own: in a batch those columns are restored by the default drivers' rules.

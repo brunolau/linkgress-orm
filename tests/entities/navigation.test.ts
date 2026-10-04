@@ -46,12 +46,12 @@ describe('Navigation Properties', () => {
       await withDatabase(async (db) => {
         const { posts } = await seedTestData(db);
 
-        const post = await db.posts
+        const post = (await db.posts
           .select(p => ({
             title: p.title,
             authorName: p.user!.username,
           }))
-          .first();
+          .first())!;
 
         expect(post).toBeDefined();
         expect(post.authorName).toBeDefined();
@@ -147,13 +147,13 @@ describe('Navigation Properties', () => {
         const { users, posts } = await seedTestData(db);
 
         // Navigate from post -> user -> back to posts
-        const result = await db.posts
+        const result = (await db.posts
           .select(p => ({
             postTitle: p.title,
             authorName: p.user!.username,
             userId: p.user!.id,
           }))
-          .first();
+          .first())!;
 
         expect(result).toBeDefined();
         expect(result.authorName).toBeDefined();
