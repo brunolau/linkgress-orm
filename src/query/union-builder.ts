@@ -5,7 +5,8 @@ import { parseOrderBy } from './query-utils';
 import type { DatabaseClient } from '../database/database-client.interface';
 import type { SelectQueryBuilder } from './query-builder';
 import { materializeMockSelection } from './query-builder';
-import { FutureQuery } from './future-query';
+import { FutureCountQuery, FutureQuery, FutureSingleQuery } from './future-query';
+import type { FutureBatchMeta } from './future-query';
 import { Subquery } from './subquery';
 import type { DbCte } from './cte-builder';
 import { assertStatementLevelCtes, cteDeclarationAt, declareStatementCtes, isStatementCte, sameCteDefinition, withCteDependencies } from './cte-builder';
@@ -86,6 +87,19 @@ function unionTypeConflicts(legs: ReadonlyArray<{ owner: UnionLegBuilder; select
   });
 
   return conflicts.size > 0 ? conflicts : undefined;
+}
+
+/**
+ * How `futureCount()` / `futureFirstOrDefault()` refuse a union whose WITH declares a data-modifying CTE: a
+ * QueryBatch reads every member as a subquery, where PostgreSQL allows no such WITH — and would run the
+ * mutation as a side effect of a read.
+ */
+function unbatchableUnionError(method: 'futureCount' | 'futureFirstOrDefault', immediate: 'count' | 'firstOrDefault', cteName: string): Error {
+  return new Error(
+    `${method}(): the union's legs declare the data-modifying CTE "${cteName}" — a future is read as a subquery `
+    + 'by a QueryBatch, where a data-modifying WITH is not allowed (it must lead its statement). '
+    + `Run ${immediate}() for it: a statement of its own.`
+  );
 }
 
 /**
@@ -377,7 +391,106 @@ export class UnionQueryBuilder<TSelection> {
    * leg does not declare: the batch sends that column's runtime type.
    */
   future(): FutureQuery<TSelection> {
-    const { sql, params } = this.buildSql();
+    const { sql, params, transformFn, batchMeta } = this.buildFutureParts();
+
+    const future = new FutureQuery<TSelection>(sql, params, transformFn, this.client, this.executor);
+    future._batchMeta = batchMeta;
+
+    return future;
+  }
+
+  /**
+   * Create a future query of this union's first row, or null — `firstOrDefault()` fixed now and executed
+   * later: by `execute()`, by `FutureQueryRunner.runAsync()`, or as a member of a `QueryBatch`
+   * (`batch.addFirstOrDefault(union, id)`), which reads it in the batch's one round trip. LIMIT 1 is applied
+   * to the future only: the builder keeps its own paging. The row reads as {@link future}'s rows do.
+   *
+   * A union whose legs declare a data-modifying CTE is refused (see {@link futureCount}).
+   *
+   * @example
+   * ```typescript
+   * const batch = new QueryBatch();
+   * const newest = batch.addFirstOrDefault(
+   *   db.errorLogs.select(l => ({ at: l.createdAt, message: l.message }))
+   *     .unionAll(db.infoLogs.select(l => ({ at: l.createdAt, message: l.message })))
+   *     .orderBy(r => [[r.at, 'DESC']]),
+   *   'newest',
+   * );
+   * ```
+   */
+  futureFirstOrDefault(): FutureSingleQuery<TSelection> {
+    const originalLimit = this.limitValue;
+    this.limitValue = 1;
+
+    let parts: ReturnType<UnionQueryBuilder<TSelection>['buildFutureParts']>;
+    try {
+      parts = this.buildFutureParts('futureFirstOrDefault');
+    } finally {
+      this.limitValue = originalLimit;
+    }
+
+    const future = new FutureSingleQuery<TSelection>(parts.sql, parts.params, parts.transformFn, this.client, this.executor);
+    future._batchMeta = parts.batchMeta;
+
+    return future;
+  }
+
+  /**
+   * Create a future query of the number of rows of this union — `count()` fixed now and executed later: by
+   * `execute()`, by `FutureQueryRunner.runAsync()`, or as a member of a `QueryBatch`
+   * (`batch.addCount(union, id)`), which counts it in the batch's one round trip. It is the statement
+   * `count()` runs: `SELECT COUNT(*) as count FROM (<the union, its WITH included>) as union_count` — the
+   * union's own LIMIT / OFFSET included, as `count()` counts them.
+   *
+   * A union whose legs declare a data-modifying CTE is refused: a batch reads every member as a subquery,
+   * where PostgreSQL does not allow one (0A000 "WITH clause containing a data-modifying statement must be at
+   * the top level") — and a batch would run the mutation as a side effect of a read. `count()` runs it as a
+   * statement of its own.
+   *
+   * @example
+   * ```typescript
+   * const batch = new QueryBatch();
+   * const cart = batch.addFirstOrDefault(db.carts.where(c => eq(c.id, cartId)).select(c => ({ id: c.id })), 'cart');
+   * const cards = batch.addCount(
+   *   db.campaigns.where(c => eq(c.active, true)).select(c => ({ id: c.id, holderId: literal(0) }))
+   *     .with(scope.cte)
+   *     .unionAll(db.codes.select(c => ({ id: c.discountId, holderId: c.userId }))
+   *       .selectDistinct(r => ({ id: r.id, holderId: r.holderId }))),
+   *   'cards',
+   * );
+   *
+   * await batch.executeBatch();   // ONE statement
+   * batch.getCount(cards);        // number
+   * ```
+   */
+  futureCount(): FutureCountQuery {
+    const { sql, params, dataModifying } = this.buildCountStatement();
+
+    if (dataModifying !== undefined) {
+      throw unbatchableUnionError('futureCount', 'count', dataModifying);
+    }
+
+    const future = new FutureCountQuery(sql, params, this.client, this.executor);
+    future._batchMeta = { hasNestedPaths: false };
+
+    return future;
+  }
+
+  /**
+   * What a future of this union's rows is made of (see {@link future}): the statement, the first leg's reads
+   * and how the rows travel through a QueryBatch. `refusing` names the method that refuses a data-modifying
+   * WITH ({@link future} itself builds it, as it always did).
+   */
+  private buildFutureParts(refusing?: 'futureFirstOrDefault'): {
+    sql: string;
+    params: any[];
+    transformFn: (rows: any[]) => TSelection[];
+    batchMeta: FutureBatchMeta;
+  } {
+    const context: SqlBuildContext = { paramCounter: 1, params: [] };
+    const { withClause, body, dataModifying } = this.buildSqlParts(context, false);
+    const sql = withClause ? `${withClause}\n${body}` : body;
+    const params = context.params;
 
     let firstLegMeta: { nestedPaths: Set<string>; selectionResult: any } | undefined;
     let firstLegOwner: UnionLegBuilder | undefined;
@@ -396,6 +509,11 @@ export class UnionQueryBuilder<TSelection> {
       }
     }
 
+    // After the legs' metadata is drained: a refused build leaves no stale state on the leg builders
+    if (refusing !== undefined && dataModifying !== undefined) {
+      throw unbatchableUnionError(refusing, 'firstOrDefault', dataModifying);
+    }
+
     const forcedRuntime = unionTypeConflicts(legs);
 
     const transformFn = (rows: any[]): TSelection[] => {
@@ -406,12 +524,11 @@ export class UnionQueryBuilder<TSelection> {
       return rows as TSelection[];
     };
 
-    const future = new FutureQuery<TSelection>(sql, params, transformFn, this.client, this.executor);
-    future._batchMeta = firstLegMeta && firstLegOwner?._buildUnionBatchMeta
+    const batchMeta: FutureBatchMeta = firstLegMeta && firstLegOwner?._buildUnionBatchMeta
       ? firstLegOwner._buildUnionBatchMeta(firstLegMeta.selectionResult, firstLegMeta.nestedPaths.size > 0, forcedRuntime)
       : { hasNestedPaths: (firstLegMeta?.nestedPaths.size ?? 0) > 0 };
 
-    return future;
+    return { sql, params, transformFn, batchMeta };
   }
 
   /**
@@ -435,6 +552,20 @@ export class UnionQueryBuilder<TSelection> {
    * @returns Promise resolving to the count
    */
   async count(): Promise<number> {
+    const { sql, params } = this.buildCountStatement();
+
+    const result = this.executor
+      ? await this.executor.query(sql, params)
+      : await this.client.query(sql, params);
+
+    return parseInt(result.rows[0]?.count || '0', 10);
+  }
+
+  /**
+   * The statement {@link count} runs; `dataModifying` names the data-modifying CTE its WITH declares, when it
+   * declares one (the WITH then leads the statement — see below).
+   */
+  private buildCountStatement(): { sql: string; params: any[]; dataModifying: string | undefined } {
     const context: SqlBuildContext = { paramCounter: 1, params: [] };
     const { withClause, body, dataModifying } = this.buildSqlParts(context, false);
     const params = context.params;
@@ -443,15 +574,11 @@ export class UnionQueryBuilder<TSelection> {
     // count's subquery (0A000 "WITH clause containing a data-modifying statement must be at the top level"):
     // the WITH then leads the statement, the count reads the union below it. Otherwise the union, its WITH
     // included, is the count's subquery, as it always was.
-    const sql = dataModifying
+    const sql = dataModifying !== undefined
       ? `${withClause}\nSELECT COUNT(*) as count FROM (${body}) as union_count`
       : `SELECT COUNT(*) as count FROM (${withClause ? `${withClause}\n${body}` : body}) as union_count`;
 
-    const result = this.executor
-      ? await this.executor.query(sql, params)
-      : await this.client.query(sql, params);
-
-    return parseInt(result.rows[0]?.count || '0', 10);
+    return { sql, params, dataModifying };
   }
 
   /**
@@ -489,10 +616,10 @@ export class UnionQueryBuilder<TSelection> {
 
   /**
    * The union's statement in two parts: the `WITH` that declares the legs' CTEs (`''` when it declares none) and
-   * the union below it (with ORDER BY / LIMIT / OFFSET); `dataModifying` when that WITH declares a
-   * data-modifying CTE. The parameters land in `context` in the statement's order — the WITH's first.
+   * the union below it (with ORDER BY / LIMIT / OFFSET); `dataModifying` names the first data-modifying CTE
+   * that WITH declares, when it declares one. The parameters land in `context` in the statement's order — the WITH's first.
    */
-  private buildSqlParts(context: SqlBuildContext, isNested: boolean): { withClause: string; body: string; dataModifying: boolean } {
+  private buildSqlParts(context: SqlBuildContext, isNested: boolean): { withClause: string; body: string; dataModifying: string | undefined } {
     // Hoist the legs' attached CTEs to STATEMENT level.
     //
     // Every leg renders its own `WITH` prefix and this builder wraps each leg in
@@ -616,7 +743,7 @@ export class UnionQueryBuilder<TSelection> {
     return {
       withClause: withParts.length > 0 ? `WITH ${withParts.join(', ')}` : '',
       body,
-      dataModifying: withParts.length > 0 && declaredHere.some(cte => cte.dataModifying),
+      dataModifying: withParts.length > 0 ? declaredHere.find(cte => cte.dataModifying)?.name : undefined,
     };
   }
 

@@ -1,7 +1,9 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, jest } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
 import { expectToReject } from '../utils/expect-rejects';
-import { DbCteBuilder, and, eq, gt, sql } from '../../src';
+import {
+  DbCteBuilder, FutureCountQuery, FutureQueryRunner, FutureSingleQuery, QueryBatch, and, eq, gt, gte, inSubquery, literal, sql,
+} from '../../src';
 
 /**
  * Two CTE-visibility gaps, both surfaced by a discount-badge read
@@ -253,6 +255,165 @@ describe('CTE visibility across UNION legs and aggregate wrappers', () => {
 
       expect(twinSql.split('"older_users" AS MATERIALIZED (').length - 1).toBe(1);
       expect(twinParams).toEqual([30]);
+    });
+  });
+});
+
+/**
+ * `UnionQueryBuilder.futureCount()` / `futureFirstOrDefault()` (1.0.31): a union offered `future()` only, so
+ * `batch.addCount(union)` threw `query.futureCount is not a function` and the count of a union cost a round
+ * trip of its own beside the batch — or the batch shipped the union's ROWS for a `.length` in JS.
+ *
+ * The shape below is the one that asked for it: a MATERIALIZED scope CTE read by both legs, a card leg tagged
+ * with a literal, a DISTINCT leg, UNION ALL, counted — as a member of a QueryBatch beside another read.
+ */
+describe('a union as a QueryBatch count / first-row member', () => {
+  // alice(25), bob(35), charlie(45, inactive); posts: alice x2 (views 100, 150), bob x1 (views 200).
+  // Leg 1: the active users in scope (alice, bob) — 2 rows. Leg 2: DISTINCT (author, author) of the posts in
+  // scope with at least `minViews` views — alice and bob for 100 (3 posts, 2 distinct), bob alone for 200.
+  const cardUnion = (db: any, minViews: number) => {
+    const cteBuilder = new DbCteBuilder();
+    const scope = cteBuilder.with(
+      'card_scope',
+      db.users.where((u: any) => gt(u.age, 20)).select((u: any) => ({ id: u.id })),
+      { materialized: true }
+    );
+    const scopeIds = () => db.selectFromCte(scope.cte).select((s: any) => ({ id: s.id })).asSubquery('array');
+
+    return db.users
+      .where((u: any) => and(eq(u.isActive, true), inSubquery(u.id, scopeIds())))
+      .select((u: any) => ({ id: u.id, holderId: literal(0) }))
+      .with(scope.cte)
+      .unionAll(db.posts
+        .where((p: any) => and(inSubquery(p.userId, scopeIds()), gte(p.views, minViews)))
+        .select((p: any) => ({ id: p.userId, holderId: p.userId }))
+        .selectDistinct((row: any) => ({ id: row.id, holderId: row.holderId })));
+  };
+
+  const oneRoundTrip = async (db: any, run: () => Promise<void>) => {
+    const querySpy = jest.spyOn(db.client, 'query');
+
+    try {
+      await run();
+
+      expect(querySpy).toHaveBeenCalledTimes(1);
+    } finally {
+      querySpy.mockRestore();
+    }
+  };
+
+  test('addCount(union) rides the batch\'s ONE statement beside another member, with count()\'s number', async () => {
+    await withDatabase(async (db) => {
+      const { users } = await seedTestData(db);
+
+      expect(await cardUnion(db, 100).count()).toBe(4);
+      expect(await cardUnion(db, 200).count()).toBe(3);
+
+      const batch = new QueryBatch();
+      const bob = batch.addFirstOrDefault(
+        db.users.where(u => eq(u.username, 'bob')).select(u => ({ id: u.id, name: u.username })),
+        'bob'
+      );
+      const cards = batch.addCount(cardUnion(db, 100), 'cards');
+      const fewerCards = batch.addCount(cardUnion(db, 200), 'fewerCards');
+
+      await oneRoundTrip(db, () => batch.executeBatch());
+
+      expect(batch.getItem(bob)).toEqual({ id: users.bob.id, name: 'bob' });
+      // 5 rows without the DISTINCT of leg 2, 4 with it
+      expect(batch.getCount(cards)).toBe(4);
+      expect(batch.getCount(fewerCards)).toBe(3);
+    });
+  });
+
+  test('futureCount() is count()\'s statement: the WITH inside the count\'s subquery, the parameters in its order', async () => {
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const future = cardUnion(db, 150).futureCount();
+
+      expect(future).toBeInstanceOf(FutureCountQuery);
+      expect(future.getSql().startsWith('SELECT COUNT(*) as count FROM (WITH "card_scope" AS MATERIALIZED (')).toBe(true);
+      expect(future.getSql().endsWith(') as union_count')).toBe(true);
+      // the CTE's parameter first, then the legs' in their order
+      expect(future.getParams()).toEqual([20, true, 150]);
+      // alice + bob, and the authors of the posts with 150+ views: alice, bob
+      expect(await future.execute()).toBe(4);
+      expect(await future.execute()).toBe(await cardUnion(db, 150).count());
+
+      // A union's own LIMIT is counted, as count() counts it
+      const limited = cardUnion(db, 100).orderBy((r: any) => [[r.id, 'ASC'], [r.holderId, 'ASC']]).limit(3);
+
+      expect(await limited.futureCount().execute()).toBe(3);
+      expect(await limited.count()).toBe(3);
+
+      const [counted, total] = await FutureQueryRunner.runAsync([cardUnion(db, 100).futureCount(), db.users.futureCount()]);
+
+      expect(counted).toBe(4);
+      expect(total).toBe(3);
+    });
+  });
+
+  test('addFirstOrDefault(union) reads firstOrDefault()\'s row in the batch, and leaves the builder\'s paging alone', async () => {
+    await withDatabase(async (db) => {
+      const { users } = await seedTestData(db);
+
+      const ordered = () => cardUnion(db, 100).orderBy((r: any) => [[r.holderId, 'DESC'], [r.id, 'ASC']]);
+      const expected = await ordered().firstOrDefault();
+
+      expect(expected).toEqual({ id: users.bob.id, holderId: users.bob.id });
+
+      const union = ordered().limit(3);
+      const batch = new QueryBatch();
+      const first = batch.addFirstOrDefault(union, 'first');
+      const none = batch.addFirstOrDefault(cardUnion(db, 100).offset(10), 'none');
+      const cards = batch.addCount(cardUnion(db, 100), 'cards');
+
+      await oneRoundTrip(db, () => batch.executeBatch());
+
+      expect(batch.getItem(first)).toEqual(expected);
+      expect(batch.getItem(none)).toBeNull();
+      expect(batch.getCount(cards)).toBe(4);
+
+      // LIMIT 1 was the future's: the builder still reads its three rows
+      expect(await union.toList()).toHaveLength(3);
+
+      const future = ordered().futureFirstOrDefault();
+
+      expect(future).toBeInstanceOf(FutureSingleQuery);
+      expect(future.getSql().endsWith('LIMIT 1')).toBe(true);
+      expect(await future.execute()).toEqual(expected);
+    });
+  });
+
+  test('a union whose legs declare a data-modifying CTE is refused as a future — count() runs it', async () => {
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const touchedUnion = () => {
+        const cteBuilder = new DbCteBuilder();
+        const touched = cteBuilder.withMutation('touched', db.users
+          .where(u => eq(u.username, 'alice'))
+          .update({ age: 26 })
+          .toStatement(u => ({ id: u.id })));
+
+        return db.selectFromCte(touched.cte).select(r => ({ id: r.id }))
+          .unionAll(db.selectFromCte(touched.cte).select(r => ({ id: r.id })));
+      };
+      const aliceAge = () => db.users.where(u => eq(u.username, 'alice')).select(u => ({ age: u.age })).firstOrDefault();
+
+      expect(() => touchedUnion().futureCount()).toThrow(/futureCount\(\): the union's legs declare the data-modifying CTE "touched"/);
+      expect(() => touchedUnion().futureFirstOrDefault()).toThrow(/futureFirstOrDefault\(\): the union's legs declare the data-modifying CTE "touched"/);
+      expect(() => new QueryBatch().addCount(touchedUnion(), 'touched')).toThrow(/Run count\(\) for it/);
+      // refused before anything ran
+      expect(await aliceAge()).toEqual({ age: 25 });
+
+      // ... and a refused future leaves the builder usable
+      const union = touchedUnion();
+
+      expect(() => union.futureFirstOrDefault()).toThrow(/data-modifying CTE "touched"/);
+      expect(await union.count()).toBe(2);
+      expect(await aliceAge()).toEqual({ age: 26 });
     });
   });
 });
