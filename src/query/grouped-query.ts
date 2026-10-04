@@ -296,6 +296,20 @@ function isFieldRefValue(value: unknown): value is FieldRef & { __tableAlias?: s
   return typeof value === 'object' && value !== null && '__dbColumnName' in value && !(value instanceof WhereConditionBase);
 }
 
+/**
+ * Whether two operands of a list aggregate are the same expression of the grouped row: the same object
+ * (listAggregatesOver hands out one per column and per expression), or two refs to one column.
+ */
+function sameOperand(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+
+  return isFieldRefValue(a) && isFieldRefValue(b)
+    && a.__dbColumnName === b.__dbColumnName
+    && ((a as any).__tableAlias ?? '') === ((b as any).__tableAlias ?? '');
+}
+
 /** What `value` is, for an error that refuses it in a grouped query. */
 function describeGroupedValue(value: unknown): string {
   if (value === undefined) {
@@ -1378,8 +1392,36 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
    * GroupedBuildState.rowOperands); a read of the projection's shape passes none.
    */
   private listAggregatesOver(row: any, operands?: Set<unknown>): Pick<GroupedItem<TGroupingKey, TOriginalRow>, 'arrayAgg' | 'countDistinct'> {
-    // One operand per column of the row: an argument and its ORDER BY key are the same expression
+    // ONE operand object per column and per expression of the row, whichever selector selected it: an
+    // argument and its ORDER BY key are then the same expression to the build — one `__arg<n>` column of the
+    // subquery that computes expression keys. Two selectors returning `sql\`${r.views} + 1\`` each used to be
+    // two operands, `"q1"."__arg0"` and `"q1"."__arg1"`: with DISTINCT, PostgreSQL refused the ORDER BY key as
+    // one that is not in the argument list (42P10).
     const typedRefs = new Map<object, object>();
+    const expressions = new Map<string, unknown>();
+    const expressionOf = (operand: WhereConditionBase): unknown => {
+      let key: string;
+
+      try {
+        // As it renders on its own: its SQL and what it binds (a fragment over the row's columns needs no
+        // more than that; one that cannot render alone stays an operand of its own)
+        const probe: SqlBuildContext = { paramCounter: 1, params: [] };
+
+        key = `${operand.buildSql(probe)}\u0000${JSON.stringify(probe.params)}`;
+      } catch {
+        return operand;
+      }
+
+      const known = expressions.get(key);
+
+      if (known !== undefined) {
+        return known;
+      }
+
+      expressions.set(key, operand);
+
+      return operand;
+    };
     const operandOf = (name: string, selector: unknown): unknown => {
       if (typeof selector !== 'function') {
         throw new TypeError(`${name}: expected a selector of the grouped row (r => r.column), got ${describeGroupedValue(selector)}`);
@@ -1402,7 +1444,9 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           typedRefs.set(ref, typed);
           operand = typed;
         }
-      } else if (!(operand instanceof WhereConditionBase)) {
+      } else if (operand instanceof WhereConditionBase) {
+        operand = expressionOf(operand);
+      } else {
         throw new Error(`${name}: the selector returned ${describeGroupedValue(operand)} — it must return a column or an sql expression of the grouped row.`);
       }
 
@@ -1423,7 +1467,19 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
           return [operandOf('g.arrayAgg(): an ORDER BY key', keySelector), direction];
         });
 
-        return agg.arrayAgg(operandOf('g.arrayAgg()', selector) as any, { distinct: options?.distinct === true, orderBy }) as any;
+        const argument = operandOf('g.arrayAgg()', selector);
+        const distinct = options?.distinct === true;
+
+        // PostgreSQL orders a DISTINCT aggregate by its argument only (42P10 "in an aggregate with DISTINCT,
+        // ORDER BY expressions must appear in argument list"): said here, where the call is written
+        if (distinct && orderBy.some(([key]) => !sameOperand(key, argument))) {
+          throw new Error(
+            'g.arrayAgg(): with distinct, the list can be ordered by the aggregated value only — PostgreSQL refuses any other '
+            + 'ORDER BY key in a DISTINCT aggregate. Order by the selector that selects the value, or drop distinct.'
+          );
+        }
+
+        return agg.arrayAgg(argument as any, { distinct, orderBy }) as any;
       },
       countDistinct: (selector: any) => agg.countDistinct(operandOf('g.countDistinct()', selector) as any) as any,
     };
@@ -1736,7 +1792,14 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
         let alias = argumentAliases.get(identity);
 
         if (alias === undefined) {
-          alias = `__arg${argumentAliases.size}`;
+          // `__arg<n>`, past a grouping key the caller named like one (the subquery's column list would hold
+          // the name twice: 42702 "column reference is ambiguous")
+          let index = argumentAliases.size;
+
+          do {
+            alias = `__arg${index++}`;
+          } while (groupByAliases.includes(`"${alias}"`) || [...argumentAliases.values()].includes(alias));
+
           const argumentSql = argument instanceof WhereConditionBase && !isFieldRefValue(argument)
             ? renderInner(argument)
             : this.directArgumentSql(argument, aggregate, buildContext);

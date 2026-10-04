@@ -445,4 +445,72 @@ describe('grouped list / distinct aggregates over the grouped row', () => {
         .toThrow(/g\.arrayAgg\(\): expected a selector of the grouped row/);
     });
   });
+
+  test('distinct: ordered by the aggregated value — a column or the SAME expression written twice — over plain and expression keys', async () => {
+    await withDatabase(async (db) => {
+      const { users } = await seedTestData(db);
+      // alice: views 100, 150; bob: 200
+      const byUser = () => db.posts
+        .select(p => ({ userId: p.userId, views: p.views }))
+        .groupBy(r => ({ userId: r.userId }));
+      // an expression key: the statement groups the rows of a subquery, and reads the operands as its columns
+      const byBucket = () => db.posts
+        .select(p => ({ bucket: sql<number>`${p.userId} % 2`, views: p.views }))
+        .groupBy(r => ({ bucket: r.bucket }));
+      const bucketOf = (userId: number) => userId % 2;
+      const sortedByKey = <T extends { key: number }>(rows: T[]): T[] => [...rows].sort((a, b) => a.key - b.key);
+
+      // a column
+      expect(sortedByKey(await byUser()
+        .select(g => ({ key: g.key.userId, vs: g.arrayAgg(r => r.views, { distinct: true, orderBy: [[r => r.views, 'DESC']] }) }))
+        .toList())).toEqual([{ key: users.alice.id, vs: [150, 100] }, { key: users.bob.id, vs: [200] }]);
+      expect(sortedByKey(await byBucket()
+        .select(g => ({ key: g.key.bucket, vs: g.arrayAgg(r => r.views, { distinct: true, orderBy: [r => r.views] }), n: g.countDistinct(r => r.views) }))
+        .toList())).toEqual(sortedByKey([{ key: bucketOf(users.alice.id), vs: [100, 150], n: 2 }, { key: bucketOf(users.bob.id), vs: [200], n: 1 }]));
+
+      // an expression, written once per selector: ONE operand to the statement (it used to be two columns of the
+      // subquery, `"q1"."__arg0"` and `"q1"."__arg1"` — PostgreSQL: 42P10, the ORDER BY key is not the argument)
+      const plusOne = (g: any) => g.arrayAgg((r: any) => sql<number>`${r.views} + 1`, { distinct: true, orderBy: [[(r: any) => sql<number>`${r.views} + 1`, 'DESC']] });
+
+      expect(sortedByKey(await byUser().select(g => ({ key: g.key.userId, vs: plusOne(g) })).toList()))
+        .toEqual([{ key: users.alice.id, vs: [151, 101] }, { key: users.bob.id, vs: [201] }]);
+      expect(sortedByKey(await byBucket().select(g => ({ key: g.key.bucket, vs: plusOne(g) })).toList()))
+        .toEqual(sortedByKey([{ key: bucketOf(users.alice.id), vs: [151, 101] }, { key: bucketOf(users.bob.id), vs: [201] }]));
+
+      const statement = byBucket().select(g => ({ key: g.key.bucket, vs: plusOne(g) })).future().getSql().replace(/\s+/g, ' ');
+
+      expect(statement).toMatch(/(array_agg|json_agg)\(DISTINCT "q1"\."__arg0" ORDER BY "q1"\."__arg0" DESC\) as "vs"/);
+      expect(statement).not.toContain('__arg1');
+
+      // any OTHER key: said where the call is written, not by PostgreSQL's 42P10
+      const refused = 'g.arrayAgg(): with distinct, the list can be ordered by the aggregated value only — PostgreSQL refuses any other '
+        + 'ORDER BY key in a DISTINCT aggregate. Order by the selector that selects the value, or drop distinct.';
+
+      expect(() => byUser().select(g => ({ vs: g.arrayAgg(r => r.views, { distinct: true, orderBy: [[r => r.userId, 'DESC']] }) })).future()).toThrow(refused);
+      expect(() => byBucket().select(g => ({ vs: g.arrayAgg(r => r.views, { distinct: true, orderBy: [r => r.views, r => r.bucket] }) })).future()).toThrow(refused);
+      expect(() => byUser().select(g => ({ vs: g.arrayAgg(r => sql<number>`${r.views} + 1`, { distinct: true, orderBy: [r => sql<number>`${r.views} + 2`] }) })).future()).toThrow(refused);
+      // without distinct any key orders the list
+      expect(sortedByKey(await byUser()
+        .select(g => ({ key: g.key.userId, vs: g.arrayAgg(r => sql<number>`${r.views} + 1`, { orderBy: [[r => r.views, 'DESC']] }) }))
+        .toList())).toEqual([{ key: users.alice.id, vs: [151, 101] }, { key: users.bob.id, vs: [201] }]);
+    });
+  });
+
+  test('a grouping key the caller named like a generated operand column (__arg0) does not collide with one', async () => {
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const rows = await db.posts
+        .select(p => ({ bucket: sql<number>`${p.userId} % 2`, __arg0: p.title, views: p.views }))
+        .groupBy(r => ({ bucket: r.bucket, __arg0: r.__arg0 }))
+        .select(g => ({ title: g.key.__arg0, vs: g.arrayAgg(r => r.views), total: g.sum(r => r.views) }))
+        .toList();
+
+      expect([...rows].sort((a, b) => a.title.localeCompare(b.title))).toEqual([
+        { title: 'Alice Post 1', vs: [100], total: 100 },
+        { title: 'Alice Post 2', vs: [150], total: 150 },
+        { title: 'Bob Post', vs: [200], total: 200 },
+      ]);
+    });
+  });
 });
