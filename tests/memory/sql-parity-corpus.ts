@@ -249,6 +249,45 @@ export const sqlParityCorpus: ParityCase[] = [
     ],
   },
   {
+    // An aggregate of a correlated subquery belongs to that subquery as soon as ONE column of it is among the
+    // aggregate's arguments, its ORDER BY keys or its FILTER — whatever else of an outer query they read. (One
+    // that reads outer columns only is an aggregate of the outer query: the engine refuses those, see
+    // in-memory-database.test.ts — the differential test cannot hold them.)
+    name: 'aggregates that read an outer query beside their own',
+    statements: [
+      'CREATE TABLE agg_parent (id int PRIMARY KEY, n int, name text)',
+      'CREATE TABLE agg_child (id int PRIMARY KEY, parent_id int, n int)',
+      "INSERT INTO agg_parent VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')",
+      'INSERT INTO agg_child VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3)',
+      // the argument is the outer row's, an ORDER BY key the subquery's own
+      'SELECT p.id, (SELECT array_agg(p.n ORDER BY c.id) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      "SELECT p.id, (SELECT string_agg(p.name, ',' ORDER BY c.id DESC) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id",
+      'SELECT p.id, (SELECT json_agg(p.name ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id)::text AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT array_agg(p.n ORDER BY p.n, c.n DESC) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, s.v FROM agg_parent p, LATERAL (SELECT array_agg(p.n ORDER BY c.id) AS v FROM agg_child c WHERE c.parent_id = p.id) s ORDER BY p.id',
+      // ... or its FILTER, or the other way round
+      'SELECT p.id, (SELECT sum(p.n) FILTER (WHERE c.n > 1) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT sum(c.n) FILTER (WHERE p.n > 10) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // ... or the argument itself reads both, a whole row, or a subquery that reads the aggregate's query
+      'SELECT p.id, (SELECT sum(c.n + p.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT count(c) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      "SELECT p.id, (SELECT json_agg(json_build_object('c', c.id, 'n', p.n) ORDER BY c.id) FROM agg_child c WHERE c.parent_id = p.id)::text AS v FROM agg_parent p ORDER BY p.id",
+      'SELECT p.id, (SELECT sum((SELECT count(*) FROM agg_child x WHERE x.parent_id = c.parent_id AND x.id >= p.id)) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT (SELECT sum(x.n + p.n) FROM agg_child x WHERE x.parent_id = c.parent_id) FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      'WITH t AS (SELECT parent_id, sum(n)::int AS s FROM agg_child GROUP BY parent_id) SELECT p.id, (SELECT max(t.s + p.n) FROM t WHERE t.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // an aggregate that reads no column at all, and a window aggregate, are their own query's
+      'SELECT p.id, (SELECT count(*) FROM agg_child c WHERE c.parent_id = p.id) AS n, (SELECT sum(1) FROM agg_child c WHERE c.parent_id = p.id) AS s FROM agg_parent p ORDER BY p.id',
+      p('SELECT p.id, (SELECT sum($1::int) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id', 2),
+      'SELECT p.id, (SELECT sum(p.n) OVER () FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT count(p.n) OVER (PARTITION BY c.parent_id) FROM agg_child c WHERE c.parent_id = p.id LIMIT 1) AS v FROM agg_parent p ORDER BY p.id',
+      // an ordered-set aggregate is placed by its aggregated (WITHIN GROUP) arguments: a direct argument may be outer
+      'SELECT p.id, (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      'SELECT p.id, (SELECT percentile_disc(p.n / 40.0) WITHIN GROUP (ORDER BY c.n) FROM agg_child c WHERE c.parent_id = p.id) AS v FROM agg_parent p ORDER BY p.id',
+      // grouped by an outer column
+      'SELECT p.id, (SELECT sum(c.n) FROM agg_child c WHERE c.parent_id = p.id GROUP BY p.id) AS v FROM agg_parent p ORDER BY p.id',
+    ],
+  },
+  {
     name: 'window functions',
     statements: [
       'CREATE TABLE scores (player text, game int, points int)',
