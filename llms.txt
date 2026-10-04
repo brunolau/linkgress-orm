@@ -35,5 +35,5 @@ These docs ship inside the npm package and match the installed version: `node_mo
 
 ## Optional
 
-- [Changelog](https://github.com/brunolau/linkgress-orm/tree/main/changelog): one file per version (`v1.0.32.md`, …); read this when you need to know in which version an API was added or changed (the docs mark recent additions with `since 1.0.N`).
+- [Changelog](https://github.com/brunolau/linkgress-orm/tree/main/changelog): one file per version (`v1.0.33.md`, …); read this when you need to know in which version an API was added or changed (the docs mark recent additions with `since 1.0.N`).
 - [Contributing](https://github.com/brunolau/linkgress-orm/blob/main/CONTRIBUTING.md): read this when you change linkgress-orm itself: development setup, the test suite (PostgreSQL, in-memory, parity), code style and how to update these docs.

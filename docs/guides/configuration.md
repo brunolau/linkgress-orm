@@ -33,17 +33,17 @@ Most settings change logging, timing, statement naming or caching, not the rows 
 
 | Need | Use | SQL shape · round trips | Avoid |
 |---|---|---|---|
-| See each statement a context sends, with parameters and duration | `logQueries`, `logParameters`, `logExecutionTime` | unchanged · +0 | expecting `db.query()`, `PreparedQuery.execute()` or `FutureQueryRunner`'s multi-statement message in the log: they bypass the executor |
+| See each statement a context sends, with parameters and duration | `logQueries`, `logParameters`, `logExecutionTime` | unchanged · +0 | expecting `db.query()` or `FutureQueryRunner`'s multi-statement message in the log: they bypass the executor (a `prepare()`d query's executions are logged since 1.0.33) |
 | Record every failed statement in production | `logFailedQueries: true`, `logQueries` off | unchanged · +0 | `logQueries: true` in production: two `'sql'` lines per statement |
 | Learn which call site ran a slow statement | `onQueryTakingTooLong` + `longRunningQueryThreshold` (default 10000 ms) | unchanged · +0 | expecting a cancellation: it is a notice after the statement finished |
 | Give one known-slow query a larger budget | `.expectedExecutionTime(ms)`; for a transaction `{ expectedExecutionMs }` | unchanged · +0 | raising `longRunningQueryThreshold` for every query |
 | Cancel a statement after N ms | `statement_timeout` on the client; `db.transaction(fn, { timeoutMs })`; `.withTimeout(ms)` on `PostgresClient` | `.withTimeout()`: `begin`, `SET LOCAL statement_timeout = N`, the statement, `commit` · +3; transaction: `SET LOCAL` · +1; client option · +0 | `.withTimeout()` on `PgClient`, `BunClient`, `PGliteClient`: ignored |
-| Skip parse and plan of repeated statements (postgres.js) | `preparedStatements: true`; per query `.withPreparedStatements(bool)` | same text, sent named · 2 network round trips on first use per connection, then 1 (unnamed with parameters: 2 every time) | statements whose text varies per call; `PgClient`, `BunClient`, `PGliteClient` (ignored) |
+| Skip parse and plan of repeated statements (postgres.js) | `preparedStatements: true`; per query `.withPreparedStatements(bool)`; a `prepare()`d query follows both (since 1.0.33) | same text, sent named · 2 network round trips on first use per connection, then 1 (unnamed with parameters: 2 every time) | statements whose text varies per call; `PgClient`, `BunClient`, `PGliteClient` (ignored) |
 | Change how collections in a projection are aggregated | `collectionStrategy: 'lateral' \| 'cte' \| 'temptable'` | `lateral`, `cte`: 1 statement; `temptable` on `PgClient`: 1 + 5 per collection, on the other clients 1 to 1 + 1 per collection | `temptable` without measuring it first; `temptable` inside `db.transaction()` on `PostgresClient`, `BunClient`, `PGliteClient` |
 | Fewer distinct statement texts for list filters of varying length | `inArrayOpt()` (or plain `inArray` under `LinkgressConfig.inArrayUsesOpt`), tuned by `LinkgressConfig.inArrayOptThreshold` and `inArrayPadBuckets`; `eqAny()` for one text at every length | `IN ($1, …)` up to the threshold (default 8), `= ANY($1::type[])` above it · +0 | per-context values: these are process-wide |
 | Cut CPU spent building queries | `MockRowCache.setEnabled(true)` | identical SQL · +0 | processes that build mostly one-off query shapes |
-| Find where one query's time goes | `traceTime: true` plus an executor duty | unchanged · +0 | `traceTime` alone: prints nothing |
-| Raw driver values for an export | `disableMappers: true` or `rawResult: true`, plus an executor duty | unchanged · +0 | typed application code: `rawResult` keeps the mapped TypeScript type |
+| Find where one query's time goes | `traceTime: true`, on its own since 1.0.33 (before, only beside an executor duty) | unchanged · +0 | expecting a trace from `count()`, `exists()`, `sum()` / `min()` / `max()`, unions, futures, a `prepare()`d query or a table's own reads: only a select builder's `toList()`, `first()`, `firstOrDefault()` and `countOver()` report one |
+| Raw driver values for an export | `disableMappers: true` or `rawResult: true`, on their own since 1.0.33 (before, only beside an executor duty) | unchanged · +0 | typed application code: `rawResult` keeps the mapped TypeScript type |
 | The SQL of a query without running it | `future().getSql()`, `toSql()`, `toStatement()` | 0 statements | `logQueries` for this: it shows statements only as they run |
 
 ## Where settings live and which value wins
@@ -120,17 +120,18 @@ Every key of `QueryOptions` (`src/entity/db-context.ts`):
 | `inArrayOptThreshold` | `number` · `8` | Writes `LinkgressConfig.inArrayOptThreshold`, process-wide | at construction |
 | `inArrayPadBuckets` | `readonly number[] \| null` · `null` | Writes `LinkgressConfig.inArrayPadBuckets`, process-wide | at construction |
 | `inArrayUsesOpt` | `boolean` · `false` | Writes `LinkgressConfig.inArrayUsesOpt`, process-wide | at construction |
-| `traceTime` | `boolean` · `false` | Per-phase timing of one query (build, execution, result processing) on `'timing'` | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
-| `disableMappers` | `boolean` · `false` | Results skip `fromDriver` (raw driver values); `toDriver` still converts bound values | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
-| `rawResult` | `boolean` · `false` | Returns the driver's rows without any shaping | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
-| `useBinaryProtocol` | `boolean` · `false` | Asks the client for a binary result protocol. Inert: no shipped client reads it (each one's `supportsBinaryProtocol()` is `false`) | never today |
+| `traceTime` | `boolean` · `false` | Per-phase timing of one query (build, execution, result processing) on `'timing'` | always (creates the executor since 1.0.33; before, only beside an executor duty); [not on every read path](#read-raw-driver-values-or-time-one-query) |
+| `disableMappers` | `boolean` · `false` | Results skip `fromDriver` (raw driver values); `toDriver` still converts bound values | always (creates the executor since 1.0.33; before, only beside an executor duty); [not on every read path](#read-raw-driver-values-or-time-one-query) |
+| `rawResult` | `boolean` · `false` | Returns the driver's rows without any shaping | always (creates the executor since 1.0.33; before, only beside an executor duty); [not on every read path](#read-raw-driver-values-or-time-one-query) |
+| `useBinaryProtocol` | `boolean` · `false` | Asks the client for a binary result protocol. Inert: no shipped client reads it (each one's `supportsBinaryProtocol()` is `false`) | never today; since 1.0.33 it creates the executor |
 
 **Executor duty.** The context creates its executor (the object that logs, times and names
-statements) only when one of `logQueries`, `logFailedQueries`, `logExecutionTime`,
-`onQueryTakingTooLong` or `preparedStatements` is set. Without one, statements go straight to the
-client, and `traceTime`, `disableMappers` and `rawResult` are never read: `{ traceTime: true }` alone
-prints nothing and `{ disableMappers: true }` alone still maps (verified). Add `logFailedQueries: true`,
-which only acts when a statement fails.
+statements, and that the query builders read the result options from) only when one of
+`logQueries`, `logFailedQueries`, `logExecutionTime`, `onQueryTakingTooLong`, `preparedStatements`
+or, since 1.0.33, `disableMappers`, `rawResult`, `traceTime` or `useBinaryProtocol` is set. Without
+one, statements go straight to the client. Before 1.0.33 the last four created no executor, so set
+alone they were never read: `{ traceTime: true }` printed nothing and `{ disableMappers: true }` still
+mapped. On an older install add `logFailedQueries: true`, which only acts when a statement fails.
 
 `LoggingOptions` (an alias of `QueryOptions`) and `LogLevel` (an alias of `LogSection`) are deprecated.
 
@@ -180,12 +181,12 @@ The logger is called four times for this one statement:
 > sent, so counting those lines counts its round trips; the statements listed below are not among them.
 
 > **Pitfall:** never logged, because they do not go through the executor: `db.query()` and
-> `client.query()`, `PreparedQuery.execute()`, `FutureQueryRunner.runAsync()`'s multi-statement
-> message, statements on a `connect()` lease, the `BEGIN` / `COMMIT` of `db.transaction()`, the
-> `begin` / `SET LOCAL` / `commit` that `PostgresClient` wraps around `.withTimeout()` (inside a
-> transaction: `SHOW statement_timeout`, `SET LOCAL` and the restoring `SET LOCAL`), the `SET LOCAL` of
-> `TransactionOptions.timeoutMs`, and the closing `DROP TABLE` of the `temptable` strategy on `PgClient`
-> (6 statements, 5 logged).
+> `client.query()`, `FutureQueryRunner.runAsync()`'s multi-statement message (and, before 1.0.33,
+> `PreparedQuery.execute()`), statements on a `connect()` lease, the `BEGIN` / `COMMIT` of
+> `db.transaction()`, the `begin` / `SET LOCAL` / `commit` that `PostgresClient` wraps around
+> `.withTimeout()` (inside a transaction: `SHOW statement_timeout`, `SET LOCAL` and the restoring
+> `SET LOCAL`), the `SET LOCAL` of `TransactionOptions.timeoutMs`, and the closing `DROP TABLE` of the
+> `temptable` strategy on `PgClient` (6 statements, 5 logged).
 
 ## Record failed statements in production: `logFailedQueries`
 
@@ -260,7 +261,7 @@ const routedDb = new AppDatabase(client, {
 |---|---|---|
 | `'sql'` | `'\n[SQL Query]'` then the text; `'\n[SQL Query - Multi-Statement]'` / `'\n[SQL Query - Fully Optimized Multi-Statement]'` before the multi-statement messages of the `temptable` strategy | `logQueries` |
 | `'params'` | `'[Parameters] [...]'` | `logQueries` and `logParameters`, statement with parameters |
-| `'timing'` | `'[Execution Time] …ms'`; the `traceTime` summary | `logExecutionTime`; `traceTime` with an executor |
+| `'timing'` | `'[Execution Time] …ms'`; the `traceTime` summary | `logExecutionTime`; `traceTime` |
 | `'error'` | `'[SQL Error] <message>\n<statement>'`, plus `'\n[Parameters] [...]'` with `logParameters` | `logFailedQueries` |
 | `'warn'` | schema-manager warnings (skipped drops, an INVALID index left alone) | schema manager |
 | `'info'` | progress of `MigrationRunner` (its own `logger` and `verbose` options) and `EnumMigrator` | those tools, not the context |
@@ -319,9 +320,9 @@ select, join, grouped, union and CTE-rooted builders.
 > statements at depth 50 on a deep async chain); the string is formatted only for a slow one. Lower
 > `slowQueryStackTraceLimit` on hot paths.
 
-> **Pitfall:** only statements that go through the executor are timed: `db.query()`,
-> `PreparedQuery.execute()` and `FutureQueryRunner`'s multi-statement message are not. An error thrown
-> by the callback is swallowed.
+> **Pitfall:** only statements that go through the executor are timed: `db.query()` and
+> `FutureQueryRunner`'s multi-statement message are not (a `prepare()`d query's executions are, since
+> 1.0.33). An error thrown by the callback is swallowed.
 
 ## Cancel statements that run too long: `withTimeout()` and `statement_timeout`
 
@@ -455,11 +456,12 @@ WHERE "users"."id" = $1
 The second call sends the same text with `[2]`. Afterwards `pg_prepared_statements` on that connection
 holds this text once, besides postgres.js's own named statements.
 
-> **Pitfall:** `.prepare('name')` with `sql.placeholder()` is a different thing: a client-side query
-> object built once and executed with new values ([Batching and prepared queries](./batching-and-prepared-queries.md)).
-> The two do not combine: `PreparedQuery.execute()` bypasses the executor, so its statement is always
-> sent unnamed, even on a `preparedStatements: true` context. Which one a hot path should use depends on the client:
-> [Run one query shape many times](./batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client).
+`.prepare('name')` with `sql.placeholder()` is a different thing: a client-side query object built once
+and executed with new values ([Batching and prepared queries](./batching-and-prepared-queries.md)).
+Since 1.0.33 the two combine: a prepared query's executions run through the context's executor, so on a
+`preparedStatements: true` context each execution is the named statement, the hot-path form on
+`PostgresClient` ([Run one query shape many times](./batching-and-prepared-queries.md#run-one-query-shape-many-times-prepare-and-preparedstatements)).
+Before 1.0.33 `PreparedQuery.execute()` bypassed the executor and was always sent unnamed.
 
 ### Opt one query in or out: `withPreparedStatements()`
 
@@ -516,7 +518,7 @@ Verified with `pg_prepared_statements`: the orders page was not named, the tags 
 | Where | Form | Covers |
 |---|---|---|
 | `DbEntityTable` | `db.users.withPreparedStatements(false)` | a derived table: every query and write started from it |
-| `QueryBuilder`, `SelectQueryBuilder` (what a table's `where()`, `select()`, `innerJoin()` and `leftJoin()` return, typed `IEntityQueryable` / `EntitySelectQueryBuilder`); the exported `JoinQueryBuilder` has it too | `query.withPreparedStatements(false)` | that builder (changed in place): `toList()`, `count()`, `countOver()`, `firstOrDefault()`, … |
+| `QueryBuilder`, `SelectQueryBuilder` (what a table's `where()`, `select()`, `innerJoin()` and `leftJoin()` return, typed `IEntityQueryable` / `EntitySelectQueryBuilder`); the exported `JoinQueryBuilder` has it too | `query.withPreparedStatements(false)` | that builder (changed in place): `toList()`, `count()`, `countOver()`, `firstOrDefault()`, …, and (since 1.0.33) a `prepare()` called after it |
 | grouped queries | set it before `.groupBy()` | carried into the grouped query (verified) |
 | unions | set it on the first leg before `.union()` / `.unionAll()` | the union runs on its first leg's executor (verified) |
 | `QueryBatch` | `new QueryBatch().withPreparedStatements(false)` | the batch's one statement, whatever the legs' context says |
@@ -535,8 +537,9 @@ statement is one more cached plan on every pooled connection.
 - `insertWithChildren`, `insertBulkWithChildren` and the fused `MutationBatch` statement: their text
   embeds a per-call `VALUES` list, so a named statement would be created per variant and never reused.
 - Statements without parameters: postgres.js sends them over the simple protocol (verified).
-- Paths that bypass the executor: `PreparedQuery.execute()`, `db.query()`, `FutureQueryRunner`'s
-  multi-statement message. A `QueryBatch` and `future().execute()` do go through it and are named.
+- Paths that bypass the executor: `db.query()`, `FutureQueryRunner`'s multi-statement message. A
+  `QueryBatch`, `future().execute()` and (since 1.0.33) `PreparedQuery.execute()` go through it and are
+  named; before 1.0.33 `PreparedQuery.execute()` bypassed it and was never named.
 
 ### Measure before turning it on
 
@@ -675,7 +678,9 @@ On `PostgresClient` that statement runs between `begin`, `SET LOCAL statement_ti
 > executor duty, it builds a fresh executor and drops a `withTimeout()`, `withPreparedStatements()` or
 > `expectedExecutionTime()` set before it on the same table (verified:
 > `db.users.withTimeout(5000).withQueryOptions({ logFailedQueries: true })` sent no `SET LOCAL`;
-> `db.users.withQueryOptions({ logFailedQueries: true }).withTimeout(5000)` did).
+> `db.users.withQueryOptions({ logFailedQueries: true }).withTimeout(5000)` did). Since 1.0.33 a result
+> option alone does the same: after `db.users.withTimeout(5000).withQueryOptions({ disableMappers: true })`
+> the executor handed the client no timeout, in the other order `timeoutMs: 5000`.
 
 > **Pitfall:** `withQueryOptions({ logQueries: false })` cannot mute a context whose only executor duty is
 > `logQueries`: the merged options then have no duty, and the context's logging executor is kept
@@ -812,13 +817,16 @@ MockRowCache.reset();              // tests: drop its entries AND switch all thr
 
 ## Read raw driver values or time one query
 
-`disableMappers`, `rawResult` and `traceTime` are read from the executor, so they need an executor duty
-next to them (`logFailedQueries: true` is enough). Only the select-query builder (`where()`, `select()`,
-join chains) reads them, and not on every one of its terminal methods: the table below says which read
-paths apply each key (each path verified on the harness).
+`disableMappers`, `rawResult` and `traceTime` are read from the executor, and since 1.0.33 each of them
+creates it on its own, in the context's options and in `withQueryOptions()`. Before 1.0.33 they took
+effect only next to an executor duty (`logFailedQueries: true` was enough) and were ignored alone. The
+select-query builder (`where()`, `select()`, join chains) reads them, though not on every one of its
+terminal methods, and since 1.0.33 a table's own `toList()`, `first()` and `firstOrDefault()` read
+`rawResult` and `disableMappers` too: the table below says which read paths apply each key (each path
+verified on the harness, with the key set alone).
 
 ```ts
-const exportDb = new AppDatabase(client, { disableMappers: true, logFailedQueries: true });
+const exportDb = new AppDatabase(client, { disableMappers: true });
 const rows = await exportDb.posts
   .where(p => eq(p.id, 1))
   .select(p => ({ id: p.id, publishTime: p.publishTime }))
@@ -837,16 +845,31 @@ custom mapper returns `{ hour: 9, minute: 30 }`.
 
 | Key | Returns | Applied by | Not applied by |
 |---|---|---|---|
-| `disableMappers` | raw driver values, collection items included, and a collection's `min()` / `max()` of a mapped column (which reads through the mapper since 1.0.31); bound values still go through `toDriver` (`eq(p.publishTime, { hour: 9, minute: 30 })` still binds `570`) | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; a union (through its first leg); `future()` and `QueryBatch` legs; a `prepare()`d query's `execute()` | grouped selects; CTE- and set-rooted queries; a table's own `toList()`, `first()`, `firstOrDefault()` |
-| `rawResult` | the driver's rows: no mapping, no nested-object reconstruction (a collection stays what the driver made of its JSON); the TypeScript result type stays the mapped one | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; a `prepare()`d query's `execute()` | unions; `future()` and `QueryBatch` legs; grouped selects; CTE- and set-rooted queries; a table's own `toList()`, `first()`, `firstOrDefault()` |
-| `traceTime` | a per-phase summary on `'timing'`: total, query build, query execution, result processing, rows, and detailed entries over 0.1 ms | `toList()`, `first()`, `firstOrDefault()`, `countOver()` | `count()`, `exists()`, a `prepare()`d query's `execute()`, unions, futures, grouped selects, CTE- and set-rooted queries, a table's own reads |
+| `disableMappers` | raw driver values, collection items included, and a collection's `min()` / `max()` of a mapped column (which reads through the mapper since 1.0.31); bound values still go through `toDriver` (`eq(p.publishTime, { hour: 9, minute: 30 })` still binds `570`) | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; the select builder's `min()` / `max()` (the stored value, `1125`, since 1.0.33); a union (through its first leg); `future()` and `QueryBatch` legs; a `prepare()`d query's `execute()`; a table's own `toList()`, `first()`, `firstOrDefault()` (since 1.0.33: stored values under the property names) | grouped selects; CTE- and set-rooted queries |
+| `rawResult` | the driver's rows: no mapping, no nested-object reconstruction (a collection stays what the driver made of its JSON); the TypeScript result type stays the mapped one | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; the select builder's `sum()` / `min()` / `max()` (the driver's value, `'450'`); a `prepare()`d query's `execute()`; a table's own `toList()`, `first()`, `firstOrDefault()` (since 1.0.33: the driver's rows, keyed by the database column names) | unions; `future()` and `QueryBatch` legs; grouped selects; CTE- and set-rooted queries |
+| `traceTime` | a per-phase summary on `'timing'`: total, query build, query execution, result processing, rows, and detailed entries over 0.1 ms | `toList()`, `first()`, `firstOrDefault()`, `countOver()` | `count()`, `exists()`, `sum()` / `min()` / `max()`, a `prepare()`d query's `execute()`, unions, futures, grouped selects, CTE- and set-rooted queries, a table's own reads |
 
-Per query, pass them with an executor duty through `withQueryOptions()`:
+A table's own reads keep their own column naming under `rawResult` (since 1.0.33):
+
+```ts
+const raw = await db.posts.withQueryOptions({ rawResult: true }).firstOrDefault();
+// { id: 1, title: 'Alice Post 1', …, user_id: 1, …, publish_time: 570, … }: database column names
+const stored = await db.posts.withQueryOptions({ disableMappers: true }).first();
+// { id: 1, title: 'Alice Post 1', …, userId: 1, …, publishTime: 570, … }: property names, stored values
+```
+
+```sql
+SELECT "id", "title", "subtitle", "content", "user_id", "published_at", "views", "publish_time", "custom_date", "string_stamped_at", "category" FROM "posts" LIMIT 1
+
+SELECT "id", "title", "subtitle", "content", "user_id", "published_at", "views", "publish_time", "custom_date", "string_stamped_at", "category" FROM "posts" LIMIT 1
+```
+
+Per query, pass them through `withQueryOptions()`:
 
 ```ts
 const lines: string[] = [];
 await db.posts
-  .withQueryOptions({ traceTime: true, logFailedQueries: true, logger: (message: string) => { lines.push(message); } })
+  .withQueryOptions({ traceTime: true, logger: (message: string) => { lines.push(message); } })
   .where(p => eq(p.id, 1))
   .select(p => ({ id: p.id, title: p.title }))
   .toList();
@@ -862,14 +885,16 @@ WHERE "posts"."id" = $1
 `lines` then holds `'timing'` messages (shown trimmed): the summary `[Time Trace Summary]`,
 `Total: …ms`, `Query Build: …ms`, `Query Execution: …ms`, `Result Processing: …ms` and `Rows: 1`, then
 `[Detailed Trace]` with one line per operation that took over 0.1 ms; on the harness that was one line,
-`[queryExecution] executeQuery: 0.30ms ({"rowCount":"pending"})` (eight messages in all; the detailed
+`[queryExecution] executeQuery: …ms ({"rowCount":"pending"})` (eight messages in all; the detailed
 part varies with timing). Use it to decide whether time goes to building (→ `MockRowCache`), to the
 database, or to result processing (→ `disableMappers` for an export). `TimeTracer`, `QueryTimeTrace`
 and `TimeTraceEntry` are exported for the same data.
 
 `useBinaryProtocol` asks the client for a binary result protocol. No shipped client supports one
 (`pg`'s `rowMode: 'array'` is not a binary protocol and would break name-based result mapping), so
-the key is inert; `BunClient`'s binary or text decoding is chosen by its own `prepare` option.
+the key is inert; `BunClient`'s binary or text decoding is chosen by its own `prepare` option. Since
+1.0.33 it creates the executor like the keys above, so a `withQueryOptions({ useBinaryProtocol: true })`
+leg cannot share a `QueryBatch` with plain legs.
 
 ## See the SQL a query sends
 
@@ -998,23 +1023,23 @@ await countingDb.users.select(u => ({ id: u.id, posts: u.posts!.select(p => ({ t
 
 ## Pitfalls
 
-- **Don't** pass `traceTime`, `rawResult` or `disableMappers` on their own → **Do** add an executor duty
-  such as `logFailedQueries: true`. Without one there is no executor to read them: `{ traceTime: true }`
-  printed nothing and `{ disableMappers: true }` still returned mapped values (verified).
 - **Don't** rely on `.withTimeout()` with `PgClient`, `BunClient` or `PGliteClient` → **Do** set
   `statement_timeout` on `PgClient`'s pool, or use `db.transaction(fn, { timeoutMs })` (`PgClient`,
   `BunClient`). Only `PostgresClient` honors the per-query option; the others ignore it, and only the
   connection default, if any, applies. `PGliteClient` cannot cancel a statement at all.
 - **Don't** call `withQueryOptions()` after `withTimeout()`, `withPreparedStatements()` or
   `expectedExecutionTime()` on a table → **Do** call it first. With an executor duty in the merged
-  options it builds a fresh executor and the earlier override is lost (verified: no `SET LOCAL` was sent).
+  options (since 1.0.33 `disableMappers`, `rawResult` or `traceTime` alone is one) it builds a fresh
+  executor and the earlier override is lost (verified: no `SET LOCAL` was sent).
 - **Don't** mix a leg with its own override (`withTimeout()`, `withPreparedStatements()`,
-  `expectedExecutionTime()`, `withQueryOptions()` with a duty) into a `QueryBatch` with plain legs →
-  **Do** start every leg from one derived table, or set the policy on the context or the transaction.
-  The batch throws before sending anything.
-- **Don't** expect a `.prepare()`d query to be named under `preparedStatements: true` → **Do** use the
-  ordinary builder when you want a server-side prepared statement. `PreparedQuery.execute()` bypasses the
-  executor: never named, never logged, no timeout.
+  `expectedExecutionTime()`, `withQueryOptions()` with a duty, since 1.0.33 `{ rawResult: true }` alone
+  included) into a `QueryBatch` with plain legs → **Do** start every leg from one derived table, or set
+  the policy on the context or the transaction. The batch throws before sending anything.
+- **Don't** set `withTimeout()`, `withPreparedStatements()` or `expectedExecutionTime()` on a builder after
+  its `prepare()` → **Do** set them before: since 1.0.33 a prepared query's executions run through the
+  executor its builder had at `prepare()` time (a later `withTimeout(5000)` on the builder handed the
+  client no timeout). Before 1.0.33 `PreparedQuery.execute()` bypassed the executor: never named, never
+  logged, no timeout.
 - **Don't** expect `db.query()` to be logged, timed or named → **Do** use the builders for ordinary reads
   and writes; keep `db.query()` for statements they do not cover (`EXPLAIN`, `SET TRANSACTION`,
   `SAVEPOINT`).
@@ -1026,10 +1051,10 @@ await countingDb.users.select(u => ({ id: u.id, posts: u.posts!.select(p => ({ t
   (`Fully optimized mode requires querySimpleMulti support`, or `querySimpleMulti not supported by this
   client` on a context with an executor duty), and on `PostgresClient` a base query with parameters
   returned every collection empty, without an error (verified).
-- **Don't** expect `rawResult` or `disableMappers` on a table's own `toList()`, `first()` or
-  `firstOrDefault()` or on grouped selects, nor `rawResult` on unions, futures and `QueryBatch` legs →
-  **Do** go through `where()` / `select()` and a terminal method of the select builder. Those paths
-  always map (verified).
+- **Don't** expect `rawResult` or `disableMappers` on grouped selects or CTE- and set-rooted queries, nor
+  `rawResult` on unions, futures and `QueryBatch` legs → **Do** go through `where()` / `select()` and a
+  terminal method of the select builder. Those paths always map (verified on 1.0.33). A table's own
+  `toList()`, `first()` and `firstOrDefault()` honour both since 1.0.33; before, they always mapped.
 - **Don't** wait for `'slow'` lines in the logger → **Do** set `onQueryTakingTooLong`. Nothing sends the
   `'slow'` section.
 

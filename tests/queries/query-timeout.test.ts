@@ -212,6 +212,22 @@ describe('Query timeouts (PostgresClient)', () => {
       }
     });
 
+    // 1.0.33: a prepared query's executions run through its executor (they went to the client directly)
+    it('enforces a per-query .withTimeout(ms) override on a prepared query', async () => {
+      const client = new PostgresClient({ ...connectionBase });
+      const db = new AppDatabase(client, { collectionStrategy: 'cte' });
+      try {
+        const slow = db.users
+          .select(u => ({ id: u.id, slept: sql<unknown>`pg_sleep(5)` }))
+          .withTimeout(400)
+          .prepare('slow');
+        const err = await captureError(slow.execute({}));
+        expect(err).toBeInstanceOf(QueryTimeoutError);
+      } finally {
+        await client.end();
+      }
+    });
+
     it('names the connection default in the logged [SQL Error] line', async () => {
       // Mirrors how an app wires this up: it builds the pool, hands the instance to the
       // client, and routes DbContext's logger to its own logging stack. The `[SQL Error]`

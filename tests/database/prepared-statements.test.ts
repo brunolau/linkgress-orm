@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import 'dotenv/config';
-import { DbColumn, DbContext, DbEntity, DbEntityTable, DbModelConfig, eq, integer, PostgresClient, QueryTimeoutError, varchar } from '../../src';
+import { DbColumn, DbContext, DbEntity, DbEntityTable, DbModelConfig, eq, integer, PostgresClient, QueryTimeoutError, sql, varchar } from '../../src';
 import type { QueryOptions } from '../../src';
 import { MutationBatch } from '../../src/query/mutation-batch';
 import { QueryBatch } from '../../src/query/query-batch';
@@ -131,6 +131,34 @@ describe('preparedStatements (PostgresClient)', () => {
       await db.transaction(async (ctx) => {
         await ctx.users.where(u => eq(u.id, 1)).withPreparedStatements(true).toList();
         await ctx.users.where(u => eq(u.id, 2)).toList();
+
+        expect(await namedStatementCount(ctx)).toBe(1);
+      });
+    });
+  });
+
+  // 1.0.33: a PreparedQuery's executions go through the executor (they went to the client directly, unnamed)
+  test('a prepare()d query runs its executions as ONE named statement on a prepared context', async () => {
+    await withFreshDb({ preparedStatements: true }, async (db) => {
+      await db.transaction(async (ctx) => {
+        const byId = ctx.users.where(u => eq(u.id, sql.placeholder('id'))).select(u => ({ id: u.id })).prepare('byId');
+        await byId.execute({ id: 1 });
+        await byId.execute({ id: 2 });
+
+        expect(await namedStatementCount(ctx)).toBe(1);
+      });
+    });
+  });
+
+  test('withPreparedStatements(true) on the builder carries into its prepared query', async () => {
+    await withFreshDb({}, async (db) => {
+      await db.transaction(async (ctx) => {
+        const byId = ctx.users
+          .where(u => eq(u.id, sql.placeholder('id')))
+          .select(u => ({ id: u.id }))
+          .withPreparedStatements(true)
+          .prepare('byId');
+        await byId.execute({ id: 1 });
 
         expect(await namedStatementCount(ctx)).toBe(1);
       });

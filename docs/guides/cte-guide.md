@@ -245,7 +245,7 @@ as the body, `first` read back as `{ hour: 9, minute: 30 }` (see [Querying](./qu
 `db.selectFromCte(cte, alias?)` starts a query whose FROM root is the CTE. Use it to read a CTE's rows — the
 RETURNING rows of a data-modifying CTE, rank-filtered window results — or, nested with `.asSubquery()`, to read a
 statement's CTE from a subquery. Methods: `where()`, `select()`, `orderBy()`, `limit()`, `offset()`,
-`forUpdate()` (it locks no rows here, see [Lock the rows a CTE reads](#lock-the-rows-a-cte-reads-forupdate-in-the-body)),
+`forUpdate()` (`@deprecated`: it throws since 1.0.33, see [Lock the rows a CTE reads](#lock-the-rows-a-cte-reads-forupdate-in-the-body)),
 `withTimeout(ms)`, `expectedExecutionTime(ms)`, the joins of the next section, `union()` / `unionAll()`,
 `asSubquery()`; terminals `toList()`, `first()`, `toSql()`, `buildQuery()`.
 
@@ -299,7 +299,7 @@ OFFSET 0
   (`CAST($2 AS text) as "kind"`).
   An array of columns is refused: `selectFromCte().select(): "pair" is an array of columns or expressions, which has no single SQL value to select — …`.
 
-> **Pitfall:** a CTE-rooted builder is mutable. `where()`, `orderBy()`, `limit()`, `offset()`, `forUpdate()`,
+> **Pitfall:** a CTE-rooted builder is mutable. `where()`, `orderBy()`, `limit()`, `offset()`,
 > `withTimeout()` and `expectedExecutionTime()` change the builder and return it, and `first()` leaves `LIMIT 1`
 > on it: `const q = db.selectFromCte(c).select(…); await q.first(); await q.toList()` returns one row. Build a new
 > query for each use. (`select()` returns a new builder; set queries are immutable.)
@@ -767,12 +767,23 @@ FROM "locked"
 -- params: ["{1,2}"]
 ```
 
-> **Pitfall:** `db.selectFromCte(cte).select(…).forUpdate()` appends `FOR UPDATE` to the outer SELECT, whose FROM
-> holds only CTEs. PostgreSQL's locking clause does not apply to the `WITH` queries the primary query references
-> (PostgreSQL manual, SELECT, "The Locking Clause"), so it locks no rows: while its transaction is open, another
-> session's `FOR UPDATE NOWAIT` of the same row succeeds; with `.forUpdate()` in the body that statement fails with
-> 55P03.
-> Lock in the body. (The method's own JSDoc says it locks the root CTE's rows; it does not.)
+The CTE-rooted query itself refuses `forUpdate()` (since 1.0.33; the method is `@deprecated`). A `FOR UPDATE`
+without `OF` locks only the plain tables in the FROM of the query it is attached to, not the `WITH` queries that
+FROM reads (PostgreSQL manual, SELECT, "The Locking Clause"), and a CTE-rooted query's FROM holds only CTEs. The
+call throws before anything is sent, with or without options:
+
+```ts
+db.selectFromCte(locked.cte).select(l => ({ id: l.id })).forUpdate();   // throws
+```
+
+```text
+forUpdate() on a CTE-rooted query locks no rows: PostgreSQL applies FOR UPDATE to the plain tables of its own FROM only, and this query reads only CTEs. Call .forUpdate() on the builder that forms the CTE body instead (new DbCteBuilder().with('x', db.<table>.where(…).select(…).forUpdate())): its FOR UPDATE locks the rows the body reads.
+```
+
+> **Pitfall:** before 1.0.33 that call appended `FOR UPDATE` to the outer SELECT and the statement locked no rows:
+> while its transaction was open, another session's `FOR UPDATE NOWAIT` of the same row succeeded; with
+> `.forUpdate()` in the body that statement fails with 55P03. On an older install, lock in the body. (The method's
+> JSDoc then said it locked the root CTE's rows; it did not.)
 
 > **Pitfall:** order the locked rows by a stable key (`orderBy(u => u.id)`) when a statement locks several rows:
 > two statements locking the same rows in different orders can deadlock.
@@ -1153,7 +1164,8 @@ LEFT JOIN "active_users" ON "users"."id" = "active_users"."userId"
 - **Don't** rely on the order of two data-modifying CTEs → **Do** guard the second with `afterMutation(first)`.
   PostgreSQL promises no order between them.
 - **Don't** call `forUpdate()` on a CTE-rooted query to lock rows → **Do** put `.forUpdate()` on the CTE body. A
-  locking clause does not reach the WITH queries the main query reads.
+  locking clause does not reach the WITH queries the main query reads: since 1.0.33 the call throws
+  (`forUpdate() on a CTE-rooted query locks no rows: …`); before, it sent a lock that held nothing.
 - **Don't** reuse a CTE-rooted builder after `first()`, `where()` or `limit()` → **Do** build a new query per use.
   The builder is mutable; `first()` leaves `LIMIT 1` on it.
 - **Don't** `joinFilter()` a CTE with several rows per key when you want one row per entity → **Do** use

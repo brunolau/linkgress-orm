@@ -4,10 +4,11 @@ import { AppDatabase } from '../../debug/schema/appDatabase';
 import { DbCteBuilder, eq } from '../../src';
 
 /**
- * `forUpdate()` — the row-level lock clause on SelectQueryBuilder and
- * CteRootQueryBuilder.
+ * `forUpdate()` — the row-level lock clause on SelectQueryBuilder, and on the
+ * builder a CTE body is made of. CteRootQueryBuilder refuses it (1.0.33): its
+ * FOR UPDATE, on a SELECT reading only CTEs, locked no rows.
  *
- * SQL-shape assertions (toSql) plus one live lock-behaviour check: two
+ * SQL-shape assertions (toSql) plus live lock-behaviour checks: two
  * concurrent transactions reading the same row FOR UPDATE serialize — the
  * second blocks until the first commits. That serialization point is what the
  * fused-conditional-INSERT pattern uses as its DB-side guard.
@@ -62,15 +63,47 @@ describe('forUpdate()', () => {
 		expect(locked.cte.query).toMatch(/SELECT[\s\S]*FOR UPDATE\s*\)?\s*$/);
 	});
 
-	test('CteRootQueryBuilder emits FOR UPDATE after LIMIT', () => {
+	// 1.0.33: PostgreSQL applies a FOR UPDATE without OF to the plain tables of its own FROM only — a WITH query
+	// referenced there is skipped — so the clause on a SELECT that reads only CTEs held no lock at all
+	test('forUpdate() on a CTE-rooted query is refused: FOR UPDATE there locks no rows', () => {
 		const b = new DbCteBuilder();
 		const root = b.with('root', db.users.where(u => eq(u.isActive, true)).select(u => ({ id: u.id })));
-		const q = db.selectFromCte(root.cte)
-			.select(r => ({ id: r.id }))
-			.orderBy(r => r.id)
-			.forUpdate();
+		const q = db.selectFromCte(root.cte).select(r => ({ id: r.id })).orderBy(r => r.id);
 
-		expect(q.toSql()).toMatch(/FOR UPDATE\s*$/);
+		expect(() => q.forUpdate()).toThrow(/locks no rows[\s\S]*CTE body/);
+		expect(() => q.forUpdate({ skipLocked: true })).toThrow(/locks no rows/);
+		expect(q.toSql()).not.toContain('FOR UPDATE');
+	});
+
+	// Needs a second session while the first holds the lock — PGlite runs one
+	test.skipIf(process.env.LINKGRESS_TEST_DRIVER === 'pglite')('live: forUpdate() on the CTE body locks the rows the body reads', async () => {
+		const user = await db.users.insert({
+			username: `for-update-cte-${Date.now()}`,
+			email: `for-update-cte-${Date.now()}@test.local`,
+			isActive: true,
+		} as any).returning();
+
+		const client = getSharedDatabase().getClient();
+		let tx2rejectedByLock = false;
+
+		await db.transaction(async (tx) => {
+			const b = new DbCteBuilder();
+			const locked = b.with('locked_user', tx.users.where(u => eq(u.id, user.id)).select(u => ({ id: u.id })).forUpdate());
+			const rows = await tx.selectFromCte(locked.cte).select(r => ({ id: r.id })).toList();
+			expect(rows).toEqual([{ id: user.id }]);
+
+			try {
+				await client.transaction(async (q2) => {
+					await q2('SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT', [user.id]);
+				});
+			} catch (err: any) {
+				tx2rejectedByLock = /lock|55P03|could not obtain/i.test(String(err?.message ?? err));
+			}
+		});
+
+		await db.users.where(u => eq(u.id, user.id)).delete();
+
+		expect(tx2rejectedByLock).toBe(true);
 	});
 
 	// Needs a second session while the first holds the lock — PGlite runs one

@@ -211,6 +211,8 @@ commit
 - `.withTimeout()` gives the query an executor of its own: such a query cannot share a `QueryBatch`
   with plain queries
   ([Batching and prepared queries](./guides/batching-and-prepared-queries.md#batch-inside-a-transaction-or-under-a-timeout)).
+  Set before `prepare()`, it limits every execution of the prepared query (since 1.0.33; before, the
+  executions ignored it).
 
 ### Name statements on the server: `preparedStatements`
 
@@ -239,8 +241,9 @@ await db.orders
 
 - Precedence: a per-call option, then the builder's override, then the context option.
 - The override covers every execution of that builder (`toList()`, `count()`, `countOver()`,
-  `firstOrDefault()`, …) and survives `.withTimeout()` / `.expectedExecutionTime()` chaining. Grouped,
-  union and CTE-rooted builders have no override: set it before `groupBy()`.
+  `firstOrDefault()`, …, and since 1.0.33 a `prepare()` called after it) and survives `.withTimeout()` /
+  `.expectedExecutionTime()` chaining. Grouped, union and CTE-rooted builders have no override: set it
+  before `groupBy()`.
 - Observed: with the option on, `pg_prepared_statements` of the session lists the `SELECT` once
   after two executions with different parameters.
 - Measure before enabling. After five executions PostgreSQL may switch a named statement to a generic
@@ -248,9 +251,10 @@ await db.orders
   vary per call (`IN` lists of varying length, `VALUES` lists, `LIMIT`/`OFFSET` literals) are cached
   per variant on every pooled connection: `inArrayOpt` / `inArrayPadBuckets` bound the variety of
   list texts ([Querying](./guides/querying.md)).
-- Never named, whatever the option: `PreparedQuery.execute()` (`.prepare(name)`), `db.query()`,
-  `FutureQueryRunner`'s multi-statement message, statements without parameters (simple protocol), and
-  the bulk-insert legs of `insertWithChildren`, `insertBulkWithChildren` and `MutationBatch`.
+- Never named, whatever the option: `db.query()`, `FutureQueryRunner`'s multi-statement message,
+  statements without parameters (simple protocol), and the bulk-insert legs of `insertWithChildren`,
+  `insertBulkWithChildren` and `MutationBatch`. A `prepare()`d query's executions are named under the
+  option since 1.0.33 (before, never).
 - Only `PostgresClient` honors it, and only when the postgres.js instance was not created with
   `prepare: false`.
 
@@ -590,8 +594,8 @@ that succeeds.
   line only with `logParameters: true`.
 - Without `logger`, sections `error` and `warn` go to `console.error` / `console.warn`, the rest to
   `console.log`.
-- `db.query()`, `db.getClient().query()`, `PreparedQuery.execute()` and `FutureQueryRunner`'s
-  multi-statement message are never logged.
+- `db.query()`, `db.getClient().query()` and `FutureQueryRunner`'s multi-statement message are never
+  logged. A `prepare()`d query's executions are, since 1.0.33 (before, never).
 
 Every logging and diagnostics option: [Configuration](./guides/configuration.md).
 

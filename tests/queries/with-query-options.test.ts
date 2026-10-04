@@ -511,7 +511,7 @@ describe('withQueryOptions Method', () => {
       await withDatabase(async (db) => {
         await seedTestData(db);
 
-        const result = await db.users
+        const result = (await db.users
           .withQueryOptions({ collectionStrategy: 'temptable' })
           .select(u => ({
             id: u.id,
@@ -519,7 +519,7 @@ describe('withQueryOptions Method', () => {
             posts: u.posts!.select(p => ({ title: p.title })).toList('posts'),
           }))
           .where(u => eq(u.username!, 'alice'))
-          .first();
+          .first())!;
 
         // Type assertions
         assertType<number, typeof result.id>(result.id);

@@ -992,8 +992,10 @@ export class QueryExecutor {
   }
 
   /**
-   * Whether these options call for an executor at all — any logging, failure reporting,
-   * timing or slow-query duty. A context without any of them talks to the client directly.
+   * Whether these options call for an executor at all — any logging, failure reporting, timing or
+   * slow-query duty, and the options the query builders read from it (`disableMappers`, `rawResult`,
+   * `traceTime`, `useBinaryProtocol`: set alone, they were ignored before 1.0.33). A context without any
+   * of them talks to the client directly.
    */
   static isNeeded(options?: QueryOptions): boolean {
     return !!options && !!(
@@ -1002,6 +1004,10 @@ export class QueryExecutor {
       || options.logExecutionTime
       || options.onQueryTakingTooLong
       || options.preparedStatements
+      || options.disableMappers
+      || options.rawResult
+      || options.traceTime
+      || options.useBinaryProtocol
     );
   }
 
@@ -3368,9 +3374,10 @@ export interface IEntityQueryable<TEntity extends DbEntity> {
   toList(): Promise<UnwrapDbColumns<TEntity>[]>;
 
   /**
-   * Execute query and return first result
+   * Execute the query and return its first row, or `null` when no row matches — the same as
+   * {@link firstOrDefault}. (The table's own `first()` throws on an empty table instead.)
    */
-  first(): Promise<UnwrapDbColumns<TEntity>>;
+  first(): Promise<UnwrapDbColumns<TEntity> | null>;
 
   /**
    * Execute query and return first result or null if not found
@@ -3539,7 +3546,8 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
 
   exists(): Promise<boolean>;
 
-  first(): Promise<ResolveCollectionResults<TSelection>>;
+  /** The first row, or `null` when no row matches — the same as {@link firstOrDefault}; {@link firstOrThrow} throws instead. */
+  first(): Promise<ResolveCollectionResults<TSelection> | null>;
 
   firstOrDefault(): Promise<ResolveCollectionResults<TSelection> | null>;
 
@@ -3676,7 +3684,8 @@ export interface EntitySelectQueryBuilder<TEntity extends DbEntity, TSelection> 
 
   toList(): Promise<ResolveCollectionResults<TSelection>[]>;
 
-  first(): Promise<ResolveCollectionResults<TSelection>>;
+  /** The first row, or `null` when no row matches — the same as {@link firstOrDefault}. */
+  first(): Promise<ResolveCollectionResults<TSelection> | null>;
 
   firstOrDefault(): Promise<ResolveCollectionResults<TSelection> | null>;
 
@@ -4319,7 +4328,18 @@ export class DbEntityTable<TEntity extends DbEntity> {
       ? await executor.query(sql, [])
       : await client.query(sql, []);
 
-    return this.mapResultsToEntities(result.rows);
+    return this.readEntityRows(result.rows, executor);
+  }
+
+  /**
+   * The rows of the table's own reads (`toList()`, `first()`, `firstOrDefault()`) under the executor's
+   * options: `rawResult` returns the driver's rows (the database's column names, values as the driver read
+   * them), `disableMappers` the entities with their stored values. Both were ignored here before 1.0.33.
+   */
+  private readEntityRows(rows: any[], executor: QueryExecutor | undefined): UnwrapDbColumns<TEntity>[] {
+    const options = executor?.getOptions();
+
+    return options?.rawResult ? rows : this.mapResultsToEntities(rows, options?.disableMappers ?? false);
   }
 
   /**
@@ -4349,7 +4369,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       throw new Error('Sequence contains no elements');
     }
 
-    const mapped = this.mapResultsToEntities(result.rows);
+    const mapped = this.readEntityRows(result.rows, executor);
     return mapped[0];
   }
 
@@ -4379,7 +4399,7 @@ export class DbEntityTable<TEntity extends DbEntity> {
       return null;
     }
 
-    const mapped = this.mapResultsToEntities(result.rows);
+    const mapped = this.readEntityRows(result.rows, executor);
     return mapped[0];
   }
 
@@ -7215,8 +7235,10 @@ RETURNING 1`;
    * present-column subset of the mapping plan is derived from the first row
    * once, and the per-row loop runs without `in` checks. A type declared
    * immutable shares its mapped values across the rows (see forResultSet).
+   * `disableMappers`: every column keeps its stored value — the property names
+   * still apply, as a select reads them under `disableMappers`.
    */
-  private mapResultsToEntities(results: any[]): UnwrapDbColumns<TEntity>[] {
+  private mapResultsToEntities(results: any[], disableMappers = false): UnwrapDbColumns<TEntity>[] {
     if (results.length === 0) {
       return [];
     }
@@ -7225,7 +7247,10 @@ RETURNING 1`;
     const restoreZeroScale = this._getClient().losesNumericZeroScale();
     const presentPlan = this.getEntityMappingPlan()
       .filter(entry => entry.dbColumnName in results[0])
-      .map(entry => ({ ...entry, mapper: forResultSet(entry.mapper, results.length) ?? (restoreZeroScale ? entry.zeroScale : undefined) }));
+      .map(entry => ({
+        ...entry,
+        mapper: disableMappers ? undefined : forResultSet(entry.mapper, results.length) ?? (restoreZeroScale ? entry.zeroScale : undefined),
+      }));
     const mapped: UnwrapDbColumns<TEntity>[] = new Array(results.length);
 
     for (let rowIndex = 0; rowIndex < results.length; rowIndex++) {

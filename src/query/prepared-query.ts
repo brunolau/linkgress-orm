@@ -1,5 +1,10 @@
 import type { DatabaseClient, QueryResult } from '../database/database-client.interface';
 
+/** What an execution needs of the context's executor (`QueryExecutor`): its `query()` — logging, timeouts, … */
+interface PreparedQueryExecutor {
+  query(sql: string, params?: any[]): Promise<QueryResult>;
+}
+
 /**
  * Prepared query for efficient reusable parameterized queries.
  *
@@ -47,6 +52,9 @@ export class PreparedQuery<TResult, TParams extends Record<string, any> = Record
    * @param name - Optional name for the prepared query (for debugging)
    * @param boundParams - The values the build bound for every NON-placeholder `$n`, in `$n` order
    *   (placeholders take a number but bind nothing at build time)
+   * @param executor - The executor of the query that was prepared: every execution runs through it, so the
+   *   context's logging, failure reporting, slow-query detection, timeout and prepared-statement options apply
+   *   (since 1.0.33; executions went to the client directly). Without one, the client runs them.
    */
   constructor(
     private readonly sql: string,
@@ -55,7 +63,8 @@ export class PreparedQuery<TResult, TParams extends Record<string, any> = Record
     private readonly client: DatabaseClient,
     private readonly transformFn: (rows: any[]) => TResult[],
     public readonly name: string,
-    boundParams: readonly unknown[] = []
+    boundParams: readonly unknown[] = [],
+    private readonly executor?: PreparedQueryExecutor
   ) {
     const placeholderSlots = new Set(placeholderMap.values());
     let next = 0;
@@ -86,7 +95,9 @@ export class PreparedQuery<TResult, TParams extends Record<string, any> = Record
       paramArray[index - 1] = (params as Record<string, any>)[name];
     }
 
-    const result = await this.client.query(this.sql, paramArray);
+    const result = this.executor
+      ? await this.executor.query(this.sql, paramArray)
+      : await this.client.query(this.sql, paramArray);
     return this.transformFn(result.rows);
   }
 
