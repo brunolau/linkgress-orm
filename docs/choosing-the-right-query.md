@@ -39,7 +39,7 @@ const db = new AppDatabase(client);
   - [Compute statistics per key: `groupBy()` and `having()`](#compute-statistics-per-key-groupby-and-having)
   - [Read a page and its total in one statement](#read-a-page-and-its-total-in-one-statement)
   - [Read several independent results in one round trip: `QueryBatch`](#read-several-independent-results-in-one-round-trip-querybatch)
-  - [Run one query shape many times: pick the tool by client](#run-one-query-shape-many-times-pick-the-tool-by-client)
+  - [Run one query shape many times: `prepare()` and `preparedStatements`](#run-one-query-shape-many-times-prepare-and-preparedstatements)
   - [Filter by rows of another table: `exists()` and `inSubquery()`](#filter-by-rows-of-another-table-exists-and-insubquery)
   - [Match a list of values: `inArrayOpt()` and `eqAny()`](#match-a-list-of-values-inarrayopt-and-eqany)
   - [Keep the top N rows per parent or per group](#keep-the-top-n-rows-per-parent-or-per-group)
@@ -69,7 +69,7 @@ trips).
    replace `(await q.toList()).length`, `count() > 0`, the builder's `sum()` / `min()` / `max()` and grouping in JS.
    Measured: `count()` returned 1 row of 1 column where `toList().length` read 2 rows of 8 columns; a count, a sum, a
    minimum, a maximum and a filtered count came back in 1 statement, where `sum()`, `min()` and `max()` took 3
-   statements and returned the sum as the string `'450'`.
+   statements (and, before 1.0.33, returned the sum as the string `'450'`).
 3. **Select only the columns you use.** `select(u => ({ id: u.id, username: u.username }))` replaces entity rows read
    for two fields. Measured: 2 columns per row instead of the 8 of `users`, in the same 1 statement.
 4. **Batch independent reads.** `QueryBatch` (`addFirstOrDefault()`, `addList()`, `addCount()`, `executeBatch()`)
@@ -112,7 +112,7 @@ section with every option of the call.
 
 | Need | Use | SQL shape · round trips | Avoid |
 |---|---|---|---|
-| [One row by key](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first) | `where(u => eq(u.id, id)).select(…).firstOrDefault()` | `… WHERE "users"."id" = $1 LIMIT 1` · 1 | `(await q.toList())[0]`: no LIMIT, every column; builder `first()`, which returns `null` although typed non-null |
+| [One row by key](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first) | `where(u => eq(u.id, id)).select(…).firstOrDefault()` | `… WHERE "users"."id" = $1 LIMIT 1` · 1 | `(await q.toList())[0]`: no LIMIT, every column; reading a builder `first()` result without a `null` check (it resolves `null` when no row matches; typed `T \| null` since 1.0.33, `T` before) |
 | [One row, an error when it is missing](./guides/querying.md#get-one-row-firstordefault-firstorthrow-first) | `select(…).firstOrThrow()` | `… LIMIT 1` · 1 | a one-value select whose value can be `false`, `0`, `''` or `null` (it throws for an existing row) |
 | [Whether any row matches](./guides/querying.md#check-whether-rows-exist-exists) | `exists()` | `SELECT EXISTS(SELECT 1 FROM "users" WHERE …)` · 1 | `count() > 0`; `any()` / `none()`, which do not exist |
 | [How many rows match](./guides/querying.md#count-rows-without-loading-them-count) | `count()` | `SELECT COUNT(*) as count FROM "users" WHERE …` · 1 | `(await q.toList()).length`; `count()` of a paged or DISTINCT query (it ignores LIMIT, OFFSET and DISTINCT) |
@@ -155,7 +155,7 @@ section with every option of the call.
 
 | Need | Use | SQL shape · round trips | Avoid |
 |---|---|---|---|
-| [Several totals of one set](./guides/querying.md#aggregate-the-whole-set-in-one-statement-agg) | `select(p => ({ posts: agg.count(), totalViews: agg.sum(p.views), … })).firstOrDefault()` | `SELECT count(*) as "posts", sum("posts"."views") as "totalViews", … count(*) FILTER (WHERE …) … LIMIT 1` · 1 | the builder's `sum()` / `min()` / `max()`: 1 statement each, raw driver values (`'450'`) |
+| [Several totals of one set](./guides/querying.md#aggregate-the-whole-set-in-one-statement-agg) | `select(p => ({ posts: agg.count(), totalViews: agg.sum(p.views), … })).firstOrDefault()` | `SELECT count(*) as "posts", sum("posts"."views") as "totalViews", … count(*) FILTER (WHERE …) … LIMIT 1` · 1 | the builder's `sum()` / `min()` / `max()`: 1 statement each (before 1.0.33 also the driver's values: `'450'`) |
 | [Statistics per key](./guides/querying.md#group-rows-groupby) | `select(…).groupBy(r => ({ userId: r.userId })).select(g => ({ … }))` | `… GROUP BY "posts"."user_id"` · 1 | loading every row and grouping in JS |
 | [Only the groups that pass a condition](./guides/querying.md#filter-groups-having) | `.having(g => gt(g.count(), 1))` | `HAVING COUNT(*) > $1` · 1 | filtering groups in JS; row conditions in `having()` (put them in `where()` before `select()`) |
 | [Statistics per day, month or another expression](./guides/querying.md#group-by-a-column-a-navigation-or-an-expression) | `.groupBy(r => ({ day: dateTrunc('day', r.publishedAt) }))` | `FROM (SELECT date_trunc('day', "posts"."published_at") as "day", "posts"."views" as "__arg0" FROM "posts") "q1" GROUP BY "day"` · 1 | loading the rows and bucketing them in JS |
@@ -191,8 +191,8 @@ section with every option of the call.
 | [Several independent reads (a screen, an endpoint)](./guides/batching-and-prepared-queries.md#read-several-independent-results-in-one-round-trip-querybatch) | `QueryBatch` | one `UNION ALL` of per-read JSON envelopes · 1 for any number of reads | sequential `await`s (N); `Promise.all` (N statements on up to N pooled connections); `FutureQueryRunner.runAsync()`, which is 1 round trip only for parameter-free futures on `PostgresClient` / `BunClient` / `PGliteClient` outside a transaction |
 | [A union's count or first row next to other reads](./guides/batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch) | `batch.addCount(union, id)` / `batch.addFirstOrDefault(union.orderBy(…), id)` (since 1.0.31; [recipe](#read-several-independent-results-in-one-round-trip-querybatch)) | `SELECT COUNT(*) as count FROM ((SELECT …) UNION (SELECT …)) as union_count` and the union with `LIMIT 1`, legs of the batch's `UNION ALL` · 1 | `union.count()` / `union.firstOrDefault()` awaited beside the batch (a statement each: 3 instead of 1); a paged union for the total (its count counts its own `LIMIT` / `OFFSET`); a union whose legs declare a data-modifying CTE (refused as a count or first row) |
 | [Independent lists of thousands of rows each, free pool connections](./guides/batching-and-prepared-queries.md#choose-the-right-tool) | `Promise.all` of `toList()` | N statements, run concurrently · N | `QueryBatch`: `bench/querybatch`, 10 lists of 2,000 rows on a local server, 16 ms with `Promise.all`, 24 ms as one statement |
-| [Run one query shape many times with new values (a hot path)](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client) | by client ([recipe](#run-one-query-shape-many-times-pick-the-tool-by-client)): on `PostgresClient` the ordinary builder on a context with `preparedStatements: true`, plus `MockRowCache.setEnabled(true)` once at startup; on `PgClient`, `BunClient`, `PGliteClient` `prepare(name)` with `sql.placeholder(name)`, then `execute(values)` | the same text on every call · 1 statement per call; on `PostgresClient` the named statement costs 2 network round trips on its first use per connection, then 1 (unnamed with parameters: 2 every time) | `prepare()` on `PostgresClient` (never named: 2 network round trips per call) or wherever the query needs logging, a timeout or slow-query reports (it bypasses the executor); texts that vary per call (`inArray()` lengths, `limit()` / `offset()` values) under `preparedStatements` |
-| [Less query-build CPU on a hot path with many query shapes](./guides/configuration.md#cut-query-build-cpu-mockrowcache) | `MockRowCache.setEnabled(true)` once at startup; keep the ordinary builders | unchanged SQL · unchanged round trips | `prepare()` when the query also needs logging or a timeout; the switch in a process that builds mostly one-off shapes (it retains memory: up to 2,000 mock-row and 2,000 lateral-SQL entries, 5,000 navigation paths) |
+| [Run one query shape many times with new values (a hot path)](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-prepare-and-preparedstatements) | `prepare(name)` with `sql.placeholder(name)`, then `execute(values)`, on every client; on `PostgresClient` from a context with `preparedStatements: true`, which sends every execution as one named statement (since 1.0.33; [recipe](#run-one-query-shape-many-times-prepare-and-preparedstatements)) | the same text on every call · 1 statement per call; on `PostgresClient` the named statement costs 2 network round trips on its first use per connection, then 1 (unnamed with parameters: 2 every time) | rebuilding the query on every call; a placeholder compared with a custom-mapped column (it skips `toDriver`); before 1.0.33, `prepare()` on `PostgresClient` (never named: 2 network round trips per call); texts that vary per call (`inArray()` lengths, `limit()` / `offset()` values) under `preparedStatements` |
+| [Less query-build CPU on a hot path with many query shapes](./guides/configuration.md#cut-query-build-cpu-mockrowcache) | `MockRowCache.setEnabled(true)` once at startup; keep the ordinary builders | unchanged SQL · unchanged round trips | the switch in a process that builds mostly one-off shapes (it retains memory: up to 2,000 mock-row and 2,000 lateral-SQL entries, 5,000 navigation paths) |
 | [A derived set read in several places of one statement](./guides/cte-guide.md#read-one-cte-from-several-subqueries-declare-it-once) | a CTE: `new DbCteBuilder().with(name, query)` and `.with(cte)` on the executing query | `WITH "older_users" AS (…)`, every reader reads it by name · 1 | the same CTE without `.with()`: each reader declares and binds its own copy (params `[30, 30]`) |
 | [A read model (joins, aggregates) many queries share](./guides/schema-configuration.md#expose-a-read-only-view-modelview) | a model-managed view: `model.view(…)` in `setupModel()`, read through a `this.view(Class)` getter | the view's own query, which PostgreSQL inlines into the reading statement · 1 | repeating the same joins in every query; writes to the view (refused) |
 | [One list over several tables](./guides/querying.md#combine-result-sets-union-unionall) | `a.select(…).unionAll(b.select(…))` | `(SELECT …) UNION ALL (SELECT …) ORDER BY "label" ASC LIMIT 4` · 1 | two queries merged in JS; legs that list their keys in different orders (columns match by position) |
@@ -208,7 +208,7 @@ section with every option of the call.
 |---|---|---|---|
 | [Reads and writes that commit together](./guides/insert-update-guide.md#make-several-statements-atomic-dbtransaction) | `db.transaction(async tx => …)` with `tx.<table>` | the statements on the transaction's connection, between BEGIN and COMMIT · statements + 2 | `db.<table>` inside the callback: another connection, which did not see the transaction's uncommitted row |
 | [Lock the rows you read before writing them](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate) | `tx.users.where(…).select(…).forUpdate().firstOrDefault()` | `… LIMIT 1 FOR UPDATE` · 1 | `forUpdate()` outside a transaction (the lock ends with the statement) |
-| [Claim work-queue rows other workers have not locked](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate) | `.orderBy(t => t.id).limit(n).forUpdate({ skipLocked: true })` | `ORDER BY "id" ASC LIMIT 5 FOR UPDATE SKIP LOCKED` · 1 | an unordered claim (two workers can deadlock); `skipLocked` with `noWait` (throws); `forUpdate()` on a CTE-rooted query (`db.selectFromCte(…)`): it locks no rows, put it on the CTE body |
+| [Claim work-queue rows other workers have not locked](./guides/insert-update-guide.md#lock-the-rows-you-read-before-writing-them-forupdate) | `.orderBy(t => t.id).limit(n).forUpdate({ skipLocked: true })` | `ORDER BY "id" ASC LIMIT 5 FOR UPDATE SKIP LOCKED` · 1 | an unordered claim (two workers can deadlock); `skipLocked` with `noWait` (throws); `forUpdate()` on a CTE-rooted query (`db.selectFromCte(…)`): it throws since 1.0.33 (before, it locked no rows), put it on the CTE body |
 | [Serialize check-then-write on a key that is not a row (an import per partner, a number series)](./guides/insert-update-guide.md#serialize-check-then-write-on-a-key-that-is-not-a-row-advisory-locks) | `tx.advisoryXactLock(classId, key)` (waits), `tx.tryAdvisoryXactLock(key)` (`true` / `false`), `tx.advisoryXactLockAll(classId, keys)` | `SELECT pg_advisory_xact_lock($1, $2)` · 1; released at COMMIT or ROLLBACK | a lock table; `forUpdate()` (rows that do not exist yet cannot be locked); calling it on `db` (throws: the lock would end with the statement); a lock where a unique index plus `ON CONFLICT` already decides |
 | [Take many keys without waiting, or leave the work to whoever holds one](./guides/insert-update-guide.md#try-many-keys-without-waiting-tryadvisoryxactlockall-since-1031) | `if (!await tx.tryAdvisoryXactLockAll(classId, keys)) return …` (since 1.0.31) | `WITH RECURSIVE walk(ord, ok) AS (SELECT 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[1]) UNION ALL …) SELECT bool_and(walk.ok) AS "acquired" FROM walk` · 1 | `tryAdvisoryXactLock()` per key (3 keys: 3 statements instead of 1); going on after `false` (the keys tried before the busy one stay held until the transaction ends) |
 | [Several reads inside the transaction in one round trip](./guides/batching-and-prepared-queries.md#batch-inside-a-transaction-or-under-a-timeout) | a `QueryBatch` whose legs all start from `tx` | one `UNION ALL` statement on the transaction's connection · 1 | legs from `db` and `tx` in one batch (refused before sending) |
@@ -456,7 +456,7 @@ The tempting alternatives: loading the rows to count them, counting to test exis
 ```ts
 const adultsLoaded = (await db.users.where(u => gt(u.age, 30)).toList()).length;           // 2
 const hasInactiveByCount = (await db.users.where(u => eq(u.isActive, false)).count()) > 0; // true
-const total = await db.posts.select(p => ({ views: p.views })).sum(r => r.views);          // '450' (a string)
+const total = await db.posts.select(p => ({ views: p.views })).sum(r => r.views);          // 450 (before 1.0.33: '450')
 const min = await db.posts.select(p => ({ views: p.views })).min(r => r.views);            // 100
 const max = await db.posts.select(p => ({ views: p.views })).max(r => r.views);            // 200
 ```
@@ -485,7 +485,8 @@ FROM "posts"
 > **Efficiency:** `toList().length` transferred every column of both matching rows to count them; `count()` returns one
 > value. `EXISTS` stops at the first matching row, while `COUNT(*)` visits every match. One `agg` select computes any
 > number of aggregates and `FILTER` counts in one scan and reads them as numbers; the builder's `sum()` / `min()` /
-> `max()` cost a statement each and return the raw driver value (`SUM` of an integer column: `'450'`).
+> `max()` cost a statement each. Since 1.0.33 they read their value as `agg.sum()` / `agg.min()` / `agg.max()` do
+> (before, the driver's value: `SUM` of an integer column was `'450'`).
 
 > **Pitfall:** `count()` ignores `orderBy()`, `limit()`, `offset()` and `selectDistinct()`; to count distinct values
 > use `agg.countDistinct(col)`. There is no `any()`, `none()` or `avg()` on a table: use `exists()`,
@@ -949,47 +950,48 @@ on its own.
 Guides: [Read several independent results in one round trip](./guides/batching-and-prepared-queries.md#read-several-independent-results-in-one-round-trip-querybatch),
 [Count a union or read its first row in a batch](./guides/batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch).
 
-### Run one query shape many times: pick the tool by client
+<a id="run-one-query-shape-many-times-pick-the-tool-by-client"></a>
+
+### Run one query shape many times: `prepare()` and `preparedStatements`
 
 A hot path that runs one query shape thousands of times with new values (a lookup per request, a filter per job)
-costs a query build in your process and a parse and plan on the server per call. Two mechanisms cut them, and they do
-not combine: `prepare(name)` + `sql.placeholder()` builds the SQL once but always sends an unnamed statement and
-bypasses the executor; `preparedStatements: true` names the statement on the server, honored by `PostgresClient`
-only. The client decides:
+costs a query build in your process and a parse and plan on the server per call. `prepare(name)` +
+`sql.placeholder()` builds the SQL once; `preparedStatements: true` names the statement on the server, honored by
+`PostgresClient` only. Since 1.0.33 the two combine: a prepared query's executions run through the context's
+executor, so on a `preparedStatements: true` context each one is sent as the named statement, and logging,
+slow-query reports and a `withTimeout()` set before `prepare()` apply to it. Use `prepare()` on every client:
 
-| Client | Use | Statements per call | Why |
-|---|---|---|---|
-| `PostgresClient` | the ordinary builder on a context with `preparedStatements: true`, plus `MockRowCache.setEnabled(true)` once at startup | 1: a named statement, 2 network round trips on its first use per pooled connection, then 1 | `prepare()` is never named there: Parse/Describe, then Bind/Execute, 2 network round trips on every call |
-| `PgClient` | `prepare(name)` + `sql.placeholder(name)`, then `execute(values)` | 1 network round trip | node-postgres sends an unnamed statement in one round trip; `preparedStatements` is ignored |
-| `BunClient` | `prepare(name)` + `sql.placeholder(name)` | 1 | Bun.SQL names statements itself (its `prepare` option, default `true`); `prepare()` saves the build |
-| `PGliteClient` | `prepare(name)` + `sql.placeholder(name)` | 1 (in-process, no network) | ignores `preparedStatements`; `prepare()` saves the build |
+| Client | `execute()` sends | Network round trips per call |
+|---|---|---|
+| `PostgresClient`, context with `preparedStatements: true` (or `.withPreparedStatements(true)` before `prepare()`) | a named statement (since 1.0.33) | 2 on its first use per pooled connection, then 1 |
+| `PostgresClient` without it | an unnamed statement: Parse/Describe, then Bind/Execute | 2 on every call |
+| `PgClient` | an unnamed statement; `preparedStatements` is ignored | 1 |
+| `BunClient` | what Bun.SQL's own `prepare` option decides (default `true`: named) | 1 |
+| `PGliteClient` | an in-process statement; `preparedStatements` is ignored | none |
 
-On every client, keep the ordinary builder (with `MockRowCache` for the build cost) when the query needs logging,
-`onQueryTakingTooLong` reports, a timeout or a value bound through a column's custom mapper: `PreparedQuery.execute()`
-gets none of them (a placeholder value skips the mapper's `toDriver`).
+Keep the ordinary builder (with `MockRowCache` for the build cost) when the shape varies per call (optional
+filters) or a value is bound through a column's custom mapper: a placeholder value skips the mapper's `toDriver`.
+Before 1.0.33 `prepare()` was never named and bypassed the executor (no logging, no timeout), so on `PostgresClient`
+the hot-path form was the ordinary builder on a `preparedStatements: true` context with `MockRowCache`.
 
 ```ts
-import { gt, MockRowCache, sql } from 'linkgress-orm';
+import { gt, sql } from 'linkgress-orm';
 
-// PgClient, BunClient, PGliteClient: build once, execute many times
-const byMinViews = db.posts
+// once, at startup: preparedStatements names the statement on PostgresClient; the other clients ignore it
+const appDb = new AppDatabase(client, { preparedStatements: true });
+const byMinViews = appDb.posts
   .where(p => gt(p.views, sql.placeholder('minViews')))
   .select(p => ({ id: p.id, title: p.title }))
   .prepare<{ minViews: number }>('byMinViews');
+
+// per call: no build, the same text, one statement
 await byMinViews.execute({ minViews: 100 });   // [{ id: 2, title: 'Alice Post 2' }, { id: 3, title: 'Bob Post' }]
 await byMinViews.execute({ minViews: 160 });   // [{ id: 3, title: 'Bob Post' }]
-
-// PostgresClient: the ordinary builder, named on the server, cheaper to build
-MockRowCache.setEnabled(true);                                   // once at startup
-const preparedDb = new AppDatabase(client, { preparedStatements: true });
-const popular = (minViews: number) =>
-  preparedDb.posts.where(p => gt(p.views, minViews)).select(p => ({ id: p.id, title: p.title })).toList();
-await popular(100);
-await popular(160);
 ```
 
-Both forms send the same text with a new value per call (captured on `PgClient`, which does not name statements;
-on `PostgresClient` the second form's text is a named statement):
+Both executions send the same text with a new value (captured on `PgClient`, which does not name statements; the
+executor asked the client for a named statement both times, and `PostgresClient` sends it named:
+`tests/database/prepared-statements.test.ts` counts one `pg_prepared_statements` entry after two executions):
 
 ```sql
 SELECT "posts"."id" as "id", "posts"."title" as "title"
@@ -1003,16 +1005,17 @@ WHERE "posts"."views" > $1
 -- params: [ 160 ]
 ```
 
-> **Efficiency:** neither form saves statements: each call is 1. `prepare()` skips the build, `MockRowCache` shortens
-> it (a checkout burst measured in 0.4.67: 42–45 to 92–104 orders/s), and a named statement skips the server's parse
-> and postgres.js's describe round trip (a 16 KB cart read: 7.35 ms unnamed, 0.95 ms named, on one connection).
+> **Efficiency:** no form saves statements: each call is 1. `prepare()` skips the build (`MockRowCache` shortens the
+> ordinary builder's: a checkout burst measured in 0.4.67 went from 42–45 to 92–104 orders/s), and a named statement
+> skips the server's parse and postgres.js's describe round trip (a 16 KB cart read: 7.35 ms unnamed, 0.95 ms named,
+> on one connection).
 
 > **Pitfall:** under `preparedStatements` every distinct text is one cached statement per pooled connection. Keep the
 > text stable: `eqAny()` instead of `inArray()` for lists, `.withPreparedStatements(false)` on paging queries whose
 > `limit()` / `offset()` values are written into the text. After five executions PostgreSQL may switch to a generic
 > plan; measure wide analytical shapes before naming them.
 
-Guides: [Run one query shape many times](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-pick-the-tool-by-client),
+Guides: [Run one query shape many times](./guides/batching-and-prepared-queries.md#run-one-query-shape-many-times-prepare-and-preparedstatements),
 [Send statements named on the server](./guides/configuration.md#send-statements-named-on-the-server-preparedstatements),
 [Cut query-build CPU](./guides/configuration.md#cut-query-build-cpu-mockrowcache).
 
@@ -2040,9 +2043,9 @@ The logger received three calls for that one statement:
 | `'params'` | `'[Parameters] ["alice"]'` |
 
 - Logging misses what bypasses the executor: `db.query()` (verified: `debugDb.query('SELECT 1 AS one')` added no log
-  line), `PreparedQuery.execute()`, the multi-statement message of `FutureQueryRunner.runAsync()`, statements on a
-  `connect()` lease, the BEGIN / COMMIT of `db.transaction()` and the statements `PostgresClient` wraps around
-  `.withTimeout()`.
+  line), the multi-statement message of `FutureQueryRunner.runAsync()`, statements on a `connect()` lease, the BEGIN /
+  COMMIT of `db.transaction()` and the statements `PostgresClient` wraps around `.withTimeout()`. A `prepare()`d
+  query's executions are logged since 1.0.33 (before, they bypassed the executor too).
 - A `QueryBatch` and the `temptable` strategy send other statements than one leg's `getSql()` shows: observe those
   with `logQueries`.
 - Plans come from a real server only; the in-memory database used for this page shows the statements, not PostgreSQL's
@@ -2149,7 +2152,7 @@ Details and the SQL of every shape: [Collection strategies](./collection-strateg
   every match.
 - **Don't** write `(await q.count()) > 0` → **Do** call `q.exists()`: `EXISTS` stops at the first matching row.
 - **Don't** call the builder's `sum()`, `min()` and `max()` one after another → **Do** select `agg.*` aggregates in one
-  `select()`: 1 statement instead of 3, values read as numbers (`sum()` returned `'450'`).
+  `select()`: 1 statement instead of 3 (before 1.0.33 the builder's `sum()` also returned the string `'450'`).
 - **Don't** treat top-level `decimal` / `numeric` / `bigint` values as numbers → **Do** convert them where you read
   them, or aggregate with `agg.sum()`: the drivers deliver them as strings (`orders.totalAmount`, typed `number`,
   arrived as `'99.99'`).
@@ -2159,10 +2162,11 @@ Details and the SQL of every shape: [Collection strategies](./collection-strateg
   there).
 - **Don't** fetch ids, then query by them → **Do** use `inSubquery()`, `exists()` or a navigation: 1 statement instead
   of 2.
-- **Don't** use `prepare()` for a hot path on `PostgresClient` → **Do** run the ordinary builder on a
-  `preparedStatements: true` context, with `MockRowCache.setEnabled(true)`: `PreparedQuery.execute()` is never named
-  (2 network round trips per call there) and skips logging and timeouts. On `PgClient`, `BunClient` and
-  `PGliteClient`, `prepare()` is the choice.
+- **Don't** rebuild a hot query on every call → **Do** `prepare()` it once with `sql.placeholder()` and `execute()` it
+  with values; on `PostgresClient` prepare it from a `preparedStatements: true` context: since 1.0.33 each execution
+  is the named statement (2 network round trips on its first use per connection, then 1). Before 1.0.33
+  `PreparedQuery.execute()` was never named and skipped logging and timeouts, and the ordinary builder on such a
+  context was the choice there.
 - **Don't** send a query per id, or `inArray()` with lists of varying length → **Do** use `inArrayOpt()` or `eqAny()`:
   1 statement, and at most 8 `IN` texts, 1 array text and 1 empty-list text (`eqAny()`: 1 text) instead of one text
   per length.
@@ -2215,7 +2219,8 @@ Details and the SQL of every shape: [Collection strategies](./collection-strateg
 - **Don't** use `db.<table>` inside `db.transaction()` → **Do** use `tx.<table>`: `db` runs on another connection, which
   did not see the transaction's uncommitted row.
 - **Don't** call `forUpdate()` on a `db.selectFromCte(…)` query to lock rows → **Do** put `.forUpdate()` on the query
-  that is the CTE's body: the outer `FOR UPDATE` reads only CTEs, and PostgreSQL locks no row through it.
+  that is the CTE's body: an outer `FOR UPDATE` over CTEs locks no row in PostgreSQL, so since 1.0.33 the call
+  throws (`forUpdate() on a CTE-rooted query locks no rows: …`); before 1.0.33 it sent a lock that held nothing.
 - **Don't** make `collectionStrategy: 'temptable'` the default → **Do** keep `lateral`, and use `cte` per query for
   nested trees over most parents: 6 statements instead of 1 for one collection on `PgClient`.
 - **Don't** rely on `.withTimeout()` with `PgClient`, `BunClient` or `PGliteClient` → **Do** set `statement_timeout`
