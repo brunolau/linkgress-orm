@@ -616,14 +616,6 @@ interface OracleInput {
 
 interface ContextSpec {
   name: string;
-  /**
-   * The condition is written over the items of a collection navigation, whose column refs carry no
-   * custom mapper: values compared with a mapped column bind WITHOUT its `toDriver` there — a separate,
-   * pre-existing gap of collection items, not of the membership builders. For a mapped operand the rows
-   * are therefore not checked against the oracle (which maps the values); the statement is still checked
-   * for orphan parameters and must run.
-   */
-  itemColumnsUnmapped?: true;
   /** The condition is written over a column row (a bulk update's `t`): navigations are not in scope there. */
   ownColumnsOnly?: true;
   run(db: MembershipDatabase, cond: Cond, model: SeedModel): Promise<Observed>;
@@ -698,8 +690,10 @@ const CONTEXTS: ContextSpec[] = [
     expected: ({ model, truth }) => idsWhere(model.widgets, w => truth(w) === false),
   },
   {
+    // The items' column refs carry their mapper since 1.0.31: a mapped operand's values bind through its
+    // `toDriver` here too, and its rows are checked against the oracle like every other context's (they used to
+    // be left out: the values were bound as written)
     name: 'correlated exists() over a collection navigation',
-    itemColumnsUnmapped: true,
     run: async (db, cond) => sortedIds(await db.makers
       .where(m => and(gte(m.id, 0), exists(m.widgets!.where(w => cond(w)))))
       .select(m => ({ id: m.id }))
@@ -886,14 +880,12 @@ describe('membership over an empty list binds nothing for its operand', () => {
                   expect({ orphans: statementFindings(statements), failure }).toEqual({ orphans: [], failure: null });
                   expect(statements.length).toBeGreaterThan(0);
 
-                  // (c) the rows SQL's own semantics give (see ContextSpec.itemColumnsUnmapped for the one gap)
-                  if (!(context.itemColumnsUnmapped && shape.mapped)) {
-                    expect(observed).toEqual(context.expected({
-                      model,
-                      truth: w => builder.holds(shape.valueOf(w), values),
-                      reaches: shape.reaches,
-                    }));
-                  }
+                  // (c) the rows SQL's own semantics give
+                  expect(observed).toEqual(context.expected({
+                    model,
+                    truth: w => builder.holds(shape.valueOf(w), values),
+                    reaches: shape.reaches,
+                  }));
                 });
               }
             }

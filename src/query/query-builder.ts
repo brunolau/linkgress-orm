@@ -8300,7 +8300,16 @@ ${joinClauses.join('\n')}`;
     // Collection types
     if (value instanceof CollectionQueryBuilder || (value && typeof value === 'object' && '__collectionResult' in value)) {
       if (value instanceof CollectionQueryBuilder && value.isScalarAggregation()) {
-        return { key, type: FieldType.COLLECTION_SCALAR, value, aggregationType: value.getAggregationType() };
+        // A min() / max() of a mapped column reads through that column's mapper (see getAggregateReadMapper)
+        const aggregateMapper = disableMappers ? undefined : value.getAggregateReadMapper();
+
+        return {
+          key,
+          type: FieldType.COLLECTION_SCALAR,
+          value,
+          aggregationType: value.getAggregationType(),
+          mapper: aggregateMapper === undefined ? undefined : forResultSet(aggregateMapper, rows.length),
+        };
       }
 
       if ('isArrayAggregation' in value && value.isArrayAggregation()) {
@@ -8439,6 +8448,11 @@ ${joinClauses.join('\n')}`;
       case FieldType.COLLECTION_SCALAR:
         if (read.aggregationType === 'COUNT') {
           return this.convertValue(rawValue);
+        }
+
+        // MIN / MAX of a mapped column: the column's value, read as the column reads; NULL (no items) kept
+        if (read.mapper !== undefined) {
+          return rawValue === null || rawValue === undefined ? rawValue : read.mapper.fromDriver(rawValue);
         }
 
         // MAX/MIN/SUM: preserve NULL, convert numeric strings
@@ -9893,7 +9907,10 @@ export function readCollectionResult(
   }
 
   if (collection.isScalarAggregation()) {
-    return scalarCollectionValue(collection.getAggregationType(), raw);
+    // A min() / max() of a mapped column reads through that column's mapper (see getAggregateReadMapper)
+    const aggregateMapper = raw === null || raw === undefined ? undefined : collection.getAggregateReadMapper();
+
+    return aggregateMapper !== undefined ? aggregateMapper.fromDriver(raw) : scalarCollectionValue(collection.getAggregationType(), raw);
   }
 
   if (typeof (collection as any).isArrayAggregation === 'function' && (collection as any).isArrayAggregation()) {
@@ -11109,8 +11126,15 @@ export class CollectionQueryBuilder<TItem = any> {
     // when both target the same table (e.g., post.user.posts where both are "posts" table)
     const tableAlias = `__collection_${this.targetTable}__`;
 
+    // A mapped column's ref carries its mapper, as the root's and a reference navigation's do (see
+    // ReferenceQueryBuilder.buildMockRowDescriptors): a value compared with it in the collection's filter is
+    // bound through `toDriver` — it used to be bound as it was written — and a min() / max() of it reads back
+    // through `fromDriver` (see getAggregateReadMapper). An unmapped column's ref is as it always was.
+    const columnMeta = getSchemaColumnMeta(this.targetTableSchema!);
+
     const descriptors: PropertyDescriptorMap = {};
     for (const [colName, dbColumnName] of columnNameMap) {
+      const mapper = columnMeta.get(colName)?.mapper;
       descriptors[colName] = {
         get(this: any) {
           const slots: MockRowSlots = this;
@@ -11123,6 +11147,9 @@ export class CollectionQueryBuilder<TItem = any> {
               __tableAlias: tableAlias,  // Include table alias for unambiguous references
               __chainId: slots[MOCK_ROW_CHAIN_ID],  // This collection's identity — see chainId
             };
+            if (mapper) {
+              cached.__mapper = mapper;  // toDriver for the values it is compared with, fromDriver for its min() / max()
+            }
           }
           return cached;
         },
@@ -11916,6 +11943,26 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   getAggregationType(): 'MIN' | 'MAX' | 'SUM' | 'COUNT' | 'EXISTS' | undefined {
     return this.aggregationType;
+  }
+
+  /**
+   * The mapper a `min()` / `max()` of this collection reads back through: the aggregated COLUMN's — an
+   * item's, or one reached through the item's navigations. Its smallest / greatest value is one of the
+   * column's values, and it used to read back as the driver sent it: the stored smallint of a column mapped
+   * to `{ hour, minute }`, the text of a mapped timestamp. `undefined` for every other aggregate (a count, a
+   * sum, an existence is not a value of the column), for an aggregated expression and for an unmapped column.
+   * @internal
+   */
+  getAggregateReadMapper(): { fromDriver(value: any): any } | undefined {
+    if (this.aggregationType !== 'MIN' && this.aggregationType !== 'MAX') {
+      return undefined;
+    }
+
+    const aggregated = this.evaluateSelector();
+
+    return aggregated !== null && typeof aggregated === 'object' && '__dbColumnName' in aggregated
+      ? fromDriverMapper((aggregated as any).__mapper)
+      : undefined;
   }
 
   /**
@@ -14075,6 +14122,13 @@ export class CollectionQueryBuilder<TItem = any> {
               flattenResultType: field.getFlattenResultType(),
               scalarAlias: field.getScalarSelectionAlias(),
             };
+          } else {
+            // A min() / max() of a mapped column reads through that column's mapper (see getAggregateReadMapper)
+            const aggregateMapper = field.getAggregateReadMapper();
+
+            if (aggregateMapper !== undefined) {
+              joined.mapper = aggregateMapper;
+            }
           }
 
           return joined;
@@ -14087,11 +14141,16 @@ export class CollectionQueryBuilder<TItem = any> {
         const isScalarAggregation = aggregationType && ['COUNT', 'MIN', 'MAX', 'SUM', 'EXISTS'].includes(aggregationType);
 
         if (isScalarAggregation) {
-          // Scalar aggregation - just return the expression, no nested transformation needed
-          return {
-            alias,
-            expression: nestedResult.selectExpression || nestedResult.sql,
-          };
+          // Scalar aggregation - just return the expression, no nested transformation needed. A min() /
+          // max() of a mapped column reads through that column's mapper (see getAggregateReadMapper)
+          const aggregateMapper = field.getAggregateReadMapper();
+          const scalar: SelectedField = { alias, expression: nestedResult.selectExpression || nestedResult.sql };
+
+          if (aggregateMapper !== undefined) {
+            scalar.mapper = aggregateMapper;
+          }
+
+          return scalar;
         }
 
         return {
