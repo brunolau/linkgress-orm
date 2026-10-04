@@ -14402,12 +14402,20 @@ export class CollectionQueryBuilder<TItem = any> {
     // under the same rules as our own WHERE (see detectNavigationJoins).
     const nestedCorrelationRefs: FieldRef[] = [];
     if (this.selector && this.targetTableSchema && selectorResult !== undefined) {
-      // A CollectionQueryBuilder summand already had its navigation joins built via the
-      // recursive buildCTE above; detectNavigationJoins would iterate its own properties
-      // as if they were fields and produce nothing useful. Skip the walk in that case.
-      if (!(selectorResult instanceof CollectionQueryBuilder)) {
-        this.detectNavigationJoins(selectorResult, navigationJoins, this.targetTable, this.targetTableSchema, nestedCorrelationRefs);
-      }
+      // A collection summand (`sum(l => l.discount.codes.where(…).count())`) is a collection nested in
+      // our selector like a projected one: its correlated subquery reads the reference hops it hangs off
+      // (`"discount"."id"`) and our item's navigations its filter correlates through, and leaves both to
+      // OUR FROM. They used to be skipped here — the walk would have read the builder's own properties as
+      // fields — so the hop rendered unjoined: `missing FROM-clause entry` (42P01), or, where an enclosing
+      // query had a join of that name, bound to THAT row — an aggregate of the enclosing query to
+      // PostgreSQL (42803), and a wrong sum where the statement was accepted.
+      this.detectNavigationJoins(
+        selectorResult instanceof CollectionQueryBuilder ? { summand: selectorResult } : selectorResult,
+        navigationJoins,
+        this.targetTable,
+        this.targetTableSchema,
+        nestedCorrelationRefs
+      );
     }
 
     // The selector says nothing about the collection's own WHERE, so a navigation used only
