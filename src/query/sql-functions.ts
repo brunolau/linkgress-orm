@@ -2372,6 +2372,67 @@ export function arrayContains<V>(column: SqlOperand<V[] | null | undefined>, val
   return new SqlFragment<boolean>(['(', ' = ANY(', '))'], [element, column]);
 }
 
+/** The element type of an array column, when the ref carries its declared type (`integer[]` → `integer`). */
+function arrayElementType(column: unknown): string | undefined {
+  const arrayType = declaredSqlType(column);
+
+  return arrayType && arrayType.endsWith('[]') ? arrayType.slice(0, -2) : undefined;
+}
+
+/** A value as an element of `column`: a plain value is ONE parameter cast to the element type, when it is known. */
+function arrayElementOperand(column: unknown, value: unknown): unknown {
+  const elementType = arrayElementType(column);
+
+  return isPlainSqlValue(value) && elementType ? castTo(value, elementType) : value === null ? NULL_SQL : value;
+}
+
+/**
+ * The array with `value` appended — unless it holds the value already, then the array as it is:
+ * `(CASE WHEN value = ANY(col) THEN col ELSE array_append(COALESCE(col, '{}'), value) END)`. A NULL array is
+ * treated as empty: the result is `{value}`. For the SET of an UPDATE: the append happens in the statement,
+ * on the row's current value — no read-modify-write, and running it twice adds the value once.
+ *
+ * @example
+ * await db.products
+ *   .where(p => inArray(p.id, productIds))
+ *   .update(p => ({ locationIds: arrayAppendUnique(p.locationIds, locationId) }));
+ */
+export function arrayAppendUnique<V>(column: SqlOperand<V[] | null | undefined>, value: SqlOperand<V>): SqlFragment<V[]> {
+  requireOperand('arrayAppendUnique()', column);
+  requireOperand('arrayAppendUnique()', value);
+
+  if (value === null) {
+    // NULL = ANY(…) is never true: every call would append another NULL
+    throw new TypeError('arrayAppendUnique(): the value is null — NULL equals nothing, so it would be appended on every call');
+  }
+
+  const arrayType = declaredSqlType(column);
+  const element = arrayElementOperand(column, value);
+  const empty = new SqlFragment(["'{}'"], []);
+
+  return new SqlFragment<V[]>(
+    ['(CASE WHEN ', ' = ANY(', ') THEN ', ' ELSE array_append(COALESCE(', ', ', '), ', ') END)'],
+    [element, column, column, column, arrayType && arrayType.endsWith(']') ? castTo(empty, arrayType) : empty, element]
+  );
+}
+
+/**
+ * `array_remove(col, value)` — the array without the elements equal to `value` (every occurrence; `null`
+ * removes the NULL elements). An array that does not hold the value comes back as it is, and a NULL array
+ * stays NULL. For the SET of an UPDATE, like {@link arrayAppendUnique}.
+ *
+ * @example
+ * await db.products
+ *   .where(p => arrayContains(p.locationIds, locationId))
+ *   .update(p => ({ locationIds: arrayRemove(p.locationIds, locationId) }));
+ */
+export function arrayRemove<V>(column: SqlOperand<V[] | null | undefined>, value: SqlOperand<V | null>): SqlFragment<V[] | null> {
+  requireOperand('arrayRemove()', column);
+  requireOperand('arrayRemove()', value);
+
+  return new SqlFragment<V[] | null>(['array_remove(', ', ', ')'], [column, arrayElementOperand(column, value)]);
+}
+
 /** `(arrayColumn @> values)` — the array contains every value. */
 export function arrayContainsAll<V>(column: SqlOperand<V[] | null | undefined>, values: readonly V[] | SqlFragment<V[]>): SqlFragment<boolean> {
   requireOperand('arrayContainsAll()', column);

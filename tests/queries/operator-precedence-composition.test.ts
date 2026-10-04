@@ -521,6 +521,8 @@ describe('1. every expression builder renders a self-delimited expression', () =
     jsonbValueText: frag(() => jsonbValueText(J)),
     jsonbPathExists: frag(() => jsonbPathExists(J, '$.a'), () => jsonbPathExists(J, literal('$.a ? (@ > $x)', 'jsonpath'), { vars: jsonbBuildObject({ x: N }), silent: true })),
     arrayContains: frag(() => arrayContains(A, 'a')),
+    arrayAppendUnique: frag(() => Surface.arrayAppendUnique(A, 'a'), () => Surface.arrayAppendUnique(A, T)),
+    arrayRemove: frag(() => Surface.arrayRemove(A, 'a'), () => Surface.arrayRemove(A, null)),
     arrayContainsAll: frag(() => Surface.arrayContainsAll(A, ['a'])),
     arrayOverlaps: frag(() => Surface.arrayOverlaps(A, ['a'])),
     arrayContainedBy: frag(() => Surface.arrayContainedBy(A, ['a'])),

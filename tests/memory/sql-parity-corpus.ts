@@ -148,6 +148,12 @@ export const sqlParityCorpus: ParityCase[] = [
       "SELECT (ARRAY[1,2,3])[2], (ARRAY[1,2,3])[2:3], (ARRAY[1,2,3])[:2], (ARRAY[[1,2],[3,4]])[2][1], (ARRAY[[1,2],[3,4]])[1:1], (ARRAY[1,2,3])[5], ('{1,2,3}'::int[])[0]",
       'SELECT array_length(ARRAY[1,2,3], 1), cardinality(ARRAY[[1,2],[3,4]]), array_dims(ARRAY[[1,2],[3,4]]), array_lower(ARRAY[1], 1), array_upper(ARRAY[]::int[], 1), array_ndims(ARRAY[[1]])',
       'SELECT array_append(ARRAY[1], 2), array_prepend(0, ARRAY[1]), array_cat(ARRAY[1], ARRAY[2,3]), array_remove(ARRAY[1,2,1], 1), array_replace(ARRAY[1,2,1], 1, 9), array_position(ARRAY[5,6,7], 6), array_positions(ARRAY[1,2,1], 1)',
+      // Not strict (their element may be NULL): a NULL ARRAY is NULL, a NULL element is searched for
+      'SELECT array_remove(NULL::int[], 1), array_replace(NULL::int[], 1, 9), array_position(NULL::int[], 6), array_positions(NULL::int[], 1), array_append(NULL::int[], 1), array_prepend(1, NULL::int[])',
+      'SELECT array_remove(ARRAY[1,NULL,2,NULL], NULL), array_replace(ARRAY[1,NULL], NULL, 0), array_position(ARRAY[1,NULL], NULL), array_positions(ARRAY[NULL,1,NULL]::int[], NULL), array_remove(ARRAY[]::int[], 1)',
+      "SELECT CASE WHEN 3 = ANY(a) THEN a ELSE array_append(COALESCE(a, '{}'), 3) END FROM (VALUES (ARRAY[1,2]), (ARRAY[3]), (ARRAY[]::int[]), (NULL::int[])) AS t(a)",
+      // An unnamed CASE is named after its ELSE result when that names itself (a function, a column), else "case"
+      'SELECT CASE WHEN a > 1 THEN 0 ELSE abs(a) END, CASE WHEN a > 1 THEN 0 ELSE a END, CASE WHEN a > 1 THEN a ELSE 0 END, CASE WHEN a > 1 THEN a END, CASE WHEN a > 1 THEN 0 ELSE a::int8 END, CASE WHEN a > 1 THEN 0 ELSE 5::int8 END FROM (VALUES (1)) AS t(a)',
       'SELECT ARRAY[1,2] @> ARRAY[2], ARRAY[1,2] <@ ARRAY[1,2,3], ARRAY[1,2] && ARRAY[2,5], ARRAY[1,2] = ARRAY[1,2], ARRAY[1,2] < ARRAY[1,3], ARRAY[1,NULL] = ARRAY[1,NULL]',
       'SELECT 3 = ANY (ARRAY[1,2,3]), 3 > ALL (ARRAY[1,2]), 1 = ANY (ARRAY[]::int[]), 1 = ALL (ARRAY[]::int[]), NULL = ANY (ARRAY[1])',
       "SELECT * FROM unnest(ARRAY['a','b','c']) WITH ORDINALITY AS u(v, n)",

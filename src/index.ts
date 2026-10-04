@@ -121,6 +121,8 @@ export {
 
 export type {
   GroupedItem,
+  GroupedAggregateOrderKey,
+  GroupedListAggregateOptions,
 } from './query/grouped-query';
 
 export {
@@ -272,6 +274,8 @@ export {
   toJsonb,
   jsonbPathExists,
   arrayContains,
+  arrayAppendUnique,
+  arrayRemove,
   arrayContainsAll,
   arrayOverlaps,
   arrayContainedBy,
