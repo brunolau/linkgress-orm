@@ -50,15 +50,15 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 - **[Querying](./guides/querying.md)** - Query data with type-safe filters, joins, and aggregations
   - Basic queries (SELECT, WHERE, ORDER BY)
   - Nested collections
-  - Aggregations (count, sum, min, max)
-  - GROUP BY and HAVING
+  - Aggregations (count, sum, min, max) — a collection's mapped columns compared and read through their mapper
+  - GROUP BY and HAVING, with the group's members as a list and a distinct count (`g.arrayAgg()`, `g.countDistinct()`)
   - JOINs (inner, left, multiple); [how a joined table's columns read](./guides/querying.md#how-a-joined-tables-columns-read) — its own mapper and type, as through a navigation
   - Subqueries
   - CTEs (Common Table Expressions)
   - Magic SQL strings with custom formatters
   - Built-in operators: coalesce, JSONB extraction, flag/bitmask operations
   - Advanced patterns and type safety
-  - [QueryBatch](./guides/querying.md#querybatch-several-reads-in-one-round-trip): several reads (grouped ones too) in one round trip, and the known limitations of its JSON transport
+  - [QueryBatch](./guides/querying.md#querybatch-several-reads-in-one-round-trip): several reads (grouped ones and a union's count too) in one round trip, and the known limitations of its JSON transport
 
 - **[SQL Expression Helpers](./guides/sql-expressions.md)** - Built-in spellings of common SQL expressions
   - Casts (`cast`, `castAsInt`, `castAsString`, … and `.cast*()` on every fragment)
@@ -66,7 +66,8 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
   - Reading a fragment as a column type (`.withReadType()`)
   - CASE (`caseWhen`, `caseOf`), GREATEST / LEAST / NULLIF, IS DISTINCT FROM
   - String, math and date/time functions, intervals (`concatStrict`, `modulo`, regex `substring`)
-  - JSON paths, builders (`jsonbBuildObject`, `jsonBuildObject`), mutations and predicates; array-column operators
+  - JSON paths, builders (`jsonbBuildObject`, `jsonBuildObject`), mutations and predicates; array-column operators and
+    in-statement array changes (`arrayAppendUnique`, `arrayRemove`)
   - Aggregates as expressions (`agg.count().filter(…)`, `agg.arrayAgg(x, { distinct, orderBy })`, …)
 
 - **[Insert/Update/Upsert/BULK](./guides/insert-update-guide.md)** - Insert, update, and delete operations
@@ -79,7 +80,7 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
     arbiters (`targetWhere`)
   - Row-guarded inserts in a `MutationBatch` (`rowGuard`); an insert leg's `returning`; the statement's
     parameter guard (`parameterCount`)
-  - Advisory transaction locks
+  - Advisory transaction locks (one key or many, waiting or `try…`)
   - Type safety and performance tips
 
 - **[Configuration & Options](./guides/configuration.md)** - Every option, and when to turn it on

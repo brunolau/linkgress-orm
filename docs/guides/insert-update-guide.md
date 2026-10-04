@@ -906,6 +906,14 @@ const got = await db.transaction(tx => tx.tryAdvisoryXactLock('import:partner-7'
 await db.transaction(async (tx) => {
   await tx.advisoryXactLockAll(LockClass.Order, orderIds);   // many keys, one statement, fixed order
 });
+
+const settled = await db.transaction(async (tx) => {
+  if (!await tx.tryAdvisoryXactLockAll(LockClass.Order, orderIds)) {   // many keys, one statement, no waiting
+    return false;   // another transaction holds one of them
+  }
+  // … every order is ours until COMMIT / ROLLBACK
+  return true;
+});
 ```
 
 - Keys: one integer (int8 range), a `(classId, key)` pair (int4 each), or a string hashed with
@@ -920,7 +928,13 @@ await db.transaction(async (tx) => {
   transactions locking overlapping sets cannot deadlock on each other. The order is an SQL
   guarantee: `SELECT pg_advisory_xact_lock($1, t.k) FROM unnest(CAST($2 AS integer[])) WITH
   ORDINALITY AS t(k, ord) ORDER BY t.ord` (strings: `hashtext(t.k)` over `text[]`).
-- All three must be called on the context `db.transaction()` hands you: outside a transaction
+- `tryAdvisoryXactLockAll` (1.0.31) tries the keys in the same order without waiting, in ONE statement that stops
+  at the first busy key: `true` when the transaction holds them all, `false` otherwise — the keys before the
+  busy one stay held until the transaction ends (advisory locks are not given back one by one), the keys after it
+  are never tried. An empty list is `true` without a statement. The statement is a recursive walk over the keys
+  (a step per key, a next step only while the last try succeeded): filtering `unnest(…)` on the failed try under
+  a `LIMIT 1` stops at the busy key only through the executor's laziness, which SQL does not promise.
+- All four must be called on the context `db.transaction()` hands you: outside a transaction
   the lock would end with the statement, so they throw instead.
 
 ## Performance Tips

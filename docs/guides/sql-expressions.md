@@ -379,6 +379,19 @@ arrayContainedBy(book.slots, [1, 2, 3])     // (slots <@ CAST($1 AS integer[]))
 arrayLength(book.tags)                      // cardinality(tags)
 arrayIsEmpty(book.tags)                     // cardinality(tags) = 0 — a NULL array is not empty
 arrayIsNotEmpty(book.tags)
+arrayAppendUnique(book.slots, 4)            // (CASE WHEN 4 = ANY(slots) THEN slots ELSE array_append(COALESCE(slots, '{}'), 4) END)
+arrayRemove(book.slots, 4)                  // array_remove(slots, 4)
+```
+
+`arrayAppendUnique()` and `arrayRemove()` (1.0.31) are values for the SET of an UPDATE: the change is made by the
+statement on each row's current array — no read-modify-write, and running it twice changes nothing more.
+`arrayAppendUnique` treats a NULL array as empty (the result is `{value}`) and refuses a `null` value;
+`arrayRemove` removes every occurrence (`null`: the NULL elements) and leaves a NULL array NULL:
+
+```typescript
+await db.products
+  .where(p => inArray(p.id, productIds))
+  .update(p => ({ locationIds: arrayAppendUnique(p.locationIds, locationId) }));
 ```
 
 A JS list binds as ONE array-literal parameter cast to the column's declared array type, so the
