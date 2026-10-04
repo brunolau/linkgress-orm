@@ -169,7 +169,7 @@ console.log(users.length); // 3
 ```
 
 **Performance:**
-- Bulk insert uses a single `INSERT` statement
+- Bulk insert uses a single `INSERT` statement — a large input one per chunk ([Batch Size](#batch-size))
 - Significantly faster than individual inserts
 - All inserts are atomic (all succeed or all fail)
 
@@ -277,8 +277,8 @@ await db.discountAuditLog.insertFrom(
   ahead of its own mutation CTE, in the one `WITH`). Note PostgreSQL's snapshot rule: the statement's other
   parts do not see the rows its CTE inserted in the TABLE — read them from the CTE.
 - `toStatement()` compiles ONE statement: rows that execution would split into chunks (`chunkSize`, or the
-  automatic chunk under PostgreSQL's 65 535-parameter limit) are refused, as are zero rows and a navigation
-  or collection in the selector. Compile larger sets in batches.
+  automatic chunk under PostgreSQL's 65 535-parameter limit and the client's own — [Batch Size](#batch-size)) are
+  refused, as are zero rows and a navigation or collection in the selector. Compile larger sets in batches.
 - A data-modifying CTE the source reads but `with` does not declare is refused with a message naming the
   option. Compiled with `toStatement()`, the statement is a CTE's body: a data-modifying CTE it reads — through
   its source, its `where`, its `with` — is read by name, and every statement declaring the CTE built over it
@@ -677,8 +677,78 @@ statement binds the SUM of its legs' parameters, which `batch.parameterCount` re
 a statement over 65 535 parameters (PostgreSQL's limit — or the client's own when lower,
 `DatabaseClient.maxParameters()`: PGlite takes 32 767) before sending anything:
 `MutationBatch: the statement binds 70000 parameters — over PostgreSQL's 65 535: execute some of its legs in
-another batch ("a": 35000, "b": 35000)`. A caller that registers a leg only when it fits checks
-`parameterCount` first.
+another batch ("a": 35000, "b": 35000)`.
+
+**Registering a leg only when it fits (`ifFits`).** A leg whose size depends on the data — the rows a fan-out
+produces, say — can ride the statement when it is small and must go standalone when it is not. `ifFits: true`
+(every leg kind but `addDependentInsert`: `addInsertBulk`, `addUpsertBulk`, `addBulkUpdate`, `addDeleteWhereIn`,
+`addUpdateWhereIn`, `addInsertBulkWithChildren`) makes that verdict at registration and returns null — registering
+nothing — when the statement cannot carry the leg:
+
+```typescript
+const batch = new MutationBatch();
+batch.addBulkUpdate(db.routes, touchedRoutes, 'routes');
+const parcels = batch.addInsertBulk(db.parcels, newParcels, 'parcels', { returning: ['id', 'label'], ifFits: true });
+await batch.executeBatch();
+const written = parcels != null
+  ? batch.getLegRows(parcels)                                                    // in the statement
+  : await db.parcels.insertBulk(newParcels).returning(p => ({ id: p.id, label: p.label })); // standalone, chunked
+```
+
+- The verdict is the rule a leg registered without `ifFits` is held to: its rows within a leg's own budget (the rows
+  a standalone mutation sends in ONE chunk on PostgreSQL, `⌊⌊65 535 / columns⌋ · 0.6⌋` — over it, registering
+  without `ifFits` throws), and the parameters it binds, with every leg registered BEFORE it, within the client's
+  limit (over it, `executeBatch()` refuses the statement). Checking `parameterCount` alone is not enough: a leg
+  within the statement's limit can still be over its own budget.
+- It counts the leg as compiled: an SQL fragment cell binds nothing; a typed row guard and an update leg's `where`
+  bind their own parameters.
+- A leg that fits compiles to the same statement it would without `ifFits`. Empty input returns null either way; a
+  duplicate identifier and an executed batch still throw.
+- A declined leg registers nothing (its identifier stays free); one declined for its row count is not compiled — the
+  standalone mutation validates that input. What a caller writes instead:
+
+  | Leg | Standalone |
+  |---|---|
+  | `addInsertBulk` | `insertBulk(rows)`, `.returning(…)` for the readback — chunked |
+  | `addUpsertBulk` | `upsertBulk(rows, config)` — chunked |
+  | `addBulkUpdate` | `bulkUpdate(rows, config)` — chunked |
+  | `addDeleteWhereIn` | `where(r => eqAny(r.col, values)).delete()` — one array parameter |
+  | `addUpdateWhereIn` | `where(r => and(eqAny(r.col, values), guard(r))).update(set)` |
+  | `addInsertBulkWithChildren` | `insertBulkWithChildren(…)` — ONE statement under a budget of its own, every parent with a child; split a larger input |
+  | `addInsertBulk` with `rowGuard` | no standalone form: register it `ifFits` in a batch of its own, its rows split in parts until each registers |
+
+  The chunked mutations keep every chunk within the client's limit ([Batch Size](#batch-size)), so the fallback
+  works on PGlite too.
+- Register the legs that must ride the statement first: a leg registered after an `ifFits` leg, without `ifFits`, is
+  held to the limit by `executeBatch()` alone.
+
+## A Guarded Update over a Key List (`addUpdateWhereIn` with `where`)
+
+`MutationBatch.addUpdateWhereIn(table, column, values, set, id)` sets CONSTANT values on the rows whose `column` is
+in `values`. `where` guards it — a typed condition over the target row, ANDed into the leg's WHERE — so the update
+applies only to the rows still in the state it was decided for:
+
+```typescript
+const batch = new MutationBatch();
+const requeued = batch.addUpdateWhereIn(db.printJobs, 'id', stalledIds, { state: 'queued', printerId: null }, 'requeue', {
+  where: j => eq(j.state, 'printing'),   // not the jobs a printer finished or failed meanwhile
+});
+batch.addInsertBulk(db.printLog, entries, 'log');
+await batch.executeBatch();
+batch.getAffectedCount(requeued!);      // the jobs the guard let through
+// UPDATE "print_jobs" AS t SET "state" = $1, "printer_id" = $2 WHERE "id" IN ($3, …) AND ("t"."state" = $n)
+```
+
+- `where(target)` takes the shape `addBulkUpdate`'s `where` takes: a condition over the column row `t` — its columns
+  render `"t"."<column>"` and bind through their mappers; navigations are not in scope. A subquery correlated to
+  `t` is — also one over the SAME table (`notExists(db.printJobs.where(x => and(eq(x.printerId, t.printerId), …)))`),
+  which the standalone `where()` refuses (its inner and outer rows would share the table's name).
+- The SET stays constant: a parameter per SET value and per key, no VALUES join — where `addBulkUpdate` would need a
+  row per key repeating the same values.
+- `getAffectedCount` counts the rows the guard let through; `exposeColumns` / `exposeOldColumns` publish only those to
+  dependent legs. Its parameters are the leg's (`parameterCount`, `ifFits`).
+- Without `where` the leg compiles exactly as before. With it the target is aliased `t`: a raw `sql` SET value that
+  names the table names it `t`.
 
 ## Bulk Update with SET Expressions (`set` / `where`)
 
@@ -954,6 +1024,11 @@ await db.users.insertBulk(users);
 ```
 
 ### Batch Size
+
+`insertBulk`, `upsertBulk`, `bulkUpdate` and `mergeBulk` split a large input themselves: statements of
+`⌊⌊65 535 / columns⌋ · 0.6⌋` rows (the columns of the first row) — and never a chunk binding more parameters than
+the client takes (`DatabaseClient.maxParameters()`: PGlite's 32 767), so the same call runs on every driver. A
+`chunkSize` option is used as given; `insertBulk(…).toStatement()` compiles at most one such chunk.
 
 For very large datasets, process in batches:
 

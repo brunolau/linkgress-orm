@@ -225,17 +225,32 @@ export function hasAutoIncrementPrimaryKey(schema: TableSchema, dataKeys: string
 export const POSTGRES_MAX_PARAMS = 65535;
 
 /**
- * Calculate optimal chunk size for bulk operations
+ * The most parameters one statement binds through `client`: PostgreSQL's 65 535 — or the client's own limit, when
+ * lower (`DatabaseClient.maxParameters()`; PGlite: 32 767).
+ */
+export function clientParameterLimit(client: { maxParameters?: () => number } | null | undefined): number {
+  return Math.min(POSTGRES_MAX_PARAMS, typeof client?.maxParameters === 'function' ? client.maxParameters() : POSTGRES_MAX_PARAMS);
+}
+
+/**
+ * Calculate optimal chunk size for bulk operations: `configChunkSize` when given; otherwise 60 % of the rows of
+ * `columnCount` columns PostgreSQL's 65 535 parameters take — and never more rows than `maxParameters` take, on a
+ * client whose limit is lower (see {@link clientParameterLimit}; PGlite: 32 767).
  */
 export function calculateOptimalChunkSize(
   columnCount: number,
-  configChunkSize?: number
+  configChunkSize?: number,
+  maxParameters: number = POSTGRES_MAX_PARAMS
 ): number {
   if (configChunkSize != null) {
     return configChunkSize;
   }
   const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-  return Math.floor(maxRowsPerBatch * 0.6); // Use 60% of max to be safe
+  const chunkSize = Math.floor(maxRowsPerBatch * 0.6); // Use 60% of max to be safe
+
+  return maxParameters < POSTGRES_MAX_PARAMS
+    ? Math.min(chunkSize, Math.max(1, Math.floor(maxParameters / columnCount)))
+    : chunkSize;
 }
 
 /**

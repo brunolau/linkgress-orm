@@ -73,13 +73,15 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 - **[Insert/Update/Upsert/BULK](./guides/insert-update-guide.md)** - Insert, update, and delete operations
   - Fluent API for update and delete (`.where().update()`, `.where().delete()`)
   - RETURNING clause support with selectors, and PostgreSQL 18's `old` row (`.returning((row, old) => …)`)
-  - Bulk insert and update, with SET expressions (`bulkUpdate` `set` / `where`)
+  - Bulk insert and update, with SET expressions (`bulkUpdate` `set` / `where`), chunked within the client's
+    parameter limit
   - INSERT … SELECT (`insertFrom`), with `ON CONFLICT DO NOTHING`, expressions cast to the column's type, and
     expected SQLSTATEs kept out of the failure log
   - Upsert (INSERT ... ON CONFLICT), with SET expressions (`updateSet` / `updateWhere`) and partial-index
     arbiters (`targetWhere`)
   - Row-guarded inserts in a `MutationBatch` (`rowGuard`); an insert leg's `returning`; the statement's
-    parameter guard (`parameterCount`)
+    parameter guard (`parameterCount`); a leg registered only when the statement can carry it (`ifFits`); a
+    guarded update over a key list (`addUpdateWhereIn` with `where`)
   - Advisory transaction locks (one key or many, waiting or `try…`)
   - Type safety and performance tips
 

@@ -97,7 +97,7 @@ export type {
 export { QueryBatch } from './query/query-batch';
 // MutationBatch — independent insertBulk/bulkUpdate legs in ONE round trip (data-modifying CTEs)
 export { MutationBatch } from './query/mutation-batch';
-export type { MutationBatchKey, UpsertLegConfig, BulkUpdateLegConfig } from './query/mutation-batch';
+export type { MutationBatchKey, UpsertLegConfig, BulkUpdateLegConfig, LegFitOptions, UpdateWhereInLegOptions } from './query/mutation-batch';
 
 export type {
   BatchListKey,

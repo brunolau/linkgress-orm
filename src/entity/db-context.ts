@@ -56,6 +56,7 @@ import {
   buildColumnNamesList,
   detectPrimaryKeys,
   calculateOptimalChunkSize,
+  clientParameterLimit,
   extractUniqueColumnKeys,
   buildValuesClause,
   buildColumnConfigs,
@@ -1852,9 +1853,9 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       return [];
     }
 
-    // Calculate chunk size based on max rows per batch
+    // Calculate chunk size based on max rows per batch — within what the client binds
     const columnCount = Object.keys(dataArray[0]).length;
-    const chunkSize = calculateOptimalChunkSize(columnCount, insertConfig?.chunkSize);
+    const chunkSize = calculateOptimalChunkSize(columnCount, insertConfig?.chunkSize, clientParameterLimit(this.client));
 
     // Check if we need to chunk
     if (dataArray.length > chunkSize) {
@@ -1958,9 +1959,9 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       updateColumnFilter = (colId: string) => !primaryKeys.includes(colId);
     }
 
-    // Calculate chunk size based on max rows per batch
+    // Calculate chunk size based on max rows per batch — within what the client binds
     const columnCount = Object.keys(values[0]).length;
-    const chunkSize = calculateOptimalChunkSize(columnCount, config?.chunkSize);
+    const chunkSize = calculateOptimalChunkSize(columnCount, config?.chunkSize, clientParameterLimit(this.client));
 
     // Check if we need to chunk
     if (values.length > chunkSize) {
@@ -4862,17 +4863,13 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const dataArray = Array.isArray(value) ? value : [value];
 
     // The rows one statement takes: the `chunkSize` option, or ~60 % of what fits PostgreSQL's
-    // 65 535-parameter limit
+    // 65 535-parameter limit — never more than the client binds (PGlite: 32 767)
     const resolveChunkSize = (): number => {
       if (options?.chunkSize != null) {
         return options.chunkSize;
       }
 
-      const POSTGRES_MAX_PARAMS = 65535;
-      const columnCount = Object.keys(dataArray[0]).length;
-      const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-
-      return Math.floor(maxRowsPerBatch * 0.6);
+      return calculateOptimalChunkSize(Object.keys(dataArray[0]).length, undefined, clientParameterLimit(table._getClient()));
     };
 
     const executeInsertBulk = async <TResult>(
@@ -6297,13 +6294,10 @@ WHERE ${guardSql}`,
         ? { updateSet: config.updateSet as any, updateWhere: config.updateWhere as any }
         : undefined;
 
-      // Calculate chunk size
+      // Calculate chunk size — within what the client binds
       let chunkSize = config?.chunkSize;
       if (chunkSize == null) {
-        const POSTGRES_MAX_PARAMS = 65535;
-        const columnCount = Object.keys(values[0]).length;
-        const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-        chunkSize = Math.floor(maxRowsPerBatch * 0.6);
+        chunkSize = calculateOptimalChunkSize(Object.keys(values[0]).length, undefined, clientParameterLimit(table._getClient()));
       }
 
       // Process in chunks if needed
@@ -6542,18 +6536,47 @@ WHERE ${guardSql}`,
   }
 
   /**
+   * The typed `where` of an UPDATE whose target renders aliased `t`: {@link bulkUpdate}'s `where(target, values)`,
+   * the VALUES row `v` beside the target, and a `MutationBatch` update-where-in leg's `where(target)` — that leg has
+   * no VALUES row. The callback runs over column rows (a navigation throws, naming `usage`); the condition is ANDed
+   * into the statement's own match by {@link andUpdateWhere}.
+   * @internal
+   */
+  private updateWhereCondition(where: (target: any, values: any) => Condition, usage: string, withValues: boolean): Condition {
+    return withValues
+      ? where(this.createColumnRowProxy('t', usage), this.createColumnRowProxy('v', usage))
+      : (where as (target: any) => Condition)(this.createColumnRowProxy('t', usage));
+  }
+
+  /**
+   * `<match> AND (<condition>)` — an UPDATE's typed `where` ({@link updateWhereCondition}) ANDed into the statement's
+   * own match, its parameters continuing the statement's numbering (`context`).
+   * @internal
+   */
+  private static andUpdateWhere(match: string, condition: Condition, context: SqlBuildContext): string {
+    return `${match} AND (${condition.buildSql(context)})`;
+  }
+
+  /**
    * Builds a bare `UPDATE t SET .. WHERE "col" IN ($1, …)` statement (no
    * RETURNING) so `MutationBatch.addUpdateWhereIn` can compose it as a
    * data-modifying-CTE leg. SET semantics mirror the fluent `update()`:
    * plain values run through column mappers, `SqlFragment` values inline
    * with their params merged, and the lambda form resolves column refs
    * against this table's mock row. Returns null for an empty values array.
+   *
+   * `where` — the leg's guard over the target row — is applied as
+   * {@link bulkUpdate}'s `where` is ({@link updateWhereCondition},
+   * {@link andUpdateWhere}): the target renders aliased `t` and
+   * `… WHERE "col" IN (…) AND (<guard>)`, its parameters after the IN list's.
+   * Without it the statement is the unaliased one above.
    * @internal
    */
   _buildUpdateWhereInStatement(
     field: string,
     values: any[],
-    set: Record<string, any> | ((row: any) => Record<string, any>)
+    set: Record<string, any> | ((row: any) => Record<string, any>),
+    where?: (target: any) => Condition
   ): { sql: string; params: any[] } | null {
     if (values.length === 0) {
       return null;
@@ -6567,6 +6590,7 @@ WHERE ${guardSql}`,
     }
 
     const whereConfig = (whereColBuilder as any).build();
+    const guard = where ? this.updateWhereCondition(where, 'addUpdateWhereIn where', false) : undefined;
     const resolvedSet = typeof set === 'function' ? set(this.createMockEntity()) : set;
 
     const setClauses: string[] = [];
@@ -6603,8 +6627,17 @@ WHERE ${guardSql}`,
     const placeholders = whereParams.map(() => `$${paramIndex++}`).join(', ');
     params.push(...whereParams);
 
+    const match = `"${whereConfig.name}" IN (${placeholders})`;
+
+    if (!guard) {
+      return {
+        sql: `UPDATE ${this._getQualifiedTableName()} SET ${setClauses.join(', ')} WHERE ${match}`,
+        params,
+      };
+    }
+
     return {
-      sql: `UPDATE ${this._getQualifiedTableName()} SET ${setClauses.join(', ')} WHERE "${whereConfig.name}" IN (${placeholders})`,
+      sql: `UPDATE ${this._getQualifiedTableName()} AS t SET ${setClauses.join(', ')} WHERE ${DbEntityTable.andUpdateWhere(match, guard, { paramCounter: paramIndex, params })}`,
       params,
     };
   }
@@ -6919,13 +6952,10 @@ RETURNING 1`;
           : (config.updateColumns as string[]);
       }
 
-      // Calculate chunk size (same bound as upsertBulk)
+      // Calculate chunk size (same bound as upsertBulk) — within what the client binds
       let chunkSize = config.chunkSize;
       if (chunkSize == null) {
-        const POSTGRES_MAX_PARAMS = 65535;
-        const columnCount = Object.keys(values[0]).length;
-        const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-        chunkSize = Math.floor(maxRowsPerBatch * 0.6);
+        chunkSize = calculateOptimalChunkSize(Object.keys(values[0]).length, undefined, clientParameterLimit(table._getClient()));
       }
 
       if (values.length > chunkSize) {
@@ -7320,14 +7350,10 @@ RETURNING 1`;
 
       const primaryKeys = table._resolveBulkUpdatePrimaryKeys(data, config);
 
-      // Calculate chunk size
+      // Calculate chunk size — within what the client binds
       let chunkSize = config?.chunkSize;
       if (chunkSize == null) {
-        const POSTGRES_MAX_PARAMS = 65535;
-        const referenceItem = data[0];
-        const columnCount = Object.keys(referenceItem).length;
-        const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-        chunkSize = Math.floor(maxRowsPerBatch * 0.6);
+        chunkSize = calculateOptimalChunkSize(Object.keys(data[0]).length, undefined, clientParameterLimit(table._getClient()));
       }
 
       // Process in chunks if needed
@@ -7509,7 +7535,7 @@ RETURNING 1`;
       ? expressions.set(this.createColumnRowProxy('t', 'bulkUpdate set'), this.createColumnRowProxy('v', 'bulkUpdate set'))
       : undefined;
     const expressionWhere = expressions?.where
-      ? expressions.where(this.createColumnRowProxy('t', 'bulkUpdate where'), this.createColumnRowProxy('v', 'bulkUpdate where'))
+      ? this.updateWhereCondition(expressions.where, 'bulkUpdate where', true)
       : undefined;
     const expressionEntries = expressionSet
       ? Object.entries(expressionSet as Record<string, unknown>).filter(([, value]) => value !== undefined)
@@ -7635,7 +7661,7 @@ RETURNING 1`;
         .concat(Array.from(assigned.values()));
 
       if (expressionWhere) {
-        effectiveWhereClause = `${whereClause} AND (${expressionWhere.buildSql(context)})`;
+        effectiveWhereClause = DbEntityTable.andUpdateWhere(whereClause, expressionWhere, context);
       }
     }
 

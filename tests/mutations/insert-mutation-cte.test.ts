@@ -226,9 +226,13 @@ describe('insert as a data-modifying CTE feeding insertFrom (one statement)', ()
       expect(() => db.codes.insertBulk(rows(3), { chunkSize: 2 }).toStatement(c => ({ id: c.id })))
         .toThrow('toStatement(): 3 rows exceed the 2-row chunk of one insert into "mc_codes" — insertBulk() would execute them as 2 statements');
 
-      // 4 columns: the automatic chunk is floor(floor(65535 / 4) * 0.6) = 9829 rows
-      expect(() => db.codes.insertBulk(rows(9830)).toStatement()).toThrow('toStatement(): 9830 rows exceed the 9829-row chunk');
-      expect(db.codes.insertBulk(rows(9829)).toStatement().params).toHaveLength(9829 * 4);
+      // 4 columns: the automatic chunk is floor(floor(65535 / 4) * 0.6) = 9829 rows — and no more than the client
+      // binds in one statement: on PGlite (32 767 parameters) floor(32767 / 4) = 8191
+      const chunk = Math.min(9829, Math.floor(Math.min(65535, client.maxParameters()) / 4));
+
+      expect(chunk).toBe(client.maxParameters() === 32767 ? 8191 : 9829);
+      expect(() => db.codes.insertBulk(rows(chunk + 1)).toStatement()).toThrow(`toStatement(): ${chunk + 1} rows exceed the ${chunk}-row chunk`);
+      expect(db.codes.insertBulk(rows(chunk)).toStatement().params).toHaveLength(chunk * 4);
 
       expect(() => db.codes.insertBulk([]).toStatement()).toThrow('toStatement(): insertBulk() into "mc_codes" has no rows');
     });

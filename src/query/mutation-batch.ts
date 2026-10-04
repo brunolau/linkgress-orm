@@ -5,13 +5,42 @@ import type { DbEntityTable } from '../entity/db-context';
 import type { DbEntity } from '../entity/entity-base';
 import type { Condition } from './conditions';
 import { renumberPlaceholders } from './query-batch';
-import { hasBarePlaceholder } from './sql-utils';
+import { calculateOptimalChunkSize, clientParameterLimit, hasBarePlaceholder } from './sql-utils';
 
 const POSTGRES_MAX_PARAMS = 65535;
 
 /** Typed handle returned by MutationBatch.addInsertBulk / addBulkUpdate. */
 export interface MutationBatchKey {
   readonly id: string;
+}
+
+/**
+ * The option every leg kind but the dependent insert takes ({@link MutationBatch.addInsertBulk}, `addUpsertBulk`,
+ * `addBulkUpdate`, `addDeleteWhereIn`, `addUpdateWhereIn`, `addInsertBulkWithChildren`).
+ */
+export interface LegFitOptions {
+  /**
+   * Register the leg only when the batch's ONE statement can carry it — the rule a leg registered without it is held
+   * to, as a verdict instead of an error:
+   *
+   * - its rows (a where-in leg's values; an insert-with-children leg's parents and children) within a leg's own budget,
+   *   the rows a standalone mutation sends in one chunk on PostgreSQL (`⌊⌊65 535 / columns⌋ · 0.6⌋`, the columns of its
+   *   first row) — over it, a leg registered without `ifFits` throws here;
+   * - the parameters it binds, counted on the leg as compiled (an SQL fragment cell binds none; a typed row guard and
+   *   an update leg's `where` bind their own), together with every leg registered BEFORE it, within the most one statement binds through its
+   *   client (`DatabaseClient.maxParameters()`: PostgreSQL's 65 535, PGlite's 32 767) — over it,
+   *   {@link MutationBatch.executeBatch} refuses the statement.
+   *
+   * When the statement cannot carry it, the call registers NOTHING and returns null — write the same input
+   * standalone: `insertBulk`, `upsertBulk` and `bulkUpdate` chunk it, each chunk within the client's limit; a
+   * where-in leg is `table.where(r => eqAny(r.col, values)).delete()` / `.update(set)` (one array parameter); an
+   * insert-with-children leg is `insertBulkWithChildren` — one statement under a budget of its own, every parent with
+   * a child, not chunked; a row-guarded insert has no standalone form: register it `ifFits` in a batch of its own and
+   * split its rows until it registers. A leg declined for its rows is not compiled: the standalone mutation validates
+   * that input. The verdict counts the legs registered so far, so register the legs that must ride the statement
+   * first; a leg registered after it without `ifFits` is held to the limit by `executeBatch` alone.
+   */
+  ifFits?: boolean;
 }
 
 /** The column row of an entity — `any` for an untyped table (a `ColumnRow<any>` would have no columns). */
@@ -25,7 +54,7 @@ type ColumnRowOf<TEntity> = 0 extends (1 & TEntity) ? any : ColumnRow<TEntity>;
 export type RowGuard<TEntity = any> = string | ((v: ColumnRowOf<TEntity>) => Condition);
 
 /** Options of an insert leg ({@link MutationBatch.addInsertBulk}). */
-export interface InsertLegOptions<TEntity = any> {
+export interface InsertLegOptions<TEntity = any> extends LegFitOptions {
   overridingSystemValue?: boolean;
   onConflictDoNothing?: boolean;
   rowGuard?: RowGuard<TEntity>;
@@ -57,11 +86,28 @@ export interface UpsertLegConfig<TEntity = any> {
   targetWhere?: ArbiterPredicate<TEntity>;
 }
 
+/** Options of an update-where-in leg ({@link MutationBatch.addUpdateWhereIn}). */
+export interface UpdateWhereInLegOptions<TEntity = any> extends LegFitOptions {
+  /** Columns (property names) the leg's CTE publishes under their property names, for dependent legs. */
+  exposeColumns?: string[];
+  /** Columns (property names) whose PRE-update values the leg's CTE publishes as `old__<prop>` (PostgreSQL 18's `old.`). */
+  exposeOldColumns?: string[];
+  /**
+   * A guard over the target row, ANDed into the leg's WHERE: `UPDATE … AS t SET … WHERE "<column>" IN (…) AND
+   * (<guard>)`. The shape `addBulkUpdate`'s `where` takes — a typed condition over the column row `t` (its columns
+   * render `"t"."<db_column>"`; navigations are not in scope, a subquery correlated to `t` is) — without the VALUES row
+   * this leg does not have. Only the rows it lets through are updated: {@link MutationBatch.getAffectedCount} counts
+   * them, and only they are exposed to dependent legs. Its parameters are the leg's (`parameterCount`, `ifFits`).
+   * The target is aliased `t` only with a guard: a raw `sql` SET value that names the table then names it `t`.
+   */
+  where?: (target: ColumnRowOf<TEntity>) => Condition;
+}
+
 /**
  * Bulk-update leg configuration: the match key and the same typed `set` / `where` over
- * `(target, values)` that `bulkUpdate` accepts.
+ * `(target, values)` that `bulkUpdate` accepts — and `ifFits` ({@link LegFitOptions}).
  */
-export interface BulkUpdateLegConfig {
+export interface BulkUpdateLegConfig extends LegFitOptions {
   primaryKey?: string | string[];
   set?: (target: any, values: any) => Record<string, unknown>;
   where?: (target: any, values: any) => Condition;
@@ -94,7 +140,8 @@ interface MutationCapableTable {
   _buildUpdateWhereInStatement(
     field: string,
     values: any[],
-    set: Record<string, any> | ((row: any) => Record<string, any>)
+    set: Record<string, any> | ((row: any) => Record<string, any>),
+    where?: (target: any) => Condition
   ): { sql: string; params: any[] } | null;
   _buildUpsertBulkStatement(
     values: Record<string, any>[],
@@ -161,7 +208,9 @@ interface MutationLeg {
  * conditional legs need no guards; an empty batch's executeBatch() is a no-op.
  * A leg larger than the single-statement parameter budget throws at
  * registration — chunked mutations cannot ride one statement, execute those
- * standalone.
+ * standalone; registered `ifFits` ({@link LegFitOptions}), such a leg — and one
+ * that would take the statement over its client's parameter limit — is
+ * declined instead: null, nothing registered.
  *
  * @example
  * const batch = new MutationBatch();
@@ -178,7 +227,8 @@ export class MutationBatch {
 
   /**
    * Register a bulk INSERT leg. Returns null (and registers nothing) for an
-   * empty row array or rows resolving to zero insertable columns.
+   * empty row array or rows resolving to zero insertable columns — and, with
+   * `options.ifFits`, for a leg the statement cannot carry.
    *
    * `options.rowGuard` turns the leg into a ROW-GUARDED insert — `INSERT ..
    * SELECT .. FROM (VALUES ..) AS v(..) WHERE <guard>` — so each candidate row
@@ -212,6 +262,12 @@ export class MutationBatch {
    * statement: raw JSON values (json_agg readback, no fromDriver pass), the
    * inserted rows only (a conflict skipped or a guard blocked is not among them),
    * in no particular order.
+   *
+   * `options.ifFits` registers the leg only when the statement can carry it,
+   * and returns null — nothing registered — when it cannot
+   * ({@link LegFitOptions}): write those rows with the standalone `insertBulk`.
+   * A row-guarded leg has no standalone form — register one declined `ifFits`
+   * in a batch of its own, its rows split in parts until each registers.
    */
   addInsertBulk<TEntity extends DbEntity = any>(
     table: DbEntityTable<TEntity> | MutationCapableTable,
@@ -226,7 +282,10 @@ export class MutationBatch {
     const leg = table as MutationCapableTable;
 
     this.assertRegisterable(id);
-    MutationBatch.assertSingleStatementBudget(rows, id);
+
+    if (!MutationBatch.withinLegBudget(rows, id, options?.ifFits)) {
+      return null;
+    }
 
     const rowGuard = options?.rowGuard;
 
@@ -257,11 +316,17 @@ export class MutationBatch {
       return null;
     }
 
+    const client = leg._getClient();
+
+    if (options?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
+    }
+
     this.legs.push({
       id,
       sql: built.sql,
       params: built.params,
-      client: leg._getClient(),
+      client,
       executor: leg._getExecutor(),
       returningSql: returningCols.length > 0 ? returningCols.map(c => `"${c.dbName}" AS "${c.prop}"`).join(', ') : undefined,
       readRows: returningCols.length > 0,
@@ -273,7 +338,9 @@ export class MutationBatch {
   /**
    * Register a DELETE leg: `DELETE FROM t WHERE "col" IN (…)`, values run
    * through the column's toDriver mapper. Returns null (and registers
-   * nothing) for an empty values array.
+   * nothing) for an empty values array — and, with `options.ifFits`, for a leg
+   * the statement cannot carry ({@link LegFitOptions}; declined, the same
+   * delete runs standalone as `table.where(r => eqAny(r.col, values)).delete()`).
    *
    * Parent + child rows CAN be deleted by two legs of one batch when the
    * child's foreign key is NO ACTION (PostgreSQL's default): NO ACTION is
@@ -285,16 +352,20 @@ export class MutationBatch {
     table: MutationCapableTable,
     field: string,
     values: any[],
-    id: string
+    id: string,
+    options?: LegFitOptions
   ): MutationBatchKey | null {
     if (values.length === 0) {
       return null;
     }
 
     this.assertRegisterable(id);
+
     // Same single-statement parameter budget the row-based legs enforce, at
     // one parameter per value (single-column IN list).
-    MutationBatch.assertSingleStatementBudget(values.map(value => ({ value })), id);
+    if (!MutationBatch.withinLegBudget(values.map(value => ({ value })), id, options?.ifFits)) {
+      return null;
+    }
 
     const built = table._buildDeleteWhereInStatement(field, values);
 
@@ -302,7 +373,13 @@ export class MutationBatch {
       return null;
     }
 
-    this.legs.push({ id, sql: built.sql, params: built.params, client: table._getClient(), executor: table._getExecutor() });
+    const client = table._getClient();
+
+    if (options?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
+    }
+
+    this.legs.push({ id, sql: built.sql, params: built.params, client, executor: table._getExecutor() });
 
     return { id };
   }
@@ -313,29 +390,42 @@ export class MutationBatch {
    * values inlined (flag operators, CASE expressions), lambda form resolving
    * column refs. Returns null for an empty values array.
    *
+   * `options.where` guards the leg: a typed condition over the target row
+   * `t`, ANDed into its WHERE — `UPDATE … AS t SET … WHERE "col" IN (…) AND
+   * (<guard>)` (see {@link UpdateWhereInLegOptions.where}) — so a constant SET
+   * over an id list applies only to the rows still in the state the guard
+   * reads; {@link getAffectedCount} counts those.
+   *
    * `options.exposeColumns` / `options.exposeOldColumns` publish columns on
    * the leg's CTE for dependent legs: plain columns under their prop name,
    * pre-update values via PostgreSQL 18's `old.` RETURNING qualifier under
    * `old__<prop>`. Exposed legs still report counts; their rows are NOT
    * readable via getLegRows (register an upsert leg with `returning` for
-   * readback).
+   * readback). `options.ifFits`: see {@link LegFitOptions} — declined, the
+   * same update runs standalone as `table.where(r => and(eqAny(r.col,
+   * values), guard(r))).update(set)` (ONE array parameter for the values).
    */
-  addUpdateWhereIn(
-    table: MutationCapableTable,
+  addUpdateWhereIn<TEntity extends DbEntity = any>(
+    table: DbEntityTable<TEntity> | MutationCapableTable,
     field: string,
     values: any[],
     set: Record<string, any> | ((row: any) => Record<string, any>),
     id: string,
-    options?: { exposeColumns?: string[]; exposeOldColumns?: string[] }
+    options?: UpdateWhereInLegOptions<TEntity>
   ): MutationBatchKey | null {
     if (values.length === 0) {
       return null;
     }
 
-    this.assertRegisterable(id);
-    MutationBatch.assertSingleStatementBudget(values.map(value => ({ value })), id);
+    const leg = table as MutationCapableTable;
 
-    const built = table._buildUpdateWhereInStatement(field, values, set);
+    this.assertRegisterable(id);
+
+    if (!MutationBatch.withinLegBudget(values.map(value => ({ value })), id, options?.ifFits)) {
+      return null;
+    }
+
+    const built = leg._buildUpdateWhereInStatement(field, values, set, options?.where as ((target: any) => Condition) | undefined);
 
     if (!built) {
       return null;
@@ -343,20 +433,26 @@ export class MutationBatch {
 
     const exposeParts: string[] = [];
 
-    for (const col of table._resolveColumnDbNames(options?.exposeColumns ?? [])) {
+    for (const col of leg._resolveColumnDbNames(options?.exposeColumns ?? [])) {
       exposeParts.push(`"${col.dbName}" AS "${col.prop}"`);
     }
 
-    for (const col of table._resolveColumnDbNames(options?.exposeOldColumns ?? [])) {
+    for (const col of leg._resolveColumnDbNames(options?.exposeOldColumns ?? [])) {
       exposeParts.push(`old."${col.dbName}" AS "old__${col.prop}"`);
+    }
+
+    const client = leg._getClient();
+
+    if (options?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
     }
 
     this.legs.push({
       id,
       sql: built.sql,
       params: built.params,
-      client: table._getClient(),
-      executor: table._getExecutor(),
+      client,
+      executor: leg._getExecutor(),
       returningSql: exposeParts.length > 0 ? exposeParts.join(', ') : undefined,
     });
 
@@ -372,13 +468,14 @@ export class MutationBatch {
    * accumulator reads. `config.targetWhere` is the arbiter predicate of a
    * PARTIAL unique index, as `upsertBulk` takes it (typed: unqualified,
    * bind-free — a predicate that binds anything throws at registration).
+   * `options.ifFits`: see {@link LegFitOptions}.
    */
   addUpsertBulk<TEntity extends DbEntity = any>(
     table: DbEntityTable<TEntity> | MutationCapableTable,
     rows: Record<string, any>[],
     config: UpsertLegConfig<TEntity>,
     id: string,
-    options?: { returning?: string[] }
+    options?: { returning?: string[] } & LegFitOptions
   ): MutationBatchKey | null {
     if (rows.length === 0) {
       return null;
@@ -387,7 +484,10 @@ export class MutationBatch {
     const leg = table as MutationCapableTable;
 
     this.assertRegisterable(id);
-    MutationBatch.assertSingleStatementBudget(rows, id);
+
+    if (!MutationBatch.withinLegBudget(rows, id, options?.ifFits)) {
+      return null;
+    }
 
     const built = leg._buildUpsertBulkStatement(rows, config);
 
@@ -396,12 +496,17 @@ export class MutationBatch {
     }
 
     const returningCols = leg._resolveColumnDbNames(options?.returning ?? []);
+    const client = leg._getClient();
+
+    if (options?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
+    }
 
     this.legs.push({
       id,
       sql: built.sql,
       params: built.params,
-      client: leg._getClient(),
+      client,
       executor: leg._getExecutor(),
       returningSql: returningCols.length > 0 ? returningCols.map(c => `"${c.dbName}" AS "${c.prop}"`).join(', ') : undefined,
       readRows: returningCols.length > 0,
@@ -418,7 +523,10 @@ export class MutationBatch {
    * (see addUpdateWhereIn's expose options); `whereColumn` is the EXPOSED
    * alias (`old__<prop>` for old-columns). Cell values run through column
    * mappers with `$n::type` casts. The sentinel comparison is `<>` on
-   * non-null values (v1: no NULL-sentinel support).
+   * non-null values (v1: no NULL-sentinel support). It takes no `ifFits`
+   * ({@link LegFitOptions}): it reads its parent's CTE, so it has no
+   * standalone form to fall back to — its parameters count against the
+   * statement like any later leg's, held to the limit by executeBatch.
    */
   addDependentInsert(
     table: MutationCapableTable,
@@ -464,7 +572,10 @@ export class MutationBatch {
    * `options.parentReturning` (prop names) exposes the parent rows in INPUT
    * order via {@link getLegRows} (raw JSON values — e.g. read back generated
    * task ids to publish after the batch commits). Unlike the standalone form,
-   * childless parents are allowed.
+   * childless parents are allowed. `options.ifFits`: see {@link LegFitOptions}
+   * (the leg's rows are its parents and its children; declined, the standalone
+   * `insertBulkWithChildren` is ONE statement under a budget of its own and
+   * needs a child per parent — a larger input is split by the caller).
    */
   addInsertBulkWithChildren(
     table: MutationCapableTable,
@@ -473,26 +584,34 @@ export class MutationBatch {
       children: { table: any; foreignKey: string; rows: Array<{ parentIndex: number; row: Record<string, any> }> };
     },
     id: string,
-    options?: { parentReturning?: string[] }
+    options?: { parentReturning?: string[] } & LegFitOptions
   ): MutationBatchKey | null {
     if (config.rows.length === 0) {
       return null;
     }
 
     this.assertRegisterable(id);
-    MutationBatch.assertSingleStatementBudget([...config.rows, ...config.children.rows.map(child => child.row)], id);
+
+    if (!MutationBatch.withinLegBudget([...config.rows, ...config.children.rows.map(child => child.row)], id, options?.ifFits)) {
+      return null;
+    }
 
     const built = table._buildInsertBulkWithChildrenCtes(config);
     const returningCols = table._resolveColumnDbNames(options?.parentReturning ?? []);
     const rowsSelect = returningCols.length > 0
       ? `(SELECT COALESCE(json_agg(json_build_object(${returningCols.map(c => `'${c.prop}', o."${c.dbName}"`).join(', ')}) ORDER BY o."__mbw_ord"), '[]'::json) FROM "__MB_SELF___o" o)`
       : undefined;
+    const client = table._getClient();
+
+    if (options?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
+    }
 
     this.legs.push({
       id,
       sql: '',
       params: built.params,
-      client: table._getClient(),
+      client,
       executor: table._getExecutor(),
       readRows: rowsSelect != null,
       multi: { ctes: built.ctes, rowsSelect },
@@ -503,7 +622,8 @@ export class MutationBatch {
 
   /**
    * Register a bulk UPDATE leg (same per-row `"col__provided"` semantics as
-   * standalone bulkUpdate). Returns null for an empty row array.
+   * standalone bulkUpdate). Returns null for an empty row array — and, with
+   * `config.ifFits`, for a leg the statement cannot carry ({@link LegFitOptions}).
    */
   addBulkUpdate(
     table: MutationCapableTable,
@@ -516,7 +636,10 @@ export class MutationBatch {
     }
 
     this.assertRegisterable(id);
-    MutationBatch.assertSingleStatementBudget(rows, id);
+
+    if (!MutationBatch.withinLegBudget(rows, id, config?.ifFits)) {
+      return null;
+    }
 
     const primaryKeys = table._resolveBulkUpdatePrimaryKeys(rows, config);
     const built = table._buildBulkUpdateStatement(
@@ -524,8 +647,13 @@ export class MutationBatch {
       primaryKeys,
       config?.set || config?.where ? { set: config.set, where: config.where } : undefined
     );
+    const client = table._getClient();
 
-    this.legs.push({ id, sql: built.sql, params: built.params, client: table._getClient(), executor: table._getExecutor() });
+    if (config?.ifFits === true && !this.takes(client, built.params)) {
+      return null;
+    }
+
+    this.legs.push({ id, sql: built.sql, params: built.params, client, executor: table._getExecutor() });
 
     return { id };
   }
@@ -538,8 +666,9 @@ export class MutationBatch {
   /**
    * The parameters the batch's statement binds: every registered leg's. A statement binds at most 65 535
    * (PostgreSQL's protocol limit; a client may take fewer, see `DatabaseClient.maxParameters()`) —
-   * {@link executeBatch} refuses more before sending anything; a caller that registers a leg only when it fits
-   * checks this first (each leg's own budget is checked when it registers).
+   * {@link executeBatch} refuses more before sending anything. To register a leg only when the statement can
+   * carry it, register it `ifFits` ({@link LegFitOptions}): that verdict also holds the leg to its own budget, which
+   * this count alone does not show.
    */
   get parameterCount(): number {
     return this.legs.reduce((count, leg) => count + leg.params.length, 0);
@@ -566,8 +695,7 @@ export class MutationBatch {
 
     const first = this.legs[0];
     const parameterCount = this.parameterCount;
-    // PostgreSQL's limit — or the client's own, when lower (PGlite: 32 767)
-    const limit = Math.min(POSTGRES_MAX_PARAMS, typeof first.client.maxParameters === 'function' ? first.client.maxParameters() : POSTGRES_MAX_PARAMS);
+    const limit = MutationBatch.parameterLimit(first.client);
 
     if (parameterCount > limit) {
       const over = limit === POSTGRES_MAX_PARAMS ? "PostgreSQL's 65 535" : `the ${limit.toLocaleString('en-US').replace(/,/g, ' ')} this client takes`;
@@ -704,19 +832,44 @@ export class MutationBatch {
   }
 
   /**
-   * A leg must fit one statement — the same parameter-budget formula the
-   * standalone mutations use to CHUNK large inputs. A chunked mutation cannot
-   * ride a single-statement batch, so oversize inputs are rejected here.
+   * A leg's own budget: it must fit one statement — the rows the standalone
+   * mutations send in ONE chunk on PostgreSQL ({@link calculateOptimalChunkSize},
+   * the formula they CHUNK large inputs by; a client with a lower limit takes
+   * smaller chunks, and holds the leg to its limit through the statement's
+   * count). A chunked mutation cannot ride a single-statement batch: a leg over
+   * it is declined (false) when registered `ifFits`, refused (thrown) otherwise.
    */
-  private static assertSingleStatementBudget(rows: Record<string, any>[], id: string): void {
+  private static withinLegBudget(rows: Record<string, any>[], id: string, ifFits: boolean | undefined): boolean {
     const columnCount = Math.max(1, Object.keys(rows[0]).length);
-    const maxRowsPerBatch = Math.floor(POSTGRES_MAX_PARAMS / columnCount);
-    const singleStatementLimit = Math.floor(maxRowsPerBatch * 0.6);
+    const singleStatementLimit = calculateOptimalChunkSize(columnCount);
 
-    if (rows.length > singleStatementLimit) {
-      throw new Error(
-        `MutationBatch: leg "${id}" carries ${rows.length} rows, above the ~${singleStatementLimit}-row single statement budget for ${columnCount} columns — execute this mutation standalone (it needs chunking)`
-      );
+    if (rows.length <= singleStatementLimit) {
+      return true;
     }
+
+    if (ifFits === true) {
+      return false;
+    }
+
+    throw new Error(
+      `MutationBatch: leg "${id}" carries ${rows.length} rows, above the ~${singleStatementLimit}-row single statement budget for ${columnCount} columns — execute this mutation standalone (it needs chunking)`
+    );
+  }
+
+  /**
+   * The statement's budget, for a leg registered `ifFits` ({@link LegFitOptions}): whether the statement — every leg
+   * registered so far, and `params` more — stays within the most one statement binds through `client`.
+   */
+  private takes(client: DatabaseClient, params: readonly unknown[]): boolean {
+    return this.parameterCount + params.length <= MutationBatch.parameterLimit(client);
+  }
+
+  /**
+   * The most parameters one statement binds through `client` ({@link clientParameterLimit}: PostgreSQL's 65 535, or the
+   * client's own limit when lower — PGlite: 32 767). What {@link executeBatch} refuses a statement over, and what
+   * `ifFits` registers within.
+   */
+  private static parameterLimit(client: DatabaseClient): number {
+    return clientParameterLimit(client);
   }
 }
