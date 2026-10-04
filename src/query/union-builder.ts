@@ -435,9 +435,17 @@ export class UnionQueryBuilder<TSelection> {
    * @returns Promise resolving to the count
    */
   async count(): Promise<number> {
-    const { sql: innerSql, params } = this.buildSql();
+    const context: SqlBuildContext = { paramCounter: 1, params: [] };
+    const { withClause, body, dataModifying } = this.buildSqlParts(context, false);
+    const params = context.params;
 
-    const sql = `SELECT COUNT(*) as count FROM (${innerSql}) as union_count`;
+    // A data-modifying CTE must be declared by the statement's OWN WITH — PostgreSQL refuses it inside the
+    // count's subquery (0A000 "WITH clause containing a data-modifying statement must be at the top level"):
+    // the WITH then leads the statement, the count reads the union below it. Otherwise the union, its WITH
+    // included, is the count's subquery, as it always was.
+    const sql = dataModifying
+      ? `${withClause}\nSELECT COUNT(*) as count FROM (${body}) as union_count`
+      : `SELECT COUNT(*) as count FROM (${withClause ? `${withClause}\n${body}` : body}) as union_count`;
 
     const result = this.executor
       ? await this.executor.query(sql, params)
@@ -469,6 +477,22 @@ export class UnionQueryBuilder<TSelection> {
           params: [],
         };
 
+    const { withClause, body } = this.buildSqlParts(context, isNested);
+    const sql = withClause ? `${withClause}\n${body}` : body;
+
+    if (isNested) {
+      return sql;
+    }
+
+    return { sql, params: context.params };
+  }
+
+  /**
+   * The union's statement in two parts: the `WITH` that declares the legs' CTEs (`''` when it declares none) and
+   * the union below it (with ORDER BY / LIMIT / OFFSET); `dataModifying` when that WITH declares a
+   * data-modifying CTE. The parameters land in `context` in the statement's order — the WITH's first.
+   */
+  private buildSqlParts(context: SqlBuildContext, isNested: boolean): { withClause: string; body: string; dataModifying: boolean } {
     // Hoist the legs' attached CTEs to STATEMENT level.
     //
     // Every leg renders its own `WITH` prefix and this builder wraps each leg in
@@ -571,33 +595,29 @@ export class UnionQueryBuilder<TSelection> {
     // this union's legs and must not leak into a sibling expression.
     context.hoistedCteNames = outerHoistedCteNames;
 
-    let sql = sqlParts.join('\n');
-
-    if (withParts.length > 0) {
-      sql = `WITH ${withParts.join(', ')}\n${sql}`;
-    }
+    let body = sqlParts.join('\n');
 
     // Add ORDER BY (applies to the entire union result)
     if (this.orderByFields.length > 0) {
       const orderParts = this.orderByFields.map(({ field, direction }) => `"${field}" ${direction}`);
-      sql += `\nORDER BY ${orderParts.join(', ')}`;
+      body += `\nORDER BY ${orderParts.join(', ')}`;
     }
 
     // Add LIMIT
     if (this.limitValue !== undefined) {
-      sql += `\nLIMIT ${this.limitValue}`;
+      body += `\nLIMIT ${this.limitValue}`;
     }
 
     // Add OFFSET
     if (this.offsetValue !== undefined) {
-      sql += `\nOFFSET ${this.offsetValue}`;
+      body += `\nOFFSET ${this.offsetValue}`;
     }
 
-    if (isNested) {
-      return sql;
-    }
-
-    return { sql, params: context.params };
+    return {
+      withClause: withParts.length > 0 ? `WITH ${withParts.join(', ')}` : '',
+      body,
+      dataModifying: withParts.length > 0 && declaredHere.some(cte => cte.dataModifying),
+    };
   }
 
   /**

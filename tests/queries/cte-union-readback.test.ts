@@ -404,4 +404,64 @@ describe('typed UNION readback of CTE-rooted queries, and FULL JOIN parity', () 
       void literal;
     });
   });
+
+  /**
+   * The legs of mutation CTEs counted, and their first row: the union's WITH declares data-modifying CTEs, which
+   * PostgreSQL accepts only in the statement's own WITH (0A000 "WITH clause containing a data-modifying statement
+   * must be at the top level"). `count()` wrapped the whole union — its WITH included — in its subquery.
+   */
+  describe('the legs of mutation CTEs, counted and paged', () => {
+    const reset = async () => {
+      await client.query('TRUNCATE ur_slots RESTART IDENTITY');
+      await db.slots.insertBulk([
+        { unitId: 1, tenantId: 10, bin: null, isCurrent: true },
+        { unitId: 2, tenantId: 20, bin: 3, isCurrent: true },
+      ]);
+    };
+
+    const legsOf = (units: number[]) => {
+      const builder = new DbCteBuilder();
+      const closed = builder.withMutation('ur_closed', db.slots
+        .where(s => and(eqAny(s.unitId, units), eq(s.isCurrent, true)))
+        .update({ isCurrent: false })
+        .toStatement(s => ({ id: s.id, unitId: s.unitId, tenantId: s.tenantId })));
+      const opened = builder.withMutation('ur_opened', db.slots.insertFrom(
+        fromSet(unnestZip({ unitId: { values: units, type: 'integer' } }), 'd').select(d => ({ unitId: d.unitId })).asSubquery('table'),
+        src => ({ unitId: src.unitId, tenantId: 99, isCurrent: true }),
+        { where: () => afterMutation(closed.cte) }
+      ).toStatement(s => ({ id: s.id, unitId: s.unitId, tenantId: s.tenantId })));
+
+      return { closed, opened };
+    };
+
+    for (const units of [[], [1], [1, 2]]) {
+      for (const order of ['closed first', 'opened first'] as const) {
+        for (const reader of ['count', 'first row'] as const) {
+          test(`${units.length} units | ${order} | ${reader}`, async () => {
+            await reset();
+            const { closed, opened } = legsOf(units);
+            const closedLeg = db.selectFromCte(closed.cte).select(r => ({ leg: 'c', id: r.id, unitId: r.unitId, tenantId: r.tenantId }));
+            const openedLeg = db.selectFromCte(opened.cte).select(r => ({ leg: 'o', id: r.id, unitId: r.unitId, tenantId: r.tenantId }));
+            const union = order === 'closed first' ? (closedLeg as any).unionAll(openedLeg) : (openedLeg as any).unionAll(closedLeg);
+            captured.length = 0;
+
+            if (reader === 'count') {
+              expect(await union.count()).toBe(units.length * 2);
+            } else {
+              const row = await union.orderBy((r: any) => [r.unitId, r.leg]).firstOrDefault();
+              expect(row === null ? null : { leg: row.leg, unitId: row.unitId, tenantId: row.tenantId }).toEqual(units.length > 0 ? { leg: 'c', unitId: 1, tenantId: 10 } : null);
+            }
+
+            // ONE statement, whose own WITH declares the close leg before the open leg; both legs ran to completion
+            const statements = captured.filter(entry => entry.includes('\nUNION ALL\n'));
+            expect(statements).toHaveLength(1);
+            expect(statements[0].startsWith('WITH "ur_closed" AS (')).toBe(true);
+            expect(statements[0].match(/"ur_opened" AS \(/g)).toHaveLength(1);
+            expect(await db.slots.where(s => eq(s.isCurrent, true)).count()).toBe(2);
+            expect((await db.slots.where(s => eq(s.tenantId, 99)).count())).toBe(units.length);
+          });
+        }
+      }
+    }
+  });
 });

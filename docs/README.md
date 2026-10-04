@@ -130,11 +130,11 @@ Complete documentation for Linkgress ORM - A type-safe ORM for PostgreSQL and Ty
 
 - **[Set-Returning Functions](./guides/set-returning-functions.md)** - `unnest`, `unnestZip`, `jsonbArrayElements`, `jsonbEachText`
   - As projection values that multiply rows
-  - As row sources: `fromSet()`, `db.selectFromSet()`, `crossJoinLateral()`
+  - As row sources: `fromSet()`, `db.selectFromSet()` (or a table's `<table>.selectFromSet()`, on its own context), `crossJoinLateral()`
   - Typed rows bound through a table's columns: `unnestRows()` / `fromRows()`
 
 - **[CTE Guide](./guides/cte-guide.md)** - Common Table Expressions
-  - CTE-rooted queries (`db.selectFromCte`) with every join flavour, `where()` and `union()` / `unionAll()`
+  - CTE-rooted queries (`db.selectFromCte`, or `<table>.selectFromCte` on the table's own context — its transaction) with every join flavour, `where()` and `union()` / `unionAll()`
   - Every query builder as a CTE body (CTE-rooted and set queries included)
   - CTEs declared once per statement, read by name from nested subqueries
   - Data-modifying CTEs (`withMutation`) with typed `toStatement()` rows; statements reading earlier ones, and

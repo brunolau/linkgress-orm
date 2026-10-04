@@ -1,7 +1,7 @@
 import { Catalog, Column, Constraint, Relation, StoredExpr, TypeOid } from '../catalog/catalog';
 import { PgError, SqlState } from '../errors';
 import { CatalogRTE, Query, RelationRTE, TExpr } from '../analyze/nodes';
-import { Heap, Snapshot, Tuple, UndoLog, WaitForTransaction } from '../storage/mvcc';
+import { Heap, INVALID_XID, Snapshot, Tuple, UndoLog, WaitForTransaction } from '../storage/mvcc';
 import { lockTuple } from '../storage/store';
 import { outputValue } from '../types/io';
 import { EvalCtx, Evaluator, StatementState, TransitionCapture } from './runtime';
@@ -61,6 +61,8 @@ interface TableInfo {
   fksIn: Constraint[];
   generated: { col: Column; ev: Evaluator; plan: QueryPlan }[];
   partitions: Relation[];
+  /** physical indexes of the columns of the unique indexes a foreign key can reference (no predicate, no expression) */
+  keyColumns: number[];
 }
 
 export class DmlExecutor {
@@ -182,7 +184,18 @@ export class DmlExecutor {
       }
       partitions.sort((a, b) => a.oid - b.oid);
     }
-    const info: TableInfo = { rel, live, width: rel.columns.length, defaultEvs: new Map(), checks, uniques, fksOut, fksIn, generated, partitions };
+    // PostgreSQL's key columns (INDEX_ATTR_BITMAP_KEY): those of the unique indexes a foreign key can reference — no
+    // predicate, no expression. An UPDATE that changes one locks the row FOR UPDATE, any other FOR NO KEY UPDATE.
+    const keyColumns = new Set<number>();
+    for (const ix of catalog.indexesOf(rel.oid)) {
+      const index = ix.index!;
+      if (index.unique && !index.predicate && index.keys.every((k) => k.attnum > 0)) {
+        for (const k of index.keys) {
+          keyColumns.add(k.attnum - 1);
+        }
+      }
+    }
+    const info: TableInfo = { rel, live, width: rel.columns.length, defaultEvs: new Map(), checks, uniques, fksOut, fksIn, generated, partitions, keyColumns: [...keyColumns] };
     this.st.scratch.set(key, info);
     return info;
   }
@@ -376,11 +389,22 @@ export class DmlExecutor {
     return { ...this.st.snapshot, curCid: this.st.cid + 1 };
   }
 
+  /**
+   * RI_FKey_check — `SELECT 1 FROM ONLY <referenced> WHERE <key> FOR KEY SHARE`: whether a row with the key is there
+   * for this statement. A version another transaction inserted and has not committed is NOT there: the check reads a
+   * snapshot, and PostgreSQL does not wait for such a row (23503 at once). A visible version is locked FOR KEY SHARE:
+   * a running transaction that deletes it, changes its key or holds it FOR UPDATE makes the statement wait — it then
+   * runs again, on a new snapshot, and finds the row gone (a committed delete or key change) or there (a rollback, a
+   * released lock). A non-key update and the weaker row locks do not conflict. A version whose delete or key change
+   * committed after this statement's snapshot (repeatable read) is not there either — PostgreSQL raises 40001 there;
+   * the engine models no serialization failure.
+   */
   private refRowExists(con: Constraint, keyVals: unknown[]): boolean {
     const refRel = this.st.catalog.getRelation(con.fk!.refRelOid)!;
     const heaps = this.host.relationHeaps(refRel, true, this.st);
     const snap = this.fkSnapshot();
     const vis = this.host.store.vis;
+    const txns = this.host.store.txns;
     const typeOps = this.st.session.typeOps;
     const refCols = con.fk!.refColumns;
     const types = refCols.map((a) => refRel.columns[a - 1].typeOid);
@@ -399,16 +423,75 @@ export class DmlExecutor {
       });
       const key = this.compositeKey(types, keyVals, typeOps);
       for (const t of index.get(key) ?? []) {
-        if (vis.visible(t, snap)) {
+        if (!vis.visible(t, snap)) {
+          continue;
+        }
+        const holder = this.keyShareConflict(t, physs, types);
+        if (holder === INVALID_XID) {
+          this.holdForKeyShare(t);
           return true;
         }
-        const l = vis.liveness(t, this.ownXid());
-        if (typeof l === 'object') {
-          throw new WaitForTransaction(l.waitFor, refRel.name);
+        if (txns.isRunning(holder)) {
+          throw new WaitForTransaction(holder, refRel.name);
         }
       }
     }
     return false;
+  }
+
+  /**
+   * Holds the row FOR KEY SHARE until this transaction ends — its version `t` and every newer one: another
+   * transaction's delete, key change or FOR UPDATE of it waits for this one (a non-key update does not, and carries
+   * the lock on to its new version). Holders that ended are dropped on the way.
+   */
+  private holdForKeyShare(t: Tuple): void {
+    const xid = this.host.ensureXid(this.st);
+    const txns = this.host.store.txns;
+    for (let version: Tuple | null = t; version !== null; version = version.next) {
+      const locks = (version.locks ??= new Map());
+      for (const holder of [...locks.keys()]) {
+        if (holder !== xid && !txns.isRunning(holder)) {
+          locks.delete(holder);
+        }
+      }
+      if (!locks.has(xid)) {
+        locks.set(xid, 'KEY SHARE');
+      }
+    }
+  }
+
+  /**
+   * The transaction a FOR KEY SHARE lock on the visible version `t` conflicts with — one other than ours that
+   * deleted the row, changed its key (`physs`) or holds it FOR UPDATE, running or committed — or INVALID_XID. A
+   * non-key update does not conflict: the lock follows the update chain (PostgreSQL's heap_lock_updated_tuple), where
+   * a newer version may be deleted or re-keyed.
+   */
+  private keyShareConflict(t: Tuple, physs: number[], types: number[]): number {
+    const txns = this.host.store.txns;
+    const typeOps = this.st.session.typeOps;
+    const own = this.ownXid();
+    const ownTop = own !== INVALID_XID ? txns.topLevel(own) : INVALID_XID;
+    const other = (xid: number) => ownTop === INVALID_XID || txns.topLevel(xid) !== ownTop;
+    const keyOf = (data: unknown[]) => this.compositeKey(types, physs.map((p) => (p < data.length ? data[p] ?? null : null)), typeOps);
+    const key = keyOf(t.data);
+    for (let version: Tuple | null = t; version !== null; version = version.next) {
+      if (version.locks) {
+        for (const [holder, strength] of version.locks) {
+          // FOR KEY SHARE conflicts with FOR UPDATE only
+          if (strength === 'UPDATE' && other(holder) && txns.isRunning(holder)) {
+            return holder;
+          }
+        }
+      }
+      const xmax = version.xmax;
+      if (xmax === INVALID_XID || txns.isAborted(xmax) || !other(xmax)) {
+        return INVALID_XID;
+      }
+      if (version.next === null || keyOf(version.next.data) !== key) {
+        return xmax;
+      }
+    }
+    return INVALID_XID;
   }
 
   checkForeignKeysOut(info: TableInfo, data: unknown[], relForMessages: Relation, changedOnly?: unknown[] | null): void {
@@ -520,13 +603,12 @@ export class DmlExecutor {
         return this.compositeKey(types, vals, typeOps);
       });
       for (const t of index.get(this.compositeKey(types, keyVals, typeOps)) ?? []) {
+        // A referencing row another transaction inserted and has not committed is not there (PostgreSQL's check
+        // reads a snapshot): its own foreign-key check holds the referenced row FOR KEY SHARE, so the delete or key
+        // change that got here waited for that transaction first — or, deferred, it checks at its COMMIT and finds
+        // the referenced row gone.
         if (vis.visible(t, snap)) {
           out.push({ heap: part.heap, rel: part.rel, tuple: t });
-        } else {
-          const l = vis.liveness(t, this.ownXid());
-          if (typeof l === 'object') {
-            throw new WaitForTransaction(l.waitFor, rel.name);
-          }
         }
       }
     }
@@ -673,7 +755,9 @@ export class DmlExecutor {
 
   updateTuple(info: TableInfo, heap: Heap, old: Tuple, newData: unknown[], rel: Relation, fromRi: boolean): Tuple | null {
     const xid = this.host.ensureXid(this.st);
-    const outcome = lockTuple(this.host.store, old, xid, 'NO KEY UPDATE', 'BLOCK', rel.name, false);
+    // a key change conflicts with FOR KEY SHARE (a foreign-key check of another transaction holding the row)
+    const strength = this.changesKey(info, old.data, newData) ? 'UPDATE' : 'NO KEY UPDATE';
+    const outcome = lockTuple(this.host.store, old, xid, strength, 'BLOCK', rel.name, false);
     if (outcome === 'deleted' || outcome === 'skip') {
       return null;
     }
@@ -698,6 +782,7 @@ export class DmlExecutor {
     this.undo().recordXmax(heap, old);
     const t = heap.update(old, data, xid, this.st.cid, this.st);
     this.undo().recordInsert(heap, t);
+    this.carryLocksForward(old, t, xid);
     this.host.noteHeapWrite(heap, true);
     this.st.modifiedRelations.add(rel.oid);
     this.checkUniques(info, heap, data, t, rel, old);
@@ -708,6 +793,37 @@ export class DmlExecutor {
       this.handleReferencedChange(info, old.data, data);
     }
     return t;
+  }
+
+  /** Whether an UPDATE from `oldData` to `newData` changes one of the table's key columns (see TableInfo.keyColumns). */
+  private changesKey(info: TableInfo, oldData: unknown[], newData: unknown[]): boolean {
+    if (info.keyColumns.length === 0) {
+      return false;
+    }
+    const typeOps = this.st.session.typeOps;
+    const valueAt = (data: unknown[], p: number) => (p < data.length ? data[p] ?? null : null);
+    return info.keyColumns.some((p) => {
+      const type = info.rel.columns[p].typeOid;
+      return this.compositeKey([type], [valueAt(oldData, p)], typeOps) !== this.compositeKey([type], [valueAt(newData, p)], typeOps);
+    });
+  }
+
+  /**
+   * The row locks other running transactions hold on `old` move on to its new version `t`, as PostgreSQL carries the
+   * lockers of an updated row forward: a foreign-key check's FOR KEY SHARE (which a non-key update does not wait for)
+   * still holds the row when this transaction deletes or re-keys it next.
+   */
+  private carryLocksForward(old: Tuple, t: Tuple, xid: number): void {
+    if (!old.locks) {
+      return;
+    }
+    const txns = this.host.store.txns;
+    const own = txns.topLevel(xid);
+    for (const [holder, strength] of old.locks) {
+      if (txns.topLevel(holder) !== own && txns.isRunning(holder)) {
+        (t.locks ??= new Map()).set(holder, strength);
+      }
+    }
   }
 
   deleteTuple(info: TableInfo, heap: Heap, t: Tuple, rel: Relation, fromRi: boolean): boolean {

@@ -726,6 +726,56 @@ UNION ALL
 - The in-memory database runs CTEs in the order the main query first reads them, as PostgreSQL does: a test
   that reads the open leg first exercises the dangerous order on both engines.
 
+## On a Table: `<table>.selectFromCte()` and `<table>.selectFromSet()`
+
+The query roots of a context are also every table's (1.0.30): `trx.leases.selectFromCte(cte)` and
+`trx.leases.selectFromSet(set)` run on the context the table belongs to — its client, its executor, its
+transaction. Code that is handed a TABLE rather than a context — a helper that writes versioned rows into whichever
+table it gets, `db.leases` or a caller's `trx.leases` — builds the legs on the table and executes and reads them back
+on it, in ONE statement:
+
+```typescript
+const foldLeases = async (leases: DbEntityTable<Lease>, units: number[], desired: DesiredLease[], now: Date) => {
+  const builder = new DbCteBuilder(leases.getClient());
+  const closed = builder.withMutation('closed', leases
+    .where(l => and(eqAny(l.unitId, units), eq(l.isCurrent, true),
+      notExists(fromRows(leases, desired, { columns: ['unitId', 'tenantId'], alias: 'k' })
+        .where(k => and(eq(k.unitId, l.unitId), eq(k.tenantId, l.tenantId))).select(() => ({ one: literal(1) })).asSubquery())))
+    .update({ validTo: now, isCurrent: false })
+    .toStatement(l => ({ id: l.id, unitId: l.unitId })));
+  const opened = builder.withMutation('opened', leases.insertFrom(
+    fromRows(leases, desired, { columns: ['unitId', 'tenantId'], alias: 'd' })
+      .where(d => notExists(leases.where(c => and(eq(c.unitId, d.unitId), eq(c.tenantId, d.tenantId), eq(c.isCurrent, true)))
+        .select(c => ({ id: c.id })).asSubquery()))
+      .asSubquery('table'),
+    src => ({ unitId: src.unitId, tenantId: src.tenantId, validFrom: now, isCurrent: true }),
+    { where: () => afterMutation(closed.cte) },
+  ).toStatement(l => ({ id: l.id, unitId: l.unitId })));
+
+  // ONE statement on the table's own connection — inside the caller's transaction when there is one
+  const rows = await leases.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id, unitId: r.unitId }))
+    .unionAll(leases.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id, unitId: r.unitId })))
+    .toList();
+
+  // outside a caller's transaction the statement commits on its own: running it again after a deadlock or a
+  // serialization failure (40P01 / 40001) is this helper's call; inside one, the failure aborted the CALLER's transaction
+  return { rows, ownsUnitOfWork: !leases.isInTransaction() };
+};
+```
+
+- Rooted on `db` instead, a transaction's legs ran on ANOTHER connection, outside the transaction: the statement
+  could not see the transaction's uncommitted rows — a foreign key to a parent the transaction had just inserted
+  failed with 23503 — and on a pool of one connection it waited for a second one forever (PGlite, one session,
+  refuses it at once).
+- The same signatures, typings and SQL as `db.selectFromCte()` / `db.selectFromSet()`. A table derived with
+  `.withTimeout()`, `.withQueryOptions()`, `.withPreparedStatements()` or `.expectedExecutionTime()` runs them through
+  its own executor, as its other queries; a view (`DbViewTable`) has them too.
+- `isInTransaction()` — `true` on the tables of a transaction's context (also after it ended, when their statements
+  are refused with `TransactionEndedError`), `false` on the root's. There are no nested transactions; a SAVEPOINT
+  stays inside the transaction.
+- `getClient()` — the client of the table's context (the transaction's, on `trx.<table>`), for what takes a client:
+  `new DbCteBuilder(client)` renders the driver's array capability into the CTE bodies it builds.
+
 ## Type Safety
 
 Linkgress provides full TypeScript type inference for CTE columns:

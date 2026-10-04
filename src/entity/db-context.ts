@@ -2582,6 +2582,10 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * `alias` renders the root as `FROM "<cte>" AS "<alias>"` (its columns `"<alias>"."<column>"`): a
    * subquery over a CTE correlated to an enclosing query over the SAME CTE needs one — both rows would
    * otherwise be named after the CTE, and such a correlation is refused.
+   *
+   * The query runs on THIS context: on the root context outside any transaction, on a transaction's context
+   * inside it. A table offers the same root on its own context — `trx.<table>.selectFromCte(cte)` — for code
+   * that holds a table rather than the context ({@link DbEntityTable.selectFromCte}).
    */
   selectFromCte<TRootColumns extends Record<string, any>>(
     rootCte: DbCte<TRootColumns>,
@@ -2595,7 +2599,8 @@ export class DataContext<TSchema extends ContextSchema = any> {
    * this context: `.where()`, `.select()`, `.orderBy()`, `.limit()`, then `.toList()` /
    * `.firstOrDefault()`. The set's columns read back as the driver delivers them (text stays text).
    * The alias defaults to the function's name. `fromSet()` builds the same query without a context,
-   * to embed it.
+   * to embed it; a table runs it on its own context — `trx.<table>.selectFromSet(set)`
+   * ({@link DbEntityTable.selectFromSet}).
    *
    * @example
    * const rows = await db
@@ -3798,6 +3803,73 @@ export class DbEntityTable<TEntity extends DbEntity> {
   // not make DbEntityTable<T> incomparable with DbEntityTable<any>
   as<TScope extends DbEntity = TEntity>(alias: string): AliasedScope<[import('./column-row').ColumnRow<TScope>]> {
     return AliasedScope.forTable<TScope>(this._getSchema(), alias);
+  }
+
+  // --------------------------------------------------------------------------
+  // The query roots of this table's context
+  // --------------------------------------------------------------------------
+
+  /**
+   * {@link DataContext.selectFromCte} on the context this table belongs to: a query whose FROM root is a CTE, run
+   * on the table's own client and executor — on a transaction's table (`trx.<table>`), inside that transaction: it
+   * sees the transaction's uncommitted rows and runs on its connection. A helper that is handed a table — the
+   * root's or a transaction's — builds data-modifying CTEs on it and executes and reads them back in ONE statement
+   * on that same context:
+   *
+   * ```typescript
+   * const builder = new DbCteBuilder(leases.getClient());
+   * const closed = builder.withMutation('closed', leases.where(…).update({ validTo: now, isCurrent: false }).toStatement(l => ({ id: l.id })));
+   * const opened = builder.withMutation('opened', leases.insertFrom(source, map, { where: () => afterMutation(closed.cte) }).toStatement(l => ({ id: l.id })));
+   * const rows = await leases.selectFromCte(opened.cte).select(r => ({ leg: 'opened', id: r.id }))
+   *   .unionAll(leases.selectFromCte(closed.cte).select(r => ({ leg: 'closed', id: r.id })))
+   *   .toList();
+   * ```
+   *
+   * The same signature, typing and SQL as the context's. A table derived with `.withTimeout()`,
+   * `.withQueryOptions()`, `.withPreparedStatements()` or `.expectedExecutionTime()` runs it through its derived
+   * executor, as its other queries.
+   */
+  selectFromCte<TRootColumns extends Record<string, any>>(
+    rootCte: DbCte<TRootColumns>,
+    alias?: string
+  ): CteRootQueryBuilder<TRootColumns> {
+    return this.context.selectFromCte(rootCte, alias);
+  }
+
+  /**
+   * {@link DataContext.selectFromSet} on the context this table belongs to — a query over a set-returning function
+   * (`unnest`, `unnestZip`, `unnestRows`, `jsonbArrayElements`, `jsonbEachText`) run on the table's own client and
+   * executor, inside its transaction (see {@link selectFromCte}). The same signature, typing and SQL as the
+   * context's.
+   */
+  selectFromSet<TRow extends Record<string, unknown>>(
+    set: import('../query/set-returning').SetReturningFunction<TRow>,
+    alias?: string
+  ): import('../query/set-returning').SetQueryBuilder<TRow, TRow> {
+    return this.context.selectFromSet(set, alias);
+  }
+
+  /**
+   * Whether this table's context is a transaction's: `true` for the tables of the context `db.transaction()` hands
+   * its callback (also once that transaction has ended — their statements are then refused with a
+   * `TransactionEndedError`), `false` for the root context's. Nested transactions do not exist (`transaction()` on
+   * a transaction's context throws); a SAVEPOINT stays inside the transaction.
+   *
+   * A helper handed a table decides with it whether it owns the unit of work: outside a caller's transaction its
+   * statement commits on its own, and it may run it again after a deadlock or a serialization failure (40P01 /
+   * 40001); inside one, such a failure aborts the CALLER's transaction — only the caller can retry.
+   */
+  isInTransaction(): boolean {
+    return this._getClient().isInTransaction();
+  }
+
+  /**
+   * The client of this table's context — {@link DataContext.getClient}; on a transaction's table, the
+   * transaction's. For what takes a client, such as `new DbCteBuilder(client)` (which renders the driver's array
+   * capability into the CTE bodies it builds).
+   */
+  getClient(): DatabaseClient {
+    return this._getClient();
   }
 
   /**
@@ -8322,6 +8394,7 @@ export type DbViewTable<TEntity extends DbEntity> = Pick<
   | 'toList' | 'first' | 'firstOrDefault' | 'count' | 'exists'
   | 'orderBy' | 'limit' | 'offset' | 'select' | 'selectDistinct' | 'where'
   | 'with' | 'leftJoin' | 'innerJoin' | 'getColumns' | 'getColumnKeys' | 'props'
+  | 'selectFromCte' | 'selectFromSet' | 'isInTransaction' | 'getClient'
 >;
 
 /**

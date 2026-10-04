@@ -1779,6 +1779,9 @@ export class Session implements ExecSession, AnalyzerEnv {
       if (this.txn && this.txn.failed && stmt.op !== 'ROLLBACK' && stmt.op !== 'ROLLBACK_TO' && stmt.op !== 'COMMIT') {
         throw new PgError(SqlState.IN_FAILED_SQL_TRANSACTION, 'current transaction is aborted, commands ignored until end of transaction block');
       }
+      if (stmt.op === 'COMMIT') {
+        await this.settleDeferredChecks();
+      }
       return this.executeTransactionStmt(stmt);
     }
     if (this.txn && this.txn.failed) {
@@ -1892,6 +1895,42 @@ export class Session implements ExecSession, AnalyzerEnv {
       return await Promise.race([p, cancelled]);
     } finally {
       this.cancelWaiters.delete(waiter!);
+    }
+  }
+
+  /**
+   * The deferred constraint checks of an explicit COMMIT, run before it: a check that meets a concurrent transaction
+   * (a referenced row another transaction deletes, re-keys or holds FOR UPDATE; a deferred unique key another one
+   * inserted) waits for it, then they all run again — PostgreSQL waits inside the check, and COMMIT does not restart
+   * as a statement does. A violation, a deadlock or a timeout aborts the transaction, as a failed check at COMMIT does.
+   */
+  private async settleDeferredChecks(): Promise<void> {
+    const txn = this.txn;
+    if (!txn || !txn.explicit || txn.failed || txn.deferredChecks.length === 0) {
+      return;
+    }
+    const started = Date.now();
+    const timeoutMs = parseInt(this.getSetting('statement_timeout', false) ?? '0', 10);
+    this.statementRunning = true;
+    this.cancelPending = false;
+    try {
+      for (;;) {
+        try {
+          this.runDeferredChecks(true);
+          return;
+        } catch (e) {
+          if (!(e instanceof WaitForTransaction)) {
+            throw e;
+          }
+          await this.waitForXid(e.xid, started, timeoutMs);
+        }
+      }
+    } catch (e) {
+      this.abortTxn();
+      throw e;
+    } finally {
+      this.statementRunning = false;
+      this.cancelPending = false;
     }
   }
 

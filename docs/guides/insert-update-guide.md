@@ -878,6 +878,17 @@ futures with `db`'s (or with a kept, ended transaction's) is refused before anyt
 and PGlite such a batch without parameters used to run every future on the first one's client, `tx`'s outside the
 transaction.
 
+### Code that is handed a table
+
+A helper that receives a table — `db.posts` or a caller's `tx.posts` — runs everything on that table's context:
+its queries and writes, and also its query roots `tx.posts.selectFromCte(cte)` / `tx.posts.selectFromSet(set)`
+(1.0.30), so it can execute data-modifying CTEs built on the table and read them back in ONE statement inside the
+caller's transaction. `tx.posts.isInTransaction()` tells it whether it is inside one (outside, its statement
+commits on its own and it may run it again after 40P01 / 40001; inside, such a failure aborts the caller's
+transaction), and `tx.posts.getClient()` is the transaction's client. Rooting such a statement on `db` instead
+runs it on another connection, outside the transaction. See
+[the CTE guide](./cte-guide.md#on-a-table-tableselectfromcte-and-tableselectfromset).
+
 ### Advisory Locks
 
 Transaction-scoped advisory locks serialize concurrent units of work on a key that is not a

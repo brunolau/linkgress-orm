@@ -102,11 +102,15 @@ fromSet(unnest(['a', 'b'], 'text'), 'n').where(n => ne(n.value, 'b')).select(n =
 - The set's row carries an identity of its own: an entity query nested in the set query reads its columns as
   correlations, also when the set's alias equals one of that query's navigations (a set aliased `group` read by a
   `db.boxes` query that has a `group` navigation) — by alias name alone it used to be that query's own join.
-- A context-free set query cannot run: `.toList()` throws and points to `db.selectFromSet()`.
+- A context-free set query cannot run: `.toList()` throws and points to `db.selectFromSet()` (or a table's
+  `.selectFromSet()`).
 
 ## `db.selectFromSet(set, alias?)` — a query of its own
 
-The same builder, bound to the context: `.toList()`, `.firstOrDefault()`, `.toSql()`.
+The same builder, bound to the context: `.toList()`, `.firstOrDefault()`, `.toSql()`. A table binds it to ITS
+context (1.0.30): `trx.boxes.selectFromSet(set, alias?)` runs on the table's client and executor — inside the
+transaction for a transaction's table, where a set correlated to the table sees the transaction's own rows — with
+the same signature, typing and SQL (see [the CTE guide](./cte-guide.md#on-a-table-tableselectfromcte-and-tableselectfromset)).
 
 ```typescript
 const rows = await db

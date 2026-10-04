@@ -603,7 +603,7 @@ function unboundClient(): DatabaseClient {
       }
 
       return () => {
-        throw new Error('fromSet(): a context-free set query cannot run on its own — run it through db.selectFromSet(...), or embed it with .asSubquery()');
+        throw new Error('fromSet(): a context-free set query cannot run on its own — run it through db.selectFromSet(...) or <table>.selectFromSet(...), or embed it with .asSubquery()');
       };
     },
   });
@@ -738,12 +738,12 @@ export class SetQueryBuilder<TRow extends Record<string, unknown>, TSelection = 
     return this.evaluateSelection();
   }
 
-  /** Run the query (`db.selectFromSet(...)` only) and read its rows. */
+  /** Run the query (`db.selectFromSet(...)` / a table's `.selectFromSet(...)` only) and read its rows. */
   async toList(): Promise<TSelection[]> {
     const { client, executor } = this.state;
 
     if (!client) {
-      throw new Error('fromSet(): a context-free set query cannot run on its own — run it through db.selectFromSet(...), or embed it with .asSubquery()');
+      throw new Error('fromSet(): a context-free set query cannot run on its own — run it through db.selectFromSet(...) or <table>.selectFromSet(...), or embed it with .asSubquery()');
     }
 
     const { sql, params } = this.buildStatement();

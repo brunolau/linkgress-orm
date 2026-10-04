@@ -213,6 +213,21 @@ suite) and every difference found: [bench/pglite/README.md](../../bench/pglite/R
   is a 23505 (or a row `ON CONFLICT DO NOTHING` skips); rolled back, the row is inserted — as in PostgreSQL. It
   used to restart with a new snapshot, where an `INSERT … SELECT … WHERE NOT EXISTS` saw the committed row and
   skipped it instead of failing.
+- Foreign keys are checked under PostgreSQL's locking rules (1.0.30): the check reads the referenced row on a
+  snapshot and holds it `FOR KEY SHARE` until its transaction ends. A parent another transaction inserted and has not
+  committed is not there — 23503 at once, no wait; a parent another transaction deletes, re-keys or holds
+  `FOR UPDATE` makes the check wait, then finds it gone (a committed delete or key change: 23503) or there (a
+  rollback, a released lock); a non-key update and the weaker row locks do not conflict. The other way round, a
+  delete, a key change (an UPDATE of a column of a unique index without predicate or expression locks the row
+  `FOR UPDATE`, any other `FOR NO KEY UPDATE`) or `FOR UPDATE` of a row another transaction's check holds waits for
+  that transaction — a non-key update does not, and carries the lock on to the new version; and the referenced side's
+  check does not see a referencing row another transaction has not committed. A `DEFERRABLE` check runs at COMMIT,
+  which waits like a statement. It used to wait for the uncommitted parent (a statement of a second session inside a
+  transaction that had just inserted the parent hung until cancelled), to write a child over a pending delete or key
+  change at once (an orphan once the delete committed), to let `FOR UPDATE` take a row a check held, and to fail with
+  XX000 a COMMIT whose deferred check had to wait. Under REPEATABLE READ a parent whose delete or key change committed after
+  the transaction's snapshot is not there either (23503; PostgreSQL raises 40001 — the engine models no
+  serialization failure).
 - Roles and privileges are not modelled. `CREATE ROLE`, `GRANT` / `REVOKE`, `SET ROLE` / `RESET ROLE`,
   `DROP OWNED` and the other role statements are accepted and do nothing. A session stays the user it
   connected as (`current_user` is `session_user`), every `has_*_privilege()` check answers true, and
