@@ -5,8 +5,10 @@
 > **Key APIs:** `insert` · `insertBulk` · `insertFrom` · `fromRows` · `upsertBulk` · `mergeBulk` · `where().update()` · `bulkUpdate` · `where().delete()` · `.returning()` · `.affectedCount()` · `insertWithChildren` · `MutationBatch` · `toStatement()` · `db.transaction()` · **Round trips:** 1 per statement; `insertBulk`, `upsertBulk`, `mergeBulk` and `bulkUpdate` send 1 statement per chunk (a chunk is `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows: 39 321 for one column); `insertFrom(fromRows(…))` and a `MutationBatch` are 1 for any row count; `db.transaction()` adds BEGIN and COMMIT
 
 The examples use the test model `AppDatabase` ([Example Model and Seed Data](../example-model.md)), seeded with the
-users `alice`, `bob` and `charlie` and their posts, orders and tasks. Two features need a table the test model lacks: the partial unique
-index examples use a `leases` table and the sequence examples an `invoices` table, both defined where they are used.
+users `alice`, `bob` and `charlie` and their posts, orders and tasks. Three features need a table the test model lacks:
+the partial unique index examples use a `leases` table and the sequence examples an `invoices` table, both defined where
+they are used, and the array-column examples the `books` table of
+[SQL Expression Helpers](./sql-expressions.md#query-array-columns).
 Each SQL block is what its example sent, captured on the in-memory PostgreSQL-compatible database; one statement is
 one round trip. Result comments show the captured run's values: generated ids depend on the statements that ran
 before.
@@ -58,6 +60,7 @@ pattern the **Use** column replaces; the linked sections show the SQL of both wh
 | Rows computed from data in the database | [`insertFrom(subquery, map)`](#insert-rows-computed-from-the-database-insertfrom) | `INSERT … SELECT … FROM (…) AS "src"` · 1 | read, compute in JS, insert (2, racy) |
 | The same change to every matching row | [`where(cond).update(values)`](#update-the-rows-that-match-a-condition-whereupdate) | `UPDATE … SET … WHERE …` · 1 | `where(id).update()` per id (n) |
 | Update or delete by a list of ids | [`where(r => eqAny(r.id, ids))`](#update-the-rows-that-match-a-condition-whereupdate) then `.update()` / `.delete()` | `WHERE ("users"."id" = ANY($2::integer[]))` · 1, one text for any list length | `inArray` with varying lengths (one placeholder per element) |
+| Add one value to (or remove one from) an array column, in place | [`update(b => ({ tags: arrayAppendUnique(b.tags, v) }))` / `arrayRemove(b.tags, v)`](#add-or-remove-one-value-of-an-array-column-arrayappendunique-arrayremove-since-1031) (since 1.0.31) | `SET "tags" = (CASE WHEN CAST($1 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(…) END)` · 1 | read the array, change it in JS, write it back (2, racy) |
 | Each row its own values, matched by key | [`bulkUpdate(rows)`](#update-many-rows-each-with-its-own-values-bulkupdate) | `UPDATE "users" AS t SET … FROM (VALUES …) AS v(…) WHERE t."id" = v."id"` · 1 per chunk | `where(id).update()` per row (n) |
 | Delete by a condition | [`where(cond).delete()`](#delete-rows-wheredelete) | `DELETE FROM … WHERE …` · 1 | a delete per id (n) |
 | The rows a write changed | [`.returning(selector)`](#read-back-what-a-write-changed-returningselector) | `… RETURNING …`; a navigation or collection: `WITH "__mutation__" AS (…) SELECT …` · 1 | a `SELECT` after the write |
@@ -1149,6 +1152,37 @@ UPDATE "tags" SET "name" = upper("tags"."name") WHERE TRUE
   `null` and clears the column. Leave the key out to keep the stored value.
 - `lateralJoin()` (since 1.0.23) and `crossJoinLateral()` cannot be combined with `update()` / `delete()` (refused).
 - A bare `await` resolves `undefined`, not a count: use `.affectedCount()`.
+
+### Add or remove one value of an array column: `arrayAppendUnique()`, `arrayRemove()` (since 1.0.31)
+
+`arrayAppendUnique(column, value)` and `arrayRemove(column, value)` are UPDATE values that change an array column inside
+the statement, from each row's current array: no read-modify-write, and running the statement again changes nothing
+more. The example model has no array column; these use the `books` table (`tags text[]`) and its `library` context
+from [SQL Expression Helpers](./sql-expressions.md#query-array-columns).
+
+```ts
+import { arrayAppendUnique, arrayContainsAll, arrayRemove, eqAny } from 'linkgress-orm';
+
+// Dune (id 1): tags ['novel', 'classic'] · Odes (2): ['poetry'] · Draft (3): NULL
+await library.books.where(b => eqAny(b.id, [1, 3])).update(b => ({ tags: arrayAppendUnique(b.tags, 'classic') }));
+await library.books.where(b => arrayContainsAll(b.tags, ['novel'])).update(b => ({ tags: arrayRemove(b.tags, 'novel') }));
+// Dune: ['classic'] (it held 'classic' already) · Odes: ['poetry'] · Draft: ['classic'] (a NULL array counts as empty)
+```
+
+```sql
+UPDATE "books" SET "tags" = (CASE WHEN CAST($1 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), CAST($2 AS text)) END) WHERE ("books"."id" = ANY($3::integer[]))
+-- params: [ "classic", "classic", "{1,3}" ]
+UPDATE "books" SET "tags" = array_remove("books"."tags", CAST($1 AS text)) WHERE ("books"."tags" @> CAST($2 AS text[]))
+-- params: [ "novel", "{\"novel\"}" ]
+```
+
+- `arrayAppendUnique` appends the value unless the array holds it, and treats a NULL array as empty. A `null` value
+  throws before anything is sent (NULL equals nothing, so it would be appended on every run).
+- `arrayRemove` removes every occurrence of the value; an array without it, and a NULL array, stay as they are.
+- Select the rows by key (`eqAny`), or for a removal by `arrayContainsAll(col, [v])` (`@>`, which a GIN index
+  serves): without `where()` the UPDATE rewrites every row of the table. Both directions in one statement (a
+  `caseWhen` over the two), `null` elements and the element cast:
+  [Change an array in place](./sql-expressions.md#change-an-array-in-place-arrayappendunique-arrayremove-since-1031).
 
 ### Read the row as it was before the update: `old` (PostgreSQL 18)
 
@@ -2391,6 +2425,11 @@ Transaction-scoped advisory locks serialize units of work on a key that is not a
 per partner) without a lock table. They are released at COMMIT or ROLLBACK. Use them before a check-then-write
 (`rowGuard`, `notExists`, a MAX + 1 number); when a unique index plus ON CONFLICT already decides, no lock is needed.
 
+| Keys | Wait until the lock is free | Do not wait: `true` when taken, `false` when another session holds it |
+|---|---|---|
+| one key, or one `(classId, key)` pair | `advisoryXactLock(key)` · `advisoryXactLock(classId, key)` | `tryAdvisoryXactLock(key)` · `tryAdvisoryXactLock(classId, key)` |
+| many keys of one class, one statement | `advisoryXactLockAll(classId, keys)` | [`tryAdvisoryXactLockAll(classId, keys)`](#try-many-keys-without-waiting-tryadvisoryxactlockall-since-1031) (since 1.0.31) |
+
 ```ts
 await db.transaction(async tx => {
   await tx.advisoryXactLock(7, 1001);                  // (classId, key): waits for the lock
@@ -2421,9 +2460,53 @@ UPDATE "users" SET "age" = "age" + 1 WHERE "users"."id" = $1
   deduplicates and sorts the keys (all integers or all strings; strings use `hashtext(t.k)` over `text[]`), so two
   transactions locking overlapping sets cannot deadlock on each other; the order is an SQL guarantee
   (`WITH ORDINALITY … ORDER BY t.ord`). An empty list sends nothing. One round trip for any number of keys.
-- Call all three on the context `db.transaction()` hands you; on the root context they throw before sending
+- Call all four on the context `db.transaction()` hands you; on the root context they throw before sending
   (`advisoryXactLock() takes a TRANSACTION-scoped lock — call it on the context db.transaction() hands you. …`): the
   lock would end with the statement.
+
+#### Try many keys without waiting: `tryAdvisoryXactLockAll()` (since 1.0.31)
+
+`tryAdvisoryXactLockAll(classId, keys)` tries every key without waiting, in ONE statement, and returns whether the
+transaction now holds them all. Use it where a busy key means "leave this unit of work to whoever holds it" (a
+settlement another worker is running) instead of waiting; it replaces one `tryAdvisoryXactLock()` round trip per key.
+
+```ts
+const orderIds = [5, 3, 5, 1];
+const settled = await db.transaction(async tx => {
+  if (!await tx.tryAdvisoryXactLockAll(7, orderIds)) {   // many keys, one statement, no waiting
+    return false;   // another transaction holds one of them
+  }
+  await tx.orders.where(o => eq(o.id, 1)).update({ status: 'processing' });   // every key is ours until COMMIT
+  return true;
+});
+// true
+```
+
+```sql
+WITH RECURSIVE walk(ord, ok) AS (SELECT 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[1])
+UNION ALL SELECT walk.ord + 1, pg_try_advisory_xact_lock($1, (CAST($2 AS integer[]))[walk.ord + 1])
+FROM walk WHERE walk.ok AND walk.ord < cardinality(CAST($2 AS integer[]))) SELECT bool_and(walk.ok) AS "acquired" FROM walk
+-- params: [ 7, "{1,3,5}" ]
+UPDATE "orders" SET "status" = $1 WHERE "orders"."id" = $2
+-- params: [ "processing", 1 ]
+```
+
+- Returns `true` when the transaction holds every key afterwards (keys it already held count: advisory locks are
+  re-entrant), `false` as soon as another session holds one. It never waits.
+- The keys are tried in the order `advisoryXactLockAll` takes them (deduplicated, numbers ascending, strings in
+  code-unit order, each hashed with `hashtext()` in the statement), and the statement stops at the first busy key. The
+  keys tried before it STAY held until the transaction ends (advisory locks are not given back one by one); the keys
+  after it are never tried. Observed with another transaction holding key 3:
+  `tryAdvisoryXactLockAll(7, [1, 3, 5])` returned `false`, and a third session's `tryAdvisoryXactLock(7, 1)` returned
+  `false` (held by the trying transaction) while its `tryAdvisoryXactLock(7, 5)` returned `true`. On `false`, end the
+  transaction (return or throw) unless holding that prefix is harmless.
+- An empty list returns `true` without sending a statement.
+- The statement is a recursive walk over the keys: one step per key, a next step only while the last try succeeded.
+  A shorter `… FROM unnest(…) WHERE NOT pg_try_advisory_xact_lock(…) LIMIT 1` stops at the busy key only through the
+  executor's laziness, which SQL does not promise (the in-memory database evaluates every row before the LIMIT and
+  took the keys after the busy one).
+- Same validation and transaction requirement as `advisoryXactLockAll`: an int4 class id, all keys integers or all
+  strings (`tryAdvisoryXactLockAll: keys must be all integers or all strings`).
 
 ### Lock the rows you read before writing them: `forUpdate()`
 
@@ -2556,6 +2639,11 @@ Verified with `tsc --strict` against the source:
   statement instead of n + 1.
 - **Don't** expect a collection in RETURNING to count the rows the same statement wrote → **Do** read it in a later
   statement: one statement reads one snapshot.
+- **Don't** read an array column, change it in JS and write it back → **Do**
+  `update(b => ({ tags: arrayAppendUnique(b.tags, v) }))` or `arrayRemove(b.tags, v)`: one statement on the row's
+  current array, and a second run changes nothing.
+- **Don't** call `tryAdvisoryXactLock()` once per key of a set → **Do** `tryAdvisoryXactLockAll(classId, keys)`: one
+  statement, the keys in a fixed order; on `false`, end the transaction, as the keys before the busy one stay held.
 - **Don't** call `.catch()` on a builder → **Do** `try { await builder } catch {}` or `Promise.resolve(builder).catch()`.
 
 ## See also
@@ -2566,7 +2654,7 @@ Verified with `tsc --strict` against the source:
 - [Set-Returning Functions](./set-returning-functions.md): `fromRows()` / `unnestRows()` as read sources and in joins.
 - [Batching and Prepared Queries](./batching-and-prepared-queries.md): fewer round trips for reads.
 - [SQL Expressions](./sql-expressions.md): the helpers usable as write values (`add`, `coalesce`, `caseWhen`,
-  `jsonbMerge`, …).
+  `jsonbMerge`, `arrayAppendUnique`, `arrayRemove`, …).
 - [Schema Configuration](./schema-configuration.md): unique and partial indexes, identity columns, sequences, custom
   types and mappers.
 - [Configuration](./configuration.md): `preparedStatements`, `logFailedQueries`, timeouts and other options.

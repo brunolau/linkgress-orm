@@ -837,7 +837,15 @@ Also supported under every strategy (pinned by `tests/queries/collection-navigat
 - collections reached through any chain of navigations, reading the table of the row they hang off, and comparing their items with the root row or an enclosing collection's item;
 - relations of a table to itself (a tree's children, the siblings through the parent);
 - relations keyed on a principal key other than `id` (`withPrincipalKey(c => c.code)`), joined on that key;
-- tables in another schema (`toSchema(…)`), read schema-qualified.
+- tables in another schema (`toSchema(…)`), read schema-qualified;
+- mapped columns of the items (since 1.0.31, `tests/queries/collection-item-mappers.test.ts`): a value compared
+  directly with the column in the collection's `where()` binds through `toDriver` (`gte(p.publishTime, { hour: 12,
+  minute: 0 })` bound `720` under all three), and `min()` / `max()` of the column read through `fromDriver`
+  ([Querying](./guides/querying.md#compare-and-aggregate-the-items-mapped-columns));
+- a `sum()` over a nested `count()` reached through reference navigations of the item (since 1.0.31,
+  `tests/queries/sum-nested-count.test.ts`), e.g. `c.cartDiscountCodes!.sum(cdc => cdc.discountCode!.discount!.discountProducts!.count())`:
+  the summed collection joins the hops inside its own subquery, its CTE body or its temp-table aggregation
+  ([Querying](./guides/querying.md#sum-a-count-over-each-items-related-rows)).
 
 A DISTINCT collection can only be ordered by values it selects (`u.posts!.orderBy(p => p.views).selectDistinct(p => ({ category: p.category }))` is not). Another key is refused, naming it:
 
@@ -853,7 +861,7 @@ A DISTINCT collection can only be ordered by values it selects (`u.posts!.orderB
 - `temptable` fails when every parent key is NULL, races on a `PgClient` pool outside a transaction, and inside `db.transaction()` on `PostgresClient` / `BunClient` / `PGliteClient` returns empty collections or throws (see [Failures reproduced](#failures-reproduced-on-the-harness); `BunClient` was not run, but its transaction client lacks `querySimple()` / `querySimpleMulti()` the same way).
 - Item order without `orderBy()` is unspecified under every strategy; `temptable`'s fast path lists by primary key descending.
 
-> **Pitfall:** list items and `firstOrDefault()` objects travel as JSON under every strategy (`json_agg` / `json_build_object`). An unmapped `timestamp` / `date` column inside an item reads back as its text (`orders.created_at` in `u.orders!.select(o => ({ createdAt: o.createdAt })).toList()` came back as the string `'2026-10-04T15:51:42.018'`, though typed `Date`), a `decimal` as a JS number (`total_amount`: `99.99`; the same column at the top level reads as the driver's string `'99.99'`); columns with a custom mapper go through it. See [Querying](./guides/querying.md).
+> **Pitfall:** list items and `firstOrDefault()` objects travel as JSON under every strategy (`json_agg` / `json_build_object`). An unmapped `timestamp` / `date` column inside an item reads back as its text (`orders.created_at` in `u.orders!.select(o => ({ createdAt: o.createdAt })).toList()` came back as the string `'2026-10-04T15:51:42.018'`, though typed `Date`), a `decimal` as a JS number (`total_amount`: `99.99`; the same column at the top level reads as the driver's string `'99.99'`); columns with a custom mapper go through it, and so (since 1.0.31) does a collection's `min()` / `max()` of such a column. See [Querying](./guides/querying.md).
 
 ## Measure the strategies on your own data
 

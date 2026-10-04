@@ -11,6 +11,7 @@
 - [Read a batch's results: keys, ids and getters](#read-a-batchs-results-keys-ids-and-getters)
 - [Load a page and its total count in one round trip](#load-a-page-and-its-total-count-in-one-round-trip)
 - [Batch a grouped query with other reads](#batch-a-grouped-query-with-other-reads)
+- [Count a union or read its first row in a batch](#count-a-union-or-read-its-first-row-in-a-batch)
 - [Check which queries can be a batch leg](#check-which-queries-can-be-a-batch-leg)
 - [Batch inside a transaction or under a timeout](#batch-inside-a-transaction-or-under-a-timeout)
 - [Name or un-name the batch statement: `withPreparedStatements()`](#name-or-un-name-the-batch-statement-withpreparedstatements)
@@ -30,8 +31,9 @@
 | Need | Use | SQL shape · round trips | Avoid |
 |---|---|---|---|
 | Two or more independent reads for one screen (a row, lists, counts) | `QueryBatch`: `addFirstOrDefault()` / `addList()` / `addCount()`, then `executeBatch()` | one `UNION ALL` statement, one JSON envelope per read · 1 | N sequential `await`s (N round trips); `Promise.all` (N statements on up to N pooled connections) |
-| A page of rows plus the total number of matches | `QueryBatch`: `addList(page)` + `addCount(page)` on the same builder | page leg + `SELECT COUNT(*)` leg · 1; the total stays right past the last page | `Promise.all([page.toList(), q.count()])` (2 statements); `countOver()` when a page can be empty (it reports `totalCount: 0`) |
+| A page of rows plus the total number of matches | `QueryBatch`: `addList(page)` + `addCount(page)` on the same builder (a select or a grouped query; a union's count counts its own paging: count the union without it) | page leg + `SELECT COUNT(*)` leg · 1; the total stays right past the last page | `Promise.all([page.toList(), q.count()])` (2 statements); `countOver()` when a page can be empty (it reports `totalCount: 0`) |
 | A grouped read next to other reads | `addList()` / `addFirstOrDefault()` / `addCount()` of a grouped `select()` | a grouped leg; `addCount()` counts the groups · 1 | a bare `groupBy()` without its `select()` (not accepted) |
+| The count or the first row of a union next to other reads | `addCount(union)` / `addFirstOrDefault(union)` (since 1.0.31) | `SELECT COUNT(*) as count FROM (<union>) as union_count` leg, or the union with `LIMIT 1` · 1 | `union.count()` beside the batch (a second round trip); `addList(union)` and `.length` in JS (ships every row) |
 | One read needs another read's result | one query with navigations or collections ([Querying guide](./querying.md)) | one statement with joins / `LATERAL` / CTEs · 1 under the default `lateral` or the `cte` strategy (`temptable` sends several) | a chain of `await`s feeding ids into the next query |
 | Independent lists of thousands of rows each, pool has free connections | `Promise.all` of `toList()` | N statements, run concurrently · N | `QueryBatch`: aggregating 20 000 rows into JSON cost more than the round trips it saved (see [Measured](#read-several-independent-results-in-one-round-trip-querybatch)) |
 | The same query shape many times with different values | by client ([pick the tool by client](#run-one-query-shape-many-times-pick-the-tool-by-client)): `PgClient`, `BunClient`, `PGliteClient`: `prepare(name)` + `sql.placeholder(name)`, then `execute(values)`; `PostgresClient`: the ordinary builder on a `preparedStatements: true` context, plus `MockRowCache.setEnabled(true)` | the same text on every call · 1 per call | `prepare()` on `PostgresClient` (never named: 2 network round trips per call); rebuilding the builder per call on a hot path without `MockRowCache`; a placeholder in a query run with `toList()` (the server refuses it) or in a batch leg (it can take another leg's value) |
@@ -169,8 +171,8 @@ Each `add*()` call registers a leg under an id that is unique in the batch and r
 | Register | Returns | Read with | Result | What the leg runs |
 |---|---|---|---|---|
 | `addList(query, id)` | `BatchListKey<T>` | `getList(key)` | `T[]`, `[]` when no row matches | the query as built |
-| `addFirstOrDefault(query, id)` | `BatchItemKey<T>` | `getItem(key)` | `T \| null` | the query with `LIMIT 1` (the builder itself keeps its own limit) |
-| `addCount(query, id)` | `BatchCountKey` | `getCount(key)` | `number` | `SELECT COUNT(*)` of the query without its `ORDER BY` / `LIMIT` / `OFFSET` |
+| `addFirstOrDefault(query, id)` | `BatchItemKey<T>` | `getItem(key)` | `T \| null` | the query with `LIMIT 1` (the builder itself keeps its own limit; a union too, since 1.0.31) |
+| `addCount(query, id)` | `BatchCountKey` | `getCount(key)` | `number` | `SELECT COUNT(*)` of the query without its `ORDER BY` / `LIMIT` / `OFFSET`; of a union (since 1.0.31) the statement its `count()` sends, its own `LIMIT` / `OFFSET` counted |
 
 ```ts
 import { eq, QueryBatch } from 'linkgress-orm';
@@ -265,7 +267,7 @@ LIMIT 2 OFFSET 0
 -- params: [20]
 ```
 
-> **Pitfall:** `futureCount()` / `addCount()` of a paged builder counts every match, not the page size. That is what makes the total right; to count the rows of one page, use `getList(key).length`.
+> **Pitfall:** `futureCount()` / `addCount()` of a paged builder counts every match, not the page size. That is what makes the total right; to count the rows of one page, use `getList(key).length`. A union is the exception (since 1.0.31): its count counts its own `LIMIT` / `OFFSET`, as its `count()` does, so register the union without them for the total ([below](#count-a-union-or-read-its-first-row-in-a-batch)).
 
 ## Batch a grouped query with other reads
 
@@ -317,6 +319,107 @@ A batched grouped query reads what its `toList()` / `firstOrDefault()` reads thr
 
 > **Pitfall:** `limit()` on a builder changes that builder (`perUser.limit(1)` above). The count leg ignores the limit, so registering the limited builder for `addList()` and the same builder for `addCount()` is safe; a later `toList()` of `perUser` would read one row.
 
+## Count a union or read its first row in a batch
+
+Since 1.0.31 a union (`union()` / `unionAll()`, of entity, CTE-rooted or set queries) has all three future factories: `future()` for `addList()`, `futureFirstOrDefault()` for `addFirstOrDefault()` and `futureCount()` for `addCount()`. Its count and its first row then ride the batch's one round trip instead of a `count()` / `firstOrDefault()` of their own (before 1.0.31, `batch.addCount(union, id)` threw `query.futureCount is not a function`).
+
+```ts
+import { eq, QueryBatch } from 'linkgress-orm';
+
+// users who wrote a post or placed an order, once each (UNION removes the duplicates)
+const participants = () => db.posts
+  .select(p => ({ userId: p.userId }))
+  .union(db.orders.select(o => ({ userId: o.userId })));
+
+const batch = new QueryBatch();
+const totalKey = batch.addCount(participants(), 'participants');                                  // every row
+const lastKey = batch.addFirstOrDefault(participants().orderBy(r => [[r.userId, 'DESC']]), 'last');
+const pageCountKey = batch.addCount(participants().orderBy(r => r.userId).limit(1), 'pageCount'); // its LIMIT counted
+const userKey = batch.addFirstOrDefault(db.users.where(u => eq(u.id, 2)).select(u => ({ id: u.id, username: u.username })), 'user');
+await batch.executeBatch();
+
+batch.getCount(totalKey);       // 2
+batch.getItem(lastKey);         // { userId: 2 }
+batch.getCount(pageCountKey);   // 1
+batch.getItem(userKey);         // { id: 2, username: 'bob' }
+```
+
+```sql
+SELECT 0 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+  SELECT COUNT(*) as count FROM ((SELECT "posts"."user_id" as "userId"
+  FROM "posts")
+  UNION
+  (SELECT "orders"."user_id" as "userId"
+  FROM "orders")) as union_count
+) __batch_q
+UNION ALL
+SELECT 1 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+  (SELECT "posts"."user_id" as "userId"
+  FROM "posts")
+  UNION
+  (SELECT "orders"."user_id" as "userId"
+  FROM "orders")
+  ORDER BY "userId" DESC
+  LIMIT 1
+) __batch_q
+UNION ALL
+SELECT 2 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+  SELECT COUNT(*) as count FROM ((SELECT "posts"."user_id" as "userId"
+  FROM "posts")
+  UNION
+  (SELECT "orders"."user_id" as "userId"
+  FROM "orders")
+  ORDER BY "userId" ASC
+  LIMIT 1) as union_count
+) __batch_q
+UNION ALL
+SELECT 3 AS __batch_ix, coalesce(json_agg(row_to_json(__batch_q)), '[]'::json) AS __batch_items FROM (
+  SELECT "users"."id" as "id", "users"."username" as "username"
+  FROM "users"
+  WHERE "users"."id" = $1
+  LIMIT 1
+) __batch_q
+-- params: [2]
+```
+
+- `futureCount()` (behind `addCount()`) is the statement the union's `count()` sends: `SELECT COUNT(*) as count FROM (<the union, its WITH included>) as union_count`, with the union's own `ORDER BY` / `LIMIT` / `OFFSET`, so a paged union counts its page (`pageCount` is `1`). A select's or a grouped query's count drops them; for the total of a paged union, register the union without `limit()` / `offset()`.
+- `futureFirstOrDefault()` (behind `addFirstOrDefault()`) is `firstOrDefault()`: the `LIMIT 1` is the future's, the builder keeps its own paging, and the row reads as `future()`'s rows do (by the first leg's projection).
+- Both run alone too (`execute()`) and through `FutureQueryRunner.runAsync()`; `getSql()` returns the statement without sending it (`participants().orderBy(r => r.userId).limit(1).futureCount().getSql()` is the count leg 2 above).
+- A union of CTE-rooted or set legs is a leg like any union: the count of `db.selectFromCte(cte).select(…).unionAll(db.tags.select(…))` carries the CTE's `WITH` inside the count's subquery (verified, beside a `db.selectFromSet(…)` union read as a first row in the same batch).
+
+A union whose legs declare a data-modifying CTE (`withMutation()`) is refused as a count and as a first row, before anything is sent: a batch reads every leg as a subquery, where PostgreSQL allows no data-modifying `WITH` (0A000), and the batch would run the write as a side effect of a read. Run its `count()` / `firstOrDefault()`, a statement of its own:
+
+```ts
+import { DbCteBuilder, eq, QueryBatch } from 'linkgress-orm';
+
+const builder = new DbCteBuilder();
+const touched = builder.withMutation('touched', db.users
+  .where(u => eq(u.username, 'alice'))
+  .update({ age: 26 })
+  .toStatement(u => ({ id: u.id })));
+const touchedIds = db.selectFromCte(touched.cte).select(r => ({ id: r.id }))
+  .unionAll(db.selectFromCte(touched.cte).select(r => ({ id: r.id })));
+
+new QueryBatch().addCount(touchedIds, 'touched');
+// throws: futureCount(): the union's legs declare the data-modifying CTE "touched" — a future is read as a subquery
+// by a QueryBatch, where a data-modifying WITH is not allowed (it must lead its statement). Run count() for it: a
+// statement of its own.
+const n = await touchedIds.count();   // 2: a statement of its own, the WITH at its top
+```
+
+```sql
+WITH "touched" AS (UPDATE "users" SET "age" = $1 WHERE "users"."username" = $2 RETURNING "id" AS "id")
+SELECT COUNT(*) as count FROM ((SELECT "touched"."id" as "id"
+FROM "touched")
+UNION ALL
+(SELECT "touched"."id" as "id"
+FROM "touched")) as union_count
+-- params: [26, "alice"]
+```
+
+- `futureFirstOrDefault()` / `addFirstOrDefault()` throw the same way (`futureFirstOrDefault(): … Run firstOrDefault() for it: a statement of its own.`).
+- `future()` (behind `addList()`) is not refused: the batch statement is sent, and PostgreSQL refuses it with 0A000 `WITH clause containing a data-modifying statement must be at the top level` (the in-memory database answers the same). Read such a union with `toList()`.
+
 ## Check which queries can be a batch leg
 
 A leg is any query that has the future factory its adder calls: `future()` for `addList()`, `futureFirstOrDefault()` for `addFirstOrDefault()`, `futureCount()` for `addCount()`.
@@ -326,9 +429,9 @@ A leg is any query that has the future factory its adder calls: `future()` for `
 | A table (`db.tags`): every column of every row | yes | yes | yes |
 | `where()` / `orderBy()` / `limit()` builders, `select()` projections, `innerJoin()` / `leftJoin()` | yes | yes | yes |
 | A grouped `select()` (after `groupBy()`), a grouped join | yes | yes | yes |
-| `union()` / `unionAll()` | yes | no | no |
+| `union()` / `unionAll()`, also of CTE-rooted and set legs | yes | yes (since 1.0.31) | yes (since 1.0.31) |
 | A bare `groupBy()` without its `select()` | no | no | no |
-| `selectFromCte()` / `selectFromSet()` roots (no future API: run them on their own) | no | no | no |
+| `selectFromCte()` / `selectFromSet()` roots (no future API: run them on their own; their `union()` / `unionAll()` is a union, row above) | no | no | no |
 
 ```ts
 import { eq, gt, QueryBatch } from 'linkgress-orm';
@@ -363,16 +466,15 @@ The type checker refuses the other sources:
 // fragment: each line under a @ts-expect-error is a compile error (checked with tsc); do not run these
 import { DbCteBuilder, gt, QueryBatch } from 'linkgress-orm';
 
-const union = db.users.select(u => ({ name: u.username })).unionAll(db.tags.select(t => ({ name: t.name })));
 const b2 = new QueryBatch();
-// @ts-expect-error a union has future() only: addList, never addCount / addFirstOrDefault
-b2.addCount(union, 'n');
 // @ts-expect-error a bare groupBy() is not a source: project it with select() first
 b2.addList(db.posts.select(p => ({ userId: p.userId })).groupBy(r => ({ userId: r.userId })), 'g');
 const top = new DbCteBuilder().with('top_posts', db.posts.where(p => gt(p.views, 120)).select(p => ({ id: p.id, title: p.title })));
 // @ts-expect-error a selectFromCte() root has no future API: run it on its own
 b2.addList(db.selectFromCte(top.cte).select(r => ({ id: r.id })), 'cte');
 ```
+
+A union compiles for all three adders since 1.0.31 (`b2.addCount(union, 'n')` and `b2.addFirstOrDefault(union, 'first')` were compile errors before; see [Count a union or read its first row in a batch](#count-a-union-or-read-its-first-row-in-a-batch)).
 
 The five legs (a table, a count, a join, a union, a projection with a nested object and a collection) are one statement:
 
@@ -685,9 +787,9 @@ WHERE "posts"."views" > $1
 |---|---|---|---|
 | `future()` | `FutureQuery<T>` | `T[]` | the query as built |
 | `futureFirstOrDefault()` | `FutureSingleQuery<T>` | `T \| null` | the query with `LIMIT 1`; the builder keeps its own limit |
-| `futureCount()` | `FutureCountQuery` | `number` | `SELECT COUNT(*)` without the query's `ORDER BY` / `LIMIT` / `OFFSET` |
+| `futureCount()` | `FutureCountQuery` | `number` | `SELECT COUNT(*)` without the query's `ORDER BY` / `LIMIT` / `OFFSET`; of a union, `SELECT COUNT(*) as count FROM (<the union>) as union_count` with its `LIMIT` / `OFFSET` |
 
-All three have `getSql(): string` and `getParams(): any[]`. The type guards `isFutureQuery()`, `isFutureSingleQuery()` and `isFutureCountQuery()` tell them apart; the types `AnyFutureQuery`, `FutureQueryResult<F>` and `FutureQueryResults<Fs>` describe them. Tables (every column), `where()` / `select()` / join builders and grouped selects have all three factories; a union has `future()` only; CTE-rooted and set queries have none (use their `toSql()` / `toList()`).
+All three have `getSql(): string` and `getParams(): any[]`. The type guards `isFutureQuery()`, `isFutureSingleQuery()` and `isFutureCountQuery()` tell them apart; the types `AnyFutureQuery`, `FutureQueryResult<F>` and `FutureQueryResults<Fs>` describe them. Tables (every column), `where()` / `select()` / join builders, grouped selects and unions have all three factories (a union's `futureFirstOrDefault()` and `futureCount()` since 1.0.31, refused when its legs declare a data-modifying CTE); CTE-rooted and set queries have none (use their `toSql()` / `toList()`).
 
 > **Pitfall:** a future is frozen when it is built: a later `limit(1)` on its builder does not change it (verified). It is also bound to the context it was built on: a future built on `db` and executed inside `db.transaction()` runs OUTSIDE the transaction (it counted 3 tags while the transaction's own future counted 4, its uncommitted insert included); a future built on `tx` and executed after the transaction throws `TransactionEndedError` without sending anything.
 
@@ -1150,6 +1252,8 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "
 - **Don't** mix legs from `db` and `tx`, or add a leg with its own `withTimeout()` / `withPreparedStatements()` / `expectedExecutionTime()`, or a `withQueryOptions()` leg that gets an executor of its own (an executor option, or any `withQueryOptions()` on a context with logging, slow-query detection or `preparedStatements`). **Do** build every leg from one context; bound the batch with `db.transaction(fn, { timeoutMs })`. Mixed legs throw before anything is sent.
 - **Don't** reuse a `QueryBatch` after `executeBatch()`. **Do** create a new batch per round: the second call throws.
 - **Don't** use `countOver()` when a requested page can lie past the end. **Do** batch `addList(page)` + `addCount(page)`: `countOver()` read `totalCount: 0` for `OFFSET 10` while 3 rows matched.
+- **Don't** register a paged union for `addCount()` expecting its total. **Do** count the union without `limit()` / `offset()`: a union's count (since 1.0.31) counts its own paging (`limit(1)` counted 1 of 2 rows), unlike a select's.
+- **Don't** batch a union whose legs declare a data-modifying CTE. **Do** run its `count()`, `firstOrDefault()` or `toList()` on its own: `addCount()` / `addFirstOrDefault()` throw before anything is sent, and an `addList()` leg makes PostgreSQL refuse the whole batch statement (0A000).
 - **Don't** expect `FutureQueryRunner.runAsync()` to be one round trip for parameterised futures, on `PgClient` or in a transaction. **Do** use `QueryBatch`, which is one statement with parameters on every client.
 - **Don't** call `runAsync([...])` without `as const`. **Do** pass the array `as const` so each result keeps its own type.
 - **Don't** put `sql.placeholder()` in a query run with `toList()`, `future()` or a batch: the statement is sent and refused (`there is no parameter $1`, or `bind message supplies … parameters` when the query binds other values), and in a batch whose later leg binds a value the placeholder silently takes that value. **Do** `prepare()` it and `execute()` it with values; in a batch, use plain values.

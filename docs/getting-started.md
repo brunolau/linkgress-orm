@@ -419,7 +419,8 @@ Their SQL and NULL rules: [Querying](./guides/querying.md).
 ## Aggregate per group: `select().groupBy().select()`
 
 `groupBy()` is called on a projection; the second `select()` reads the key and the aggregates
-(`count()`, `sum()`, `min()`, `max()`, `avg()`). This is also the way to an average per parent row.
+(`count()`, `sum()`, `min()`, `max()`, `avg()`, and since 1.0.31 `countDistinct()` and the list `arrayAgg()`).
+This is also the way to an average per parent row.
 
 ```ts
 const avgViews = await db.posts

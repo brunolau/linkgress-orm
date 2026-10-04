@@ -774,6 +774,15 @@ lateral SQL of collections) can be memoised because schemas do not change after 
 switch, off by default, turns on all three caches. The SQL and the results are identical either way
 (verified); the CPU and garbage per query build drop.
 
+A mock-row prototype holds what its builder read of the model: column names, relations, mappers. Since 1.0.31 its
+cache key carries the model, the `DbContext` subclass, besides the table (and the navigation path): every instance of
+one context class shares the prototypes, and two context classes that name a table alike each build their own. Before
+1.0.31 the key was the table name, so with the cache on the second class's rows read the first class's columns,
+relations and mappers. Verified with two context classes whose `members` entity maps the property `name` to different
+columns: with `ShopA`'s prototypes cached, `ShopA` rendered `"members"."name"` and `ShopB` `"members"."full_name"`, and a
+second `ShopB` instance added no entry. A context built on the internal schema-first `DataContext` still shares by
+table name.
+
 ```ts
 import { LateralSqlCache, MockRowCache, NavigationPathCache } from 'linkgress-orm';
 
@@ -788,7 +797,7 @@ MockRowCache.reset();              // tests: drop its entries AND switch all thr
 
 | Cache | Memoises | Bound (beyond it, builds run uncached) | `reset()` |
 |---|---|---|---|
-| `MockRowCache` | mock-row prototypes per signature | 2,000 entries | drops entries and switches all three caches off |
+| `MockRowCache` | mock-row prototypes per signature: the model (the `DbContext` class, since 1.0.31), the table, the navigation path | 2,000 entries | drops entries and switches all three caches off |
 | `NavigationPathCache` | the navigation-path search | 5,000 entries across all contexts; the count falls only on `NavigationPathCache.reset()` (a dropped context's entries are garbage-collected but stay counted) | drops entries only |
 | `LateralSqlCache` | the rendered SQL of each lateral collection shape | 2,000 entries | drops entries only |
 
@@ -828,7 +837,7 @@ custom mapper returns `{ hour: 9, minute: 30 }`.
 
 | Key | Returns | Applied by | Not applied by |
 |---|---|---|---|
-| `disableMappers` | raw driver values, collection items included; bound values still go through `toDriver` (`eq(p.publishTime, { hour: 9, minute: 30 })` still binds `570`) | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; a union (through its first leg); `future()` and `QueryBatch` legs; a `prepare()`d query's `execute()` | grouped selects; CTE- and set-rooted queries; a table's own `toList()`, `first()`, `firstOrDefault()` |
+| `disableMappers` | raw driver values, collection items included, and a collection's `min()` / `max()` of a mapped column (which reads through the mapper since 1.0.31); bound values still go through `toDriver` (`eq(p.publishTime, { hour: 9, minute: 30 })` still binds `570`) | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; a union (through its first leg); `future()` and `QueryBatch` legs; a `prepare()`d query's `execute()` | grouped selects; CTE- and set-rooted queries; a table's own `toList()`, `first()`, `firstOrDefault()` |
 | `rawResult` | the driver's rows: no mapping, no nested-object reconstruction (a collection stays what the driver made of its JSON); the TypeScript result type stays the mapped one | `toList()`, `first()`, `firstOrDefault()`, `countOver()`; a `prepare()`d query's `execute()` | unions; `future()` and `QueryBatch` legs; grouped selects; CTE- and set-rooted queries; a table's own `toList()`, `first()`, `firstOrDefault()` |
 | `traceTime` | a per-phase summary on `'timing'`: total, query build, query execution, result processing, rows, and detailed entries over 0.1 ms | `toList()`, `first()`, `firstOrDefault()`, `countOver()` | `count()`, `exists()`, a `prepare()`d query's `execute()`, unions, futures, grouped selects, CTE- and set-rooted queries, a table's own reads |
 

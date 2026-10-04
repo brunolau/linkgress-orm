@@ -631,6 +631,9 @@ UNION ALL
   start it with `db.selectFromSet()`, or embed it. Entity legs mix with set legs:
   `db.selectFromSet(unnest(['dave'], 'text'), 'n').select(n => ({ name: n.value })).union(db.users.where(u => eq(u.id, 1)).select(u => ({ name: u.username })))`
   returns `[{ name: 'dave' }, { name: 'alice' }]`.
+- A set query itself has no future API, but a union of one is a union: it joins a `QueryBatch` as a list, a first
+  row or a count (the last two since 1.0.31; see
+  [Batching](./batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch)).
 - A set query is a CTE body (since 1.0.29):
   `new DbCteBuilder().with('wanted', fromSet(unnest(['alice', 'bob'], 'text'), 'n').select(n => ({ name: n.value })))`
   renders `WITH "wanted" AS (SELECT "n"."value" as "name" FROM unnest(CAST($1 AS text[])) AS "n"("value"))`. See

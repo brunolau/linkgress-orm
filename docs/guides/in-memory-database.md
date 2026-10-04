@@ -400,6 +400,65 @@ only once its plan turns generic.
   into another join first. The check runs when the join runs: a FULL JOIN in a subquery that never runs
   is not refused (PostgreSQL plans it), one in an unreferenced CTE is not refused on either.
 
+### Aggregates that read only an outer query's columns (refused since 1.0.31)
+
+PostgreSQL evaluates an aggregate in the query of the LOWEST-level columns its aggregated arguments, ORDER BY keys and
+FILTER read: in `SELECT u.username, (SELECT sum(u.age) FROM posts p …) FROM users u` the `sum()` reads only `u`, so it
+is an aggregate of the OUTER query, grouped and evaluated there. The engine evaluates every aggregate in the query it
+is written in and models no outer-level aggregates, so it refuses one (`0A000`). Before 1.0.31 it answered in place,
+with another result than PostgreSQL's and no error. On the [example model](../example-model.md):
+
+```ts
+import { agg, eq } from 'linkgress-orm';
+
+// sum() reads only u.age, a column of the outer query: refused in memory
+await db.users
+  .select(u => ({
+    username: u.username,
+    ageSum: db.posts.where(p => eq(p.userId, u.id)).select(() => agg.sum(u.age)).asSubquery('scalar'),
+  }))
+  .toList();
+
+// the ORDER BY key p.id is a column of the subquery's own table: an aggregate of its own query, on both engines
+const names = await db.users
+  .select(u => ({
+    username: u.username,
+    names: db.posts.where(p => eq(p.userId, u.id)).select(p => agg.arrayAgg(u.username, { orderBy: [[p.id, 'ASC']] })).asSubquery('scalar'),
+  }))
+  .orderBy(u => u.username)
+  .toList();
+// [{ username: 'alice', names: ['alice', 'alice'] }, { username: 'bob', names: ['bob'] }, { username: 'charlie', names: null }]
+```
+
+```sql
+SELECT "users"."username" as "username", (SELECT sum("users"."age")
+FROM "posts"
+WHERE "posts"."user_id" = "users"."id") as "ageSum"
+FROM "users"
+-- error: aggregate function sum() reads only columns of an outer query: outer-level aggregates are not supported by the in-memory database
+
+SELECT "users"."username" as "username", (SELECT array_agg("users"."username" ORDER BY "posts"."id" ASC)
+FROM "posts"
+WHERE "posts"."user_id" = "users"."id") as "names"
+FROM "users"
+ORDER BY "username" ASC
+```
+
+- The error carries SQLSTATE `0A000`, the detail `PostgreSQL evaluates such an aggregate in the outer query whose
+  columns it reads, not in the subquery it is written in.` and the hint `Make the aggregate read a column of its own
+  query — for example join the table it means to read inside that subquery.`
+- PostgreSQL 18 (observed on PGlite) answers the first statement with 42803 (`column "users.username" must appear in
+  the GROUP BY clause or be used in an aggregate function`), and `SELECT (SELECT sum(u.age) FROM posts p WHERE p.id = 1)
+  FROM users u`, which projects no other outer column, with ONE row: the sum over all users (`105`). The engine before
+  1.0.31 returned a row per user for both.
+- One column of the aggregate's own query among its aggregated arguments, ORDER BY keys or FILTER makes it an aggregate
+  of that query, answered as PostgreSQL answers it (each observed identical on both): `array_agg(u.username ORDER BY
+  p.id)`, `sum(u.age) FILTER (WHERE p.views > 100)`, `sum(u.age + p.views)`. An aggregate that reads no column
+  (`count(*)`, `sum(1)`) and a window aggregate (`sum(u.age) OVER ()`) belong to their own query too.
+- Through the ORM the shape comes from an `agg.*` fragment over an outer column in a scalar subquery, as above, and from
+  a collection summand that reads nothing of the collection it sums: `u.posts!.sum(_p => u.orders!.count())` is refused
+  the same way (PostgreSQL: 42803).
+
 ### Transactions, locks and constraints
 
 - Data-modifying CTEs run in the order the main query first reads them (the rest after it), on the
@@ -535,6 +594,9 @@ and `to_tsvector()` raised `0A000` `in-memory engine: function … is not implem
   `fork()` per test (2.9 ms against tens of ms of DDL and seed).
 - **Don't** depend on the order of an unordered result → **Do** add `orderBy()`; neither engine
   guarantees it.
+- **Don't** aggregate only an outer query's columns inside a subquery (`agg.sum(u.age)` in a scalar subquery over
+  `posts`) → **Do** aggregate a column of the subquery's own table, or compute the value in the outer query. PostgreSQL
+  makes such an aggregate the outer query's (42803, or one row); the engine refuses it with `0A000` since 1.0.31.
 
 ## See also
 

@@ -310,7 +310,7 @@ const overSql = new BunClient(new Bun.SQL('postgres://postgres:password@localhos
 
 | | default (prepared, binary results) | `prepare: false` (unnamed statements, text results) |
 |---|---|---|
-| `supportsBinaryArrayResults()` | `false`: collections aggregate with `json_agg` instead of `array_agg` | `true`: `array_agg` kept |
+| `supportsBinaryArrayResults()` | `false`: collections aggregate with `json_agg` instead of `array_agg`, and a projected `agg.arrayAgg()` or `g.arrayAgg()` (since 1.0.31) travels as JSON too ([SQL Expression Helpers](./guides/sql-expressions.md#aggregate-inside-an-expression-agg)) | `true`: `array_agg` kept |
 | Scaled numeric zero (`0.0000::numeric(20,4)`) | read as `"0"`; restored for columns declared with a scale | `"0.0000"` |
 | Multidimensional array result | fails: `ERR_POSTGRES_MULTIDIMENSIONAL_ARRAY_NOT_SUPPORTED_YET` (read it as text, or use `prepare: false`) | `[[1, 2], [3, 4]]` |
 | Cost | – | a re-parse per query (about 0.05 ms, per the client's source) |

@@ -10,7 +10,7 @@
 npm install linkgress-orm
 ```
 
-- Current version: 1.0.30. The package ships CommonJS (`dist/index.js`, ES2020) with type
+- Current version: 1.0.31. The package ships CommonJS (`dist/index.js`, ES2020) with type
   declarations; `package.json` requires Node.js 16 or later. It also runs under Bun.
 - No database driver is a hard dependency. `pg`, `postgres` and `@electric-sql/pglite` are optional
   peer dependencies (`^8.0.0`, `^3.0.0`, `^0.5.0`): install the one whose client you construct.
@@ -170,7 +170,7 @@ linkgress-orm itself does:
 ```json
 {
   "dependencies": {
-    "linkgress-orm": "^1.0.30"
+    "linkgress-orm": "^1.0.31"
   },
   "peerDependencies": {
     "@electric-sql/pglite": "^0.5.0",

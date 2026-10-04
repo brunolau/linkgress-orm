@@ -875,7 +875,7 @@ WHERE "posts"."views" > $1) AS "popular" ON "users"."id" = "popular"."userId"
 ```
 
 - **The alias is the 4th argument** and is required (the typings demand it; without it the call throws `Alias is required when joining a subquery`). `Subquery.as(alias)` sets an alias no join reads.
-- **Columns read through the body's own mappers.** A CTE-rooted body declares its `WITH` inside the parentheses, or once at statement level when the executing query declares the CTE with `.with(cte)` ([CTE guide](./cte-guide.md)); a set body (`fromSet(unnestZip(…), 'z').asSubquery('table')`) joins JS tuples bound as one array parameter per column ([Set-returning functions](./set-returning-functions.md)).
+- **Columns read through the body's own mappers.** A CTE-rooted body declares its `WITH` inside the parentheses, or once at statement level when the executing query declares the CTE with `.with(cte)` ([CTE guide](./cte-guide.md)); a set body (`fromSet(unnestZip(…), 'z').asSubquery('table')`) joins JS tuples bound as one array parameter per column ([Set-returning functions](./set-returning-functions.md)). One exception: a collection's `min()` / `max()` of a mapped column (`firstSlot: u.posts!.min(p => p.publishTime)` in the body) reads through the mapper in the body's own query since 1.0.31, but as a column of the joined subquery it is the stored value (`570`, verified), as it is through a CTE ([CTE guide](./cte-guide.md#how-a-ctes-columns-read-back)).
 - **A 1:N derived table duplicates outer rows**, like any join. To filter only, use `exists` / `inSubquery`.
 - **No subquery as the FROM root.** For a query rooted at a derived relation use a CTE and `db.selectFromCte()`, or `db.selectFromSet()` for a set.
 
@@ -1259,6 +1259,7 @@ A projected scalar subquery is typed by its value: `db.users.select(u => ({ id: 
 
 | Version | Change |
 |---|---|
+| 1.0.31 | A collection's `min()` / `max()` of a mapped column reads through the column's mapper where its query projects it (before: the stored value); read back as a column of a joined `'table'` subquery or a CTE it is still the stored value. |
 | 1.0.29 | A projected scalar subquery of ONE column reads like that column: a text column's `'0042'` stays text, a mapped column goes through its mapper (before: `'0042'` read as `42`, a mapped column as its stored value). |
 | 1.0.9 | Added `eqAnySubquery` / `neAllSubquery`, `Subquery.asExpression()`, [aliased scopes](./aliased-scopes.md), and a `'scalar'` Subquery operand for the comparison operators (before: `isNull(subquery)` rendered `"[object Object]" IS NULL`, `eq(column, subquery)` bound the Subquery object as a parameter, and `gt(u.posts!.count(), 1)` rendered `"[object Object]" > $1`). |
 | 1.0.9 | A projected subquery's outer navigations are joined (before: `missing FROM-clause entry for table "user"`); a subquery in a collection's item renders in parentheses (before: it was bound as a parameter and the item read back the serialized Subquery object); a subquery's navigation path takes its own alias (before: it read the query's join of the same name, silently). |

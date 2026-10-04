@@ -666,6 +666,10 @@ WHERE (CAST($1 AS text) = ANY("posts"."tags"))
 -- params: [ "sql" ]
 ```
 
+Filter on an array column with the array helpers (`arrayContains`, `arrayContainsAll`, `arrayOverlaps`, …) and add or
+remove one value in an UPDATE with `arrayAppendUnique()` / `arrayRemove()` (since 1.0.31):
+[Query array columns](./sql-expressions.md#query-array-columns).
+
 ### Name any other SQL type: `new ColumnBuilder<T>(name, sqlType)`
 
 For types without a factory (`inet`, `interval`, `citext`, `vector(3)`, …) construct the builder yourself; `T` is the
@@ -1905,6 +1909,14 @@ WHERE "posts"."publish_time" = $1
 
 SELECT "publish_time" FROM "posts" ORDER BY "id" LIMIT 1
 ```
+
+A mapped column of a collection's item (since 1.0.31): a value compared directly with the bare column inside the
+collection's `where()` binds through `toDriver`, and the collection's `min()` / `max()` of the bare column read through
+`fromDriver`. On the docs model, `u.posts!.where(p => eq(p.publishTime, { hour: 9, minute: 30 })).exists()` binds `570`
+and `u.posts!.max(p => p.customDate)` reads a `Date`; before 1.0.31 the object was bound as written and the stored
+number came back. An expression over an item column keeps no mapper (`gt(add(p.publishTime, 60), 1000)` inside the
+collection binds `60` and `1000` as written), and `sum()` / `count()` read numbers. Collections in queries:
+[Querying](./querying.md).
 
 Helpers: `applyToDriver(mapper, value)`, `applyFromDriver(mapper, value)`, `applyFromDriverArray(mapper, values)`,
 `identityMapper`.

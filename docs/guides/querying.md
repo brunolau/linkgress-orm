@@ -9,8 +9,11 @@ data: users `alice` (age 25), `bob` (35) and `charlie` (45, inactive); alice wro
 views), bob one (200 views), charlie none. Navigations used below: `posts.user` (required),
 `tasks.level` → `taskLevels.createdBy` (optional), `postComments.post` / `.order`, `orderTasks.task` /
 `.order`. Collections: `users.posts`, `users.orders`, `posts.postComments`, `orders.orderTasks`,
-`products.productPrices` / `.productTags` (every table, column and seed row:
-[Example Model and Seed Data](../example-model.md)). Every SQL block was captured from the in-memory
+`products.productPrices` / `.productTags`, and `carts.cartDiscountCodes`, whose items reach
+`discountCode` → `discount` → the collection `discountProducts`. Mapped columns: `posts.publishTime`
+(`{ hour, minute }` stored as minutes, `{ hour: 9, minute: 30 }` is `570`) and `posts.customDate` (a `Date`
+stored as seconds); every table, column and seed row:
+[Example Model and Seed Data](../example-model.md). Every SQL block was captured from the in-memory
 PostgreSQL-compatible database; each statement in a block is one round trip and `$n` are bound parameters.
 
 ## Contents
@@ -63,6 +66,7 @@ PostgreSQL-compatible database; each statement in a block is one round trip and 
 | A page and the total | `countOver()` or a `QueryBatch` | `COUNT(*) OVER()` or one `UNION ALL` · 1 | `Promise.all([toList(), count()])` · 2 |
 | Several totals of one set | `select(p => ({ n: agg.count(), total: agg.sum(p.views) })).firstOrDefault()` | one aggregate row · 1 | builder `sum()` / `min()` / `max()` · 1 each |
 | Statistics per key | `select(…).groupBy(…).select(…)` | `GROUP BY` · 1 | grouping rows in JS |
+| Each group's members as a list, a distinct count per key | `g.arrayAgg(r => r.id)`, `g.countDistinct(r => r.userId)` in the grouped `select()` (since 1.0.31) | `array_agg(…)`, `count(DISTINCT …)` per group · 1 | folding the grouped rows into lists in JS |
 | A related row's columns | `p.user!.username` inside `select()` | one `JOIN` per hop · 1 | a lookup per row |
 | Each row's children | `u.posts!.select(…).toList()` inside `select()` | `LEFT JOIN LATERAL (… json_agg …)` · 1 | a query per parent row (N+1) |
 | Several independent reads | `QueryBatch` | one `UNION ALL` statement · 1 | sequential `await`s · N |
@@ -1284,7 +1288,8 @@ LIMIT 2 OFFSET 0
 
 When a requested page may be empty (deep links, deleted rows), read the page and the count in one
 [`QueryBatch`](#read-several-independent-results-in-one-round-trip-querybatch): the count leg ignores the page's ORDER BY,
-LIMIT and OFFSET, so the same builder serves both legs.
+LIMIT and OFFSET, so the same builder serves both legs. (Not for a union: its count counts its own LIMIT / OFFSET,
+so register the union without them for the count.)
 
 ```ts
 import { QueryBatch } from 'linkgress-orm';
@@ -1879,9 +1884,167 @@ ORDER BY "users"."id" ASC
 > instead ([Join per-key aggregates computed once](#join-per-key-aggregates-computed-once)).
 
 > **Pitfall:** `sum()` / `min()` / `max()` are typed `number | null` for every column: `max()` of a timestamp
-> reads a `Date`, of a text column a string. After `select()` on a collection, `count()`, `exists()`,
-> `min()`, `max()` and `sum()` are typed `Promise<…>` although they produce plain values: call them before
-> `select()`.
+> reads a `Date`, of a text column a string, of a column with a custom mapper the mapped value (since 1.0.31,
+> [below](#compare-and-aggregate-the-items-mapped-columns)). After `select()` on a collection, `count()`,
+> `exists()`, `min()`, `max()` and `sum()` are typed `Promise<…>` although they produce plain values: call them
+> before `select()`.
+
+### Compare and aggregate the items' mapped columns
+
+A column of a collection's item with a custom mapper (`hasCustomMapper()`; in the example model `Post.publishTime`,
+`{ hour, minute }` stored as minutes, and `Post.customDate`, a `Date` stored as seconds) goes through its mapper in
+two places (since 1.0.31): a value compared directly with the bare column in the collection's `where()` is bound
+through `toDriver`, and `min()` / `max()` of the bare column read back through `fromDriver`.
+
+```ts
+import { between, exists, gte } from 'linkgress-orm';
+
+const schedule = await db.users
+  .orderBy(u => u.id)
+  .select(u => ({
+    username: u.username,
+    afternoonPosts: u.posts!.where(p => gte(p.publishTime, { hour: 12, minute: 0 })).count(),   // binds 720
+    firstSlot: u.posts!.min(p => p.publishTime),   // { hour: 9, minute: 30 }; typed number | null
+    lastDate: u.posts!.max(p => p.customDate),     // a Date
+  }))
+  .toList();
+// alice: { afternoonPosts: 1, firstSlot: { hour: 9, minute: 30 }, lastDate: new Date('2024-01-16T10:00:00.000Z') }
+// charlie: { afternoonPosts: 0, firstSlot: null, lastDate: null }
+
+const onTheSixteenth = await db.users
+  .where(u => exists(u.posts!.where(p => between(p.customDate, new Date('2024-01-16T00:00:00Z'), new Date('2024-01-17T00:00:00Z')))))
+  .select(u => u.username)
+  .toList();   // ['alice']
+```
+
+```sql
+SELECT "users"."username" as "username", (SELECT COALESCE(COUNT(*), 0)
+FROM "posts" "lateral_0_posts"
+WHERE "lateral_0_posts"."user_id" = "users"."id" AND "lateral_0_posts"."publish_time" >= $1) as "afternoonPosts", (SELECT COALESCE(MIN("lateral_1_posts"."publish_time"), null)
+FROM "posts" "lateral_1_posts"
+WHERE "lateral_1_posts"."user_id" = "users"."id") as "firstSlot", (SELECT COALESCE(MAX("lateral_2_posts"."custom_date"), null)
+FROM "posts" "lateral_2_posts"
+WHERE "lateral_2_posts"."user_id" = "users"."id") as "lastDate"
+FROM "users"
+ORDER BY "users"."id" ASC
+-- params: [ 720 ]
+
+SELECT "users"."username"
+FROM "users"
+WHERE EXISTS (SELECT 1 FROM "posts"
+WHERE "posts"."user_id" = "users"."id" AND "posts"."custom_date" BETWEEN $1 AND $2)
+-- params: [ -30326400, -30240000 ]
+```
+
+| Written over a mapped column of the item | Through the mapper | Example (alice's posts: 570 and 840 stored) |
+|---|---|---|
+| A value compared directly with the bare column in the collection's `where()`: `eq` / `ne` / `gt` / `gte` / `lt` / `lte` / `like` …, `between`, `inArray` / `notInArray`, `eqAny` / `neAll` and the `…Opt` forms; in `exists()` / `notExists()`, a projected collection, a collection reached through navigations or nested in another, under every strategy | bound through `toDriver` | `gte(p.publishTime, { hour: 12, minute: 0 })` binds `720` |
+| `min()` / `max()` of the bare column, also of one reached through the item's navigation (`max(p => p.user!.lastActiveAt)`) | read through `fromDriver`: in a root projection, in a collection's items, in a mutation's RETURNING, in a `QueryBatch` | `{ hour: 9, minute: 30 }`, a `Date` |
+| A list of the bare column (`select(p => p.publishTime).toList()`) | read through `fromDriver`, as before 1.0.31 | `[{ hour: 9, minute: 30 }, { hour: 14, minute: 0 }]` |
+| An expression over the column (`coalesce`, `add` / `sub` / `mul` / `div`, `greatest` / `least` / `nullIf`, `caseOf`, `caseWhen`, an `sql` template), in the filter or in the projection; `min()` / `max()` of an expression | no: its plain operands bind as written, it reads the stored value | ``max(p => sql`${p.publishTime} + 60`)`` reads `900` |
+| `sum()` / `count()` | no: numbers | `sum(p => p.publishTime)` reads `1410` |
+| A `min()` / `max()` read as a column of a CTE or of a joined table subquery | no: the stored value | `570` ([CTE guide](./cte-guide.md#how-a-ctes-columns-read-back)) |
+
+Captured: an expression, a sum and a filter over an expression read and bind the stored values; the list of the
+bare column reads mapped.
+
+```ts
+import { eq, gt, sql } from 'linkgress-orm';
+
+const alice = await db.users
+  .where(u => eq(u.username, 'alice'))
+  .select(u => ({
+    shifted: u.posts!.max(p => sql<number>`${p.publishTime} + 60`),                   // 900: the stored 840 + 60
+    total: u.posts!.sum(p => p.publishTime),                                          // 1410: 570 + 840
+    late: u.posts!.where(p => gt(sql<number>`${p.publishTime} + 60`, 700)).count(),   // 700 bound as written
+    times: u.posts!.orderBy(p => p.id).select(p => p.publishTime).toList(),           // mapped, as before 1.0.31
+  }))
+  .firstOrDefault();
+// { shifted: 900, total: 1410, late: 1, times: [{ hour: 9, minute: 30 }, { hour: 14, minute: 0 }] }
+```
+
+```sql
+SELECT (SELECT COALESCE(MAX("lateral_0_posts"."publish_time" + 60), null)
+FROM "posts" "lateral_0_posts"
+WHERE "lateral_0_posts"."user_id" = "users"."id") as "shifted", (SELECT COALESCE(SUM("lateral_1_posts"."publish_time"), null)
+FROM "posts" "lateral_1_posts"
+WHERE "lateral_1_posts"."user_id" = "users"."id") as "total", (SELECT COALESCE(COUNT(*), 0)
+FROM "posts" "lateral_2_posts"
+WHERE "lateral_2_posts"."user_id" = "users"."id" AND "lateral_2_posts"."publish_time" + 60 > $1) as "late", COALESCE("lateral_3".data, '[]'::json) as "times"
+FROM "users"
+LEFT JOIN LATERAL (SELECT json_agg(
+  json_build_object('publish_time', "publish_time")
+) as data
+FROM (
+  SELECT "lateral_3_posts"."publish_time" as "publish_time"
+  FROM "posts" "lateral_3_posts"
+  WHERE "lateral_3_posts"."user_id" = "users"."id"
+  ORDER BY "lateral_3_posts"."id" ASC
+) sub) "lateral_3" ON true
+WHERE "users"."username" = $2
+LIMIT 1
+-- params: [ 700, "alice" ]
+```
+
+At the root an expression over a mapped column does inherit its mapper (see [`coalesce()`](#default-a-null-coalesce));
+in a collection's item it does not, a difference older than 1.0.31 and kept by it. `disableMappers` turns both
+conversions off, as it does every read.
+
+> **Pitfall:** pass the application value, never the stored one. Since 1.0.31 `eq(p.publishTime, 570)` in a
+> collection's `where()` (the stored minutes, which 1.0.30 bound as written) goes through `toDriver` and fails:
+> `invalid input syntax for type smallint: "NaN"`. Before 1.0.31 the comparison above bound the object itself and
+> failed (`invalid input syntax for type smallint: "{"hour":12,"minute":0}"`), and `min()` / `max()` read the
+> stored value (`570`, `-30290400`): drop any mapping of the raw extreme done by hand.
+
+> **Pitfall:** `min()` / `max()` stay typed `number | null` whatever the column holds; type the mapped value
+> yourself (`firstSlot as unknown as { hour: number; minute: number } | null`).
+
+### Sum a count over each item's related rows
+
+`sum()` also sums a count of a collection of the item: reached directly (`u.posts!.sum(p => p.postComments!.count())`)
+or through reference navigations of the item (since 1.0.31), with a filter of its own:
+
+```ts
+import { eq } from 'linkgress-orm';
+
+const carts = await db.carts
+  .orderBy(c => c.id)
+  .select(c => ({
+    uuid: c.uuid,
+    // per applied code: the products its discount covers (code → discount, two reference hops)
+    coveredProducts: c.cartDiscountCodes!.sum(cdc => cdc.discountCode!.discount!.discountProducts!.count()),
+    // the summand's own filter
+    hardbackCover: c.cartDiscountCodes!.sum(cdc => cdc.discountCode!.discount!.discountProducts!.where(dp => eq(dp.productId, 1)).count()),
+  }))
+  .toList();
+// [{ uuid: 'cart-uuid-a', coveredProducts: 3, hardbackCover: 2 }, { uuid: 'cart-uuid-b', coveredProducts: 1, hardbackCover: 1 }]
+```
+
+```sql
+SELECT "carts"."uuid" as "uuid", (SELECT COALESCE(SUM((SELECT COALESCE(COUNT(*), 0)
+FROM "discount_products" "lateral_1_discountProducts"
+WHERE "lateral_1_discountProducts"."discount_id" = "discount"."id")), null)
+FROM "cart_discount_codes" "lateral_0_cartDiscountCodes"
+LEFT JOIN "discount_codes" "discountCode" ON "lateral_0_cartDiscountCodes"."discount_code_id" = "discountCode"."id"
+  LEFT JOIN "discounts" "discount" ON "discountCode"."discount_id" = "discount"."id"
+WHERE "lateral_0_cartDiscountCodes"."cart_id" = "carts"."id") as "coveredProducts", (SELECT COALESCE(SUM((SELECT COALESCE(COUNT(*), 0)
+FROM "discount_products" "lateral_3_discountProducts"
+WHERE "lateral_3_discountProducts"."discount_id" = "discount"."id" AND "lateral_3_discountProducts"."product_id" = $1)), null)
+FROM "cart_discount_codes" "lateral_2_cartDiscountCodes"
+LEFT JOIN "discount_codes" "discountCode" ON "lateral_2_cartDiscountCodes"."discount_code_id" = "discountCode"."id"
+  LEFT JOIN "discounts" "discount" ON "discountCode"."discount_id" = "discount"."id"
+WHERE "lateral_2_cartDiscountCodes"."cart_id" = "carts"."id") as "hardbackCover"
+FROM "carts"
+ORDER BY "carts"."id" ASC
+-- params: [ 1 ]
+```
+
+The count is a correlated subquery reading the hop it hangs off (`"discount"."id"`); the summed collection joins the
+summand's hops inside its own subquery, under the `lateral`, `cte` and `temptable` strategies, at the top level and
+nested in a list. A parent without items reads `null`, as any `sum()`.
+
+> **Pitfall:** before 1.0.31 the hop was never joined: the statement above failed with `missing FROM-clause entry
+> for table "discount"` (42P01, captured on 1.0.30). A summand directly on the item always worked.
 
 ### Filter or order parents by their children
 
@@ -2430,7 +2593,8 @@ LIMIT 1
 - The select builder's `sum()` / `min()` / `max()` ignore `orderBy()`, `limit()`, `offset()` and DISTINCT
   (`.orderBy(…).limit(1).sum(…)` still summed all three posts: `'450'`) but honour `where()`. Their selector must
   return a column: an `sql` expression throws `Aggregation selector must return a field reference`. A mapped
-  column's MAX comes back unmapped.
+  column's MAX comes back unmapped (`db.posts.select(p => ({ t: p.publishTime })).max(r => r.t)` read `1125`, still
+  on 1.0.31), unlike a collection's `max()`, which reads through the mapper since 1.0.31.
 - Project only aggregates and constants: a plain column next to them fails in PostgreSQL
   (`column "posts.user_id" must appear in the GROUP BY clause or be used in an aggregate function`). Group by
   it instead.
@@ -2520,7 +2684,9 @@ the same over it.
 ### Aggregates per group
 
 `g.count()`, `g.sum()`, `g.avg()`, `g.min()` and `g.max()`; the argument is a column of the projection or an
-SQL expression over it (``g.max(r => sql`length(${r.title})`)``, ``g.sum(r => sql`${r.views} * 2`)``).
+SQL expression over it (``g.max(r => sql`length(${r.title})`)``, ``g.sum(r => sql`${r.views} * 2`)``). The list
+and distinct aggregates `g.arrayAgg()` / `g.countDistinct()` (since 1.0.31) have a
+[section of their own](#list-a-groups-members-and-count-distinct-values-garrayagg-gcountdistinct).
 
 - COUNT reads as a number (`CAST(COUNT(*) AS INTEGER)`: a group of more than 2,147,483,647 rows fails with
   `integer out of range`); SUM and AVG read as numbers, cast to `DOUBLE PRECISION` (inexact for large
@@ -2592,6 +2758,110 @@ GROUP BY "orders"."user_id"
 ORDER BY "userId" ASC
 ```
 
+### List a group's members and count distinct values: `g.arrayAgg()`, `g.countDistinct()`
+
+`g.arrayAgg(r => …, { distinct?, orderBy? })` and `g.countDistinct(r => …)` (since 1.0.31) aggregate a column or
+expression of the grouped row: the members of each group as a list, and the number of distinct values. Use them
+instead of reading the rows and folding them per key in JS. (`agg.arrayAgg()` in a grouped select reads the grouping
+key only.)
+
+```ts
+const perAuthor = await db.posts
+  .select(p => ({ userId: p.userId, id: p.id, views: p.views, category: p.category, time: p.publishTime }))
+  .groupBy(r => ({ userId: r.userId }))
+  .select(g => ({
+    userId: g.key.userId,
+    postIds: g.arrayAgg(r => r.id, { orderBy: [[r => r.views, 'DESC']] }),   // number[]
+    slots: g.arrayAgg(r => r.time, { orderBy: [r => r.time] }),              // { hour, minute }[]: through the mapper
+    categories: g.countDistinct(r => r.category),                            // number
+    posts: g.count(),
+  }))
+  .orderBy(r => r.userId)
+  .toList();
+// [{ userId: 1, postIds: [2, 1], slots: [{ hour: 9, minute: 30 }, { hour: 14, minute: 0 }], categories: 1, posts: 2 },
+//  { userId: 2, postIds: [3], slots: [{ hour: 18, minute: 45 }], categories: 1, posts: 1 }]
+```
+
+```sql
+SELECT "posts"."user_id" as "userId", array_agg("posts"."id" ORDER BY "posts"."views" DESC) as "postIds",
+  array_agg("posts"."publish_time" ORDER BY "posts"."publish_time" ASC) as "slots", count(DISTINCT "posts"."category") as "categories",
+  CAST(COUNT(*) AS INTEGER) as "posts"
+FROM "posts"
+GROUP BY "posts"."user_id"
+ORDER BY "userId" ASC
+```
+
+Over an expression key the operands become columns of the subquery that computes the key (`"__arg<n>"`, one per
+column or expression however many selectors select it):
+
+```ts
+const perDay = await db.posts
+  .select(p => ({ publishedAt: p.publishedAt, title: p.title, views: p.views, userId: p.userId }))
+  .groupBy(r => ({ day: dateTrunc('day', r.publishedAt) }))
+  .select(g => ({
+    day: g.key.day,
+    titles: g.arrayAgg(r => r.title, { orderBy: [[r => r.views, 'DESC']] }),
+    authors: g.countDistinct(r => r.userId),
+  }))
+  .toList();
+// [{ day: <the seed day, a Date>, titles: ['Bob Post', 'Alice Post 2', 'Alice Post 1'], authors: 2 }]
+```
+
+```sql
+SELECT "q1"."day" as "day", array_agg("q1"."__arg0" ORDER BY "q1"."__arg1" DESC) as "titles", count(DISTINCT "q1"."__arg2") as "authors"
+FROM (SELECT date_trunc('day', "posts"."published_at") as "day", "posts"."title" as "__arg0", "posts"."views" as "__arg1", "posts"."user_id" as "__arg2"
+FROM "posts") "q1"
+GROUP BY "day"
+```
+
+Both work in `having()`; `distinct: true` lists each value once:
+
+```ts
+const shared = await db.posts
+  .select(p => ({ category: p.category, userId: p.userId, id: p.id }))
+  .groupBy(r => ({ category: r.category }))
+  .having(g => gt(g.countDistinct(r => r.userId), 1))
+  .select(g => ({
+    category: g.key.category,
+    authorIds: g.arrayAgg(r => r.userId, { distinct: true, orderBy: [[r => r.userId, 'DESC']] }),
+    postIds: g.arrayAgg(r => r.id, { orderBy: [r => r.id] }),
+  }))
+  .toList();
+// [{ category: 'tech', authorIds: [2, 1], postIds: [1, 2, 3] }]
+```
+
+```sql
+SELECT "posts"."category" as "category", array_agg(DISTINCT "posts"."user_id" ORDER BY "posts"."user_id" DESC) as "authorIds",
+  array_agg("posts"."id" ORDER BY "posts"."id" ASC) as "postIds"
+FROM "posts"
+GROUP BY "posts"."category"
+HAVING count(DISTINCT "posts"."user_id") > $1
+-- params: [ 1 ]
+```
+
+- `g.arrayAgg()` renders `array_agg([DISTINCT] … [ORDER BY …])`: one element per row of the group, a NULL value
+  too (`g.arrayAgg(r => r.subtitle)` read `[null, null]` for alice), each read like the column, through its mapper.
+  A group has at least one row, so the list is never NULL.
+- `orderBy` takes selectors over the grouped row, each alone (ascending) or as `[selector, 'ASC' | 'DESC']`; without
+  it the list is in no particular order.
+- `g.countDistinct()` renders `count(DISTINCT …)`: the distinct non-NULL values, a number.
+- The selector returns a column of the grouped row (also one read through a navigation) or an `sql` expression of
+  it. A constant or a nested aggregate is refused where the call is written: `g.arrayAgg(): the selector returned the
+  constant 5 — it must return a column or an sql expression of the grouped row.`, `g.countDistinct(): the selector
+  returned an aggregate — aggregate function calls cannot be nested.`
+- With `distinct: true` the list can be ordered by the aggregated value only: `g.arrayAgg(r => r.userId, { distinct:
+  true, orderBy: [r => r.views] })` (with `views` projected) throws `g.arrayAgg(): with distinct, the list can be
+  ordered by the aggregated value only — …` before anything is sent (PostgreSQL would answer 42P10).
+- They also work inside `sql` expressions of the projection, as a CTE body, a joined table subquery and a
+  `QueryBatch` member (`future()`, `futureFirstOrDefault()`, `futureCount()`).
+- A grouping key named `__arg<n>` no longer collides with a generated operand column (42702 before 1.0.31): the
+  generated names skip it.
+
+> **Pitfall:** postgres.js hands an unquoted NULL element of any native array to the element's parser (`'NULL'`,
+> `NaN`) where node-postgres, Bun, PGlite and the in-memory database read `null`. On `PostgresClient`, aggregate a
+> nullable column with `g.arrayAgg()` only when its NULLs are filtered out before grouping (`agg.arrayAgg()` has the
+> same caveat).
+
 <a id="having"></a>
 
 ### Filter groups: `having()`
@@ -2624,7 +2894,8 @@ HAVING (COUNT(*) > $1 AND (SUM("posts"."views") > $2 OR MIN("posts"."title") < $
 
 Any condition works: `and` / `or` / `not`, `between`, `inArray`, `isNull`, an aggregate on either side of a
 comparison (`gt(g.max(r => r.views), g.min(r => r.views))`), a grouping key (`eq(g.key.userId, 7)`), an `sql`
-fragment (``sql`${g.count()} > ${5}` ``), an aggregate of a navigation column. `having()` can be called before
+fragment (``sql`${g.count()} > ${5}` ``), an aggregate of a navigation column, a distinct count
+(`gt(g.countDistinct(r => r.userId), 1)`, since 1.0.31, [above](#list-a-groups-members-and-count-distinct-values-garrayagg-gcountdistinct)). `having()` can be called before
 or after `select()`, and repeatedly: the conditions are ANDed. Its callback runs when the query is built, over
 the same group the projection reads.
 
@@ -2867,6 +3138,11 @@ UNION
 (SELECT "users"."username" as "name"
 FROM "users")) as union_count
 ```
+
+A union also joins a `QueryBatch` as a list (`future()`), a first row (`futureFirstOrDefault()`) or a count
+(`futureCount()`), the last two since 1.0.31: its count is the statement `count()` sends above, the union's own
+`LIMIT` / `OFFSET` counted, and both are refused when the legs declare a data-modifying CTE. See
+[Count a union or read its first row in a batch](./batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch).
 
 > **Efficiency:** `UNION` sorts or hashes to remove duplicates; `UNION ALL` appends.
 
@@ -3601,10 +3877,13 @@ the others in a [`QueryBatch`](#read-several-independent-results-in-one-round-tr
 
 ## Read several independent results in one round trip: `QueryBatch`
 
-`QueryBatch` runs independent reads of one context — lists (`addList`: a select, a union or a grouped query),
-first rows (`addFirstOrDefault`) and counts (`addCount`) of selects and grouped queries — as ONE `UNION ALL`
-statement of per-query JSON envelopes; each read is planned on its own and reads back the values it reads on
-its own. Every leg must run on the same context: a leg with an executor of its own (`withTimeout()`,
+`QueryBatch` runs independent reads of one context — lists (`addList`), first rows (`addFirstOrDefault`) and
+counts (`addCount`) of selects, grouped queries and unions (a union as a first row or a count since 1.0.31) — as
+ONE `UNION ALL` statement of per-query JSON envelopes; each read is planned on its own and reads back the values it
+reads on its own. A union's count counts its own `LIMIT` / `OFFSET`, as its `count()` does; a select's or a grouped
+query's count leaves them out. A union whose legs declare a data-modifying CTE is refused as a first row or a
+count ([details](./batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch)). Every leg
+must run on the same context: a leg with an executor of its own (`withTimeout()`,
 `withPreparedStatements()`, `expectedExecutionTime()`) is refused — set prepared-statement use for the whole
 statement with `batch.withPreparedStatements(bool)`. A batch executes once: `executeBatch()` twice, or `add*()`
 after it, throws. Rules, futures and `FutureQueryRunner`:
@@ -3713,6 +3992,13 @@ WHERE "users"."id" = $1
   use `agg.sum()`. node-postgres delivers `'99.99'`; the builder's `sum()` returns `'450'`.
 - **Don't** list union legs' keys in different orders → **Do** write every leg in the same order. Legs match by
   position and silently swap same-typed values.
+- **Don't** register one paged union for both `addList()` and `addCount()` of a `QueryBatch` expecting the total →
+  **Do** count the union without its `limit()` / `offset()`. A union's count counts them (a select's ignores them).
+- **Don't** compare a mapped column of a collection's item with its stored value (`eq(p.publishTime, 570)`) →
+  **Do** pass the application value (`{ hour: 9, minute: 30 }`). Since 1.0.31 it is bound through `toDriver`, and
+  the stored value becomes `NaN` (`invalid input syntax for type smallint: "NaN"`).
+- **Don't** map a collection's `min()` / `max()` of a mapped column by hand → **Do** read it as it comes: since
+  1.0.31 it arrives mapped. A CTE or table-subquery column computed from it still holds the stored value.
 - **Don't** put an aggregate next to a plain column without `groupBy()` → **Do** group by the column. PostgreSQL
   rejects it (`must appear in the GROUP BY clause`).
 - **Don't** read a grouped `sql` expression over aggregates without a mapper → **Do** add `.mapWith(Number)`. It

@@ -2,7 +2,7 @@
 
 > **For agents:** Which typed helper writes a given SQL expression (cast, literal, bound parameter, CASE, NULL handling, string, math, date/time, JSONB, array column, aggregate, window), what SQL does it render, and what JS value comes back?
 > **Use this page when:** a projection, filter, sort key, group key or UPDATE value needs more than a plain column, or you are about to write a raw `sql` template. **Look elsewhere when:** comparing a column with values (`eq`, `inArray`, `like`, regex, flags, accent-insensitive search) → [Querying](./querying.md); turning an array or a JSON document into rows → [Set-returning functions](./set-returning-functions.md)
-> **Key APIs:** `cast` · `castAsInt` · `literal` · `param` · `caseWhen` · `coalesce` · `concatWs` · `round` · `add` · `dateTrunc` · `jsonbPathText` · `jsonbContains` · `jsonbSet` · `arrayContainsAll` · `agg` · `win` · `withReadType` · **Round trips:** none of their own: a helper renders inside the statement that uses it.
+> **Key APIs:** `cast` · `castAsInt` · `literal` · `param` · `caseWhen` · `coalesce` · `concatWs` · `round` · `add` · `dateTrunc` · `jsonbPathText` · `jsonbContains` · `jsonbSet` · `arrayContainsAll` · `arrayAppendUnique` · `agg` · `win` · `withReadType` · **Round trips:** none of their own: a helper renders inside the statement that uses it.
 
 Every helper is exported from `linkgress-orm`. The expression helpers return an `SqlFragment`; `jsonbArraySome()`
 returns a `Condition`, and `caseOf()` returns a builder that becomes a fragment at its first `.when()`. The examples run
@@ -50,6 +50,7 @@ number it had there.
 | Rows relative to the server clock | `subInterval(currentTimestamp(), { days: 7 })` | `(CURRENT_TIMESTAMP - CAST($1 AS interval))` · 0 extra | interval text spliced into an `sql` template |
 | Filter JSON documents by content | `jsonbContains(doc, { plan: 'pro' })` · `jsonbHasKey(doc, 'k')` | `@>`, `?` · GIN-indexable | `jsonbArraySome()` / `jsonbPathExists()` for what `@>` expresses: no index use |
 | Filter an array column by its elements | `arrayContainsAll(col, [v])` · `arrayOverlaps(col, list)` | `@>`, `&&` · GIN-indexable | `arrayContains(col, v)` on a large table: `= ANY(col)` uses no GIN index |
+| Add one value to an array column, or remove one, in place | `arrayAppendUnique(col, v)` · `arrayRemove(col, v)` in `update(r => …)` (since 1.0.31) | `(CASE WHEN … = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), …) END)` · `array_remove(…)` · 1 round trip | SELECT the array, change it in JS, UPDATE: 2 round trips and a lost-update window |
 | Several statistics of one filtered set | one `select()` of `agg.*` fragments | 1 statement, 1 row | one `count()` / `sum()` call per number: 1 round trip each |
 | Number or rank rows, top N per group | `win.rowNumber().over({ partitionBy, orderBy })`, filtered through a CTE | `row_number() OVER (…)` · 1 statement | loading every row to rank it in JS |
 | An expression no helper covers | an `sql` template + `.withReadType()` / `.mapWith()` | as written · 0 extra | `sql.raw()` with user input: SQL injection |
@@ -179,7 +180,7 @@ A projected value reads back by one of these rules; the helper decides which:
 | `agg.min()` / `agg.max()` | through the operand's mapper; a JS number for a numeric or int8 operand; else as delivered |
 | `agg.arrayAgg()` | an array; each element through the operand's mapper |
 | `agg.jsonAgg()` / `agg.jsonbAgg()`, the JSON builders | the driver-parsed JSON, no per-element mapping |
-| A fragment without a mapper: an `sql` template, a scalar subquery's `asExpression()`, a predicate helper (`jsonbContains`, `arrayIsEmpty`, `isDistinctFrom`, …), `jsonbSelect` / `jsonbSelectText`, `jsonbMerge`, `currentTimestamp()` and its siblings, `coalesce` and the arithmetic helpers when no operand carries a mapper | the generic conversion: a numeric-looking string becomes a number (`'007'` → `7`); NULL is `undefined` at the top level of a projection and `null` inside a nested object |
+| A fragment without a mapper: an `sql` template, a scalar subquery's `asExpression()`, a predicate helper (`jsonbContains`, `arrayIsEmpty`, `isDistinctFrom`, …), `jsonbSelect` / `jsonbSelectText`, `jsonbMerge`, `arrayAppendUnique` / `arrayRemove`, `currentTimestamp()` and its siblings, `coalesce` and the arithmetic helpers when no operand carries a mapper | the generic conversion: a numeric-looking string becomes a number (`'007'` → `7`); NULL is `undefined` at the top level of a projection and `null` inside a nested object |
 | The same fragment in a grouped select (`groupBy(…).select(…)`) | the driver's value as delivered: int8 / numeric as strings, NULL as `null` |
 
 `.withReadType(pgType)` makes a fragment read the way a COLUMN of `pgType` reads, with no change to the SQL.
@@ -1083,6 +1084,62 @@ WHERE ("books"."tags" && CAST($5 AS text[]))
   [Querying](./querying.md). To read an array's elements as rows, use `unnest` in
   [Set-returning functions](./set-returning-functions.md).
 
+### Change an array in place: arrayAppendUnique(), arrayRemove() (since 1.0.31)
+
+`arrayAppendUnique(col, value)` and `arrayRemove(col, value)` are values for the SET of an UPDATE: the statement computes
+the new array from each row's current one, so there is no read-modify-write, and running it twice changes nothing more.
+In a `select()` they preview the change without writing.
+
+| Helper (over `books`) | Renders | Result |
+|---|---|---|
+| `arrayAppendUnique(b.tags, 'classic')` | `(CASE WHEN CAST($1 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), CAST($2 AS text)) END)` | the array with the value appended, unless it holds it already; a NULL array counts as empty (`{classic}`) |
+| `arrayRemove(b.ratings, 4)` | `array_remove("books"."ratings", CAST($1 AS integer))` | every element equal to the value removed; an array without it unchanged; a NULL array stays NULL |
+| `arrayRemove(b.tags, null)` | `array_remove("books"."tags", CAST(NULL AS text))` | the NULL elements removed |
+
+```ts
+import { arrayAppendUnique, arrayRemove, eqAny } from 'linkgress-orm';
+
+// Dune: tags ['novel', 'classic'], ratings [5, 4, 4] · Odes: ['poetry'], [] · Draft: NULL, NULL
+const bookIds = [1, 2, 3];
+await library.books.where(b => eqAny(b.id, bookIds)).update(b => ({ tags: arrayAppendUnique(b.tags, 'classic') }));
+await library.books.where(b => eqAny(b.id, bookIds)).update(b => ({ ratings: arrayRemove(b.ratings, 4) }));
+// tags:    Dune ['novel', 'classic'] (held it) · Odes ['poetry', 'classic'] · Draft ['classic'] (NULL counts as empty)
+// ratings: Dune [5] (both 4s removed) · Odes [] · Draft NULL (stays NULL)
+// the first statement once more: every row keeps its tags
+```
+
+```sql
+UPDATE "books" SET "tags" = (CASE WHEN CAST($1 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), CAST($2 AS text)) END) WHERE ("books"."id" = ANY($3::integer[]))
+-- params: [ "classic", "classic", "{1,2,3}" ]
+
+UPDATE "books" SET "ratings" = array_remove("books"."ratings", CAST($1 AS integer)) WHERE ("books"."id" = ANY($2::integer[]))
+-- params: [ 4, "{1,2,3}" ]
+```
+
+Both directions in one UPDATE: a `caseWhen` picks the helper per row.
+
+```ts
+// from the rows above as seeded: Dune ['novel', 'classic'] → ['novel'] · Odes ['poetry'] → ['poetry', 'classic']
+await library.books
+  .where(b => eqAny(b.id, [1, 2]))
+  .update(b => ({ tags: caseWhen(eq(b.id, 1), arrayRemove(b.tags, 'classic')).else(arrayAppendUnique(b.tags, 'classic')) }));
+```
+
+```sql
+UPDATE "books" SET "tags" = CASE WHEN "books"."id" = $1 THEN array_remove("books"."tags", CAST($2 AS text)) ELSE (CASE WHEN CAST($3 AS text) = ANY("books"."tags") THEN "books"."tags" ELSE array_append(COALESCE("books"."tags", CAST('{}' AS text[])), CAST($4 AS text)) END) END WHERE ("books"."id" = ANY($5::integer[]))
+-- params: [ 1, "classic", "classic", "classic", "{1,2}" ]
+```
+
+- A plain value is ONE parameter cast to the column's element type when the column ref carries its type
+  (`CAST($1 AS text)`); `arrayAppendUnique` binds it twice (the test and the append) and casts the empty array to the
+  column's type (`CAST('{}' AS text[])`).
+- `arrayAppendUnique(col, null)` throws before anything is sent: `arrayAppendUnique(): the value is null — NULL equals
+  nothing, so it would be appended on every call`.
+- In a projection the result reads as the driver delivers the array, and a NULL array as `undefined` at the top level,
+  like any fragment without a mapper.
+- Select the rows to change by key, or for a removal with `arrayContainsAll(col, [v])` (`@>`, GIN-indexable): without
+  `where()` the UPDATE rewrites every row of the table ([Inserts, updates and upserts](./insert-update-guide.md#add-or-remove-one-value-of-an-array-column-arrayappendunique-arrayremove-since-1031)).
+
 ## Aggregate inside an expression: agg
 
 `agg.*` returns aggregates as fragments. A `select()` of them without `groupBy()` aggregates the whole filtered set
@@ -1248,6 +1305,13 @@ GROUP BY "orders"."user_id"
 ORDER BY "userId" ASC
 -- params: [ "completed", 1, 0 ]
 ```
+
+To list a non-key column's values per group, or count its distinct values, use the grouped row's own aggregates
+(since 1.0.31): `g.arrayAgg(r => r.col, { distinct?, orderBy? })` and `g.countDistinct(r => r.col)`. Over
+`groupBy(r => ({ userId: r.userId }))`, `g.arrayAgg(r => r.id, { orderBy: [[r => r.id, 'DESC']] })` renders
+`array_agg("posts"."id" ORDER BY "posts"."id" DESC)` (each element read through the column's mapper) and
+`g.countDistinct(r => r.customDate)` renders `count(DISTINCT "posts"."custom_date")`, in a projection and in
+`having()`. They are described with GROUP BY in [Querying](./querying.md).
 
 - `.filter(cond)` appends `FILTER (WHERE …)` with the condition bare (`and()` / `or()` keep their own parentheses); a
   second `.filter()` is ANDed with the first, and a collection's `exists()` is a valid condition
@@ -1501,6 +1565,10 @@ SELECT username, email FROM users WHERE age >= $1 ORDER BY id
   node-postgres sends a JS array as a PostgreSQL array literal: `invalid input syntax for type json`.
 - **Don't** filter a large table with `arrayContains(col, v)` → **Do** `arrayContainsAll(col, [v])`. `= ANY(col)` is
   not GIN-indexable; `@>` is.
+- **Don't** read an array column, add or remove a value in JS and write the array back → **Do**
+  `update(r => ({ col: arrayAppendUnique(r.col, v) }))` / `arrayRemove(r.col, v)`: one statement on the row's current
+  array, and a second run changes nothing. `arrayAppendUnique(col, null)` throws: remove NULL elements with
+  `arrayRemove(col, null)`.
 - **Don't** use `jsonbArraySome()` / `jsonbPathExists()` for exact matches → **Do** `jsonbContains()`. Of the operators
   these helpers emit, only `@>` / `?` / `?|` / `?&` are served by a GIN index.
 - **Don't** project a plain column next to `agg.*` without `groupBy()` → **Do** project only aggregates, or group.
@@ -1518,6 +1586,8 @@ SELECT username, email FROM users WHERE age >= $1 ORDER BY id
 
 ## Version notes
 
+- 1.0.31 added `arrayAppendUnique()` and `arrayRemove()`, and the grouped row's `g.arrayAgg()` / `g.countDistinct()`
+  ([Querying](./querying.md)).
 - 1.0.21 added `win.rowNumber()`, `win.rank()`, `win.denseRank()`.
 - 1.0.9 added `param`, `literalOf`, `concatStrict`, `modulo`, `jsonbValueText`, `jsonBuildObject` /
   `jsonBuildArray`, `agg`, `withReadType()` and the regex form of `substring()`, and made every helper render as one

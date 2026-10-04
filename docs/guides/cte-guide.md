@@ -203,6 +203,40 @@ INNER JOIN "post_times" ON ("posts"."id" = "post_times"."postId" AND "post_times
   one `FieldRef`, so reach into it in a condition with a cast: `eq((t.meta as any).title, 'x')`.
 - A table subquery (`query.asSubquery('table')`, joined with an alias) reads its columns the same way.
 
+One exception: a collection's `min()` / `max()` of a mapped column. Since 1.0.31 the body's own query reads it
+through the column's mapper (`{ hour: 9, minute: 30 }`); read back as a column of the CTE, or of a joined table
+subquery, it is the stored value:
+
+```ts
+import { DbCteBuilder } from 'linkgress-orm';
+
+const firstSlots = new DbCteBuilder().with('first_slots', db.users.select(u => ({
+  userId: u.id,
+  firstSlot: u.posts!.min(p => p.publishTime),   // at the root of this query: { hour: 9, minute: 30 }
+})));
+
+const rows = await db.selectFromCte(firstSlots.cte)
+  .select(r => ({ userId: r.userId, firstSlot: r.firstSlot }))
+  .orderBy(r => r.userId)
+  .toList();
+// [{ userId: 1, firstSlot: 570 }, { userId: 2, firstSlot: 1125 }, { userId: 3, firstSlot: null }]: the stored minutes
+```
+
+```sql
+WITH "first_slots" AS (SELECT "users"."id" as "userId", (SELECT COALESCE(MIN("lateral_0_posts"."publish_time"), null)
+  FROM "posts" "lateral_0_posts"
+  WHERE "lateral_0_posts"."user_id" = "users"."id") as "firstSlot"
+  FROM "users")
+SELECT "first_slots"."userId" as "userId", "first_slots"."firstSlot" as "firstSlot"
+FROM "first_slots"
+ORDER BY "userId" ASC
+```
+
+Map such a column where it is read, or compute it in a grouped body, whose `g.min()` / `g.max()` keep their mapper
+through the CTE: with
+`db.posts.select(p => ({ userId: p.userId, t: p.publishTime })).groupBy(r => ({ userId: r.userId })).select(g => ({ userId: g.key.userId, first: g.min(r => r.t) }))`
+as the body, `first` read back as `{ hour: 9, minute: 30 }` (see [Querying](./querying.md#aggregates-per-group)).
+
 > **Efficiency:** a navigation row projected whole (`author: p.user`) renders every column of the target table
 > into the body. Project the columns you read (`authorName: p.user!.username`).
 
@@ -914,6 +948,12 @@ UNION ALL
   `firstOrDefault()`, `asSubquery()`, a CTE body.
 - `count()` of such a union keeps the data-modifying `WITH` at the top (fixed in 1.0.30; it failed with 0A000
   before): `WITH "closed" AS (UPDATE …) SELECT COUNT(*) as count FROM ((…) UNION ALL (…)) as union_count`.
+- Such a union does not join a `QueryBatch`. Its `futureCount()` / `futureFirstOrDefault()` (since 1.0.31) throw
+  before anything is sent: `futureCount(): the union's legs declare the data-modifying CTE "closed" — a future is
+  read as a subquery by a QueryBatch, where a data-modifying WITH is not allowed (it must lead its statement). Run
+  count() for it: a statement of its own.` An `addList()` leg (`future()`) is sent and PostgreSQL refuses the batch
+  (0A000). A union of CTE-rooted legs without a data-modifying CTE joins a batch like any union
+  ([Batching](./batching-and-prepared-queries.md#count-a-union-or-read-its-first-row-in-a-batch)).
 - Read legs back with a union, not a FULL JOIN on a null-safe key: PostgreSQL plans a FULL JOIN only on merge- or
   hash-joinable conditions (0A000).
 - `afterMutation()` of a plain CTE throws: `afterMutation(): "plain" is not a data-modifying CTE — a barrier orders a statement after a mutation`.
@@ -1124,6 +1164,12 @@ LEFT JOIN "active_users" ON "users"."id" = "active_users"."userId"
   is read. The build throws a `TypeError`.
 - **Don't** run a query whose collection reads a data-modifying CTE on the `'temptable'` strategy → **Do** use
   `'cte'` or `'lateral'`. It is refused before anything runs.
+- **Don't** put a union whose legs read a data-modifying CTE into a `QueryBatch` → **Do** run its `count()`,
+  `firstOrDefault()` or `toList()` on its own. A batch reads its legs as subqueries, where no data-modifying `WITH`
+  is allowed: the count and first-row legs are refused (since 1.0.31), a list leg fails with 0A000.
+- **Don't** expect a collection's `min()` / `max()` of a mapped column in a body to read mapped through the CTE →
+  **Do** map it where it is read, or aggregate in a grouped body (`g.min()` / `g.max()` keep the mapper). The CTE
+  column holds the stored value, although the body's own query reads it mapped since 1.0.31.
 - **Don't** put a whole navigation row in a CTE body when one column is read → **Do** project the column. A
   navigation row renders every column of its table.
 - **Don't** expect `materialized: true` to speed up every CTE → **Do** use it for candidate sets that must drive the
