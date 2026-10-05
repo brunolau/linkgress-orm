@@ -17,7 +17,7 @@ import { CollectionStrategyFactory } from './collection-strategy.factory';
 import type { CollectionAggregationConfig, SelectedField, NavigationJoin } from './collection-strategy.interface';
 import { UnionQueryBuilder } from './union-builder';
 import { FutureQuery, FutureSingleQuery, FutureCountQuery, FutureBatchMeta, canonicalJsonColumnType, isCustomReadMapper, jsonColumnDelivery } from './future-query';
-import { needsClientParse } from '../database/typed-text';
+import { JSON_TYPE_OID, needsClientParse } from '../database/typed-text';
 import type { ColumnConfig } from '../schema/column-builder';
 import { createColumnRow } from '../entity/column-row';
 import { MockRowCache } from './mock-row-cache';
@@ -3531,6 +3531,21 @@ export class SelectQueryBuilder<TSelection> {
       if (ref.__cteKind === 'expression' && isCustomReadMapper(mapper)) {
         // A mapped expression: as a mapped expression of this query travels
         return isNumberResultMapper(mapper) ? KEEP_TRANSPORT : RUNTIME_TRANSPORT;
+      }
+
+      if (ref.__jsonList === true) {
+        // A collection's toList() the body projected: its json list, as JSON carries it
+        return typed('json');
+      }
+
+      if (ref.__tableColumn === true) {
+        // A declared date / timestamp / bytea column of a table the body reads: revived from its JSON form as
+        // that table's own column is — where the revival gives what this client's driver gives
+        const declared = declaredColumnTransport(this.client, ref.__sqlType, isCustomReadMapper(mapper), customOids);
+
+        if (declared !== undefined) {
+          return declared;
+        }
       }
 
       // A column — or an expression column read as a type (withReadType) — typed by what it declares;
@@ -9098,6 +9113,66 @@ type BatchTransport =
 const KEEP_TRANSPORT: BatchTransport = Object.freeze({ kind: 'keep' });
 const RUNTIME_TRANSPORT: BatchTransport = Object.freeze({ kind: 'runtime' });
 
+/**
+ * One value of each type a declared column is revived from its JSON form for (see jsonColumnDelivery): its
+ * type's OID, its text as the server sends it and its `row_to_json` form.
+ */
+const DECLARED_REVIVAL_PROBES: Readonly<Record<string, { readonly oid: number; readonly text: string; readonly json: string }>> = {
+  timestamp: { oid: 1114, text: '2024-03-01 06:00:00.123456', json: '2024-03-01T06:00:00.123456' },
+  timestamptz: { oid: 1184, text: '2024-03-01 06:00:00.123456+01', json: '2024-03-01T06:00:00.123456+01:00' },
+  date: { oid: 1082, text: '2024-03-01', json: '2024-03-01' },
+  bytea: { oid: 17, text: '\\x00ff', json: '\\x00ff' },
+};
+
+/** Whether two values a driver delivers are the same value of the same JS type (a Date by its time, bytes by their content). */
+function sameDriverValue(a: unknown, b: unknown): boolean {
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+  }
+
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    return a instanceof Uint8Array && b instanceof Uint8Array && a.constructor === b.constructor
+      && a.length === b.length && a.every((byte, ix) => byte === b[ix]);
+  }
+
+  return a === b;
+}
+
+/**
+ * How a QueryBatch carries a declared column of a table read through a CTE or a table subquery: as that table's
+ * own column travels (`declared`, revived from its JSON form — see jsonColumnDelivery) when it is a date /
+ * timestamp / timestamptz / bytea column and the revival gives what `client`'s driver gives for it — its value
+ * and JS type, for a mapped column (`hasMapper`) the driver value its mapper reads. `undefined` otherwise: a
+ * client that parses the type (or json) with parsers of its own, or otherwise than the default drivers (a Date
+ * at UTC midnight, `datesAsStrings`), a mapped column on a client that hands its mapper something other than the
+ * driver's text — it then travels as a value new to the batch, its text parsed by the client.
+ */
+function declaredColumnTransport(
+  client: DatabaseClient,
+  sqlType: unknown,
+  hasMapper: boolean,
+  customOids: readonly number[]
+): BatchTransport | undefined {
+  const type = canonicalJsonColumnType(sqlType);
+  const probe = type === undefined ? undefined : DECLARED_REVIVAL_PROBES[type];
+
+  if (probe === undefined || customOids.includes(JSON_TYPE_OID)) {
+    return undefined;
+  }
+
+  const revive = jsonColumnDelivery(type, hasMapper)?.revive ?? ((value: unknown) => value);
+  const revived = revive(probe.json);
+
+  try {
+    const revivesAsParsed = [false, true].every(parameterized =>
+      sameDriverValue(client.typedTextParser(probe.oid, { parameterized })(probe.text), revived));
+
+    return revivesAsParsed ? { kind: 'declared', sqlType: type!, hasMapper } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The config of the column `fieldName` of `schema` (its metadata cache first), if the schema has it. */
 function columnConfigOf(schema: TableSchema | undefined, fieldName: string): ColumnConfig | undefined {
   if (!schema) {
@@ -11931,6 +12006,15 @@ export class CollectionQueryBuilder<TItem = any> {
    */
   isScalarAggregation(): boolean {
     return this.aggregationType !== undefined;
+  }
+
+  /**
+   * Whether this is a `toList()` of items — rendered as a json list (`json_agg`), never an aggregate or a
+   * flat `toNumberList()` / `toStringList()` array: a column of that json type wherever it is projected.
+   * @internal
+   */
+  isJsonItemList(): boolean {
+    return this.isMarkedAsList && this.aggregationType === undefined && this.flattenResultType === undefined;
   }
 
   /**
