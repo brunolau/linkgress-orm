@@ -1,5 +1,5 @@
 import { DatabaseClient } from '../database/database-client.interface';
-import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materializeMockSelection } from './query-builder';
+import { CollectionQueryBuilder, QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materializeMockSelection } from './query-builder';
 import { Condition, SqlBuildContext, FieldRef, UnwrapSelection, WhereConditionBase } from './conditions';
 import { pgTypeOfValue } from './sql-functions';
 import { renumberPlaceholders } from './query-batch';
@@ -143,6 +143,13 @@ export function projectedColumnRef(key: string, alias: string, metaValue: unknow
       fieldRef.__cteKind = 'column';
       fieldRef.__mapper = meta.__mapper;
       fieldRef.__sqlType = meta.__sqlType;
+
+      // A declared column of a table the body reads (its own, a navigation's) — or such a column of a CTE /
+      // subquery the body reads in turn: a QueryBatch may carry it as it carries that table's own column (see
+      // SelectQueryBuilder.batchTransportOf). A manually joined table's or a set's column is not one
+      if (meta.__cteKind === undefined ? meta.__manualJoin !== true && meta.__setColumn !== true : meta.__tableColumn === true) {
+        fieldRef.__tableColumn = true;
+      }
     } else {
       // An expression — an `sql` fragment, a condition, a grouped query's aggregate, a collection
       fieldRef.__cteKind = 'expression';
@@ -159,6 +166,12 @@ export function projectedColumnRef(key: string, alias: string, metaValue: unknow
       if (scalarRead !== undefined) {
         fieldRef.__mapper = scalarRead.mapper;
         fieldRef.__sqlType = scalarRead.readType;
+      }
+
+      // A collection's `toList()`: a json list, which a QueryBatch carries as it is (see
+      // SelectQueryBuilder.batchTransportOf)
+      if (meta instanceof CollectionQueryBuilder && meta.isJsonItemList()) {
+        fieldRef.__jsonList = true;
       }
     }
   } else {

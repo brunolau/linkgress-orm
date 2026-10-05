@@ -1,6 +1,6 @@
 {
 	"name": "linkgress-orm",
-	"version": "1.0.33",
+	"version": "1.0.34",
 	"description": "The ORM built for agents: an AI-first, type-safe PostgreSQL ORM for TypeScript with LINQ-style queries and automatic type inference",
 	"main": "dist/index.js",
 	"module": "dist/index.js",
