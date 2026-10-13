@@ -57,6 +57,9 @@ import {
   detectPrimaryKeys,
   calculateOptimalChunkSize,
   clientParameterLimit,
+  boundColumnCount,
+  bulkWriteChunks,
+  parameterLimitText,
   extractUniqueColumnKeys,
   buildValuesClause,
   buildColumnConfigs,
@@ -400,6 +403,13 @@ export interface QueryOptions {
    * `inArrayOptThreshold` — see `LinkgressConfig.inArrayUsesOpt`.
    */
   inArrayUsesOpt?: boolean;
+  /**
+   * Whether an `or()` that lists keys — equalities of the same typed columns with plain values in every arm —
+   * renders past `inArrayOptThreshold` arms as one array parameter per column (`(a, b) IN (SELECT … FROM
+   * unnest(…))`). Default `true`; the rows are the OR's either way. PROCESS-WIDE for the same reason as
+   * `inArrayOptThreshold` — see `LinkgressConfig.orUsesOpt`.
+   */
+  orUsesOpt?: boolean;
   /** Collection aggregation strategy (default: 'lateral') */
   collectionStrategy?: CollectionStrategyType;
   /**
@@ -1853,17 +1863,15 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       return [];
     }
 
-    // Calculate chunk size based on max rows per batch — within what the client binds
-    const columnCount = Object.keys(dataArray[0]).length;
-    const chunkSize = calculateOptimalChunkSize(columnCount, insertConfig?.chunkSize, clientParameterLimit(this.client));
+    // The rows each statement takes — sized by the columns the rows bind, within what the client binds
+    const chunks = bulkWriteChunks(dataArray as Record<string, any>[], this.schema, this.client, insertConfig?.chunkSize);
 
     // Check if we need to chunk
-    if (dataArray.length > chunkSize) {
+    if (chunks.length > 1) {
       const results: InferTableType<TableSchema>[] = [];
 
-      for (let i = 0; i < dataArray.length; i += chunkSize) {
-        const chunk = dataArray.slice(i, i + chunkSize);
-        const chunkResults = await this.insertBulkSingle(chunk, insertConfig);
+      for (const chunk of chunks) {
+        const chunkResults = await this.insertBulkSingle(chunk as Partial<InferTableType<TableSchema>>[], insertConfig);
         results.push(...chunkResults);
       }
 
@@ -1959,18 +1967,16 @@ export class TableAccessor<TBuilder extends TableBuilder<any>> {
       updateColumnFilter = (colId: string) => !primaryKeys.includes(colId);
     }
 
-    // Calculate chunk size based on max rows per batch — within what the client binds
-    const columnCount = Object.keys(values[0]).length;
-    const chunkSize = calculateOptimalChunkSize(columnCount, config?.chunkSize, clientParameterLimit(this.client));
+    // The rows each statement takes — sized by the columns the rows bind, within what the client binds
+    const chunks = bulkWriteChunks(values as Record<string, any>[], this.schema, this.client, config?.chunkSize);
 
     // Check if we need to chunk
-    if (values.length > chunkSize) {
+    if (chunks.length > 1) {
       const results: InferTableType<TableSchema>[] = [];
 
-      for (let i = 0; i < values.length; i += chunkSize) {
-        const chunk = values.slice(i, i + chunkSize);
+      for (const chunk of chunks) {
         const chunkResults = await this.upsertBulkSingle(
-          chunk,
+          chunk as Partial<InferTableType<TableSchema>>[],
           primaryKeys,
           updateColumnFilter,
           overridingSystemValue || false,
@@ -2320,6 +2326,10 @@ export class DataContext<TSchema extends ContextSchema = any> {
 
     if (queryOptions?.inArrayUsesOpt !== undefined) {
       LinkgressConfig.inArrayUsesOpt = queryOptions.inArrayUsesOpt;
+    }
+
+    if (queryOptions?.orUsesOpt !== undefined) {
+      LinkgressConfig.orUsesOpt = queryOptions.orUsesOpt;
     }
 
     this.initializeSchema(schema);
@@ -4862,15 +4872,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
     const table = this;
     const dataArray = Array.isArray(value) ? value : [value];
 
-    // The rows one statement takes: the `chunkSize` option, or ~60 % of what fits PostgreSQL's
-    // 65 535-parameter limit — never more than the client binds (PGlite: 32 767)
-    const resolveChunkSize = (): number => {
-      if (options?.chunkSize != null) {
-        return options.chunkSize;
-      }
-
-      return calculateOptimalChunkSize(Object.keys(dataArray[0]).length, undefined, clientParameterLimit(table._getClient()));
-    };
+    // The statements the rows go in: the `chunkSize` option, or ~60 % of what fits PostgreSQL's 65 535-parameter
+    // limit for the columns the rows bind — never more than the client binds (postgres.js: 65 533, PGlite: 32 767)
+    const resolveChunks = (): InsertData<TEntity>[][] => bulkWriteChunks(dataArray, table._getSchema(), table._getClient(), options?.chunkSize);
 
     const executeInsertBulk = async <TResult>(
       returning?: undefined | true | ((entity: EntityQuery<TEntity>) => TResult)
@@ -4879,13 +4883,12 @@ export class DbEntityTable<TEntity extends DbEntity> {
         return returning === undefined ? undefined : [];
       }
 
-      const chunkSize = resolveChunkSize();
+      const chunks = resolveChunks();
 
       // Process in chunks if needed
-      if (dataArray.length > chunkSize) {
+      if (chunks.length > 1) {
         const allResults: any[] = [];
-        for (let i = 0; i < dataArray.length; i += chunkSize) {
-          const chunk = dataArray.slice(i, i + chunkSize);
+        for (const chunk of chunks) {
           const chunkResults = await table.insertBulkSingle(chunk, returning, options?.overridingSystemValue, options?.onConflictDoNothing);
           if (chunkResults) allResults.push(...chunkResults);
         }
@@ -4918,14 +4921,14 @@ export class DbEntityTable<TEntity extends DbEntity> {
           throw new Error(`toStatement(): insertBulk() into "${table._getSchema().name}" has no rows — an empty insert compiles to no statement`);
         }
 
-        const chunkSize = resolveChunkSize();
+        const chunks = resolveChunks();
 
         // Execution would run these rows as several statements: one compiled statement holding them all
         // would not be what execution runs (and may not bind), one chunk of them would drop the rest
-        if (dataArray.length > chunkSize) {
+        if (chunks.length > 1) {
           throw new Error(
-            `toStatement(): ${dataArray.length} rows exceed the ${chunkSize}-row chunk of one insert into "${table._getSchema().name}" — `
-            + `insertBulk() would execute them as ${Math.ceil(dataArray.length / chunkSize)} statements, a compiled statement is one. `
+            `toStatement(): ${dataArray.length} rows exceed the ${chunks[0].length}-row chunk of one insert into "${table._getSchema().name}" — `
+            + `insertBulk() would execute them as ${chunks.length} statements, a compiled statement is one. `
             + 'Compile the rows in batches of at most that many.'
           );
         }
@@ -5282,8 +5285,9 @@ export class DbEntityTable<TEntity extends DbEntity> {
       }
     }
 
-    const columnCount = Math.max(1, Object.keys(rows[0]).length + 1);
-    const singleStatementLimit = Math.floor(Math.floor(65535 / columnCount) * 0.6);
+    // The child rows' columns (over every row) and the foreign key they take, within what the client binds
+    const columnCount = boundColumnCount(rows, config.children.table._getSchema()) + 1;
+    const singleStatementLimit = calculateOptimalChunkSize(columnCount, undefined, clientParameterLimit(this._getClient()));
 
     if (rows.length > singleStatementLimit) {
       throw new Error(`insertWithChildren: ${rows.length} child rows exceed the ~${singleStatementLimit}-row single-statement budget — insert them standalone (they need chunking)`);
@@ -5554,8 +5558,9 @@ ${extraJoins.join('\n')}${orderBy}`;
       }
     }
 
-    const columnCount = Math.max(1, Object.keys(childRows[0].row).length + 2);
-    const singleStatementLimit = Math.floor(Math.floor(65535 / columnCount) * 0.6);
+    // The child rows' columns (over every row) and the two the statement adds, within what the client binds
+    const columnCount = boundColumnCount(childRows.map(child => child.row), config.children.table._getSchema()) + 2;
+    const singleStatementLimit = calculateOptimalChunkSize(columnCount, undefined, clientParameterLimit(this._getClient()));
 
     if (childRows.length + config.rows.length > singleStatementLimit) {
       throw new Error(`insertBulkWithChildren: ${config.rows.length} parents + ${childRows.length} children exceed the ~${singleStatementLimit}-row single-statement budget`);
@@ -5988,8 +5993,10 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
       sql += ` RETURNING ${returningClause.sql}`;
     }
 
-    if (params.length > 65535) {
-      throw new Error(`toStatement(): the compiled INSERT into "${this._getSchema().name}" binds ${params.length} parameters — over PostgreSQL's 65 535`);
+    const limit = clientParameterLimit(this._getClient());
+
+    if (params.length > limit) {
+      throw new Error(`toStatement(): the compiled INSERT into "${this._getSchema().name}" binds ${params.length} parameters — over ${parameterLimitText(limit)}`);
     }
 
     return attachReturningSelection({ sql, params }, returningClause?.selection);
@@ -6294,17 +6301,13 @@ WHERE ${guardSql}`,
         ? { updateSet: config.updateSet as any, updateWhere: config.updateWhere as any }
         : undefined;
 
-      // Calculate chunk size — within what the client binds
-      let chunkSize = config?.chunkSize;
-      if (chunkSize == null) {
-        chunkSize = calculateOptimalChunkSize(Object.keys(values[0]).length, undefined, clientParameterLimit(table._getClient()));
-      }
+      // The rows each statement takes — sized by the columns the rows bind, within what the client binds
+      const chunks = bulkWriteChunks(values, schema, table._getClient(), config?.chunkSize);
 
       // Process in chunks if needed
-      if (values.length > chunkSize) {
+      if (chunks.length > 1) {
         const allResults: any[] = [];
-        for (let i = 0; i < values.length; i += chunkSize) {
-          const chunk = values.slice(i, i + chunkSize);
+        for (const chunk of chunks) {
           const chunkResults = await table.upsertBulkSingle(
             chunk, primaryKeys, updateColumns, config?.updateColumnFilter,
             overridingSystemValue || false, config?.targetWhere, config?.setWhere, returning, upsertExpressions
@@ -6952,16 +6955,12 @@ RETURNING 1`;
           : (config.updateColumns as string[]);
       }
 
-      // Calculate chunk size (same bound as upsertBulk) — within what the client binds
-      let chunkSize = config.chunkSize;
-      if (chunkSize == null) {
-        chunkSize = calculateOptimalChunkSize(Object.keys(values[0]).length, undefined, clientParameterLimit(table._getClient()));
-      }
+      // The rows each statement takes (the same bound as upsertBulk) — within what the client binds
+      const chunks = bulkWriteChunks(values, table._getSchema(), table._getClient(), config.chunkSize);
 
-      if (values.length > chunkSize) {
+      if (chunks.length > 1) {
         const allResults: any[] = [];
-        for (let i = 0; i < values.length; i += chunkSize) {
-          const chunk = values.slice(i, i + chunkSize);
+        for (const chunk of chunks) {
           const chunkResults = await table.mergeBulkSingle(
             chunk, onKeys, config.matchWhere, updateColumns, config.updateColumnFilter, returning
           );
@@ -7350,17 +7349,13 @@ RETURNING 1`;
 
       const primaryKeys = table._resolveBulkUpdatePrimaryKeys(data, config);
 
-      // Calculate chunk size — within what the client binds
-      let chunkSize = config?.chunkSize;
-      if (chunkSize == null) {
-        chunkSize = calculateOptimalChunkSize(Object.keys(data[0]).length, undefined, clientParameterLimit(table._getClient()));
-      }
+      // The rows each statement takes — sized by the columns the rows bind, within what the client binds
+      const chunks = bulkWriteChunks(data, table._getSchema(), table._getClient(), config?.chunkSize);
 
       // Process in chunks if needed
-      if (data.length > chunkSize) {
+      if (chunks.length > 1) {
         const allResults: any[] = [];
-        for (let i = 0; i < data.length; i += chunkSize) {
-          const chunk = data.slice(i, i + chunkSize);
+        for (const chunk of chunks) {
           const chunkResults = await table.bulkUpdateSingle(chunk, primaryKeys, returning, expressions);
           if (chunkResults) allResults.push(...chunkResults);
         }

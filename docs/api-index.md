@@ -190,7 +190,8 @@ branch or a projection. A JS value becomes a bound parameter, converted by the c
 - `searchNormalize(value): SqlFragment<string>` — `public.search_normalize(x)` as an expression. [guide](./guides/querying.md#normalized-accentcase-insensitive-search)
 - `inArrayOpt(col, values)` / `notInArrayOpt(col, values)` — `IN ($1, …)` up to `LinkgressConfig.inArrayOptThreshold` (default 8) elements, `= ANY($1::type[])` / `<> ALL(…)` above it; the default choice for data-driven lists. [guide](./guides/querying.md#letting-the-list-length-decide-inarrayopt--notinarrayopt)
 - `eqAny(col, values)` / `neAll(col, values)` — the whole list as one array parameter cast to the column's type (`= ANY($1::integer[])`): one statement text for every length. [guide](./guides/querying.md#one-parameter-for-every-length-eqany--neall)
-- `inArray(col, values)` / `notInArray(col, values)` — one placeholder per element; `[]` renders `1=0` / `1=1`; a statement binds at most 65 535 parameters (32 767 on PGlite). [guide](./guides/querying.md#exact-placeholders-inarray--notinarray)
+- `inArray(col, values)` / `notInArray(col, values)` — one placeholder per element; `[]` renders `1=0` / `1=1`; a statement binds at most 65 535 parameters (65 533 on postgres.js, 32 767 on PGlite). [guide](./guides/querying.md#exact-placeholders-inarray--notinarray)
+- `or(...keys.map(k => and(eq(t.a, k.a), eq(t.b, k.b))))` — keys of two or more columns: past `inArrayOptThreshold` arms renders `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))`, one parameter per column; over one column what `inArrayOpt` renders (`LinkgressConfig.orUsesOpt`, on by default; since 1.0.34). [guide](./guides/querying.md#lists-of-keys-written-as-or-orusesopt-since-1034)
 - `flagHas(col, flag)` / `flagHasAll(col, flags)` / `flagHasAny(col, flags)` / `flagHasNone(col, flags)` — bitmask tests on integer columns, the mask bound. [guide](./guides/querying.md#test-bitmask-flags)
 
 Subquery conditions (`exists`, `inSubquery`, `gtSubquery`, …) are under [Subqueries and scopes](#subqueries-and-scopes);
@@ -585,7 +586,7 @@ Column builders are called inside `setupModel()` (`src/index.ts` marks them "for
 - `client.connect(): Promise<PooledConnection>` → `conn.query(…)`, `conn.release()` — pin one session (temp tables, SET); release it in `finally`; throws inside a transaction. [guide](./database-clients.md#pin-one-session-for-several-statements-connect-and-release)
 - `client.end(): Promise<void>` — close the pool the client created; a pool, `sql` instance or PGlite you passed in stays open. [guide](./database-clients.md#manage-the-client-lifecycle)
 - `client.getDriverName()` — `'pg'`, `'postgres'`, `'bun'` or `'pglite'`. [guide](./database-clients.md#what-each-client-supports)
-- `client.supportsMultiStatementQueries()` / `.supportsBinaryProtocol()` / `.supportsBinaryArrayResults()` / `.losesNumericZeroScale()` / `.maxParameters()` — capability flags the builders read (`maxParameters()` since 1.0.29: 65 535, PGlite 32 767; `MutationBatch` holds its statement to it, and since 1.0.32 its `ifFits` legs and the chunks of the bulk writes too). [guide](./database-clients.md#what-each-client-supports)
+- `client.supportsMultiStatementQueries()` / `.supportsBinaryProtocol()` / `.supportsBinaryArrayResults()` / `.losesNumericZeroScale()` / `.maxParameters()` — capability flags the builders read (`maxParameters()` since 1.0.29: 65 535, postgres.js 65 533 since 1.0.34, PGlite 32 767; `MutationBatch` holds its statement to it, since 1.0.32 its `ifFits` legs and the chunks of the bulk writes too, since 1.0.34 `insertBulk(…).toStatement()`). [guide](./database-clients.md#what-each-client-supports)
 - `client.parseTypedText(oid, text, read?)` / `.customParsedTypeOids()` — how a `QueryBatch` revives values sent as text; override them in a custom client. [guide](./database-clients.md#write-a-custom-client)
 - `abstract class DatabaseClient` — implement `query`, `connect`, `end`, `getDriverName` and `transaction` for another driver. [guide](./database-clients.md#write-a-custom-client)
 
@@ -622,6 +623,7 @@ take effect only next to one. [guide](./guides/configuration.md#configure-a-cont
 | `inArrayOptThreshold` | `8` | writes `LinkgressConfig.inArrayOptThreshold` for the whole process at construction |
 | `inArrayPadBuckets` | `null` | writes `LinkgressConfig.inArrayPadBuckets` for the whole process |
 | `inArrayUsesOpt` | `false` | writes `LinkgressConfig.inArrayUsesOpt` for the whole process |
+| `orUsesOpt` | `true` | writes `LinkgressConfig.orUsesOpt` for the whole process (since 1.0.34) |
 | `disableMappers` | `false` | builder reads skip `fromDriver` (bound values still go through `toDriver`) |
 | `rawResult` | `false` | builder terminals return the driver's rows |
 | `traceTime` | `false` | per-phase timing (section `'timing'`) |
@@ -639,6 +641,7 @@ take effect only next to one. [guide](./guides/configuration.md#configure-a-cont
 - `LinkgressConfig.inArrayOptThreshold` (default `8`) — the list length up to which `inArrayOpt()` renders `IN (…)`; `0` sends every list to the array form; an invalid value throws. [guide](./guides/configuration.md#bound-the-statement-texts-of-list-filters-linkgressconfig)
 - `LinkgressConfig.inArrayPadBuckets` (default `null`) — opt-in widths a shorter list is padded to by repeating its last element (`[1, 2, 8]`). [guide](./guides/configuration.md#bound-the-statement-texts-of-list-filters-linkgressconfig)
 - `LinkgressConfig.inArrayUsesOpt` (default `false`) — plain `inArray()` / `notInArray()` render as `inArrayOpt()` does. [guide](./guides/configuration.md#bound-the-statement-texts-of-list-filters-linkgressconfig)
+- `LinkgressConfig.orUsesOpt` (default `true`, since 1.0.34) — an `or()` listing keys (equalities of the same typed columns with plain values in every arm) renders past the threshold as one array parameter per column; `false` renders every `or()` as written. [guide](./guides/querying.md#lists-of-keys-written-as-or-orusesopt-since-1034)
 - `LinkgressConfig.configure(settings: LinkgressSettings)` / `LinkgressConfig.resetToDefaults()` — several settings at once / back to the defaults (tests). [guide](./guides/configuration.md#bound-the-statement-texts-of-list-filters-linkgressconfig)
 - `LinkgressConfig.DEFAULT_IN_ARRAY_OPT_THRESHOLD` (`8`) / `LinkgressConfig.DEFAULT_IN_ARRAY_PAD_BUCKETS` (`[1, 4, 8]`, applied only when you set it). [guide](./guides/configuration.md#bound-the-statement-texts-of-list-filters-linkgressconfig)
 - `MockRowCache.setEnabled(true)` — memoize query building (the one switch for `MockRowCache`, `NavigationPathCache` and `LateralSqlCache`); identical SQL; off by default. [guide](./guides/configuration.md#cut-query-build-cpu-mockrowcache)
@@ -678,7 +681,8 @@ Messages of plain `Error`s, as thrown:
 | `A selection is required. Call .select(...) before` | `toList()`, `first()`, `toSql()` or `asSubquery()` of a CTE-rooted query without `select()` | `db.selectFromCte(cte).select(r => ({ … }))` first |
 | `MutationBatch: the statement binds <n> parameters — over` | `MutationBatch.executeBatch()` | register the legs whose size depends on the data `ifFits` (since 1.0.32) and write a declined one standalone, or move some legs to a second batch |
 | `MutationBatch: leg "<id>" carries <n> rows, above the ~<m>-row single statement budget` | an `add*()` leg over its own row budget | write it standalone (it is chunked), or register it `ifFits` (since 1.0.32) |
-| `toStatement(): <n> rows exceed the <m>-row chunk of one insert into` | `insertBulk(…).toStatement()` over one chunk (on PGlite 8 191 rows of 4 keys) | compile the rows in batches, or `insertFrom(fromRows(…))` |
+| `toStatement(): <n> rows exceed the <m>-row chunk of one insert into` | `insertBulk(…).toStatement()` over one chunk (on PGlite 8 191 rows of 4 keys; since 1.0.34 also rows whose `sql`-fragment cells bind more than a chunk of plain cells) | compile the rows in batches, or `insertFrom(fromRows(…))` |
+| `toStatement(): the compiled INSERT into "<table>" binds <n> parameters — over <limit>` | a compiled insert (its RETURNING included) over the client's `maxParameters()` — PostgreSQL's 65 535 before 1.0.34 | fewer rows per compiled statement |
 | `PGliteClient: the statement binds <n> parameters — PGlite takes at most 32 767` | any statement over 32 767 parameters on PGlite (an explicit `chunkSize`, a long `inArray()`) | leave `chunkSize` out (the default chunk fits the client since 1.0.32); bind a list as one array (`eqAny()`) |
 | `addUpdateWhereIn where: navigation "<nav>" is not available` | a navigation in `addUpdateWhereIn`'s `where` | the target row's own columns, or a subquery correlated to them |
 | `Cannot update "<view>": it is a model-managed view (read-only)` (or `Cannot delete from`) | a write on a `DbViewTable` query | write to the underlying tables |

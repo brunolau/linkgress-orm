@@ -4,9 +4,11 @@ import {
   getInArrayOptThreshold,
   getInArrayPadBuckets,
   getInArrayUsesOpt,
+  getOrUsesOpt,
   setInArrayOptThreshold,
   setInArrayPadBuckets,
   setInArrayUsesOpt,
+  setOrUsesOpt,
 } from '../query/conditions';
 
 /** Settings accepted by {@link LinkgressConfig.configure}; a key left out keeps its current value. */
@@ -17,6 +19,8 @@ export interface LinkgressSettings {
   inArrayPadBuckets?: readonly number[] | null;
   /** See {@link LinkgressConfig.inArrayUsesOpt}. */
   inArrayUsesOpt?: boolean;
+  /** See {@link LinkgressConfig.orUsesOpt}. */
+  orUsesOpt?: boolean;
 }
 
 /**
@@ -112,6 +116,33 @@ export class LinkgressConfig {
     setInArrayUsesOpt(enabled);
   }
 
+  /**
+   * ON by default. Whether an `or()` that lists keys — every arm an equality, or an `and()` of equalities, of the
+   * same typed columns with plain values — renders past {@link inArrayOptThreshold} arms as ONE array parameter per
+   * column: `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))`, and over one column what `inArrayOpt`
+   * renders, `(a = ANY($1::ta[]))`. Written longhand such an `or()` binds a parameter per value — 40 000 keys of
+   * two columns are 80 000 parameters, a statement no driver sends (postgres.js refuses 65 534, pg and Bun more than
+   * 65 535, PGlite more than 32 767) — and its text changes with every key count.
+   *
+   * The rows are the OR's: a row-constructor `IN` is NULL where a key compares NULL and none matches, as the OR is,
+   * so `not()` of it and a NULL column read as before. An `or()` with anything else in an arm — a NULL value (it
+   * renders `IS NULL`), a column, an `sql` fragment, a placeholder, an untyped ref, a json or array column, a Date or
+   * another object value — renders as written, as does every `or()` under a grouped HAVING or a RETURNING expression.
+   *
+   * Turn it off for a hand-tuned query that depends on the planner seeing the arms of its `or()`.
+   *
+   * @example
+   * db.bindings.where(b => or(...keys.map(k => and(eq(b.memberId, k.memberId), eq(b.groupId, k.groupId)))));
+   * // 9 keys and more:  ("b"."member_id", "b"."group_id") IN (SELECT … FROM unnest($1::integer[], $2::integer[]) …)
+   */
+  static get orUsesOpt(): boolean {
+    return getOrUsesOpt();
+  }
+
+  static set orUsesOpt(enabled: boolean) {
+    setOrUsesOpt(enabled);
+  }
+
   /** Apply several settings at once; keys left out keep their current value. */
   static configure(settings: LinkgressSettings): void {
     if (settings.inArrayOptThreshold !== undefined) {
@@ -125,6 +156,10 @@ export class LinkgressConfig {
     if (settings.inArrayUsesOpt !== undefined) {
       setInArrayUsesOpt(settings.inArrayUsesOpt);
     }
+
+    if (settings.orUsesOpt !== undefined) {
+      setOrUsesOpt(settings.orUsesOpt);
+    }
   }
 
   /** Every setting back to its default. */
@@ -132,5 +167,6 @@ export class LinkgressConfig {
     setInArrayOptThreshold(DEFAULT_IN_ARRAY_OPT_THRESHOLD);
     setInArrayPadBuckets(null);
     setInArrayUsesOpt(false);
+    setOrUsesOpt(true);
   }
 }

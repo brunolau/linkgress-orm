@@ -169,8 +169,10 @@ describe('MutationBatch: insert-leg RETURNING and the statement parameter guard'
 
   const sortById = (rows: Array<Record<string, unknown>>) => [...rows].sort((a, b) => Number(a.id) - Number(b.id));
 
-  /** The most parameters a statement binds through the client: PostgreSQL's 65 535, PGlite's 32 767 */
-  const limitText = () => (client.maxParameters() === 65535 ? "PostgreSQL's 65 535" : 'the 32 767 this client takes');
+  /** The most parameters a statement binds through the client, as the refusal names it: PostgreSQL's 65 535, postgres.js's 65 533, PGlite's 32 767 */
+  const limitText = () => (client.maxParameters() === 65535
+    ? "PostgreSQL's 65 535"
+    : `the ${client.maxParameters().toLocaleString('en-US').replace(/,/g, ' ')} this client takes`);
 
   beforeAll(async () => {
     (EntityMetadataStore as any).metadata.clear();

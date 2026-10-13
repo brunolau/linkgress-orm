@@ -226,10 +226,121 @@ export const POSTGRES_MAX_PARAMS = 65535;
 
 /**
  * The most parameters one statement binds through `client`: PostgreSQL's 65 535 — or the client's own limit, when
- * lower (`DatabaseClient.maxParameters()`; PGlite: 32 767).
+ * lower (`DatabaseClient.maxParameters()`; postgres.js: 65 533, PGlite: 32 767).
  */
 export function clientParameterLimit(client: { maxParameters?: () => number } | null | undefined): number {
   return Math.min(POSTGRES_MAX_PARAMS, typeof client?.maxParameters === 'function' ? client.maxParameters() : POSTGRES_MAX_PARAMS);
+}
+
+/** A parameter limit as the refusals name it: "PostgreSQL's 65 535", or "the 32 767 this client takes". */
+export function parameterLimitText(limit: number): string {
+  return limit === POSTGRES_MAX_PARAMS
+    ? "PostgreSQL's 65 535"
+    : `the ${limit.toLocaleString('en-US').replace(/,/g, ' ')} this client takes`;
+}
+
+/**
+ * The columns a bulk write's rows bind: every key, over ALL the rows, that names a column of `schema` (with no schema,
+ * every key). The chunkers size their chunks by it. They used to read the keys of the FIRST row, which miss a column
+ * only later rows carry — a first row of one key before rows of five sent five parameters a row in chunks sized for
+ * one — and count the keys that bind nothing (a navigation, a property of the caller's).
+ */
+export function boundColumnCount(
+  rows: ReadonlyArray<Record<string, unknown>>,
+  schema?: { columns: Record<string, unknown> }
+): number {
+  const keys = new Set<string>();
+
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (schema === undefined || Object.prototype.hasOwnProperty.call(schema.columns, key)) {
+        keys.add(key);
+      }
+    }
+  }
+
+  return Math.max(1, keys.size);
+}
+
+/** The parameters `row`'s `sql`-fragment cells bind beyond the one a plain cell binds (each column once). */
+function fragmentCellExtraParameters(row: Record<string, unknown>, schema?: { columns: Record<string, unknown> }): number {
+  let extra = 0;
+
+  for (const key of Object.keys(row)) {
+    const value = row[key];
+
+    if (isSqlExpression(value) && (schema === undefined || Object.prototype.hasOwnProperty.call(schema.columns, key))) {
+      const context = { paramCounter: 1, params: [] as any[] };
+
+      value.buildSql(context);
+      extra += context.params.length - 1;
+    }
+  }
+
+  return extra;
+}
+
+/**
+ * The statements a bulk write of `rows` sends, in order: at most `maxRows` rows each. With a `budget` (the automatic
+ * chunk size — an explicit `chunkSize` is the caller's and is never re-cut) a statement also closes before a row would
+ * take it past `budget.parameters`: a row binds one parameter per column, and a cell holding an `sql` fragment the
+ * fragment's own parameters instead of one. Rows without such a cell cut exactly at `maxRows`.
+ */
+export function chunkBulkRows<TRow extends Record<string, any>>(
+  rows: readonly TRow[],
+  maxRows: number,
+  budget?: { columnCount: number; parameters: number; schema?: { columns: Record<string, unknown> } }
+): TRow[][] {
+  const chunks: TRow[][] = [];
+  const extras = budget === undefined ? undefined : rows.map(row => fragmentCellExtraParameters(row, budget.schema));
+
+  if (extras === undefined || extras.every(extra => extra === 0)) {
+    for (let i = 0; i < rows.length; i += maxRows) {
+      chunks.push(rows.slice(i, i + maxRows));
+    }
+
+    return chunks;
+  }
+
+  let current: TRow[] = [];
+  let parameters = 0;
+
+  rows.forEach((row, index) => {
+    const weight = budget!.columnCount + extras[index];
+
+    if (current.length > 0 && (current.length >= maxRows || parameters + weight > budget!.parameters)) {
+      chunks.push(current);
+      current = [];
+      parameters = 0;
+    }
+
+    current.push(row);
+    parameters += weight;
+  });
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
+}
+
+/**
+ * The chunks of a bulk write, the way every chunker sizes them: rows per statement by {@link calculateOptimalChunkSize}
+ * of the columns the rows bind ({@link boundColumnCount}) within the client's limit, or `configChunkSize` as given;
+ * with the automatic size, a statement also stays within the parameters such a chunk of plain cells binds
+ * ({@link chunkBulkRows}).
+ */
+export function bulkWriteChunks<TRow extends Record<string, any>>(
+  rows: readonly TRow[],
+  schema: { columns: Record<string, unknown> },
+  client: { maxParameters?: () => number } | null | undefined,
+  configChunkSize?: number
+): TRow[][] {
+  const columnCount = boundColumnCount(rows, schema);
+  const maxRows = calculateOptimalChunkSize(columnCount, configChunkSize, clientParameterLimit(client));
+
+  return chunkBulkRows(rows, maxRows, configChunkSize != null ? undefined : { columnCount, parameters: maxRows * columnCount, schema });
 }
 
 /**

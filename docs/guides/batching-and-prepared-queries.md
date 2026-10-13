@@ -638,7 +638,7 @@ Every refusal throws before anything is sent.
 
 Legs built from ONE derived table share its executor and mix (`const posts = db.posts.withTimeout(5000)`, above). A `withQueryOptions({ collectionStrategy: 'cte' })` leg also mixes with plain legs on a context without executor options, because then that option creates no executor; on a context with `logQueries: true` the same leg was refused (both verified).
 
-`QueryBatch` does not check the parameter total before sending: PostgreSQL accepts at most 65 535 bound parameters per statement, and `PGliteClient` refuses more than 32 767 before sending (since 1.0.29).
+`QueryBatch` does not check the parameter total before sending: PostgreSQL accepts at most 65 535 bound parameters per statement, postgres.js refuses 65 534 and more itself (`MAX_PARAMETERS_EXCEEDED`), and `PGliteClient` refuses more than 32 767 before sending (since 1.0.29). A leg whose `or()` lists keys binds one array parameter per column past the threshold (since 1.0.34, [Querying](./querying.md#lists-of-keys-written-as-or-orusesopt-since-1034)).
 
 Not refused: a `sql.placeholder()` inside a leg. A placeholder binds only through `prepare()`, and a batch leg has no values for it. As the batch's only leg, the statement is sent and the server refuses it (`there is no parameter $1`); followed by a leg that binds values, the placeholder's `$1` silently takes that leg's first value:
 

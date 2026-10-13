@@ -41,6 +41,7 @@ Most settings change logging, timing, statement naming or caching, not the rows 
 | Skip parse and plan of repeated statements (postgres.js) | `preparedStatements: true`; per query `.withPreparedStatements(bool)` | same text, sent named · 2 network round trips on first use per connection, then 1 (unnamed with parameters: 2 every time) | statements whose text varies per call; `PgClient`, `BunClient`, `PGliteClient` (ignored) |
 | Change how collections in a projection are aggregated | `collectionStrategy: 'lateral' \| 'cte' \| 'temptable'` | `lateral`, `cte`: 1 statement; `temptable` on `PgClient`: 1 + 5 per collection, on the other clients 1 to 1 + 1 per collection | `temptable` without measuring it first; `temptable` inside `db.transaction()` on `PostgresClient`, `BunClient`, `PGliteClient` |
 | Fewer distinct statement texts for list filters of varying length | `inArrayOpt()` (or plain `inArray` under `LinkgressConfig.inArrayUsesOpt`), tuned by `LinkgressConfig.inArrayOptThreshold` and `inArrayPadBuckets`; `eqAny()` for one text at every length | `IN ($1, …)` up to the threshold (default 8), `= ANY($1::type[])` above it · +0 | per-context values: these are process-wide |
+| A list of composite keys written as `or(...keys.map(k => and(eq(…), eq(…))))` | nothing: past the threshold such an `or()` binds one array per column (`LinkgressConfig.orUsesOpt`, on by default since 1.0.34) | `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))` · 1 parameter per column instead of 1 per value · +0 | turning it off to keep the arms: 40 000 two-column keys are 80 000 parameters, a statement no driver sends |
 | Cut CPU spent building queries | `MockRowCache.setEnabled(true)` | identical SQL · +0 | processes that build mostly one-off query shapes |
 | Find where one query's time goes | `traceTime: true` plus an executor duty | unchanged · +0 | `traceTime` alone: prints nothing |
 | Raw driver values for an export | `disableMappers: true` or `rawResult: true`, plus an executor duty | unchanged · +0 | typed application code: `rawResult` keeps the mapped TypeScript type |
@@ -68,7 +69,7 @@ context's executor resolves it, internally `QueryExecutor.buildExecutionOptions(
 | Slow-statement threshold | query: `.expectedExecutionTime()` → transaction: `expectedExecutionMs`, else its `timeoutMs` → context: `longRunningQueryThreshold` → 10000 ms |
 | Collection strategy | query: `withQueryOptions({ collectionStrategy })` → context: `collectionStrategy` → `'lateral'` |
 | Any other `QueryOptions` key | query: `withQueryOptions()`, merged over the context's options (read only when the merged options contain an executor duty) → context → default |
-| `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt` | the last write in the process, through `LinkgressConfig` or through any context constructed with the key |
+| `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt`, `orUsesOpt` | the last write in the process, through `LinkgressConfig` or through any context constructed with the key |
 
 ## Configure a context: `QueryOptions`
 
@@ -120,6 +121,7 @@ Every key of `QueryOptions` (`src/entity/db-context.ts`):
 | `inArrayOptThreshold` | `number` · `8` | Writes `LinkgressConfig.inArrayOptThreshold`, process-wide | at construction |
 | `inArrayPadBuckets` | `readonly number[] \| null` · `null` | Writes `LinkgressConfig.inArrayPadBuckets`, process-wide | at construction |
 | `inArrayUsesOpt` | `boolean` · `false` | Writes `LinkgressConfig.inArrayUsesOpt`, process-wide | at construction |
+| `orUsesOpt` | `boolean` · `true` | Writes `LinkgressConfig.orUsesOpt`, process-wide (since 1.0.34) | at construction |
 | `traceTime` | `boolean` · `false` | Per-phase timing of one query (build, execution, result processing) on `'timing'` | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
 | `disableMappers` | `boolean` · `false` | Results skip `fromDriver` (raw driver values); `toDriver` still converts bound values | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
 | `rawResult` | `boolean` · `false` | Returns the driver's rows without any shaping | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
@@ -698,8 +700,9 @@ import { LinkgressConfig, inArray, inArrayOpt } from 'linkgress-orm';
 LinkgressConfig.inArrayOptThreshold = 8;                // default 8
 LinkgressConfig.inArrayPadBuckets = [1, 2, 8];          // opt-in; default null
 LinkgressConfig.inArrayUsesOpt = true;                  // opt-in; default false
+LinkgressConfig.orUsesOpt = false;                      // opt-out; default true (since 1.0.34)
 LinkgressConfig.configure({ inArrayOptThreshold: 12 }); // several at once; omitted keys keep their value
-LinkgressConfig.resetToDefaults();                      // back to 8, null, false
+LinkgressConfig.resetToDefaults();                      // back to 8, null, false, true
 
 const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const products = await db.products
@@ -725,6 +728,24 @@ instead of through these settings.
 | `inArrayOptThreshold` | `8` (`LinkgressConfig.DEFAULT_IN_ARRAY_OPT_THRESHOLD`) | list length up to which `inArrayOpt` / `notInArrayOpt` render `IN (…)`; above it `= ANY($1::type[])` / `<> ALL($1::type[])`. `0` sends every non-empty list to the array form | a non-negative integer |
 | `inArrayPadBuckets` | `null` (one text per length) | rounds a list that renders as `IN (…)` up to the next rung, repeating its last element; a list longer than the top rung is widened to the threshold. `LinkgressConfig.DEFAULT_IN_ARRAY_PAD_BUCKETS` is `[1, 4, 8]`, a ladder to assign, not applied by default | positive integers, strictly ascending, stored as a frozen copy (changing the array you passed changes nothing); `null` switches padding off |
 | `inArrayUsesOpt` | `false` | plain `inArray` / `notInArray` render what `inArrayOpt` / `notInArrayOpt` render | a boolean |
+| `orUsesOpt` | `true` (since 1.0.34) | an `or()` that lists keys — every arm an equality, or an `and()` of equalities, of the same typed columns with plain values — renders past `inArrayOptThreshold` arms as one array parameter per column; off, every `or()` renders as written | a boolean |
+
+With `orUsesOpt` on (the default), nine `(user, title)` keys written as an `or()` bind two parameters:
+
+```ts
+await db.posts.where(p => or(...keys.map(k => and(eq(p.userId, k.userId), eq(p.title, k.title))))).select(p => p.title).toList();
+```
+
+```sql
+SELECT "posts"."title"
+FROM "posts"
+WHERE (("posts"."user_id", "posts"."title") IN (SELECT "__keys"."k1", "__keys"."k2" FROM unnest($1::integer[], $2::varchar[]) AS "__keys"("k1", "k2")))
+-- params: ["{1,1,2,2,1,1,2,2,99}", "{\"Alice Post 1\",\"Alice Post 2\",\"Bob Post\",…}"]
+```
+
+Eight keys, and every key count with `orUsesOpt = false`, render the `or()` as written:
+`(("posts"."user_id" = $1 AND "posts"."title" = $2) OR …)`. What qualifies, and what stays as written:
+[Querying](./querying.md#lists-of-keys-written-as-or-orusesopt-since-1034).
 
 With `inArrayPadBuckets = [1, 2, 8]` three ids fill the rung of 8:
 
@@ -755,8 +776,9 @@ WHERE ("products"."id" = ANY($1::integer[]))
 ```
 
 An invalid value throws and keeps the current one, for example
-`inArrayOpt threshold must be a non-negative integer, got -1` and
-`inArrayOpt pad buckets must be in strictly ascending order, got [4, 2]`.
+`inArrayOpt threshold must be a non-negative integer, got -1`,
+`inArrayOpt pad buckets must be in strictly ascending order, got [4, 2]` and
+`orUsesOpt must be a boolean, got no`.
 
 > **Efficiency:** an `IN` list gives the planner an exact row estimate and, under `preparedStatements`,
 > one cached plan per length; the array form is one text for every length. A padded statement is planned
@@ -1019,8 +1041,8 @@ await countingDb.users.select(u => ({ id: u.id, posts: u.posts!.select(p => ({ t
   and writes; keep `db.query()` for statements they do not cover (`EXPLAIN`, `SET TRANSACTION`,
   `SAVEPOINT`).
 - **Don't** set `LinkgressConfig` values per request or per context → **Do** set them once at boot. A
-  context constructed with `inArrayOptThreshold`, `inArrayPadBuckets` or `inArrayUsesOpt` rewrites them
-  for every context in the process.
+  context constructed with `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt` or `orUsesOpt`
+  rewrites them for every context in the process.
 - **Don't** use `collectionStrategy: 'temptable'` inside `db.transaction()` on `PostgresClient`,
   `BunClient` or `PGliteClient` → **Do** use `lateral` or `cte` there. A parameterless base query fails
   (`Fully optimized mode requires querySimpleMulti support`, or `querySimpleMulti not supported by this

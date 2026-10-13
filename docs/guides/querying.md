@@ -638,7 +638,8 @@ reaches the server; a subquery computes the list in the database instead.
 |---|---|---|---|
 | A data-driven list (ids, cart items): the default | `inArrayOpt(col, list)`, `notInArrayOpt` | `IN ($1, …)` up to 8 elements, `= ANY($1::integer[])` above · bounded statement texts | — |
 | One statement text for every length; long lists | `eqAny(col, list)`, `neAll` | `= ANY($1::integer[])` · 1 parameter | constant short lists whose exact estimate matters under a generic plan |
-| Short constant lists (enum members) | `inArray(col, list)`, `notInArray` | `IN ($1, $2, $3)` · 1 parameter per element | data-driven lists (one text per length); more than 65,535 elements (32,767 on PGlite) |
+| Short constant lists (enum members) | `inArray(col, list)`, `notInArray` | `IN ($1, $2, $3)` · 1 parameter per element | data-driven lists (one text per length); more than 65,535 elements (65,533 on postgres.js, 32,767 on PGlite) |
+| Keys of two or more columns | `or(...keys.map(k => and(eq(t.a, k.a), eq(t.b, k.b))))` | as written up to 8 keys, `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))` above · 1 parameter per column (since 1.0.34) | — |
 | Values another query computes | `inSubquery()`, `eqAnySubquery()` | `IN (SELECT …)` | fetching the ids first (2 round trips) |
 
 ### Letting the list length decide: `inArrayOpt` / `notInArrayOpt`
@@ -691,13 +692,13 @@ LinkgressConfig.inArrayOptThreshold = 12;                // property setter
 LinkgressConfig.configure({ inArrayOptThreshold: 12 });  // or several settings at once
 LinkgressConfig.inArrayOptThreshold;                     // -> 12
 new AppDatabase(client, { inArrayOptThreshold: 12 });    // QueryOptions writes the same process-wide value
-LinkgressConfig.resetToDefaults();                       // 8, no padding, inArrayUsesOpt off
+LinkgressConfig.resetToDefaults();                       // 8, no padding, inArrayUsesOpt off, orUsesOpt on
 ```
 
 `0` sends every non-empty list to the array form (`("users"."id" = ANY($1::integer[]))` with `'{1}'`). An
 invalid value (negative, not an integer) throws and keeps the current one.
 
-> **Pitfall:** the threshold, the pad ladder and `inArrayUsesOpt` are process-wide. Constructing ANY context
+> **Pitfall:** the threshold, the pad ladder, `inArrayUsesOpt` and `orUsesOpt` are process-wide. Constructing ANY context
 > with `inArrayOptThreshold: 2` in its options changed the SQL of an already constructed context to
 > `= ANY($1::integer[])` for a 3-element list (verified).
 
@@ -746,7 +747,7 @@ as CTE columns, stay uncast and PostgreSQL infers the array type. An empty list 
 
 | | `inArray` / `notInArray` | `eqAny` / `neAll` |
 |---|---|---|
-| Parameters | one per element (at most 65,535 per statement; 32,767 on PGlite) | always one |
+| Parameters | one per element (at most 65,535 per statement; 65,533 on postgres.js, 32,767 on PGlite) | always one |
 | Statement text | changes with the list length | fixed |
 | Row estimate under a generic plan (`preparedStatements`, after five executions) | exact per element | default selectivity |
 
@@ -852,6 +853,62 @@ threshold, same ladder, same array form above it. The rows never change, only th
 why it is safe to flip for a whole process. Leave it off when hand-tuned queries depend on the planner seeing
 an exact-length `IN` list; explicit `inArrayOpt` calls keep their rendering either way. It is also set by
 `LinkgressConfig.configure({ inArrayUsesOpt: true })` and by `new AppDatabase(client, { inArrayUsesOpt: true })`.
+
+### Lists of keys written as `or()`: `orUsesOpt` (since 1.0.34)
+
+Keys of two or more columns are written as an `or()` of `and(eq(…), eq(…))` — `inArrayOpt` takes one column.
+Written that way every value is a parameter of its own: 40 000 keys of two columns are 80 000 parameters,
+which no driver sends (postgres.js: `MAX_PARAMETERS_EXCEEDED`; pg: `bind message has 14464 parameter formats
+but 0 parameters`; Bun past 65 535; PGlite past 32 767). Past `inArrayOptThreshold` arms (8) such an `or()`
+renders as ONE array parameter per column, matched as a row; up to it, as written. On by default:
+
+```ts
+const keys = [
+  { userId: alice.id, title: 'Alice Post 1' }, { userId: alice.id, title: 'Alice Post 2' }, { userId: bob.id, title: 'Bob Post' },
+  { userId: bob.id, title: 'Alice Post 1' }, { userId: alice.id, title: 'Draft 1' }, { userId: alice.id, title: 'Draft 2' },
+  { userId: bob.id, title: 'Draft 3' }, { userId: bob.id, title: 'Draft 4' }, { userId: 99, title: 'Bob Post' },
+];
+const titles = await db.posts
+  .where(p => or(...keys.map(k => and(eq(p.userId, k.userId), eq(p.title, k.title)))))
+  .select(p => p.title)
+  .toList(); // ['Alice Post 1', 'Alice Post 2', 'Bob Post']
+
+const viewed = await db.posts
+  .where(p => or(...[100, 150, 200, 250, 300, 350, 400, 450, 500].map(v => eq(p.views, v))))
+  .select(p => p.title)
+  .toList();
+```
+
+```sql
+SELECT "posts"."title"
+FROM "posts"
+WHERE (("posts"."user_id", "posts"."title") IN (SELECT "__keys"."k1", "__keys"."k2" FROM unnest($1::integer[], $2::varchar[]) AS "__keys"("k1", "k2")))
+-- params: [ "{1,1,2,2,1,1,2,2,99}", "{\"Alice Post 1\",\"Alice Post 2\",\"Bob Post\",\"Alice Post 1\",\"Draft 1\",\"Draft 2\",\"Draft 3\",\"Draft 4\",\"Bob Post\"}" ]
+
+SELECT "posts"."title"
+FROM "posts"
+WHERE ("posts"."views" = ANY($1::integer[]))
+-- params: [ "{100,150,200,250,300,350,400,450,500}" ]
+```
+
+The first eight of those keys render as written,
+`(("posts"."user_id" = $1 AND "posts"."title" = $2) OR … OR ("posts"."user_id" = $15 AND "posts"."title" = $16))`;
+over one column the list renders what `inArrayOpt` renders.
+
+- **The rows are the OR's.** A row-constructor `IN` is NULL where a key compares NULL and none matches — as the OR of
+  its arms is — so `not()` of it, and a row whose key column is NULL, read as they did.
+- **What is rewritten:** every arm an equality, or an `and()` of equalities, over the same columns (in any order per
+  arm), each comparing a column with a declared type to a plain value that is a string, number, boolean or bigint
+  after the column's mapper (a `HourMinute` mapped to `smallint` qualifies). The column casts like `eqAny`'s
+  (`serial` → `integer[]`, `char` → `bpchar[]`).
+- **What stays as written:** an arm comparing to NULL (`eq` renders `IS NULL`), to another column, an `sql` fragment,
+  a placeholder or a subquery; a column without a declared type (a CTE column), a json/jsonb or array column; a
+  `Date` or other object value its column does not map (pg binds a Date in local time, an array literal in UTC);
+  arms over different columns, or naming a column twice; an arm that is itself an `or()` or a nested `and()`; any
+  `or()` under a grouped `HAVING` or in a `RETURNING` expression.
+- **One statement text** for every key count above the threshold, so it prepares once.
+- **Off:** `LinkgressConfig.orUsesOpt = false` (or `new AppDatabase(client, { orUsesOpt: false })`), process-wide,
+  for a hand-tuned query that depends on the planner seeing the arms. `resetToDefaults()` turns it back on.
 
 <a id="startswith-operator"></a><a id="regex-operators"></a>
 

@@ -57,7 +57,7 @@ in-memory database and PGlite 0.5.8.
 | `supportsMultiStatementQueries()` | `false` | `true` | `true` | `true` |
 | `querySimple()` / `querySimpleMulti()` | absent | yes | yes | yes (`exec()`) |
 | `query('A; B')` without parameters | runs; `rows` is `undefined` | runs; `rows` holds one array per statement | runs; `rows` holds one array per statement | refused: `cannot insert multiple commands into a prepared statement` |
-| `maxParameters()` | 65 535 | 65 535 | 65 535 | 32 767 (since 1.0.29) |
+| `maxParameters()` | 65 535 | 65 533 (since 1.0.34: postgres.js refuses 65 534 and more itself) | 65 535 | 32 767 (since 1.0.29) |
 | `supportsBinaryArrayResults()` | `true` | `true` | `false`; `true` with `prepare: false` | `true` |
 | `losesNumericZeroScale()` | `false` | `false` | `true`; `false` with `prepare: false` | `false` |
 | `connect()` session | a checked-out pool client | `sql.reserve()` (postgres 3.4+) | `sql.reserve()` | a lease of the one session |
@@ -772,7 +772,7 @@ Observed: one `firstOrDefault()` plus a transaction with one `update()` counted 
 | `supportsBinaryProtocol()` | `false` | no built-in client returns `true` |
 | `supportsBinaryArrayResults()` | `true` | `false`: collections aggregate with `json_agg` so no native array reaches the driver |
 | `losesNumericZeroScale()` | `false` | `true`: the driver reads a scaled numeric zero as `"0"`; the builders restore declared scales |
-| `maxParameters()` | 65 535 | parameters per statement; `MutationBatch` refuses a statement over it before sending, measures `ifFits` legs against it, and the standalone bulk writes size their chunks within it (since 1.0.32) |
+| `maxParameters()` | 65 535 | parameters per statement; `MutationBatch` refuses a statement over it before sending, measures `ifFits` legs against it, the standalone bulk writes size their chunks within it (since 1.0.32), and `insertBulk(…).toStatement()` refuses a compiled insert over it (since 1.0.34). Report what your driver sends: postgres.js refuses 65 534 parameters and more (`PostgresClient` reports 65 533), pg and Bun's SQL send 65 535 |
 | `parseTypedText(oid, text, read?)` | node-postgres's default parsing | the value the client delivers for a column of type `oid` whose wire text is `text` (`read.parameterized`: whether the statement binds parameters) |
 | `customParsedTypeOids()` | `[]` | types the application parses with its own parsers; a `QueryBatch` sends their values as text |
 

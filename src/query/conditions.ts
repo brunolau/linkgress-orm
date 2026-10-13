@@ -549,9 +549,22 @@ export class LogicalCondition extends WhereConditionBase {
     return refs;
   }
 
+  /** The conditions it ANDs — `undefined` for an or() or a not(). @internal */
+  andedConditions(): readonly WhereConditionBase[] | undefined {
+    return this.operator === 'and' ? this.conditions : undefined;
+  }
+
   buildSql(context: SqlBuildContext): string {
     if (this.conditions.length === 0) {
       return '1=1';
+    }
+
+    if (this.operator === 'or') {
+      const membership = this.renderKeyMembership(context);
+
+      if (membership !== undefined) {
+        return membership;
+      }
     }
 
     // A raw `sql` operand is the caller's text — `a OR b` inside an AND must keep its grouping.
@@ -571,6 +584,141 @@ export class LogicalCondition extends WhereConditionBase {
         throw new Error(`Unknown logical operator: ${this.operator}`);
     }
   }
+
+  /**
+   * An or() that lists keys — every arm an equality, or an and() of equalities, of the same typed columns with
+   * plain values (see {@link keyEqualities}) — past `inArrayOptThreshold` arms, as ONE array parameter per column:
+   * `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))`, and over one column what `inArrayOpt` renders,
+   * `(a = ANY($1::ta[]))`. Written longhand the keys bind a parameter per value — 40 000 keys of two columns are
+   * 80 000, a statement no driver sends — and the text changes with every key count. `undefined` when the or() is
+   * not such a list, when `LinkgressConfig.orUsesOpt` is off, or under a substitution (a grouped HAVING, a RETURNING
+   * expression — a column there renders as what the substitution makes of that ref): it then renders as written.
+   *
+   * The rows are the OR's, NULLs included: a row-constructor `IN` is NULL where a key compares NULL and none
+   * matches, as an OR of ANDs is — so `not()` of it, and a NULL column, read as before.
+   */
+  private renderKeyMembership(context: SqlBuildContext): string | undefined {
+    if (!orUsesOpt || this.conditions.length <= inArrayOptThreshold || context.substitute) {
+      return undefined;
+    }
+
+    const first = keyEqualities(this.conditions[0]);
+
+    if (first === undefined) {
+      return undefined;
+    }
+
+    const indexOf = new Map(first.map((equality, index) => [equality.identity, index]));
+    const values: unknown[][] = first.map(equality => [equality.driverValue]);
+
+    for (let arm = 1; arm < this.conditions.length; arm++) {
+      const equalities = keyEqualities(this.conditions[arm]);
+
+      if (equalities === undefined || equalities.length !== first.length) {
+        return undefined;
+      }
+
+      for (const equality of equalities) {
+        const index = indexOf.get(equality.identity);
+
+        if (index === undefined) {
+          return undefined;
+        }
+
+        values[index].push(equality.driverValue);
+      }
+    }
+
+    const bind = (index: number): string => {
+      context.params.push(toPgArrayLiteral(values[index]));
+
+      return `$${context.paramCounter++}${arrayElementCast(first[index].column)}`;
+    };
+
+    if (first.length === 1) {
+      return `(${this.getDbColumnName(first[0].column, context)} = ANY(${bind(0)}))`;
+    }
+
+    const row = first.map(equality => this.getDbColumnName(equality.column, context)).join(', ');
+    const arrays = first.map((_, index) => bind(index)).join(', ');
+    const names = first.map((_, index) => `"k${index + 1}"`);
+
+    return `((${row}) IN (SELECT ${names.map(name => `"__keys".${name}`).join(', ')} FROM unnest(${arrays}) AS "__keys"(${names.join(', ')})))`;
+  }
+}
+
+/** One `column = value` of a key an or() lists: the typed column, its identity, the value as the driver binds it. */
+interface KeyEquality {
+  column: FieldRef;
+  identity: string;
+  driverValue: string | number | boolean | bigint;
+}
+
+/** Column types a key never binds as an array: no element type to cast to, an array, json (compared as documents). */
+const KEY_COLUMN_EXCLUDED_TYPES = new Set(['array', 'json', 'jsonb']);
+
+/**
+ * `condition` as a key equality: a typed column compared with a plain value that an array literal carries exactly as
+ * the driver would bind it — a string, a number, a boolean or a bigint, after the column's mapper. `undefined` for
+ * anything else: `eq(col, null)` (it renders IS NULL), a column or an expression on either side, a placeholder, an
+ * untyped ref, an array or json column, a Date or any other object (pg binds a Date in local time, an array literal
+ * in UTC).
+ */
+function keyEquality(condition: WhereConditionBase): KeyEquality | undefined {
+  if (!(condition instanceof EqComparison)) {
+    return undefined;
+  }
+
+  const { field, value } = condition.comparedOperands();
+
+  if (typeof field !== 'object' || field === null || !('__dbColumnName' in field) || field instanceof SqlFragment || isSubqueryOperand(field)) {
+    return undefined;
+  }
+
+  const sqlType = (field as { __sqlType?: unknown }).__sqlType;
+
+  if (typeof sqlType !== 'string' || sqlType === '' || KEY_COLUMN_EXCLUDED_TYPES.has(sqlType) || /\[\d*\]\s*$/.test(sqlType)) {
+    return undefined;
+  }
+
+  if (value === null || value === undefined || !isSqlFragmentLiteral(value) || (typeof value === 'object' && '__dbColumnName' in value)) {
+    return undefined;
+  }
+
+  const driverValue = applyToDriverMapper(value, getComparisonMapper(field));
+
+  if (typeof driverValue !== 'string' && typeof driverValue !== 'number' && typeof driverValue !== 'boolean' && typeof driverValue !== 'bigint') {
+    return undefined;
+  }
+
+  const ref = field as FieldRef & { __tableAlias?: string };
+
+  return { column: ref, identity: `${ref.__tableAlias ?? ''}\u0000${ref.__dbColumnName}\u0000${sqlType}`, driverValue };
+}
+
+/** The key equalities of one or() arm — the arm itself, or the conditions of an and() of them — each column once. */
+function keyEqualities(arm: WhereConditionBase): KeyEquality[] | undefined {
+  const conditions = arm instanceof LogicalCondition ? arm.andedConditions() : [arm];
+
+  if (conditions === undefined || conditions.length === 0) {
+    return undefined;
+  }
+
+  const equalities: KeyEquality[] = [];
+  const seen = new Set<string>();
+
+  for (const condition of conditions) {
+    const equality = keyEquality(condition);
+
+    if (equality === undefined || seen.has(equality.identity)) {
+      return undefined;
+    }
+
+    seen.add(equality.identity);
+    equalities.push(equality);
+  }
+
+  return equalities;
 }
 
 /**
@@ -599,6 +747,14 @@ export class RawSqlCondition extends WhereConditionBase {
 export class EqComparison<V = any> extends WhereComparisonBase<V> {
   protected getOperator(): string {
     return '=';
+  }
+
+  /**
+   * Its column and the value compared with it — what an `or()` listing keys reads them from
+   * (`LogicalCondition.renderKeyMembership`). @internal
+   */
+  comparedOperands(): { field: unknown; value: unknown } {
+    return { field: this.field, value: this.value };
   }
 
   /**
@@ -1254,6 +1410,34 @@ export function setInArrayUsesOpt(enabled: boolean): void {
  */
 export function getInArrayUsesOpt(): boolean {
   return inArrayUsesOpt;
+}
+
+let orUsesOpt = true;
+
+/**
+ * INTERNAL write path behind `LinkgressConfig.orUsesOpt` (and the `QueryOptions.orUsesOpt` hook). Not part of the
+ * package surface.
+ *
+ * `true` (the default) renders an `or()` that lists keys past {@link inArrayOptThreshold} arms as one array
+ * parameter per column (`LogicalCondition.renderKeyMembership`); `false` renders every `or()` as written.
+ *
+ * @internal
+ */
+export function setOrUsesOpt(enabled: boolean): void {
+  if (typeof enabled !== 'boolean') {
+    throw new Error(`orUsesOpt must be a boolean, got ${String(enabled)}`);
+  }
+
+  orUsesOpt = enabled;
+}
+
+/**
+ * INTERNAL read path behind `LinkgressConfig.orUsesOpt`.
+ *
+ * @internal
+ */
+export function getOrUsesOpt(): boolean {
+  return orUsesOpt;
 }
 
 /**

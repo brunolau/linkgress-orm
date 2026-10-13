@@ -5,9 +5,7 @@ import type { DbEntityTable } from '../entity/db-context';
 import type { DbEntity } from '../entity/entity-base';
 import type { Condition } from './conditions';
 import { renumberPlaceholders } from './query-batch';
-import { calculateOptimalChunkSize, clientParameterLimit, hasBarePlaceholder } from './sql-utils';
-
-const POSTGRES_MAX_PARAMS = 65535;
+import { boundColumnCount, calculateOptimalChunkSize, clientParameterLimit, hasBarePlaceholder, parameterLimitText } from './sql-utils';
 
 /** Typed handle returned by MutationBatch.addInsertBulk / addBulkUpdate. */
 export interface MutationBatchKey {
@@ -24,11 +22,11 @@ export interface LegFitOptions {
    * to, as a verdict instead of an error:
    *
    * - its rows (a where-in leg's values; an insert-with-children leg's parents and children) within a leg's own budget,
-   *   the rows a standalone mutation sends in one chunk on PostgreSQL (`⌊⌊65 535 / columns⌋ · 0.6⌋`, the columns of its
-   *   first row) — over it, a leg registered without `ifFits` throws here;
+   *   the rows a standalone mutation sends in one chunk on PostgreSQL (`⌊⌊65 535 / columns⌋ · 0.6⌋`, the keys its rows
+   *   carry, over every row) — over it, a leg registered without `ifFits` throws here;
    * - the parameters it binds, counted on the leg as compiled (an SQL fragment cell binds none; a typed row guard and
    *   an update leg's `where` bind their own), together with every leg registered BEFORE it, within the most one statement binds through its
-   *   client (`DatabaseClient.maxParameters()`: PostgreSQL's 65 535, PGlite's 32 767) — over it,
+   *   client (`DatabaseClient.maxParameters()`: PostgreSQL's 65 535, postgres.js's 65 533, PGlite's 32 767) — over it,
    *   {@link MutationBatch.executeBatch} refuses the statement.
    *
    * When the statement cannot carry it, the call registers NOTHING and returns null — write the same input
@@ -592,7 +590,8 @@ export class MutationBatch {
 
     this.assertRegisterable(id);
 
-    if (!MutationBatch.withinLegBudget([...config.rows, ...config.children.rows.map(child => child.row)], id, options?.ifFits)) {
+    // Parents and children count one row each, at the PARENTS' columns (every parent's keys)
+    if (!MutationBatch.withinLegBudget([...config.rows, ...config.children.rows.map(child => child.row)], id, options?.ifFits, boundColumnCount(config.rows))) {
       return null;
     }
 
@@ -665,7 +664,8 @@ export class MutationBatch {
 
   /**
    * The parameters the batch's statement binds: every registered leg's. A statement binds at most 65 535
-   * (PostgreSQL's protocol limit; a client may take fewer, see `DatabaseClient.maxParameters()`) —
+   * (PostgreSQL's protocol limit; a client may take fewer, see `DatabaseClient.maxParameters()`: postgres.js
+   * 65 533, PGlite 32 767) —
    * {@link executeBatch} refuses more before sending anything. To register a leg only when the statement can
    * carry it, register it `ifFits` ({@link LegFitOptions}): that verdict also holds the leg to its own budget, which
    * this count alone does not show.
@@ -678,8 +678,9 @@ export class MutationBatch {
    * Execute every registered leg as ONE statement and store the per-leg
    * affected counts. A batch with zero legs resolves without touching the
    * database. One-shot: a batch that already executed throws. A statement
-   * binding more than 65 535 parameters (see {@link parameterCount}) is
-   * refused before it is sent — nothing runs.
+   * binding more parameters than its client takes (65 535; postgres.js 65 533,
+   * PGlite 32 767 — see {@link parameterCount}) is refused before it is sent —
+   * nothing runs.
    */
   async executeBatch(): Promise<void> {
     if (this.counts) {
@@ -698,9 +699,8 @@ export class MutationBatch {
     const limit = MutationBatch.parameterLimit(first.client);
 
     if (parameterCount > limit) {
-      const over = limit === POSTGRES_MAX_PARAMS ? "PostgreSQL's 65 535" : `the ${limit.toLocaleString('en-US').replace(/,/g, ' ')} this client takes`;
       throw new Error(
-        `MutationBatch: the statement binds ${parameterCount} parameters — over ${over}: execute some of its legs in another batch `
+        `MutationBatch: the statement binds ${parameterCount} parameters — over ${parameterLimitText(limit)}: execute some of its legs in another batch `
         + `(${this.legs.map(leg => `"${leg.id}": ${leg.params.length}`).join(', ')})`
       );
     }
@@ -839,8 +839,14 @@ export class MutationBatch {
    * count). A chunked mutation cannot ride a single-statement batch: a leg over
    * it is declined (false) when registered `ifFits`, refused (thrown) otherwise.
    */
-  private static withinLegBudget(rows: Record<string, any>[], id: string, ifFits: boolean | undefined): boolean {
-    const columnCount = Math.max(1, Object.keys(rows[0]).length);
+  private static withinLegBudget(
+    rows: Record<string, any>[],
+    id: string,
+    ifFits: boolean | undefined,
+    // Every row's keys, as the standalone chunkers count them — a first row carrying fewer keys than the rest
+    // undercounted what the leg binds
+    columnCount: number = boundColumnCount(rows)
+  ): boolean {
     const singleStatementLimit = calculateOptimalChunkSize(columnCount);
 
     if (rows.length <= singleStatementLimit) {
@@ -866,7 +872,7 @@ export class MutationBatch {
 
   /**
    * The most parameters one statement binds through `client` ({@link clientParameterLimit}: PostgreSQL's 65 535, or the
-   * client's own limit when lower — PGlite: 32 767). What {@link executeBatch} refuses a statement over, and what
+   * client's own limit when lower — postgres.js: 65 533, PGlite: 32 767). What {@link executeBatch} refuses a statement over, and what
    * `ifFits` registers within.
    */
   private static parameterLimit(client: DatabaseClient): number {
