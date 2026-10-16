@@ -498,6 +498,13 @@ const rootOrderByFieldOf = (key: any, direction: OrderDirection): RootOrderByFie
 /** The column an expression key's ref stands for: a projected column's key (see createOrderByProxy) stands for its column. */
 const orderKeyColumnRef = (ref: any): FieldRef => (ref?.[ORDER_KEY] as OrderKeyMeta | undefined)?.ref ?? ref;
 
+/**
+ * A projected collection aggregate an `orderBy` key names by its output alias (see createOrderByProxy):
+ * MIN, MAX and SUM. COUNT and EXISTS stay expression keys — they render as their own subquery.
+ */
+const isOrderableCollectionAggregate = (aggregationType: string | undefined): boolean =>
+  aggregationType === 'MIN' || aggregationType === 'MAX' || aggregationType === 'SUM';
+
 /** The parenthesized SQL of an ORDER BY expression key, built in `context`'s parameter sequence. */
 const buildOrderByExpressionSql = (
   expression: Condition,
@@ -2262,6 +2269,13 @@ export class SelectQueryBuilder<TSelection> {
 
         if (value && typeof value === 'object' && '__fieldName' in value && '__dbColumnName' in value) {
           return orderKey(prop, alias, { ref: value, nested });
+        }
+
+        // A projected MIN / MAX / SUM of a collection: ordered by its output alias — the value the
+        // projection already computes (as an expression it has no SQL of its own: buildSql() renders
+        // only EXISTS and COUNT, and would evaluate the aggregate a second time)
+        if (value instanceof CollectionQueryBuilder && isOrderableCollectionAggregate(value.getAggregationType())) {
+          return orderKey(prop, alias, { nested });
         }
 
         // Navigation builders pass through untouched (see createFieldRefProxy)
