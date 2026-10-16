@@ -280,6 +280,35 @@ describe('orderBy after select()', () => {
     expect(orderByClause()).toBe('ORDER BY "__nested__n__shout" ASC, "id" ASC');
   });
 
+  // Dune's editions: E-2, E-3, E-5; Emma's: E-1, E-4. A projected MIN / MAX / SUM of a collection
+  // used to throw from buildSql() ("only supported for EXISTS and COUNT aggregations")
+  test('a projected MIN / MAX / SUM of a collection: its output alias', async () => {
+    const books = () => fx.db.libBooks.select(b => ({
+      id: b.id,
+      firstEdition: b.editions!.min(ed => ed.id),
+      lastLabel: b.editions!.where(ed => gt(ed.id, fx.ids.e1)).max(ed => ed.label),
+      editionIds: b.editions!.sum(ed => ed.id),
+      n: { firstEdition: b.editions!.min(ed => ed.id) },
+    }));
+
+    fx.resetCapture();
+    const byFirst = await books().orderBy(r => [[r.firstEdition, 'DESC']]).toList();
+    expect(ids(byFirst)).toEqual([fx.ids.dune, fx.ids.emma]);
+    expect(orderByClause()).toBe('ORDER BY "firstEdition" DESC');
+
+    const byLast = await books().orderBy(r => [[r.lastLabel, 'ASC']]).toList();
+    expect(ids(byLast)).toEqual([fx.ids.emma, fx.ids.dune]);
+    expect(byLast.map(r => r.lastLabel)).toEqual(['E-4', 'E-5']);
+    expect(orderByClause()).toBe('ORDER BY "lastLabel" ASC');
+
+    const bySum = await books().orderBy(r => [[r.editionIds, 'ASC']]).toList();
+    expect(ids(bySum)).toEqual([fx.ids.emma, fx.ids.dune]);
+
+    const byNested = await books().orderBy(r => [[r.n.firstEdition, 'ASC']]).toList();
+    expect(ids(byNested)).toEqual([fx.ids.emma, fx.ids.dune]);
+    expect(orderByClause()).toBe('ORDER BY "__nested__n__firstEdition" ASC');
+  });
+
   test('a key a later select() renames still orders by the column it named', async () => {
     fx.resetCapture();
     const rows = await fx.db.libLoans
