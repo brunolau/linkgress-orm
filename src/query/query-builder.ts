@@ -280,9 +280,10 @@ export function getDbToPropertyMapForSchema(schema: TableSchema): Map<string, st
  * Building a reference mock row costs O(columns + relations) `Object.defineProperty`
  * calls plus fresh closures per row — and deep selectors (cart → items → product →
  * price → …) rebuild that graph from scratch on EVERY query build. All of it is
- * deterministic in (target schema, relation alias, navigation path), so the property
- * descriptors are built once per signature and reused: each new mock row is a bare
- * object + one `Object.defineProperties` call with the shared descriptor map.
+ * deterministic in (target schema, relation alias, source alias, navigation path, and the
+ * navigation's own join keys), so the property descriptors are built once per signature
+ * and reused: each new mock row is a bare object + one `Object.defineProperties` call with
+ * the shared descriptor map.
  *
  * Per-instance state (the lazy FieldRef cache and the memoized navigation rows)
  * lives in symbol-keyed slots read by the shared getters through `this`, so sharing
@@ -309,8 +310,12 @@ type MockRowSlots = {
   [MOCK_ROW_CHAIN_ID]?: string | number;
 };
 
+/** A navigation hop's own join as a cache-key part: its key columns on both sides, and INNER / LEFT. */
+const navigationJoinSignature = (foreignKeys: readonly string[] | undefined, matches: readonly string[] | undefined, isMandatory: boolean | undefined): string =>
+  `${(foreignKeys ?? []).join('+')}:${(matches ?? []).join('+')}:${isMandatory ? 1 : 0}`;
+
 const navigationPathSignature = (path: NavigationJoin[]): string => path
-  .map(step => `${step.alias}:${step.targetTable}:${(step.foreignKeys ?? []).join('+')}:${(step.matches ?? []).join('+')}:${step.isMandatory ? 1 : 0}:${step.sourceAlias ?? ''}`)
+  .map(step => `${step.alias}:${step.targetTable}:${navigationJoinSignature(step.foreignKeys, step.matches, step.isMandatory)}:${step.sourceAlias ?? ''}`)
   .join('>');
 
 /**
@@ -10145,9 +10150,15 @@ export class ReferenceQueryBuilder<TItem = any> {
     if (this.targetTableSchema) {
       // Prototype-level cache — see MockRowCache's doc. Everything the getters close over
       // is fully determined by (target schema object identity, relationName, sourceAlias,
-      // navigation-path content), so rows with the same signature can share one prebuilt
+      // navigation-path content, and this navigation's OWN join: foreign keys, principal keys,
+      // INNER / LEFT), so rows with the same signature can share one prebuilt
       // PROTOTYPE carrying every column/relation getter; a new row is then `Object.create`
       // plus its two own state slots — O(1) instead of one property definition per column.
+      // The own join is in the key because the getters carry it — it is the last hop of the
+      // path every collection and deeper navigation of the row records — and the source alias
+      // does not always name the source table: a table-level RETURNING anchors EVERY table's
+      // first hop on "__mutation__", where `a.user` and `b.user` (different keys) used to share
+      // one prototype, and with it the key of whichever table minted it first.
       // The cross-row cache is OPT-IN via the static switch (MockRowCache.setEnabled — the
       // host app flips it from its own config): with it off, each row gets a FRESH
       // prototype (the pre-0.4.66 memory profile — nothing retained beyond the row's
@@ -10167,6 +10178,7 @@ export class ReferenceQueryBuilder<TItem = any> {
         prototype = MockRowCache.getOrBuild(
           enabled
             ? `${MockRowCache.modelKey(this.schemaRegistry)}|${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`
+              + `|${navigationJoinSignature(this.foreignKeys, this.matches, this.isMandatory)}`
               + (this.explicitAlias !== undefined ? `|@${this.explicitAlias}` : '')
             : '',
           () => Object.defineProperties({}, this.buildMockRowDescriptors()),
