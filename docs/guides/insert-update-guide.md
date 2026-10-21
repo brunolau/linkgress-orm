@@ -2235,7 +2235,8 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "
 ### Insert parents and children as a leg: `addInsertBulkWithChildren()`
 
 The `insertBulkWithChildren` persist as one leg (three CTEs). Unlike the standalone call, parents without children are
-allowed. `getAffectedCount` reports the PARENT rows; `parentReturning` reads the parents back in input order (raw JSON).
+allowed — all of them too: with an empty `children.rows` the child CTE is left out and the leg is a plain parent insert.
+`getAffectedCount` reports the PARENT rows; `parentReturning` reads the parents back in input order (raw JSON).
 
 ```ts
 const wc = new MutationBatch();
