@@ -6723,7 +6723,9 @@ WHERE ${guardSql}`,
    * batch rewrites it to the leg's actual prefix at assembly. Params are ONE
    * $1-based space across the triple (child placeholders pre-shifted here).
    * Unlike the standalone form, childless parents are allowed — the leg reads
-   * parents from `_o` directly, not through the child join.
+   * parents from `_o` directly, not through the child join. When NO child row
+   * is given at all, `_c` is not emitted: the leg is a plain parent insert
+   * (`_p` + `_o`), as a child INSERT without rows has no columns to resolve.
    * @internal
    */
   _buildInsertBulkWithChildrenCtes(config: {
@@ -6768,6 +6770,16 @@ FROM "__MB_SELF___p" p`;
 
     if (!fkColBuilder) {
       throw new Error(`insertBulkWithChildren leg: unknown child foreign-key property "${config.children.foreignKey}"`);
+    }
+
+    if (config.children.rows.length === 0) {
+      return {
+        ctes: [
+          { suffix: 'p', sql: parentSql },
+          { suffix: 'o', sql: ordinalSql },
+        ],
+        params: parentCompiled.params,
+      };
     }
 
     const fkDbName = (fkColBuilder as any).build().name;

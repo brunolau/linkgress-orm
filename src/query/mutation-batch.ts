@@ -570,7 +570,8 @@ export class MutationBatch {
    * `options.parentReturning` (prop names) exposes the parent rows in INPUT
    * order via {@link getLegRows} (raw JSON values — e.g. read back generated
    * task ids to publish after the batch commits). Unlike the standalone form,
-   * childless parents are allowed. `options.ifFits`: see {@link LegFitOptions}
+   * childless parents are allowed — all of them too: with no child row at all
+   * the leg is a plain parent insert. `options.ifFits`: see {@link LegFitOptions}
    * (the leg's rows are its parents and its children; declined, the standalone
    * `insertBulkWithChildren` is ONE statement under a budget of its own and
    * needs a child per parent — a larger input is split by the caller).
