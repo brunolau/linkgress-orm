@@ -555,8 +555,11 @@ export class LogicalCondition extends WhereConditionBase {
   }
 
   buildSql(context: SqlBuildContext): string {
+    // The identities of AND and OR: an and() of no operand holds for every row, an or() of none for no row. An or()
+    // spread from a list that came out empty asks "any of these" about nothing, so it selects nothing — it rendered
+    // `1=1` up to 1.0.38, and read the whole table. not() always has its one operand.
     if (this.conditions.length === 0) {
-      return '1=1';
+      return this.operator === 'or' ? '1=0' : '1=1';
     }
 
     if (this.operator === 'or') {
@@ -1638,10 +1641,12 @@ export function between<T extends string, V>(
   return new BetweenComparison<V>(field as FieldLike<V>, min as FieldLike<V> | V, max as FieldLike<V> | V);
 }
 
+/** Every condition holds. With no operand it holds for every row (`1=1`). */
 export function and(...conditions: Condition[]): Condition {
   return new LogicalCondition('and', conditions);
 }
 
+/** At least one condition holds. With no operand it holds for no row (`1=0`): `or(...[])` selects nothing. */
 export function or(...conditions: Condition[]): Condition {
   return new LogicalCondition('or', conditions);
 }
