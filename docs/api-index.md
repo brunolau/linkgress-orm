@@ -181,7 +181,7 @@ branch or a projection. A JS value becomes a bound parameter, converted by the c
 - `gt(a, b)` / `gte(a, b)` / `lt(a, b)` / `lte(a, b)` — `>`, `>=`, `<`, `<=`; an `undefined` value throws `Cannot use > operator with undefined value …` when the query is built. [guide](./guides/querying.md#condition-functions)
 - `isNull(a)` / `isNotNull(a)` — `IS NULL` / `IS NOT NULL`, no parameter. [guide](./guides/querying.md#condition-functions)
 - `between(a, min, max)` — inclusive `BETWEEN $1 AND $2`; an `undefined` bound binds NULL and matches no row. [guide](./guides/querying.md#null-and-undefined-in-conditions)
-- `and(...conditions)` / `or(...conditions)` / `not(condition)` — boolean composition; `and()` or `or()` of no operand renders `1=1` (an empty `or()` matches every row); an `undefined` operand throws. [guide](./guides/querying.md#condition-functions)
+- `and(...conditions)` / `or(...conditions)` / `not(condition)` — boolean composition; `and()` of no operand renders `1=1` (every row), `or()` of no operand `1=0` (no row — up to 1.0.38 it rendered `1=1`); an `undefined` operand throws. [guide](./guides/querying.md#condition-functions)
 - `like(a, pattern)` / `ilike(a, pattern)` — `LIKE` / `ILIKE`, the pattern bound. [guide](./guides/querying.md#match-a-pattern-like-ilike-startswith)
 - `startsWith(a, prefix)` — PostgreSQL's prefix operator `^@`. [guide](./guides/querying.md#match-a-pattern-like-ilike-startswith)
 - `containsSearch(v)` / `startsWithSearch(v)` / `endsWithSearch(v): string` — build `'%v%'`, `'v%'`, `'%v'`; they do not escape `%`, `_` or `\` in `v`. [guide](./guides/querying.md#match-a-pattern-like-ilike-startswith)

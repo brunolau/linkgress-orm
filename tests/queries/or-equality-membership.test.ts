@@ -4,7 +4,7 @@ import * as linkgress from '../../src';
 import {
   DbContext, DbEntityTable, DbModelConfig, DbEntity, DbColumn, DatabaseClient, Condition,
   serial, integer, smallint, bigint, numeric, varchar, text, uuid, boolean,
-  and, or, not, eq, gt, sql, add, exists, inArrayOpt, LinkgressConfig, QueryBatch,
+  and, or, not, eq, gt, gte, sql, add, exists, inArrayOpt, LinkgressConfig, QueryBatch,
 } from '../../src';
 import { ITEM_COLUMN_MAPPER, Placeholder, SqlBuildContext } from '../../src/query/conditions';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
@@ -228,6 +228,16 @@ describe('or() of column equalities: one array parameter per column past the thr
 
       expect(condition.getFieldRefs()).toHaveLength(18);
       expect(render(condition).sql).toContain('("shelf"."name", "s"."slot_no") IN');
+    });
+
+    test('an or() of nothing renders FALSE and an and() of nothing TRUE, the identities of OR and AND', () => {
+      const noKeys: Array<[number, number]> = [];
+
+      expect(render(or()).sql).toBe('1=0');
+      expect(render(or(...noKeys.map(([s, n]) => and(eq(shelf, s), eq(slot, n))))).sql).toBe('1=0');
+      expect(render(and()).sql).toBe('1=1');
+      expect(render(not(or())).sql).toBe('NOT (1=0)');
+      expect(render(and(eq(shelf, 1), or()))).toEqual({ sql: '("s"."shelf_id" = $1 AND 1=0)', params: [1], next: 2 });
     });
   });
 
@@ -533,5 +543,32 @@ describe('or() of column equalities: one array parameter per column past the thr
       const touched = await db.slots.where(s => or(...many.map(([a, b]) => and(eq(s.shelfId, a), eq(s.slotNo, b))))).update({ touched: 0 }).returning(s => ({ label: s.label }));
       expect(touched).toHaveLength(ALL.length);
     }, 60000);
+
+    test('an or() built from an empty list selects, updates and deletes no row; not() of it and an and() of nothing take every row', async () => {
+      // A lookup whose every requested key was dropped as invalid spreads an empty list into or(): up to 1.0.38 that
+      // rendered `WHERE 1=1` and the "find these rows" read returned the whole table
+      const noKeys: Array<[number, number]> = [];
+      const keysOr = (s: any) => or(...noKeys.map(([a, b]) => and(eq(s.shelfId, a), eq(s.slotNo, b))));
+      // Throwaway slots 40–42 of shelf 3: an unguarded DELETE takes them, never the rows the other cases read
+      const extra = [40, 41, 42].map(n => slotRow(3, n));
+
+      await db.slots.insertBulk(extra);
+
+      try {
+        expect(await db.slots.where(s => keysOr(s)).select(s => ({ label: s.label })).toList()).toEqual([]);
+        expect(await db.slots.where(s => and(eq(s.shelfId, 1), keysOr(s))).count()).toBe(0);
+        expect(await db.slots.where(s => not(keysOr(s))).count()).toBe(ALL.length + extra.length);
+        expect(await db.slots.where(() => and()).count()).toBe(ALL.length + extra.length);
+
+        const updated = await db.slots.where(s => keysOr(s)).update({ touched: 9 }).returning(s => ({ label: s.label }));
+        expect(updated).toEqual([]);
+
+        const deleted = await db.slots.where(s => and(eq(s.shelfId, 3), gte(s.slotNo, 40), keysOr(s))).delete().returning(s => ({ label: s.label }));
+        expect(deleted).toEqual([]);
+      } finally {
+        await db.slots.where(s => eq(s.touched, 9)).update({ touched: 0 });
+        await db.slots.where(s => and(eq(s.shelfId, 3), gte(s.slotNo, 40))).delete();
+      }
+    });
   });
 });
