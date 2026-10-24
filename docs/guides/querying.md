@@ -575,7 +575,8 @@ A value for a column with a custom mapper is bound through the mapper's `toDrive
 | `ne(c, null)`, `ne(c, undefined)` | `c IS NOT NULL` | |
 | `gt` / `gte` / `lt` / `lte` / `like` / … with `undefined` | throws before anything is sent | `Cannot use > operator with undefined value on field "users"."age". Pass an explicit value or use eq()/ne() which treat undefined as NULL.` |
 | `between(c, undefined, 50)` | `BETWEEN $1 AND $2` with `[null, 50]` | no error, no rows |
-| `and()`, `or()` with no operands | `WHERE 1=1` | every row |
+| `and()` with no operands | `WHERE 1=1` | every row |
+| `or()` with no operands, e.g. `or(...ids.map(id => eq(c.id, id)))` over an empty `ids` | `WHERE 1=0` | no row (up to 1.0.38: `1=1`, every row) |
 | `and(…, undefined, …)` | throws a `TypeError` | filter unset conditions out first |
 
 ```ts
@@ -4027,8 +4028,9 @@ WHERE "users"."id" = $1
   returns `base` itself, now filtered by `x`.
 - **Don't** pass an unset filter value to `eq()` / `ne()` → **Do** skip the condition. `eq(col, undefined)`
   renders `IS NULL`; `gt()` & co. throw; `between()` binds NULL and returns no rows.
-- **Don't** spread a possibly empty condition list into `or()` → **Do** check its length. `or()` of nothing renders
-  `WHERE 1=1` and matches every row.
+- **Don't** spread a possibly empty condition list into `or()` when an empty list should mean "no filter" → **Do**
+  skip the `where()` for it. `or()` of nothing renders `WHERE 1=0` and matches no row (up to 1.0.38 it rendered
+  `WHERE 1=1` and matched every row).
 - **Don't** filter a projected `sql` expression after `select()` → **Do** filter before `select()`. WHERE cannot
   see the output alias: `column "loud" does not exist`.
 - **Don't** `count()` a paged or DISTINCT query to count its rows → **Do** use `countOver()`, a `QueryBatch`
