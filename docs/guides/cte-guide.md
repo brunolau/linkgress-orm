@@ -2,7 +2,7 @@
 
 > **For agents:** How do I name a derived row set once with `WITH` and read it — joined, as a FROM root or from subqueries — or run a write and read its rows back, all in one statement?
 > **Use this page when:** joining per-key aggregates to entity rows, reading one derived set from several places of a statement, FULL / RIGHT / CROSS joins between derived sets, top N rows per group, candidate-set filters, writing and reading back in one round trip. **Look elsewhere when:** the set is read once in one place → [Subqueries](./subquery-guide.md); a JS list or JS rows as a relation → [Set-returning functions](./set-returning-functions.md); child lists through a navigation → [Collection strategies](../collection-strategies.md)
-> **Key APIs:** `DbCteBuilder`, `with()`, `withAggregation()`, `withMutation()`, `db.selectFromCte()`, `<table>.selectFromCte()`, `joinFilter()`, `afterMutation()`, `onTrue()`, `onFalse()` · **Round trips:** 1 per executed statement — declaring a CTE, joining it or reading it from a nested subquery adds none
+> **Key APIs:** `DbCteBuilder`, `with()` (`materialized`, `reads`), `withAggregation()`, `withMutation()`, `db.selectFromCte()`, `<table>.selectFromCte()`, `joinFilter()`, `afterMutation()`, `onTrue()`, `onFalse()` · **Round trips:** 1 per executed statement — declaring a CTE, joining it or reading it from a nested subquery adds none
 
 A CTE is built once with a `DbCteBuilder` and becomes a `DbCte`: a named relation that a statement declares in its
 `WITH` clause. A `DbCte` is not executed on its own: it runs inside the statement that declares it — the query that
@@ -20,6 +20,7 @@ navigations, see [Collection strategies](../collection-strategies.md).
 - [Read a CTE as the FROM root: `db.selectFromCte()`](#read-a-cte-as-the-from-root-dbselectfromcte)
 - [Join derived sets with FULL OUTER, RIGHT or CROSS joins](#join-derived-sets-with-full-outer-right-or-cross-joins)
 - [Read one CTE from several subqueries: declare it once](#read-one-cte-from-several-subqueries-declare-it-once)
+- [Read a CTE from inside another CTE's body: `reads`](#read-a-cte-from-inside-another-ctes-body-reads)
 - [Keep the top N rows per group: rank in a CTE](#keep-the-top-n-rows-per-group-rank-in-a-cte)
 - [Drive a query from a candidate set: `joinFilter()` and `materialized: true`](#drive-a-query-from-a-candidate-set-joinfilter-and-materialized-true)
 - [Attach child rows as a JSON array per key: `withAggregation()`](#attach-child-rows-as-a-json-array-per-key-withaggregation)
@@ -521,6 +522,72 @@ FROM "older_users"
 Without the alias both rows would be named `"older_users"` and the comparison would hold for every row; the
 build refuses it: `selectFromCte(): the query correlates to the enclosing row "older_users"."age" under the alias
 "older_users", which names its own CTE row too … Give one of them a distinct alias: selectFromCte(cte, '<alias>').`
+
+## Read a CTE from inside another CTE's body: `reads`
+
+A CTE body renders when `with()` is called, before any statement exists. A `db.selectFromCte(other)` read inside it
+cannot know that the statement declares `other`, so it declares `other` again inside itself — an `EXISTS (WITH "other" …)`
+that PostgreSQL cannot pull up into a semi-join, written, bound and planned once more per occurrence. List the CTEs the
+body reads in `with(name, query, { reads })` and they are read by name: whoever declares the body declares them just
+before it, once.
+
+```ts
+import { agg, DbCteBuilder, eq, exists, gt } from 'linkgress-orm';
+
+const older = new DbCteBuilder().with('older_users', db.users
+  .where(u => gt(u.age, 30))
+  .select(u => ({ id: u.id, age: u.age })));
+
+const olderPosts = new DbCteBuilder().with(
+  'older_posts',
+  db.posts
+    .where(p => exists(db.selectFromCte(older.cte).where(r => eq(r.id, p.userId)).select(r => ({ id: r.id })).asSubquery()))
+    .select(p => ({ userId: p.userId, title: p.title })),
+  { reads: [older.cte] },
+);
+
+const rows = await db.users
+  .with(older.cte)
+  .select(u => ({
+    name: u.username,
+    olderPosts: db.selectFromCte(olderPosts.cte).where(r => eq(r.userId, u.id)).select(() => agg.count()).asSubquery('scalar'),
+  }))
+  .toList();
+// [{ name: 'alice', olderPosts: 0 }, { name: 'bob', olderPosts: 1 }, { name: 'charlie', olderPosts: 0 }]
+```
+
+```sql
+WITH "older_users" AS (SELECT "users"."id" as "id", "users"."age" as "age"
+FROM "users"
+WHERE "users"."age" > $1)
+SELECT "users"."username" as "name", (WITH "older_posts" AS (SELECT "posts"."user_id" as "userId", "posts"."title" as "title"
+FROM "posts"
+WHERE EXISTS (SELECT "older_users"."id" as "id"
+FROM "older_users"
+WHERE "older_users"."id" = "posts"."user_id"))
+SELECT count(*) as "value"
+FROM "older_posts"
+WHERE "older_posts"."userId" = "users"."id") as "olderPosts"
+FROM "users"
+-- params: [30]
+```
+
+`older_users` is declared once and read by name inside the body's `EXISTS`, which PostgreSQL can plan as a semi-join
+(`Nested Loop Semi Join` over a `CTE Scan`; the copy declared inside the `EXISTS` plans as a `SubPlan`). The body itself
+is declared in the subquery that reads it, as any CTE a statement does not declare.
+
+- **The statement need not declare the CTE.** Without `.with(older.cte)`, the declaration that carries the body declares
+  `older_users` just before it, in the same `WITH`: `(WITH "older_users" AS (…), "older_posts" AS (…) SELECT …)`,
+  `params: [30]`. A statement that attaches the body (`.with(olderPosts.cte)`) declares both at statement level, in that
+  order.
+- **Without `reads`**, nothing changes: the body declares `older_users` inside its `EXISTS` and binds its parameter
+  again (`WHERE EXISTS (WITH "older_users" AS (…) SELECT …)`, `params: [30, 30]`).
+- **A CTE of that name the statement declares must be the same CTE by content** — the body would read its rows
+  otherwise. A different one is refused: `The CTE "older_users" a nested query attaches is not the CTE "older_users" its
+  statement declares`.
+- **A body may read a body that reads a CTE**: every level is declared once, each after the CTEs it reads.
+- `reads` is an option of `with()` only (not of `withAggregation()` or `withMutation()`); a CTE of the body's own name
+  is refused, and so is an entry that is no `DbCte`.
 
 ## Keep the top N rows per group: rank in a CTE
 
@@ -1145,6 +1212,9 @@ LEFT JOIN "active_users" ON "users"."id" = "active_users"."userId"
 
 - **Don't** read a CTE from subqueries without `.with(cte)` on the executing query → **Do** attach it there. Each
   reader otherwise declares, binds and evaluates its own copy (`params: [30, 30]` instead of `[30]`).
+- **Don't** read a CTE from a CTE body without listing it in `reads` when the statement declares it too → **Do**
+  `with(name, query, { reads: [cte] })`. The body otherwise declares its own copy inside its `EXISTS` (`params: [30, 30]`),
+  and PostgreSQL cannot plan that as a semi-join.
 - **Don't** root a statement on `db` inside `db.transaction()` → **Do** root it on `trx` or on the table you were
   handed (`trx.orders.selectFromCte(…)`). Rooted on `db` it runs on another connection: 23503 for a parent the
   transaction inserted, a hang on a pool of one connection.

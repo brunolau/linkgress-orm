@@ -370,7 +370,7 @@ Joins of grouped selects are under [Aggregates and windows](#aggregates-and-wind
 ### CTEs
 
 - `new DbCteBuilder(client?)` — collects named CTEs; pass `db.getClient()` (or a table's) so bodies follow the driver's array support. [guide](./guides/cte-guide.md#decide-cte-subquery-join-or-collection)
-- `builder.with(name, query, { materialized? }): { cte }` — any query as the body (entity, grouped, union, CTE-rooted, set); `materialized: true` renders `AS MATERIALIZED`. [guide](./guides/cte-guide.md#choose-the-cte-body-any-query-a-statement-can-run)
+- `builder.with(name, query, { materialized?, reads? }): { cte }` — any query as the body (entity, grouped, union, CTE-rooted, set); `materialized: true` renders `AS MATERIALIZED`; `reads: [cte]` lists the CTEs the body reads by name, instead of declaring them inside itself — whoever declares the body declares them first, once (since 1.0.40). [guide](./guides/cte-guide.md#choose-the-cte-body-any-query-a-statement-can-run), [reads](./guides/cte-guide.md#read-a-cte-from-inside-another-ctes-body-reads)
 - `builder.withAggregation(name, query, keySelector, alias = 'items'): DbCte` — one row per key with the other columns folded into a JSON array; returns the `DbCte` itself. [guide](./guides/cte-guide.md#attach-child-rows-as-a-json-array-per-key-withaggregation)
 - `builder.withMutation(name, statement: CompiledStatement): { cte }` — a write (from `.toStatement()`) as a data-modifying CTE, typed by its RETURNING. [guide](./guides/cte-guide.md#write-and-read-back-in-one-statement-withmutation)
 - `builder.getCtes()` / `builder.clear()` — the CTEs collected so far / start over. [guide](./guides/cte-guide.md#combine-ctes-of-several-builders-getctes-clear)
