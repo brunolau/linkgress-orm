@@ -14,6 +14,9 @@ import path from 'node:path';
  * inferred `T` from those rows instead, and every such call was TS2345 on its column (1.0.36). The first signature of
  * each helper now takes `T` from the column alone; the second is the 1.0.36 one, which a subquery whose rows are
  * WIDER than the column still needs where the rows are checked.
+ *
+ * The consumer also joins a UNION as a table (`union.asSubquery('table')`): up to 1.0.40 its rows were typed as an
+ * ARRAY of the legs' row, so the join's selector saw `r.authorId` on an array (TS2339).
  */
 const ROOT = path.resolve(import.meta.dir, '../..');
 // Under node_modules, so the emitted declarations resolve their own imports (`pg`, `postgres`, …) as an install does.
@@ -29,6 +32,7 @@ import {
   DbEntity,
   DbEntityTable,
   DbModelConfig,
+  eq,
   eqSubquery,
   gteSubquery,
   gtSubquery,
@@ -85,6 +89,13 @@ db.authors.where(a => gtSubquery(a.id, authorIds().asSubquery('scalar')));
 db.authors.where(a => gteSubquery(a.id, authorIds().asSubquery('scalar')));
 db.authors.where(a => ltSubquery(a.id, authorIds().asSubquery('scalar')));
 db.authors.where(a => lteSubquery(a.id, authorIds().asSubquery('scalar')));
+
+// A UNION as a table source: its rows are the legs' row, never an array of them (1.0.40 typed them as one).
+const postRows = () => db.posts.select(p => ({ id: p.id, authorId: p.authorId }));
+const unionTable = postRows().unionAll(postRows()).asSubquery('table');
+const authorsOfPosts = db.authors.innerJoin(unionTable, (a, r) => eq(a.id, r.authorId), (_a, r) => ({ postId: r.id }), 'r');
+declare const joinedRows: Awaited<ReturnType<typeof authorsOfPosts.toList>>;
+export const unionTablePostId: number = joinedRows[0].postId;
 
 // T is the column's value type, whatever the subquery's rows look like.
 type Same<A, B> = (<G>() => G extends A ? 1 : 2) extends (<G>() => G extends B ? 1 : 2) ? true : false;
@@ -207,11 +218,11 @@ describe('subquery helpers in a consumer (published declarations)', () => {
     }
   }, 120_000);
 
-  test(`a one-column subquery type-checks with the installed TypeScript (${INSTALLED_TS})`, () => {
+  test(`a one-column subquery and a union table type-check with the installed TypeScript (${INSTALLED_TS})`, () => {
     expect(withInstalledTypeScript(dir)).toEqual({ status: 0, output: '' });
   }, 120_000);
 
-  test.skipIf(BUN_TS == null)(`a one-column subquery type-checks with TypeScript ${BUN_TS ?? '7'} (bun check)`, () => {
+  test.skipIf(BUN_TS == null)(`a one-column subquery and a union table type-check with TypeScript ${BUN_TS ?? '7'} (bun check)`, () => {
     expect(withBunCheck(dir)).toBe('clean');
   }, 120_000);
 });

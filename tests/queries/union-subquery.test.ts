@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt, inSubquery, exists } from '../../src';
+import { eq, gt, gte, inSubquery, exists } from '../../src';
 
 /**
  * Tests for `UnionQueryBuilder.asSubquery()` — the ability to compose a UNION
@@ -103,6 +103,40 @@ describe('UnionQueryBuilder.asSubquery()', () => {
         .toList();
 
       expect(result.map(r => r.name).sort()).toEqual(['alice', 'bob', 'charlie']);
+    });
+  });
+
+  /**
+   * A union joined as a TABLE (`asSubquery('table')`): its rows are the union's rows — never an array of them — and its
+   * columns read and bind the way the first leg's columns do, as a select's table subquery's columns do. Before, the
+   * subquery carried no selection: a mapped column (`users.last_active_at`, an integer behind `pgIntDatetime`) read its
+   * driver value (epoch seconds) and a Date compared with it bound raw against the integer.
+   */
+  test("a union joined as a table: typed rows, columns read and bound through the first leg's mappers", async () => {
+    await withDatabase(async (db) => {
+      await seedTestData(db);
+
+      const activity = db.users
+        .where(u => eq(u.isActive, true))
+        .select(u => ({ id: u.id, name: u.username, lastActiveAt: u.lastActiveAt }))
+        .unionAll(db.users
+          .where(u => eq(u.isActive, false))
+          .select(u => ({ id: u.id, name: u.username, lastActiveAt: u.lastActiveAt })))
+        .asSubquery('table');
+
+      const rows = await db.users
+        .innerJoin(activity, (u, a) => eq(u.id, a.id), (_u, a) => ({ name: a.name, lastActiveAt: a.lastActiveAt }), 'activity')
+        .where(r => gte(r.lastActiveAt, new Date('2025-03-01T00:00:00Z')))
+        .orderBy(r => r.name)
+        .toList();
+
+      // Seed: alice 2025-03-15 (active), bob 2025-06-20 (active), charlie 2025-01-10 (inactive) — the Date bound through
+      // the mapper leaves charlie out, and every value reads back as the Date the mapper makes of it.
+      expect(rows.map(r => r.name)).toEqual(['alice', 'bob']);
+      expect(rows.map(r => r.lastActiveAt instanceof Date ? r.lastActiveAt.toISOString() : r.lastActiveAt)).toEqual([
+        '2025-03-15T08:00:00.000Z',
+        '2025-06-20T14:30:00.000Z',
+      ]);
     });
   });
 });

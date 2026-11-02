@@ -1088,6 +1088,39 @@ WHERE "users"."is_active" = $2))
 -- params: ["alice", false]
 ```
 
+Joined as a table (`asSubquery('table')`), a union's rows are typed as its legs' row, and its columns read and bind the way the FIRST leg's columns do — a mapped column through its mapper — in the join, in a `where()` and in the projection, as a select's table subquery does (up to 1.0.40 the rows were typed as an array, and a mapped column read and bound its driver value):
+
+```ts
+import { eq, gte } from 'linkgress-orm';
+
+const activity = db.users.where(u => eq(u.isActive, true)).select(u => ({ id: u.id, name: u.username, lastActiveAt: u.lastActiveAt }))
+  .unionAll(db.users.where(u => eq(u.isActive, false)).select(u => ({ id: u.id, name: u.username, lastActiveAt: u.lastActiveAt })))
+  .asSubquery('table');
+const recent = await db.users
+  .innerJoin(activity, (u, a) => eq(u.id, a.id), (_u, a) => ({ name: a.name, lastActiveAt: a.lastActiveAt }), 'activity')
+  .where(r => gte(r.lastActiveAt, new Date('2025-03-01T00:00:00Z')))
+  .orderBy(r => r.name)
+  .toList();
+// [{ name: 'alice', lastActiveAt: 2025-03-15T08:00:00.000Z }, { name: 'bob', lastActiveAt: 2025-06-20T14:30:00.000Z }]
+```
+
+```sql
+SELECT "activity"."name" as "name", "activity"."lastActiveAt" as "lastActiveAt"
+FROM "users"
+INNER JOIN ((SELECT "users"."id" as "id", "users"."username" as "name", "users"."last_active_at" as "lastActiveAt"
+FROM "users"
+WHERE "users"."is_active" = $2)
+UNION ALL
+(SELECT "users"."id" as "id", "users"."username" as "name", "users"."last_active_at" as "lastActiveAt"
+FROM "users"
+WHERE "users"."is_active" = $3)) AS "activity" ON "users"."id" = "activity"."id"
+WHERE "activity"."lastActiveAt" >= $1
+ORDER BY "name" ASC
+-- params: [5097600, true, false]
+```
+
+`last_active_at` is an integer behind a custom mapper (`Date` ↔ seconds since 2025-01-01): the `Date` binds as `5097600`, and every value reads back as a `Date`.
+
 A CTE read by a subquery: declare it on the executing query with `.with(cte)`, then read it with `db.selectFromCte(cte)…asSubquery()`. The body is declared once in the statement's `WITH`, however many subqueries read it:
 
 ```ts

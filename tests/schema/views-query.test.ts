@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach } from 'bun:test';
 import { createFreshClient } from '../utils/test-database';
-import { DbContext, DbEntityTable, DbViewTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, eq, gt, gte, inArray, and, sql } from '../../src';
+import { DbContext, DbEntityTable, DbViewTable, DbModelConfig, DbEntity, DbColumn, integer, varchar, eq, gt, gte, lt, inArray, and, sql } from '../../src';
 import { EntityMetadataStore } from '../../src/entity/entity-base';
 import { inlineViewParameters, toViewLiteral } from '../../src/migration/view-query-sql';
 import { viewMarker } from '../../src/migration/view-sql';
@@ -138,6 +138,26 @@ class ChainedQueryViewDatabase extends QueryViewDatabase {
       view.definedAs((db: ChainedQueryViewDatabase) => db.stats
         .where(s => gt(s.lineCount, 1))
         .select(s => ({ id: s.id, label: s.label })));
+      view.property(e => e.id).hasType(integer('id'));
+      view.property(e => e.label).hasType(varchar('label', 50));
+    });
+  }
+}
+
+/** A UNION as a view: the orders of at least 1 000, then the orders below zero — one leg each. */
+class UnionQueryViewDatabase extends QueryViewDatabase {
+  get busy(): DbViewTable<QvBusyOrder> {
+    return this.view(QvBusyOrder);
+  }
+
+  protected override setupModel(model: DbModelConfig): void {
+    configureTables(model);
+    model.view(QvBusyOrder, (view) => {
+      view.toView(BUSY);
+      view.definedAs((db: UnionQueryViewDatabase) => db.orders
+        .where(o => gte(o.amount, 1000))
+        .select(o => ({ id: o.id, label: o.label }))
+        .unionAll(db.orders.where(o => lt(o.amount, 0)).select(o => ({ id: o.id, label: o.label }))));
       view.property(e => e.id).hasType(integer('id'));
       view.property(e => e.label).hasType(varchar('label', 50));
     });
@@ -308,6 +328,27 @@ describe('model-managed views — defined with a linkgress query', () => {
     }
   });
 
+  test('a union works as a view: its legs\' rows, read back like any view\'s', async () => {
+    const client = createFreshClient();
+    const db = new UnionQueryViewDatabase(client);
+
+    try {
+      await dropFixtures(client);
+      await db.getSchemaManager().ensureCreated();
+      const ids = await seed(client);
+
+      expect(await viewColumns(client, BUSY)).toEqual(['id', 'label']);
+      expect(await db.busy.orderBy(b => b.id).select(b => ({ id: b.id, label: b.label })).toList()).toEqual([
+        { id: ids.a, label: 'a' },
+        { id: ids.c, label: 'c' },
+      ]);
+      expect(viewOps(await db.getSchemaManager().analyze())).toEqual([]);
+    } finally {
+      await dropFixtures(client);
+      await db.dispose();
+    }
+  });
+
   test('a grouped query works as a view', async () => {
     const client = createFreshClient();
     const db = new GroupedQueryViewDatabase(client);
@@ -437,6 +478,18 @@ describe('model-managed views — a query that does not fit the view is refused 
 
   test('a projected key the view does not declare', async () => {
     const db = databaseWith(view => view.definedAs((d: QueryViewDatabase) => d.orders.select(o => ({ id: o.id, label: o.label, amount: o.amount }))));
+
+    try {
+      expect(() => db.getSchemaManager()).toThrow(/qv_busy_orders.*amount/);
+    } finally {
+      await db.dispose();
+    }
+  });
+
+  test('a union is checked like any other query: a key its first leg projects that the view does not declare', async () => {
+    const db = databaseWith(view => view.definedAs((d: QueryViewDatabase) => d.orders
+      .select(o => ({ id: o.id, label: o.label, amount: o.amount }))
+      .unionAll(d.orders.select(o => ({ id: o.id, label: o.label, amount: o.amount })))));
 
     try {
       expect(() => db.getSchemaManager()).toThrow(/qv_busy_orders.*amount/);
