@@ -203,6 +203,47 @@ describe('Insert, Update, Delete Operations', () => {
       });
     });
 
+    test('a cell some rows omit takes the column DEFAULT in those rows, as if each row were inserted alone', async () => {
+      await withDatabase(async (db) => {
+        // registry_items.active is NOT NULL DEFAULT true: binding NULL for the row that omits it raised 23502
+        const items = await db.registryItems.insertBulk([
+          { crmId: 'mixed-1', name: 'set false', active: false },
+          { crmId: 'mixed-2', name: 'omitted' },
+          { crmId: 'mixed-3', name: 'undefined', active: undefined },
+        ]).returning(r => ({ crmId: r.crmId, active: r.active }));
+
+        expect(items.map(r => [r.crmId, r.active])).toEqual([
+          ['mixed-1', false],
+          ['mixed-2', true],
+          ['mixed-3', true],
+        ]);
+
+        // users.is_active is NULLABLE DEFAULT true: the default lands, not NULL.
+        // age (no default) and last_active_at (custom mapper, no default) read NULL where a row omits them.
+        const users = await db.users.insertBulk([
+          { username: 'mixed_default_a', email: 'a@mixed.test', isActive: false, age: 30, lastActiveAt: new Date('2025-03-01T00:00:00Z') },
+          { username: 'mixed_default_b', email: 'b@mixed.test' },
+        ], { onConflictDoNothing: true }).returning(u => ({ username: u.username, isActive: u.isActive, age: u.age, lastActiveAt: u.lastActiveAt }));
+
+        expect(users.map(u => [u.username, u.isActive, u.age ?? null])).toEqual([
+          ['mixed_default_a', false, 30],
+          ['mixed_default_b', true, null],
+        ]);
+        expect(users[0].lastActiveAt).toEqual(new Date('2025-03-01T00:00:00Z'));
+        expect(users[1].lastActiveAt ?? null).toBeNull();
+
+        // With overridingSystemValue the identity column is in the list: a row without an id gets the generated one
+        const withIds = await db.users.insertBulk([
+          { id: 900001, username: 'mixed_id_explicit', email: 'explicit@mixed.test' },
+          { username: 'mixed_id_generated', email: 'generated@mixed.test' },
+        ], { overridingSystemValue: true }).returning(u => ({ id: u.id, isActive: u.isActive }));
+
+        expect(withIds[0]).toEqual({ id: 900001, isActive: true });
+        expect(withIds[1].id).toBeGreaterThan(0);
+        expect(withIds[1].id).not.toBe(900001);
+      });
+    });
+
     test('should use database default for identity columns (auto-increment)', async () => {
       await withDatabase(async (db) => {
         // Insert without providing id - should be auto-generated

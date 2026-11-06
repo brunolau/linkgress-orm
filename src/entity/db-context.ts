@@ -6068,9 +6068,13 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"`;
     const cellContext: SqlBuildContext = { paramCounter: 1, params };
 
     for (const record of data) {
-      // An sql fragment inline, anything else through the column's mapper (undefined → NULL:
-      // undefined values are not allowed by postgres drivers)
-      const rowValues = columnConfigs.map(col => renderValuesCell((record as any)[col.propName], col.mapper, cellContext));
+      // A cell the row omits (absent or undefined) is DEFAULT — what the row inserted alone gets, its
+      // column left out — never NULL; an sql fragment inline, anything else through the column's mapper
+      const rowValues = columnConfigs.map(col => {
+        const value = (record as any)[col.propName];
+
+        return value === undefined ? 'DEFAULT' : renderValuesCell(value, col.mapper, cellContext);
+      });
       valuesClauses.push(`(${rowValues.join(', ')})`);
     }
 

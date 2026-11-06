@@ -99,6 +99,23 @@ describe('MutationBatch', () => {
       });
     });
 
+    test('an insert leg whose rows omit a cell other rows set takes the column DEFAULT there, not NULL', async () => {
+      await withDatabase(async (db) => {
+        // registry_items.active is NOT NULL DEFAULT true: binding NULL for the row that omits it raised 23502
+        const batch = new MutationBatch();
+        const itemsKey = batch.addInsertBulk(db.registryItems, [
+          { crmId: 'mb-mixed-1', name: 'set false', active: false },
+          { crmId: 'mb-mixed-2', name: 'omitted' },
+        ], 'items');
+
+        await batch.executeBatch();
+
+        expect(batch.getAffectedCount(itemsKey!)).toBe(2);
+        const items = await db.registryItems.where(r => eq(r.crmId, 'mb-mixed-2')).toList();
+        expect(items.map(r => r.active)).toEqual([true]);
+      });
+    });
+
     test('cross-leg parameter renumbering is quote-aware — "$1" inside a value stays verbatim', async () => {
       await withDatabase(async (db) => {
         const { users } = await seedTestData(db);

@@ -296,19 +296,25 @@ INSERT INTO "tags" ("id", "name") OVERRIDING SYSTEM VALUE VALUES ($1, $2)
 
 - An empty array sends nothing; `.returning()` then gives `[]`.
 - The column list is the union of the rows' keys. A column no row sets is left out, so its DEFAULT applies; a column any
-  row sets is sent for every row, as NULL where a row lacks it:
+  row sets is sent for every row, as `DEFAULT` where a row lacks it (the key absent or `undefined`), so each row gets
+  what it would get inserted alone (since 1.0.42; before, that cell was NULL, and on a NOT NULL column with a DEFAULT
+  the statement failed with 23502). An explicit `null` stays NULL. A `MutationBatch.addInsertBulk` leg does the same:
 
 ```ts
 await db.users.insertBulk([
   { username: 'mia', email: 'mia@test.com', isActive: false },
-  { username: 'noah', email: 'noah@test.com' },    // isActive is stored as NULL, not the DEFAULT true
+  { username: 'noah', email: 'noah@test.com' },    // isActive is stored as the DEFAULT true
 ]);
 ```
 
 ```sql
-INSERT INTO "users" ("username", "email", "is_active") VALUES ($1, $2, $3), ($4, $5, $6)
--- params: [ "mia", "mia@test.com", false, "noah", "noah@test.com", null ]
+INSERT INTO "users" ("username", "email", "is_active") VALUES ($1, $2, $3), ($4, $5, DEFAULT)
+-- params: [ "mia", "mia@test.com", false, "noah", "noah@test.com" ]
 ```
+
+> **Pitfall:** `upsertBulk`, a `rowGuard` insert and `fromRows()` still send NULL for such a cell: an upsert's DO UPDATE
+> reads the cell through `EXCLUDED` (`DEFAULT` would overwrite the stored value with the default), and a `VALUES` list
+> read as a table cannot hold `DEFAULT`. Give every row the key there.
 
 > **Pitfall:** Chunks are separate statements. Outside a transaction each chunk commits on its own, so a failure in a
 > later chunk leaves the earlier ones written. Wrap the call in `db.transaction()` for all-or-nothing, or use
