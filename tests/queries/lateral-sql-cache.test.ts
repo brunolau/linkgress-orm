@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
-import { eq, gt, sql, MockRowCache, LateralSqlCache } from '../../src';
+import { eq, gt, sql, LinkgressConfig, MockRowCache, LateralSqlCache } from '../../src';
 import { LscDatabase, makeLscDb } from '../utils/lateral-shape-model';
 
 /**
@@ -227,6 +227,34 @@ describe('LateralSqlCache — rendered lateral SQL is memoised per shape', () =>
     expect(client.last!.sql).not.toBe(limited);
     expect(client.last!.sql).toContain('LIMIT 10');
     expect(limited).toContain('LIMIT 5');
+    expect(LateralSqlCache.diagnostics().entries).toBe(2);
+  });
+
+  test('the form of an object past 50 keys is part of the key: built with serverVersion unset, then 16, two entries in two forms', async () => {
+    MockRowCache.setEnabled(true);
+    const { client, db } = makeLscDb();
+    const build = () => db.lscUsers.select(u => ({
+      id: u.id,
+      posts: u.posts!.select(x => Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`k${i}`, [x.id, x.title, x.views][i % 3]]))).toList('posts'),
+    })).toList();
+
+    try {
+      await build();
+      const unset = client.last!.sql;
+      LinkgressConfig.serverVersion = 16;
+      await build();
+      const sixteen = client.last!.sql;
+      await build();
+
+      expect(client.last!.sql).toBe(sixteen);
+      expect([unset.includes('row_to_json(r.*)'), unset.includes('JSON_OBJECT(')]).toEqual([true, false]);
+      expect([sixteen.includes('row_to_json'), sixteen.includes(`JSON_OBJECT('k0' VALUE "k0", `)]).toEqual([false, true]);
+      expect(LateralSqlCache.diagnostics().entries).toBe(2);
+    } finally {
+      LinkgressConfig.resetToDefaults();
+    }
+    await build();
+    expect(client.last!.sql).toContain('row_to_json(r.*)');
     expect(LateralSqlCache.diagnostics().entries).toBe(2);
   });
 

@@ -1,4 +1,5 @@
 import type { TableSchema } from '../schema/table-builder';
+import { quoteSqlLiteral } from './conditions';
 
 /**
  * Quoted SQL segments (single-quoted literals with '' escaping, double-quoted
@@ -252,6 +253,25 @@ export const identifierBytes = (identifier: string): number => {
 /** MaxTupleAttributeNumber: the most entries one SELECT list holds (54011 past it). */
 export const POSTGRES_MAX_TARGET_LIST_ENTRIES = 1664;
 
+/** LinkgressConfig.serverVersion: the PostgreSQL major the statements run on, or undefined (unknown → SQL every 12+ parses). */
+let serverVersion: number | undefined;
+
+export const getServerVersion = (): number | undefined => serverVersion;
+
+export const setServerVersion = (version: number | undefined): void => {
+  if (version !== undefined && (!Number.isInteger(version) || version < 12)) {
+    throw new RangeError(`serverVersion takes a PostgreSQL major of 12 or more, or undefined, got ${String(version)}`);
+  }
+
+  serverVersion = version;
+};
+
+/**
+ * PostgreSQL 16+ (LinkgressConfig.serverVersion): JSON_OBJECT / JSON_ARRAY are SQL/JSON constructors, not function
+ * calls, so they take any number of keys / elements (no FUNC_MAX_ARGS).
+ */
+export const usesSqlJsonConstructors = (): boolean => serverVersion !== undefined && serverVersion >= 16;
+
 /** One key of an object a query builds in SQL. */
 export interface JsonObjectEntry {
   /** The key, as the reader reads it (inlined as written: `'key'`, `AS "key"`). */
@@ -259,11 +279,12 @@ export interface JsonObjectEntry {
   /**
    * The value's SQL: a COLUMN of the row source the object is built from (`"alias"`, `"nav"."col"`, `o."col"`) or a
    * nested object rendered by {@link renderJsonBuildObject} over such columns. Never an aggregate, a window function, a
-   * set-returning or an uncorrelated volatile expression: past 50 keys the value is evaluated one query level down,
-   * inside the `row_to_json` sub-select, where `count(*)` counts that sub-select's one row (1), `row_number() OVER ()`
-   * is 1, and `random()` is computed once per statement. A value that needs one is computed in the row source and
-   * referenced here by its column — what the collection strategies, `withAggregation()`, the navigation rows and
-   * `MutationBatch` RETURNING all do.
+   * set-returning or an uncorrelated volatile expression: below PostgreSQL 16 (or with `LinkgressConfig.serverVersion`
+   * unknown) a value past 50 keys is evaluated one query level down, inside the `row_to_json` sub-select, where
+   * `count(*)` counts that sub-select's one row (1), `row_number() OVER ()` is 1, and `random()` is computed once per
+   * statement (on 16+ the `JSON_OBJECT` form evaluates it where the object is). A value that needs one is computed in
+   * the row source and referenced here by its column — what the collection strategies, `withAggregation()`, the
+   * navigation rows and `MutationBatch` RETURNING all do.
    */
   readonly value: string;
 }
@@ -326,23 +347,34 @@ const columnSql = (entry: JsonObjectEntry): string => `${entry.value} AS "${entr
 const keysFitIdentifiers = (entries: readonly JsonObjectEntry[]): boolean =>
   entries.every(entry => entry.key.length > 0 && identifierBytes(entry.key) <= POSTGRES_MAX_IDENTIFIER_BYTES);
 
+/** `JSON_OBJECT('k' VALUE v, … RETURNING json)`: PostgreSQL 16+, any number of keys, any key (empty, long, quoted). */
+const jsonObjectConstructor = (entries: readonly JsonObjectEntry[]): string =>
+  `JSON_OBJECT(${entries.map(entry => `${quoteSqlLiteral(entry.key)} VALUE ${entry.value}`).join(', ')} RETURNING json)`;
+
 /**
  * THE way a query builds an object in SQL, wherever the number of keys is the caller's (a collection's items, a nested
  * object inside one, a withAggregation() item, a navigation row, a RETURNING list).
  *
  * - Up to {@link JSON_BUILD_OBJECT_MAX_PAIRS} keys: ONE `json_build_object('k', v, …)`, byte for byte as it always was —
  *   statement texts, prepared-statement names and the shape caches of consumers depend on it.
- * - Past that one call breaks PostgreSQL's {@link POSTGRES_FUNC_MAX_ARGS} (54023 on every execution), so the object is
- *   `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`: json, the keys in written order, no argument cap (its cost
- *   against nesting the keys by hand: bench/json-object/README.md). `r.*`, never a bare `r`: that resolves to a COLUMN
- *   named r first (a key, an outer table's column). The values are evaluated in the sub-select — see
- *   `value` on {@link JsonObjectEntry} for what they may be.
- * - A key that cannot name a column (empty, more than 63 bytes) or more than 1 664 keys: the texts of 50-key calls
- *   spliced ({@link spliceJsonTexts}).
+ * - Past that one call breaks PostgreSQL's {@link POSTGRES_FUNC_MAX_ARGS} (54023 on every execution). On PostgreSQL 16+
+ *   (`LinkgressConfig.serverVersion`, {@link usesSqlJsonConstructors}) the object is ONE
+ *   `JSON_OBJECT('k' VALUE v, … RETURNING json)` — a SQL/JSON constructor, not a function call: no argument cap, the
+ *   value json_build_object builds (the same server code), each value evaluated where the object is. `RETURNING json`
+ *   is not optional: without it a jsonb value turns the whole object jsonb.
+ * - Below 16 or unknown (the default): `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`: json, the keys in
+ *   written order, no argument cap (its cost against nesting the keys by hand: bench/json-object/README.md). `r.*`,
+ *   never a bare `r`: that resolves to a COLUMN named r first (a key, an outer table's column). The values are evaluated
+ *   in the sub-select — see `value` on {@link JsonObjectEntry} for what they may be. A key that cannot name a column
+ *   (empty, more than 63 bytes) or more than 1 664 keys: the texts of 50-key calls spliced ({@link spliceJsonTexts}).
  */
 export function renderJsonBuildObject(entries: readonly JsonObjectEntry[]): string {
   if (entries.length <= JSON_BUILD_OBJECT_MAX_PAIRS) {
     return `json_build_object(${entries.map(pairSql).join(', ')})`;
+  }
+
+  if (usesSqlJsonConstructors()) {
+    return jsonObjectConstructor(entries);
   }
 
   if (entries.length <= POSTGRES_MAX_TARGET_LIST_ENTRIES && keysFitIdentifiers(entries)) {

@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test';
-import { DbCteBuilder, JoinQueryBuilder, eq, gt, sql } from '../../src';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { DbCteBuilder, JoinQueryBuilder, LinkgressConfig, eq, gt, sql } from '../../src';
 import type { QueryOptions } from '../../src';
 import { expectToReject } from '../utils/expect-rejects';
 import { seedTestData, withDatabase } from '../utils/test-database';
@@ -551,11 +551,27 @@ describe('a result set\'s nested objects, rebuilt by one fold', () => {
  * PostgreSQL passes at most 100 arguments to a function call (FUNC_MAX_ARGS; past it 54023 "cannot pass more than 100
  * arguments to a function", on every execution), so ONE json_build_object takes at most 50 keys. Every object a query
  * builds in SQL — a collection's item under every strategy (toList, firstOrDefault), a nested object inside one, a
- * withAggregation item — is built past 50 keys as `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`, or, for keys
- * that cannot name a column, from the json texts of 50-key calls spliced. A projection of 51 keys used to fail on
- * PostgreSQL and pass on the in-memory database, which did not enforce the limit.
+ * withAggregation item — is built past 50 keys as ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` under
+ * `LinkgressConfig.serverVersion` 16+, else (the default) as `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`,
+ * or, for keys that cannot name a column, from the json texts of 50-key calls spliced. Every case runs under both
+ * settings and reads the same rows. A projection of 51 keys used to fail on PostgreSQL and pass on the in-memory
+ * database, which did not enforce the limit.
  */
-describe('an object wider than one function call takes (more than 50 keys)', () => {
+for (const serverVersion of [undefined, 16] as const) describe(`an object wider than one function call takes (more than 50 keys; serverVersion ${serverVersion ?? 'unset'})`, () => {
+  beforeAll(() => {
+    LinkgressConfig.serverVersion = serverVersion;
+  });
+
+  afterAll(() => {
+    LinkgressConfig.resetToDefaults();
+  });
+
+  /** The statements build their wide objects in the form the setting selects: JSON_OBJECT on 16+, row_to_json below. */
+  const expectWideForm = (statements: string) => {
+    expect({ JSON_OBJECT: statements.includes('JSON_OBJECT('), row_to_json: statements.includes('row_to_json(r.*)') })
+      .toEqual(serverVersion === 16 ? { JSON_OBJECT: true, row_to_json: false } : { JSON_OBJECT: false, row_to_json: true });
+  };
+
   /** The key names of `n` keys, in written order. */
   const keyNames = (n: number, keyOf: (i: number) => string = i => `k${i}`): string[] => Array.from({ length: n }, (_, i) => keyOf(i));
 
@@ -604,11 +620,14 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
     test(`${strategy}: a collection's items, its first item and a nested object in an item read every key, in order (51 and 120 keys)`, async () => {
       await withDatabase(async db => {
         await seedTestData(db);
+        const { statements, options } = capturing();
 
         for (const n of [51, 120]) {
+          statements.length = 0;
           const { wide, narrow } = await wideAndNarrow(
             n,
             keys => db.users
+              .withQueryOptions({ ...options, collectionStrategy: strategy })
               .where(u => gt(u.id, 0))
               .orderBy(u => u.id)
               .select(u => ({
@@ -627,6 +646,7 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
           );
 
           expect(wide).toEqual(narrow);
+          expectWideForm(statements.join('\n'));
           expect(wide.map(u => u.orders.length)).toEqual([1, 1, 0]);
           expectTyped(wide[0].orders[0], n);
           expectTyped(wide[1].latest, n);
@@ -636,7 +656,7 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
       }, { collectionStrategy: strategy });
     });
 
-    test(`${strategy}: keys that cannot name a column (64 bytes, 32 × é) take the spliced form; both forms read every key whole, in order`, async () => {
+    test(`${strategy}: keys that cannot name a column (64 bytes, 32 × é) take the spliced form below 16, JSON_OBJECT on 16+; every form reads every key whole, in order`, async () => {
       await withDatabase(async db => {
         await seedTestData(db);
         const { statements, options } = capturing();
@@ -654,17 +674,24 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
         // r (the derived table's alias), mixed case, 63 bytes, non-ASCII: still identifiers — row_to_json(r.*)
         const named = (i: number) => (i === 0 ? 'r' : i === 1 ? 'Upper_Case' : i === 2 ? 'x'.repeat(63) : i === 3 ? 'Ünï' : `k${i}`);
         const asColumns = await read(named);
-        expect(asColumns.sql).toContain('(SELECT row_to_json(r.*) FROM (SELECT ');
+        expectWideForm(asColumns.sql);
+        expect(asColumns.sql).toContain(serverVersion === 16 ? `JSON_OBJECT('r' VALUE ` : '(SELECT row_to_json(r.*) FROM (SELECT ');
         expect(Object.keys(asColumns.item)).toEqual(keyNames(51, named));
         expect(typeof asColumns.item.r).toBe('number');
         expect(asColumns.item[named(2)]).toBe(asColumns.item.k9);
 
-        // 64 bytes (PostgreSQL would truncate the column name) and 32 × é (64 bytes in UTF-8): the spliced texts
+        // 64 bytes (PostgreSQL would truncate the column name) and 32 × é (64 bytes in UTF-8): the spliced texts below
+        // 16; a JSON_OBJECT key is a literal, so on 16+ they take the one form as any other key
         const long = (i: number) => (i === 0 ? 'x'.repeat(64) : i === 1 ? 'é'.repeat(32) : `k${i}`);
         const spliced = await read(long);
         expect(spliced.sql).not.toContain('row_to_json');
-        expect(spliced.sql).toContain(`(left(json_build_object('${long(0)}', `);
-        expect(spliced.sql).toContain(`::text, -1) || ', ' || right(json_build_object('k50', `);
+        if (serverVersion === 16) {
+          expect(spliced.sql).toContain(`JSON_OBJECT('${long(0)}' VALUE `);
+          expect(spliced.sql).not.toContain('(left(json_build_object(');
+        } else {
+          expect(spliced.sql).toContain(`(left(json_build_object('${long(0)}', `);
+          expect(spliced.sql).toContain(`::text, -1) || ', ' || right(json_build_object('k50', `);
+        }
         expect(Object.keys(spliced.item)).toEqual(keyNames(51, long));
         expect(spliced.item[long(0)]).toBe(asColumns.item.r);
         expect(spliced.item[long(1)]).toBe(asColumns.item.Upper_Case);
@@ -700,8 +727,9 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
 
         const narrow = await read(10);
         const wide = await read(60);
-        expect(wide.sql).toContain('row_to_json(r.*)');
+        expectWideForm(wide.sql);
         expect(narrow.sql).not.toContain('row_to_json');
+        expect(narrow.sql).not.toContain('JSON_OBJECT(');
 
         const [aliceItem, bobItem] = [wide.rows[0].orders[0], wide.rows[1].orders[0]];
         expect(aliceItem.tasks).toEqual([{ taskId: tasks.task1.id, sortOrder: 1 }, { taskId: tasks.task2.id, sortOrder: 5 }]);
@@ -720,14 +748,17 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
   test('a withAggregation item reads every key, in order (51 and 120 keys)', async () => {
     await withDatabase(async db => {
       await seedTestData(db);
+      const { statements, options } = capturing();
 
       for (const n of [51, 120]) {
+        statements.length = 0;
         const { wide, narrow } = await wideAndNarrow(
           n,
           keys => {
             const cte = new DbCteBuilder().withAggregation('wide_orders', db.orders.select(o => ({ userId: o.userId, ...keys(o) })), o => ({ userId: o.userId }), 'items');
 
             return db.users
+              .withQueryOptions(options)
               .orderBy(u => u.id)
               .with(cte)
               .leftJoin(cte, (u, c) => eq(u.id, c.userId), (u, c) => ({ id: u.id, items: c.items }))
@@ -737,16 +768,18 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
         );
 
         expect(wide).toEqual(narrow);
+        expectWideForm(statements.join('\n'));
         expect(Object.keys(wide[0].items[0])).toEqual(keyNames(n));
       }
     });
   });
 
-  test('up to 50 keys the object is ONE json_build_object, byte for byte as before; past 50, row_to_json over a sub-select', async () => {
+  test('up to 50 keys the object is ONE json_build_object, byte for byte as before; past 50, JSON_OBJECT on 16+, else row_to_json over a sub-select', async () => {
     await withDatabase(async db => {
       await seedTestData(db);
       const pairs = (from: number, to: number, prefix = '') => Array.from({ length: to - from }, (_, i) => `'k${from + i}', "${prefix}k${from + i}"`).join(', ');
       const columns = (from: number, to: number, prefix = '') => Array.from({ length: to - from }, (_, i) => `"${prefix}k${from + i}" AS "k${from + i}"`).join(', ');
+      const values = (from: number, to: number, prefix = '') => Array.from({ length: to - from }, (_, i) => `'k${from + i}' VALUE "${prefix}k${from + i}"`).join(', ');
 
       for (const strategy of ['cte', 'lateral'] as const) {
         const { statements, options } = capturing();
@@ -760,20 +793,22 @@ describe('an object wider than one function call takes (more than 50 keys)', () 
           return statements.join('\n');
         };
 
-        // 49 keys + the nested object: 50 pairs at the item's level, 49 in the nested one — one call each
+        // 49 keys + the nested object: 50 pairs at the item's level, 49 in the nested one — one call each, any setting
         const at49 = await sqlOf(49);
         expect(at49).toContain(`json_build_object(${pairs(0, 49)}, 'w', json_build_object(${pairs(0, 49, 'w__')}))`);
         expect(at49).not.toContain('row_to_json');
+        expect(at49).not.toContain('JSON_OBJECT(');
 
-        // 50 keys + the nested object: the item's 51 keys a row_to_json, the nested object's 50 one call
-        expect(await sqlOf(50)).toContain(
-          `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 50)}, json_build_object(${pairs(0, 50, 'w__')}) AS "w") r)`
-        );
+        // 50 keys + the nested object: the item's 51 keys one JSON_OBJECT (16+) or a row_to_json, the nested object's 50 one call
+        expect(await sqlOf(50)).toContain(serverVersion === 16
+          ? `JSON_OBJECT(${values(0, 50)}, 'w' VALUE json_build_object(${pairs(0, 50, 'w__')}) RETURNING json)`
+          : `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 50)}, json_build_object(${pairs(0, 50, 'w__')}) AS "w") r)`);
 
-        // 60 and 60: both levels row_to_json, the nested one a column of the item's sub-select
-        expect(await sqlOf(60)).toContain(
-          `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60)}, (SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60, 'w__')}) r) AS "w") r)`
-        );
+        // 60 and 60: both levels JSON_OBJECT, the nested one a value of the item's; below 16 both row_to_json, the
+        // nested one a column of the item's sub-select
+        expect(await sqlOf(60)).toContain(serverVersion === 16
+          ? `JSON_OBJECT(${values(0, 60)}, 'w' VALUE JSON_OBJECT(${values(0, 60, 'w__')} RETURNING json) RETURNING json)`
+          : `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60)}, (SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60, 'w__')}) r) AS "w") r)`);
       }
     });
   });

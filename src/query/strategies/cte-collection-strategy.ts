@@ -212,7 +212,8 @@ export class CteCollectionStrategy implements ICollectionStrategy {
   /**
    * Helper to build json_build_object expression (handles nested structures)
    * Uses JSON instead of JSONB for better aggregation performance; past 50 keys a level renders
-   * as renderJsonBuildObject's row_to_json form (a call takes at most 100 arguments)
+   * as renderJsonBuildObject's JSON_OBJECT (PostgreSQL 16+) or row_to_json form (a call takes at
+   * most 100 arguments)
    */
   private buildJsonbObject(fields: SelectedField[], prefix: string = ''): string {
     const entries: JsonObjectEntry[] = [];

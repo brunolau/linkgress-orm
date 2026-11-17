@@ -1,10 +1,12 @@
 # Objects of more than 50 keys: what each SQL form costs
 
 One `json_build_object` call holds at most 50 keys — PostgreSQL passes at most 100 arguments to a function
-(`FUNC_MAX_ARGS`; 54023 past it). Since 1.0.43 linkgress builds a wider object as `row_to_json` over a one-row
-sub-select (`renderJsonBuildObject()`), and, for keys that cannot name a column and for the `jsonBuildObject()` /
-`jsonBuildArray()` helpers, as the json texts of 50-key calls spliced (`spliceJsonTexts()`). This benchmark measures
-what those forms cost per object against the alternatives.
+(`FUNC_MAX_ARGS`; 54023 past it). Since 1.0.43 linkgress builds a wider object (`renderJsonBuildObject()`) as ONE
+`JSON_OBJECT('k' VALUE v, … RETURNING json)` when `LinkgressConfig.serverVersion` is 16 or more — a SQL/JSON
+constructor, not a function call — and otherwise (the default) as `row_to_json` over a one-row sub-select, or, for
+keys that cannot name a column, as the json texts of 50-key calls spliced (`spliceJsonTexts()`). The json(b) helpers
+past the cap: `JSON_OBJECT(… RETURNING json|jsonb)` on 16+, below it the splice (json) and `||` (jsonb). This
+benchmark measures what those forms cost per object against the alternatives.
 
 ## Run it
 
@@ -19,16 +21,20 @@ BENCH_KEYS=51,60,120,200,51c bun bench/json-object/bench.ts   # the default key 
 - `jit = off` and `max_parallel_workers_per_gather = 0`, so the figure is the expression's own cost.
 - The forms run interleaved within each run; one warm-up run is discarded; the table is the median of `runs`
   (`Execution Time` / rows, µs per object).
-- The row_to_json and splice forms are rendered by linkgress's own `renderJsonBuildObject()` / `spliceJsonTexts()`.
+- Every form but hand-nested is rendered by linkgress's own code — `renderJsonBuildObject()`, `spliceJsonTexts()`,
+  `jsonbBuildObject()` — with `LinkgressConfig.serverVersion` unset (row_to_json, jsonb merge) or 16 (the two
+  `JSON_OBJECT` forms).
 
 ## Forms
 
 | form | SQL | when linkgress uses it |
 |---|---|---|
 | hand-nested | `json_build_object('k0', …, 'c0', json_build_object(…50 keys…), …)` — the keys moved into containers of ≤ 50 | never: what a consumer had to do by hand to stay under the limit (a different object, the reference cost) |
-| jsonb merge | `(jsonb_build_object(…50…) \|\| jsonb_build_object(…))::json` | never (1.0.43's first draft; reorders keys, re-serializes values) |
-| row_to_json | `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)` | every object a query builds, past 50 keys |
-| text splice | `(left(json_build_object(…50…)::text, -1) \|\| ', ' \|\| right(json_build_object(…)::text, -1))::json` | keys empty / over 63 bytes, over 1 664 keys; `jsonBuildObject()` / `jsonBuildArray()` past the limit |
+| row_to_json | `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)` | every object a query builds, past 50 keys — `serverVersion` unknown (the default) or below 16 |
+| JSON_OBJECT | `JSON_OBJECT('k' VALUE v, … RETURNING json)` | every object a query builds past 50 keys, and `jsonBuildObject()` past 50 — `serverVersion` 16+ |
+| text splice | `(left(json_build_object(…50…)::text, -1) \|\| ', ' \|\| right(json_build_object(…)::text, -1))::json` | below 16 / unknown: keys empty / over 63 bytes, over 1 664 keys; `jsonBuildObject()` / `jsonBuildArray()` past the limit |
+| jsonb merge | `(jsonb_build_object(…50…) \|\| jsonb_build_object(…))` | below 16 / unknown: `jsonbBuildObject()` past 50 keys (1.0.43's first draft used it, cast to json, for every object) |
+| JSON_OBJECT jsonb | `JSON_OBJECT('k' VALUE v, … RETURNING jsonb)` | `jsonbBuildObject()` past 50 keys — `serverVersion` 16+ |
 
 The values: round robin over an integer, a text, a numeric, a boolean, a NULL and a timestamptz computed from `g`
 (columns of the row, as every value of an object a query builds is). Shapes: the object in the select list, and

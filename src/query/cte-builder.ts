@@ -1126,7 +1126,7 @@ export class DbCteBuilder {
     let aggregationExpression: string;
     if (aggregatedColumns.length > 0) {
       // Use json_build_object for better performance - only include non-groupBy columns (past 50
-      // keys renderJsonBuildObject's row_to_json form: a call takes at most 100 arguments)
+      // keys renderJsonBuildObject's JSON_OBJECT / row_to_json form: a call takes at most 100 arguments)
       const entries = aggregatedColumns.map(col => jsonEntry(col, innerSelectionMetadata![col], col));
       aggregationExpression = `json_agg(${renderJsonBuildObject(entries)})`;
     } else {

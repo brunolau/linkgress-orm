@@ -950,8 +950,11 @@ LIMIT 1
 - No mapper applies inside JSON: a `timestamp` arrives as JSON text (`'2024-03-10T08:30:00'`, no zone), a mapped column
   as its stored value. To get typed values, project the columns themselves; a nested object in `select()` renders as
   columns read through their mappers.
-- A function call takes at most 100 arguments on PostgreSQL. Past 50 keys (100 elements) the builders render calls of
-  50 (100) joined into the one value (since 1.0.43; before, `54023` on every execution): `jsonBuildObject()` /
+- A function call takes at most 100 arguments on PostgreSQL (since 1.0.43; before, `54023` on every execution past
+  50 keys / 100 elements). With `LinkgressConfig.serverVersion` 16 or more the builders render one SQL/JSON
+  constructor past the cap: `JSON_OBJECT('k' VALUE v, … RETURNING json|jsonb)`, `JSON_ARRAY(v, … NULL ON NULL
+  RETURNING json|jsonb)` ([Configuration](./configuration.md#objects-of-more-than-50-keys-on-postgresql-16-serverversion)).
+  Unknown (the default) or below 16, calls of 50 (100) joined into the one value: `jsonBuildObject()` /
   `jsonBuildArray()` splice their json texts, `(left(json_build_object(…50 keys…)::text, -1) || ', ' ||
   right(json_build_object(…)::text, -1))::json` — the text one call would print, keys in written order;
   `jsonbBuildObject()` / `jsonbBuildArray()` merge their jsonb with `||`. Any operand keeps its meaning, an aggregate

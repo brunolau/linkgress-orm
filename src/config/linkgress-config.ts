@@ -10,9 +10,13 @@ import {
   setInArrayUsesOpt,
   setOrUsesOpt,
 } from '../query/conditions';
+import { getServerVersion, setServerVersion } from '../query/sql-utils';
+import type { DatabaseClient } from '../database/database-client.interface';
 
 /** Settings accepted by {@link LinkgressConfig.configure}; a key left out keeps its current value. */
 export interface LinkgressSettings {
+  /** See {@link LinkgressConfig.serverVersion}; a key present with `undefined` sets it back to unknown. */
+  serverVersion?: number | undefined;
   /** See {@link LinkgressConfig.inArrayOptThreshold}. */
   inArrayOptThreshold?: number;
   /** See {@link LinkgressConfig.inArrayPadBuckets}; `null` switches padding off. */
@@ -37,6 +41,7 @@ export interface LinkgressSettings {
  * LinkgressConfig.inArrayOptThreshold = 12;             // lists up to 12 elements render IN ($1, …)
  * LinkgressConfig.inArrayUsesOpt = true;                // plain inArray renders the same way too
  * LinkgressConfig.configure({ inArrayOptThreshold: 12 });
+ * LinkgressConfig.serverVersion = 18;                    // SQL only PostgreSQL 16+ parses (wide JSON objects)
  * LinkgressConfig.resetToDefaults();                     // test isolation
  */
 export class LinkgressConfig {
@@ -143,8 +148,49 @@ export class LinkgressConfig {
     setOrUsesOpt(enabled);
   }
 
+  /**
+   * UNSET (`undefined`) by default. The PostgreSQL major (16, 17, 18, …) every server this process talks to runs at
+   * least. linkgress cannot learn it before the first statement is built, so SQL only a newer server parses waits for
+   * it: from 16 an object of more than 50 keys renders as ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` — and the
+   * `json(b)BuildObject()` / `json(b)BuildArray()` helpers past 50 keys / 100 elements as `JSON_OBJECT(… RETURNING
+   * json|jsonb)` / `JSON_ARRAY(… NULL ON NULL RETURNING json|jsonb)` — instead of the row_to_json sub-select and the
+   * spliced / merged calls every version from 12 parses. Up to 50 keys (100 elements) the SQL is the same under every
+   * value; unknown or below 16, it is the same as with the setting never touched.
+   *
+   * Set it once at boot, before queries are built (a `prepare()`d query keeps the text it was built with), to the
+   * LOWEST major of the servers the process uses — {@link detectServerVersion} reads it from a server. An integer of
+   * 12 or more, or `undefined`; anything else throws a RangeError and keeps the current value.
+   *
+   * @example
+   * LinkgressConfig.serverVersion = 18;
+   * await LinkgressConfig.detectServerVersion(client); // the same, read from the server
+   */
+  static get serverVersion(): number | undefined {
+    return getServerVersion();
+  }
+
+  static set serverVersion(version: number | undefined) {
+    setServerVersion(version);
+  }
+
+  /**
+   * ONE `SHOW server_version_num` through `client` (any client, pooled connection or transaction client): sets
+   * {@link serverVersion} to the server's major and returns it.
+   */
+  static async detectServerVersion(client: Pick<DatabaseClient, 'query'>): Promise<number> {
+    const { rows } = await client.query<{ server_version_num: string }>('SHOW server_version_num');
+    const major = Math.floor(Number(rows[0].server_version_num) / 10000);
+    setServerVersion(major);
+
+    return major;
+  }
+
   /** Apply several settings at once; keys left out keep their current value. */
   static configure(settings: LinkgressSettings): void {
+    if ('serverVersion' in settings) {
+      setServerVersion(settings.serverVersion);
+    }
+
     if (settings.inArrayOptThreshold !== undefined) {
       setInArrayOptThreshold(settings.inArrayOptThreshold);
     }
@@ -168,5 +214,6 @@ export class LinkgressConfig {
     setInArrayPadBuckets(null);
     setInArrayUsesOpt(false);
     setOrUsesOpt(true);
+    setServerVersion(undefined);
   }
 }

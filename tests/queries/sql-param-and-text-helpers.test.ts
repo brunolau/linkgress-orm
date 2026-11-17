@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import {
   and, caseWhen, castAsString, coalesce, concat, concatStrict, eq, gt, isNotNull, isNull, jsonbBuildArray, jsonbBuildObject, jsonBuildArray, jsonBuildObject,
-  jsonbPathExists, jsonbPathText, jsonbValueText, literal, literalOf, mod, modulo, or, param, sql, SqlFragment, substring,
-  typedNull,
+  jsonbPathExists, jsonbPathText, jsonbValueText, LinkgressConfig, literal, literalOf, mod, modulo, or, param, sql, SqlFragment,
+  substring, typedNull,
 } from '../../src';
 import { DRIVER_VALUE_MAPPER } from '../../src/query/conditions';
 import { POSTGRES_MAX_TARGET_LIST_ENTRIES, renderJsonBuildObject, spliceJsonTexts } from '../../src/query/sql-utils';
@@ -237,6 +237,42 @@ describe('jsonBuildObject() / jsonBuildArray() — the json twins', () => {
     expect(built.sql).toEndWith(`'nested', json_build_object('a', CAST($61 AS integer)))::text, -1))::json`);
     expect(jsonBuildObject(keyed(60)).getMapper()).toBe(DRIVER_VALUE_MAPPER);
   });
+
+  test('LinkgressConfig.serverVersion 16+: past 50 keys / 100 elements ONE JSON_OBJECT / JSON_ARRAY (NULL ON NULL), RETURNING the flavor; 15 keeps the calls', () => {
+    const keyed = (n: number, value: (i: number) => unknown = () => ref('id')) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, value(i)]));
+    const ids = (n: number) => Array.from({ length: n }, () => ref('id'));
+    const values = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => `'k${from + i}' VALUE "fx_members"."id"`).join(', ');
+    const elements = (n: number) => Array.from({ length: n }, () => '"fx_members"."id"').join(', ');
+    const sqlOf = () => [jsonBuildObject(keyed(50)), jsonBuildObject(keyed(51)), jsonbBuildObject(keyed(120)), jsonBuildArray(...ids(100)), jsonBuildArray(...ids(150)), jsonbBuildArray(...ids(150))].map(f => build(f).sql);
+
+    const unset = sqlOf();
+    try {
+      LinkgressConfig.serverVersion = 15;
+      expect(sqlOf()).toEqual(unset);
+
+      LinkgressConfig.serverVersion = 16;
+      const [fifty, wide, wideb, hundred, long, longb] = sqlOf();
+      // Up to the cap: the one call, under every setting
+      expect([fifty, hundred]).toEqual([unset[0], unset[3]]);
+      expect(wide).toBe(`JSON_OBJECT(${values(0, 51)} RETURNING json)`);
+      expect(wideb).toBe(`JSON_OBJECT(${values(0, 120)} RETURNING jsonb)`);
+      expect(long).toBe(`JSON_ARRAY(${elements(150)} NULL ON NULL RETURNING json)`);
+      expect(longb).toBe(`JSON_ARRAY(${elements(150)} NULL ON NULL RETURNING jsonb)`);
+
+      // Parameters bind once each, in order; keys quoted as literals; a nested object keeps its own (one-call) form
+      const built = build(jsonBuildObject({ ...keyed(60, i => i), "it's": ref('id'), nested: { a: 1 } }));
+      expect(built.params).toEqual([...Array.from({ length: 60 }, (_, i) => i), 1]);
+      expect(built.sql).toStartWith(`JSON_OBJECT('k0' VALUE CAST($1 AS integer), 'k1' VALUE CAST($2 AS integer), `);
+      expect(built.sql).toEndWith(`'k59' VALUE CAST($60 AS integer), 'it''s' VALUE "fx_members"."id", 'nested' VALUE json_build_object('a', CAST($61 AS integer)) RETURNING json)`);
+      expect(jsonBuildArray(...ids(150)).getMapper()).toBe(DRIVER_VALUE_MAPPER);
+
+      LinkgressConfig.serverVersion = 18;
+      expect(sqlOf()).toEqual([fifty, wide, wideb, hundred, long, longb]);
+    } finally {
+      LinkgressConfig.resetToDefaults();
+    }
+    expect(sqlOf()).toEqual(unset);
+  });
 });
 
 describe('renderJsonBuildObject() — every object a query builds in SQL', () => {
@@ -277,6 +313,56 @@ describe('renderJsonBuildObject() — every object a query builds in SQL', () =>
     expect(spliceJsonTexts(['a', 'b', 'c', 'd'])).toBe(
       `(left(a::text, -1) || ', ' || left(right(b::text, -1), -1) || ', ' || left(right(c::text, -1), -1) || ', ' || right(d::text, -1))::json`
     );
+  });
+
+  test('LinkgressConfig.serverVersion 16+: past 50 keys ONE JSON_OBJECT(… RETURNING json), any key; up to 50 and below 16 as without it', () => {
+    const values = (n: number, keyOf: (i: number) => string = i => `k${i}`) => Array.from({ length: n }, (_, i) => `'${keyOf(i)}' VALUE "t"."c${i}"`).join(', ');
+    const shapes = () => [entries(0), entries(50), entries(51), entries(51, i => (i === 0 ? "it's" : i === 1 ? '' : `k${i}`))].map(renderJsonBuildObject);
+    const unset = shapes();
+
+    try {
+      for (const version of [12, 15]) {
+        LinkgressConfig.serverVersion = version;
+        expect({ version, sql: shapes() }).toEqual({ version, sql: unset });
+      }
+
+      for (const version of [16, 17, 18]) {
+        LinkgressConfig.serverVersion = version;
+        const [none, fifty, wide, odd] = shapes();
+        expect({ version, none, fifty }).toEqual({ version, none: unset[0], fifty: unset[1] });
+        expect(wide).toBe(`JSON_OBJECT(${values(51)} RETURNING json)`);
+        // quoted as literals: no identifier limits, so no splice — an empty key, a quote, 64 bytes, 1 665 keys
+        expect(odd).toBe(`JSON_OBJECT('it''s' VALUE "t"."c0", '' VALUE "t"."c1", ${values(51).split(', ').slice(2).join(', ')} RETURNING json)`);
+        expect(renderJsonBuildObject(entries(51, i => (i === 0 ? 'x'.repeat(64) : i === 1 ? 'a\\b' : `k${i}`)))).toStartWith(`JSON_OBJECT('${'x'.repeat(64)}' VALUE "t"."c0", E'a\\\\b' VALUE "t"."c1", `);
+        expect(renderJsonBuildObject(entries(POSTGRES_MAX_TARGET_LIST_ENTRIES + 1))).toBe(`JSON_OBJECT(${values(POSTGRES_MAX_TARGET_LIST_ENTRIES + 1)} RETURNING json)`);
+      }
+    } finally {
+      LinkgressConfig.resetToDefaults();
+    }
+    expect(shapes()).toEqual(unset);
+    expect(unset[2]).toStartWith('(SELECT row_to_json(r.*) FROM (SELECT ');
+  });
+
+  test('LinkgressConfig.serverVersion takes a PostgreSQL major of 12 or more, or undefined; configure() and resetToDefaults() set it', () => {
+    expect(LinkgressConfig.serverVersion).toBeUndefined();
+    try {
+      LinkgressConfig.serverVersion = 17;
+      for (const bad of [11, 16.5, Number.NaN, '16', null]) {
+        expect(() => { LinkgressConfig.serverVersion = bad as any; }).toThrow(RangeError);
+        expect(LinkgressConfig.serverVersion).toBe(17);
+      }
+      LinkgressConfig.configure({ orUsesOpt: true });
+      expect(LinkgressConfig.serverVersion).toBe(17);
+      LinkgressConfig.configure({ serverVersion: 16 });
+      expect(LinkgressConfig.serverVersion).toBe(16);
+      LinkgressConfig.configure({ serverVersion: undefined });
+      expect(LinkgressConfig.serverVersion).toBeUndefined();
+      LinkgressConfig.serverVersion = 18;
+      LinkgressConfig.resetToDefaults();
+      expect(LinkgressConfig.serverVersion).toBeUndefined();
+    } finally {
+      LinkgressConfig.resetToDefaults();
+    }
   });
 });
 
@@ -459,31 +545,55 @@ describe('against the database', () => {
     expect(Object.keys(row!.jsonb as object)).toEqual(['a', 'z']);
   });
 
-  test('jsonBuildObject() / jsonbBuildObject() of 60 keys, json(b)BuildArray() of 130 elements: every value in order; json prints the text one call would', async () => {
-    const keyed = (m: any) => Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`k${i}`, i % 3 === 0 ? m.nickname : i % 3 === 1 ? m.points : i]));
-    const listed = (m: any) => Array.from({ length: 130 }, (_, i) => (i === 129 ? m.nickname : i));
-    const row = await fixture.db.members
-      .where(m => eq(m.id, 4))
-      .select(m => ({
-        json: jsonBuildObject(keyed(m)),
-        jsonText: castAsString(jsonBuildObject(keyed(m))),
-        jsonb: jsonbBuildObject(keyed(m)),
-        list: jsonBuildArray(...listed(m)),
-        listText: castAsString(jsonBuildArray(...listed(m))),
-        listb: jsonbBuildArray(...listed(m)),
-      }))
-      .firstOrDefault();
+  for (const serverVersion of [undefined, 16]) {
+    test(`jsonBuildObject() / jsonbBuildObject() of 60 keys, json(b)BuildArray() of 130 elements: every value in order; json prints the text one call would (serverVersion ${serverVersion})`, async () => {
+      const keyed = (m: any) => Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`k${i}`, i % 3 === 0 ? m.nickname : i % 3 === 1 ? m.points : i]));
+      const listed = (m: any) => Array.from({ length: 130 }, (_, i) => (i === 129 ? m.nickname : i === 128 ? m.points : i));
+      let row: any;
+      try {
+        LinkgressConfig.serverVersion = serverVersion;
+        row = await fixture.db.members
+          .where(m => eq(m.id, 4))
+          .select(m => ({
+            json: jsonBuildObject(keyed(m)),
+            jsonText: castAsString(jsonBuildObject(keyed(m))),
+            jsonb: jsonbBuildObject(keyed(m)),
+            list: jsonBuildArray(...listed(m)),
+            listText: castAsString(jsonBuildArray(...listed(m))),
+            listb: jsonbBuildArray(...listed(m)),
+          }))
+          .firstOrDefault();
+      } finally {
+        LinkgressConfig.resetToDefaults();
+      }
 
-    const object = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`k${i}`, i % 3 === 0 ? '007' : i % 3 === 1 ? null : i]));
-    const list = [...Array.from({ length: 129 }, (_, i) => i), '007'];
-    expect(row!.json).toEqual(object);
-    expect(Object.keys(row!.json as object)).toEqual(Object.keys(object));
-    expect(row!.jsonb).toEqual(object);
-    expect(row!.list).toEqual(list);
-    expect(row!.listb).toEqual(list);
-    // json_build_object prints `"key" : value`, json_build_array `a, b` — the spliced text is exactly that
-    expect(row!.jsonText).toBe(`{${Object.entries(object).map(([k, v]) => `"${k}" : ${JSON.stringify(v)}`).join(', ')}}`);
-    expect(row!.listText).toBe(`[${list.map(v => JSON.stringify(v)).join(', ')}]`);
+      // 16+: one JSON_OBJECT / JSON_ARRAY each (NULL ON NULL keeps the NULL element); unset: the spliced / merged calls
+      const statement = fixture.lastStatement();
+      expect([statement.includes('JSON_OBJECT('), statement.includes(' NULL ON NULL RETURNING jsonb)'), statement.includes('||')])
+        .toEqual(serverVersion === 16 ? [true, true, false] : [false, false, true]);
+      const object = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`k${i}`, i % 3 === 0 ? '007' : i % 3 === 1 ? null : i]));
+      const list = [...Array.from({ length: 128 }, (_, i) => i), null, '007'];
+      expect(row!.json).toEqual(object);
+      expect(Object.keys(row!.json as object)).toEqual(Object.keys(object));
+      expect(row!.jsonb).toEqual(object);
+      expect(row!.list).toEqual(list);
+      expect(row!.listb).toEqual(list);
+      // json_build_object prints `"key" : value`, json_build_array `a, b` — the spliced text and JSON_OBJECT's are exactly that
+      expect(row!.jsonText).toBe(`{${Object.entries(object).map(([k, v]) => `"${k}" : ${JSON.stringify(v)}`).join(', ')}}`);
+      expect(row!.listText).toBe(`[${list.map(v => JSON.stringify(v)).join(', ')}]`);
+    });
+  }
+
+  test('LinkgressConfig.detectServerVersion(): one SHOW server_version_num sets serverVersion to the server\'s major', async () => {
+    const { rows } = await fixture.client.query<{ server_version_num: string }>('SHOW server_version_num');
+    const major = Math.floor(Number(rows[0].server_version_num) / 10000);
+    expect(major).toBeGreaterThanOrEqual(12);
+    try {
+      expect(await LinkgressConfig.detectServerVersion(fixture.client)).toBe(major);
+      expect(LinkgressConfig.serverVersion).toBe(major);
+    } finally {
+      LinkgressConfig.resetToDefaults();
+    }
   });
 
   test('jsonbPathExists(): an inline jsonpath with per-row vars', async () => {

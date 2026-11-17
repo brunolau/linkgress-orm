@@ -34,6 +34,7 @@ export type Expr =
   | GroupingFunc
   | AStar
   | JsonFuncExpr
+  | JsonConstructorExpr
   | ParenExpr;
 
 export interface JsonBehavior {
@@ -55,6 +56,22 @@ export interface JsonFuncExpr extends Loc {
   omitQuotes: boolean;
   itemType: 'value' | 'object' | 'array' | 'scalar';
   uniqueKeys: boolean;
+}
+
+/**
+ * SQL/JSON constructors JSON_OBJECT(…) / JSON_ARRAY(…) (PostgreSQL 16+; json_object_constructor, json_array_constructor):
+ * not function calls, so no argument cap. The legacy `json_object(text[])` call stays a FuncCall.
+ */
+export interface JsonConstructorExpr extends Loc {
+  kind: 'JsonConstructorExpr';
+  ctor: 'object' | 'array';
+  /** `key VALUE value` / `key : value` (an array element: key null); `formatJson`: the value carries FORMAT JSON */
+  items: { key: Expr | null; value: Expr; formatJson: boolean }[];
+  /** ABSENT ON NULL (default: false for JSON_OBJECT, true for JSON_ARRAY) */
+  absentOnNull: boolean;
+  /** WITH UNIQUE [KEYS] */
+  unique: boolean;
+  returning: TypeName | null;
 }
 
 export interface ColumnRef extends Loc {
