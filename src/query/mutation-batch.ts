@@ -5,7 +5,7 @@ import type { DbEntityTable } from '../entity/db-context';
 import type { DbEntity } from '../entity/entity-base';
 import type { Condition } from './conditions';
 import { renumberPlaceholders } from './query-batch';
-import { boundColumnCount, calculateOptimalChunkSize, clientParameterLimit, hasBarePlaceholder, parameterLimitText } from './sql-utils';
+import { boundColumnCount, calculateOptimalChunkSize, clientParameterLimit, hasBarePlaceholder, parameterLimitText, renderJsonBuildObject } from './sql-utils';
 
 /** Typed handle returned by MutationBatch.addInsertBulk / addBulkUpdate. */
 export interface MutationBatchKey {
@@ -599,7 +599,7 @@ export class MutationBatch {
     const built = table._buildInsertBulkWithChildrenCtes(config);
     const returningCols = table._resolveColumnDbNames(options?.parentReturning ?? []);
     const rowsSelect = returningCols.length > 0
-      ? `(SELECT COALESCE(json_agg(json_build_object(${returningCols.map(c => `'${c.prop}', o."${c.dbName}"`).join(', ')}) ORDER BY o."__mbw_ord"), '[]'::json) FROM "__MB_SELF___o" o)`
+      ? `(SELECT COALESCE(json_agg(${renderJsonBuildObject(returningCols.map(c => ({ key: c.prop, value: `o."${c.dbName}"` })))} ORDER BY o."__mbw_ord"), '[]'::json) FROM "__MB_SELF___o" o)`
       : undefined;
     const client = table._getClient();
 

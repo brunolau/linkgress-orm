@@ -225,6 +225,136 @@ export function hasAutoIncrementPrimaryKey(schema: TableSchema, dataKeys: string
 export const POSTGRES_MAX_PARAMS = 65535;
 
 /**
+ * PostgreSQL's FUNC_MAX_ARGS (a compile-time constant): a function call takes at most 100 arguments, or the parser
+ * refuses the statement — `cannot pass more than 100 arguments to a function` (54023). An argument passed as
+ * `VARIADIC ARRAY[…]` is ONE.
+ */
+export const POSTGRES_FUNC_MAX_ARGS = 100;
+
+/** The `'key', value` pairs one json(b)_build_object call takes: two arguments each. */
+export const JSON_BUILD_OBJECT_MAX_PAIRS = POSTGRES_FUNC_MAX_ARGS / 2;
+
+/** NAMEDATALEN - 1: PostgreSQL truncates a longer identifier to its first 63 bytes (a NOTICE, no error). */
+export const POSTGRES_MAX_IDENTIFIER_BYTES = 63;
+
+/** UTF-8 length of an identifier — what PostgreSQL's 63-byte limit counts. */
+export const identifierBytes = (identifier: string): number => {
+  let bytes = 0;
+
+  for (const char of identifier) {
+    const code = char.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+
+  return bytes;
+};
+
+/** MaxTupleAttributeNumber: the most entries one SELECT list holds (54011 past it). */
+export const POSTGRES_MAX_TARGET_LIST_ENTRIES = 1664;
+
+/** One key of an object a query builds in SQL. */
+export interface JsonObjectEntry {
+  /** The key, as the reader reads it (inlined as written: `'key'`, `AS "key"`). */
+  readonly key: string;
+  /**
+   * The value's SQL: a COLUMN of the row source the object is built from (`"alias"`, `"nav"."col"`, `o."col"`) or a
+   * nested object rendered by {@link renderJsonBuildObject} over such columns. Never an aggregate, a window function, a
+   * set-returning or an uncorrelated volatile expression: past 50 keys the value is evaluated one query level down,
+   * inside the `row_to_json` sub-select, where `count(*)` counts that sub-select's one row (1), `row_number() OVER ()`
+   * is 1, and `random()` is computed once per statement. A value that needs one is computed in the row source and
+   * referenced here by its column — what the collection strategies, `withAggregation()`, the navigation rows and
+   * `MutationBatch` RETURNING all do.
+   */
+  readonly value: string;
+}
+
+/** The runs of at most `size` items `items` falls into, in order (the last one may be shorter). */
+export function chunkJsonBuildArgs<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+
+  for (let start = 0; start < items.length; start += size) {
+    chunks.push(items.slice(start, start + size));
+  }
+
+  return chunks;
+}
+
+/**
+ * The text around `callCount` `json_build_object` / `json_build_array` calls whose json TEXTS are spliced into one
+ * value, cast back to json once: `(left(a::text, -1) || ', ' || left(right(b::text, -1), -1) || ', ' || right(c::text,
+ * -1))::json` — the brace / bracket between two calls dropped, `, ` in its place: byte for byte the text ONE call would
+ * print (keys and elements in order, values verbatim, duplicate keys kept), with no sub-select, so any operand keeps
+ * its meaning (an aggregate, a window, a volatile call). Each call appears once (a parameter is bound once, in order).
+ * `callCount + 1` parts, to interleave with the calls: a SqlFragment's strings, or {@link spliceJsonTexts}'s text. One
+ * call is left as it is.
+ */
+export function jsonTextSpliceParts(callCount: number): string[] {
+  if (callCount === 1) {
+    return ['', ''];
+  }
+
+  const last = callCount - 1;
+  const parts: string[] = ['(left('];
+
+  for (let i = 1; i <= last; i++) {
+    parts.push(`::text, -1)${i > 1 ? ', -1)' : ''} || ', ' || ${i === last ? 'right(' : 'left(right('}`);
+  }
+  parts.push('::text, -1))::json');
+
+  return parts;
+}
+
+/** `calls` (json_build_object / json_build_array texts) spliced into one json value: see {@link jsonTextSpliceParts}. */
+export function spliceJsonTexts(calls: readonly string[]): string {
+  const parts = jsonTextSpliceParts(calls.length);
+  let spliced = parts[0];
+
+  for (let i = 0; i < calls.length; i++) {
+    spliced += calls[i] + parts[i + 1];
+  }
+
+  return spliced;
+}
+
+/** `'key', value` — the text json_build_object takes per key, as every caller wrote it before 1.0.43. */
+const pairSql = (entry: JsonObjectEntry): string => `'${entry.key}', ${entry.value}`;
+
+/** `value AS "key"` — a column of the row_to_json sub-select, named by the key (`"` doubled). */
+const columnSql = (entry: JsonObjectEntry): string => `${entry.value} AS "${entry.key.replace(/"/g, '""')}"`;
+
+/** Whether every key can name a column and comes back whole: none empty (42601), none past 63 bytes (truncated). */
+const keysFitIdentifiers = (entries: readonly JsonObjectEntry[]): boolean =>
+  entries.every(entry => entry.key.length > 0 && identifierBytes(entry.key) <= POSTGRES_MAX_IDENTIFIER_BYTES);
+
+/**
+ * THE way a query builds an object in SQL, wherever the number of keys is the caller's (a collection's items, a nested
+ * object inside one, a withAggregation() item, a navigation row, a RETURNING list).
+ *
+ * - Up to {@link JSON_BUILD_OBJECT_MAX_PAIRS} keys: ONE `json_build_object('k', v, …)`, byte for byte as it always was —
+ *   statement texts, prepared-statement names and the shape caches of consumers depend on it.
+ * - Past that one call breaks PostgreSQL's {@link POSTGRES_FUNC_MAX_ARGS} (54023 on every execution), so the object is
+ *   `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`: json, the keys in written order, no argument cap (its cost
+ *   against nesting the keys by hand: bench/json-object/README.md). `r.*`, never a bare `r`: that resolves to a COLUMN
+ *   named r first (a key, an outer table's column). The values are evaluated in the sub-select — see
+ *   `value` on {@link JsonObjectEntry} for what they may be.
+ * - A key that cannot name a column (empty, more than 63 bytes) or more than 1 664 keys: the texts of 50-key calls
+ *   spliced ({@link spliceJsonTexts}).
+ */
+export function renderJsonBuildObject(entries: readonly JsonObjectEntry[]): string {
+  if (entries.length <= JSON_BUILD_OBJECT_MAX_PAIRS) {
+    return `json_build_object(${entries.map(pairSql).join(', ')})`;
+  }
+
+  if (entries.length <= POSTGRES_MAX_TARGET_LIST_ENTRIES && keysFitIdentifiers(entries)) {
+    return `(SELECT row_to_json(r.*) FROM (SELECT ${entries.map(columnSql).join(', ')}) r)`;
+  }
+
+  return spliceJsonTexts(
+    chunkJsonBuildArgs(entries, JSON_BUILD_OBJECT_MAX_PAIRS).map(chunk => `json_build_object(${chunk.map(pairSql).join(', ')})`)
+  );
+}
+
+/**
  * The most parameters one statement binds through `client`: PostgreSQL's 65 535 — or the client's own limit, when
  * lower (`DatabaseClient.maxParameters()`; postgres.js: 65 533, PGlite: 32 767).
  */

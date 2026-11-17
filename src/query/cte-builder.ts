@@ -3,6 +3,8 @@ import { QueryBuilder, SelectQueryBuilder, ResolveCollectionResults, materialize
 import { Condition, SqlBuildContext, FieldRef, UnwrapSelection, WhereConditionBase } from './conditions';
 import { pgTypeOfValue } from './sql-functions';
 import { renumberPlaceholders } from './query-batch';
+import { renderJsonBuildObject } from './sql-utils';
+import type { JsonObjectEntry } from './sql-utils';
 
 /**
  * Interface for queries that can be used in CTEs
@@ -1103,18 +1105,18 @@ export class DbCteBuilder {
     // One key of an aggregated item: a column of the inner query, or — for a nested object (a
     // navigation row) it rendered as flattened `__nested__<path>` columns — the object rebuilt from
     // them. It used to name a column `"<key>"` the inner query does not have
-    const jsonPart = (key: string, metaValue: unknown, column: string): string => {
+    const jsonEntry = (key: string, metaValue: unknown, column: string): JsonObjectEntry => {
       const nested = nestedProjectionMeta(metaValue);
 
       if (nested === undefined) {
-        return `'${key}', "${column}"`;
+        return { key, value: `"${column}"` };
       }
 
       // A nested value is always rendered (an undefined one as NULL, see renderFlatNestedLeaf)
       const prefix = column.startsWith('__nested__') ? column : `__nested__${column}`;
-      const parts = Object.keys(nested).map(leaf => jsonPart(leaf, nested[leaf], `${prefix}__${leaf}`));
+      const entries = Object.keys(nested).map(leaf => jsonEntry(leaf, nested[leaf], `${prefix}__${leaf}`));
 
-      return `'${key}', json_build_object(${parts.join(', ')})`;
+      return { key, value: renderJsonBuildObject(entries) };
     };
 
     // Build the aggregation expression
@@ -1123,9 +1125,10 @@ export class DbCteBuilder {
     // The result is functionally equivalent for read operations
     let aggregationExpression: string;
     if (aggregatedColumns.length > 0) {
-      // Use json_build_object for better performance - only include non-groupBy columns
-      const jsonParts = aggregatedColumns.map(col => jsonPart(col, innerSelectionMetadata![col], col)).join(', ');
-      aggregationExpression = `json_agg(json_build_object(${jsonParts}))`;
+      // Use json_build_object for better performance - only include non-groupBy columns (past 50
+      // keys renderJsonBuildObject's row_to_json form: a call takes at most 100 arguments)
+      const entries = aggregatedColumns.map(col => jsonEntry(col, innerSelectionMetadata![col], col));
+      aggregationExpression = `json_agg(${renderJsonBuildObject(entries)})`;
     } else {
       // Fallback to to_json(t.*) if we can't determine columns
       aggregationExpression = `json_agg(to_json(t.*))`;

@@ -2308,6 +2308,57 @@ LIMIT 1
 > A collection terminal without `select()` (`u.orders!.toList()`) serializes every column of the item into
 > the JSON — project the fields you use.
 
+### Projections wider than 50 keys
+
+PostgreSQL passes at most 100 arguments to a function call, so one `json_build_object` holds at most 50 keys
+(`54023 cannot pass more than 100 arguments to a function` past that, on every execution). Since 1.0.43 every
+object the ORM builds in SQL — a collection item under every strategy, a nested object inside one, a
+`withAggregation()` item, a navigation row rendered as one object, a `MutationBatch` RETURNING list — is built past
+50 keys as `row_to_json` over a one-row sub-select whose columns are named by the keys:
+
+```ts
+// 51 keys per item
+const fiftyMore = (o: Order) => Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`k${i}`, o.totalAmount]));
+const rows = await db.users
+  .where(u => eq(u.username, 'alice'))
+  .select(u => ({ orders: u.orders!.select(o => ({ id: o.id, ...fiftyMore(o) })).toList() }))
+  .toList();
+```
+
+```sql
+-- captured with future().getSql(); columns k2 … k47 and the inner select list elided
+SELECT COALESCE("lateral_0".data, '[]'::json) as "orders"
+FROM "users"
+LEFT JOIN LATERAL (SELECT json_agg(
+  (SELECT row_to_json(r.*) FROM (SELECT "id" AS "id", "k0" AS "k0", "k1" AS "k1", …, "k48" AS "k48", "k49" AS "k49") r)
+) as data
+FROM (
+  SELECT "lateral_0_orders"."id" as "id", "lateral_0_orders"."total_amount" as "k0", …
+  FROM "orders" "lateral_0_orders"
+  WHERE "lateral_0_orders"."user_id" = "users"."id"
+) sub) "lateral_0" ON true
+WHERE "users"."username" = $1
+```
+
+- Up to 50 keys the statement is the one call, byte for byte as before 1.0.43 (statement texts, prepared-statement
+  names and plan caches keyed by them do not change).
+- Past 50 keys the object is json with its keys in the written order and every value as `json_build_object` writes
+  it; only its text is compact (`{"id":1,"k0":99.99}` instead of `{"id" : 1, "k0" : 99.99}`), which no reader sees.
+- A key that cannot name a column — empty, or longer than 63 bytes (PostgreSQL would truncate the name) — and an
+  object of more than 1 664 keys take another form: the json texts of calls of 50 keys spliced into one and cast back
+  to json once, `(left(json_build_object(…50 keys…)::text, -1) || ', ' || right(json_build_object(…)::text, -1))::json`
+  — the text one call would print, byte for byte.
+- Cost per object against nesting the keys by hand into containers of ≤ 50, PostgreSQL 18, four runs
+  ([bench/json-object](https://github.com/brunolau/linkgress-orm/blob/main/bench/json-object/README.md#results)):
+  `row_to_json` 0.80–0.88× at 51–60 keys, 0.90–0.92× at 51 keys one of which is a 20-child `json_agg`, 1.01–1.12× at
+  120 and 1.28–1.75× at 200 (its per-column cost grows with the width; the crossover between 60 and 120 keys was not
+  measured). A projection of 120 keys or more that is hot enough to matter is cheaper nested by hand.
+- The values are the columns of the row the object is built from (`"k0"` above is the inner select's column), so
+  the sub-select reads them as they are. An aggregate written into the sub-select itself would count ITS one row:
+  every builder computes a `count()`, `sum()` or nested collection in the row source and references its column.
+- The top-level row and a nested object at the top level are flat columns (`__nested__<key>__<col>`), not one
+  object: they need none of this. A target list still takes at most 1 664 entries.
+
 ### Choose a collection strategy
 
 The context option `collectionStrategy` (default `'lateral'`) decides how collections render;

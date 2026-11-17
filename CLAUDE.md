@@ -144,6 +144,20 @@ Key config fields in `CollectionAggregationConfig`:
 - `foreignKeyTableAlias`: Used by `selectMany()` when the FK is on an intermediate table, not the target: the alias of the first of its HOPS (`SelectManyHop`), each rendered under `<relation>__bridge<n>` — never its table's name. A hop keeps what was written on its items (filters, and limits: `LevelConstraint` / `LevelRank`); a build renames the refs minted from its item to its alias (`renderHops`) and renders its constraints as WHERE predicates (`levelPredicates` / `rankPredicate`) — a limit as `pk IN (SELECT pk … ORDER BY … LIMIT n)` tied to the row it ranks within where the build is correlated to its parent (correlated subquery, LATERAL), as a `ROW_NUMBER()` ranking in the set-based CTE / temp-table forms. A collection nested in a collection subquery correlates to the ROW that minted it (`mintedBy`), found through `SqlBuildContext.collectionScope` (`EnclosingCollectionScope`: item chains, hop rows, taken aliases, the bare names outer rows are read by — never taken by a nested subquery, its path joins or its item navigations — and, inside the projection of the collection a selector returns, the rows a collection there may belong to), never by a table-name lookup alone
 - `selectorNavigationJoins`: JOINs within the collection's selector (not the outer navigation path)
 
+Every object a query builds in SQL (items of all three strategies, `withAggregation()`, navigation rows rendered as one
+object, MutationBatch RETURNING) renders through `renderJsonBuildObject(entries)` (`src/query/sql-utils.ts`): ONE
+`json_build_object` up to 50 keys, byte for byte; past that `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`
+(`r.*`, never a bare `r`: a column named r wins), or — a key empty or over 63 bytes, over 1 664 keys — the json TEXTS of
+50-key calls spliced (`spliceJsonTexts`). PostgreSQL takes at most 100 arguments per call (54023), and the in-memory
+engine enforces it too (`parseFuncOrColumn`). Never emit a `json_build_object(` of a caller-sized list by hand.
+- **Values are columns of the object's own row source** (`JsonObjectEntry.value`): a column ref or a nested object of
+  them, never an aggregate / window / set-returning / uncorrelated volatile expression — past 50 keys the value is
+  evaluated inside the row_to_json sub-select, one query level down (`count(*)` reads 1 there). Compute such a value in
+  the row source and reference its column, as every builder does (pinned: projection-reads "a nested collection and
+  aggregates in a wide item stay exact").
+- The `json(b)BuildObject()` / `json(b)BuildArray()` helpers take arbitrary operands, so past the cap they never use
+  row_to_json: json splices the texts (`jsonTextSpliceParts`), jsonb merges with `||`.
+
 ## Custom Type Mappers
 
 ### How They Work

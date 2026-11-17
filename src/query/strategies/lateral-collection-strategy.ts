@@ -11,6 +11,8 @@ import {
 import { QueryContext } from '../query-builder';
 import { formatJoinValue, buildCollectionCorrelationWhere, quoteTableReference, renderLateralNavigationJoin } from '../join-utils';
 import { LateralSqlCache } from '../lateral-sql-cache';
+import { renderJsonBuildObject } from '../sql-utils';
+import type { JsonObjectEntry } from '../sql-utils';
 
 /** Key-part separator: a control character no alias, column name or SQL text contains. */
 const KEY_SEP = String.fromCharCode(1);
@@ -498,14 +500,16 @@ WHERE ${whereSQL})`;
   }
 
   /**
-   * Renders the selected fields in ONE recursive pass: returns the `json_build_object(...)` text
-   * of this level and appends the flattened inner select list and the nested lateral joins to
-   * `out` (same order as the three separate walks this replaces — depth first, own join before
-   * the nested ones). No intermediate arrays: the select list of a wide collection projection was
-   * three allocations per field and three joins per statement.
+   * Renders the selected fields in ONE recursive pass: returns the object text of this level
+   * (renderJsonBuildObject: `json_build_object(...)` up to 50 keys, a call takes at most 100
+   * arguments) and appends the flattened inner select list and the nested lateral joins to `out`
+   * (same order as the three separate walks this replaces — depth first, own join before the nested
+   * ones). One list of entries per level, every value a column of the inner select (or a nested
+   * object of them): the select list of a wide collection projection was three allocations per
+   * field and three joins per statement.
    */
   private renderFields(fields: SelectedField[], prefix: string, targetTable: string, innerTableAlias: string, out: { select: string; joins: string }): string {
-    let json = '';
+    const entries: JsonObjectEntry[] = [];
     for (const field of fields) {
       const alias = field.alias;
       const fullAlias = prefix ? prefix + '__' + alias : alias;
@@ -514,15 +518,15 @@ WHERE ${whereSQL})`;
       }
       if (field.nested) {
         const nestedJson = this.renderFields(field.nested, fullAlias, targetTable, innerTableAlias, out);
-        json += (json ? ', ' : '') + "'" + alias + "', " + nestedJson;
+        entries.push({ key: alias, value: nestedJson });
       } else {
-        json += (json ? ', ' : '') + "'" + alias + "', \"" + fullAlias + '"';
+        entries.push({ key: alias, value: '"' + fullAlias + '"' });
         if (field.expression) {
           out.select += (out.select ? ', ' : '') + this.renderLeafSelect(field.expression, fullAlias, targetTable, innerTableAlias);
         }
       }
     }
-    return 'json_build_object(' + json + ')';
+    return renderJsonBuildObject(entries);
   }
 
   /**

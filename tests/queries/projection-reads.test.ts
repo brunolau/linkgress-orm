@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DbCteBuilder, JoinQueryBuilder, eq, sql } from '../../src';
+import { DbCteBuilder, JoinQueryBuilder, eq, gt, sql } from '../../src';
 import type { QueryOptions } from '../../src';
 import { expectToReject } from '../utils/expect-rejects';
 import { seedTestData, withDatabase } from '../utils/test-database';
@@ -543,6 +543,238 @@ describe('a result set\'s nested objects, rebuilt by one fold', () => {
       const valueThenPath = [{ __nested__a: 1, __nested__a__b: 2 }];
       expect(() => builder.reconstructNestedRows(valueThenPath, new Set(['__nested__a']))).toThrow(TypeError);
       expect(() => builder.reconstructNestedRows([{ __nested__a: 1 }, null], new Set(['__nested__a']))).toThrow(TypeError);
+    });
+  });
+});
+
+/**
+ * PostgreSQL passes at most 100 arguments to a function call (FUNC_MAX_ARGS; past it 54023 "cannot pass more than 100
+ * arguments to a function", on every execution), so ONE json_build_object takes at most 50 keys. Every object a query
+ * builds in SQL — a collection's item under every strategy (toList, firstOrDefault), a nested object inside one, a
+ * withAggregation item — is built past 50 keys as `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)`, or, for keys
+ * that cannot name a column, from the json texts of 50-key calls spliced. A projection of 51 keys used to fail on
+ * PostgreSQL and pass on the in-memory database, which did not enforce the limit.
+ */
+describe('an object wider than one function call takes (more than 50 keys)', () => {
+  /** The key names of `n` keys, in written order. */
+  const keyNames = (n: number, keyOf: (i: number) => string = i => `k${i}`): string[] => Array.from({ length: n }, (_, i) => keyOf(i));
+
+  /** keys `from` … `to - 1`, round robin over an integer, a numeric, a timestamp, a boolean, a NULL, an enum and a mapped column. */
+  const wideOrder = (o: any, from: number, to: number, keyOf: (i: number) => string = i => `k${i}`): Record<string, unknown> => {
+    const values = [o.id, o.totalAmount, o.createdAt, o.user!.isActive, o.items, o.status, o.user!.lastActiveAt];
+    const row: Record<string, unknown> = {};
+
+    for (let i = from; i < to; i++) {
+      row[keyOf(i)] = values[i % values.length];
+    }
+
+    return row;
+  };
+
+  /** The rows `query` reads for keys 0 … n - 1, and the same rows read as projections of at most 40 keys each, merged. */
+  const wideAndNarrow = async <T>(n: number, query: (keys: (o: any) => Record<string, unknown>) => Promise<T[]>, merge: (a: T, b: T) => T) => {
+    const wide = await query(o => wideOrder(o, 0, n));
+    let narrow: T[] | undefined;
+
+    for (let from = 0; from < n; from += 40) {
+      const part = await query(o => wideOrder(o, from, Math.min(n, from + 40)));
+      narrow = narrow === undefined ? part : narrow.map((row, i) => merge(row, part[i]));
+    }
+
+    return { wide, narrow: narrow! };
+  };
+
+  /**
+   * Every key of an object built in SQL, in written order, each value as its column reads there: the mapped column a
+   * Date, the timestamp the JSON text of one.
+   */
+  const expectTyped = (item: Record<string, unknown>, n: number) => {
+    expect(Object.keys(item)).toEqual(keyNames(n));
+    expect(typeof item.k0).toBe('number');
+    expect(Number(item.k1)).toBeGreaterThan(99);
+    expect(item.k2).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    expect(item.k3).toBe(true);
+    expect(item.k4).toBeNull();
+    expect(['completed', 'pending']).toContain(item.k5 as string);
+    expect(item.k6).toBeInstanceOf(Date);
+    expect(item[`k${n - 1}`]).toEqual(item[`k${(n - 1) % 7}`]);
+  };
+
+  for (const strategy of ['cte', 'lateral', 'temptable'] as const) {
+    test(`${strategy}: a collection's items, its first item and a nested object in an item read every key, in order (51 and 120 keys)`, async () => {
+      await withDatabase(async db => {
+        await seedTestData(db);
+
+        for (const n of [51, 120]) {
+          const { wide, narrow } = await wideAndNarrow(
+            n,
+            keys => db.users
+              .where(u => gt(u.id, 0))
+              .orderBy(u => u.id)
+              .select(u => ({
+                id: u.id,
+                orders: u.orders!.where(o => gt(o.totalAmount, 1)).orderBy(o => o.id).select(keys).toList('orders'),
+                latest: u.orders!.orderBy(o => [[o.id, 'DESC']]).select(keys).firstOrDefault('latest'),
+                nested: u.orders!.orderBy(o => o.id).select(o => ({ id: o.id, wide: keys(o) })).toList('nested'),
+              }))
+              .toList() as Promise<any[]>,
+            (a, b) => ({
+              ...a,
+              orders: a.orders.map((item: any, i: number) => ({ ...item, ...b.orders[i] })),
+              latest: a.latest === null ? null : { ...a.latest, ...b.latest },
+              nested: a.nested.map((item: any, i: number) => ({ ...item, wide: { ...item.wide, ...b.nested[i].wide } })),
+            })
+          );
+
+          expect(wide).toEqual(narrow);
+          expect(wide.map(u => u.orders.length)).toEqual([1, 1, 0]);
+          expectTyped(wide[0].orders[0], n);
+          expectTyped(wide[1].latest, n);
+          expectTyped(wide[0].nested[0].wide, n);
+          expect(wide[2].latest).toBeNull();
+        }
+      }, { collectionStrategy: strategy });
+    });
+
+    test(`${strategy}: keys that cannot name a column (64 bytes, 32 × é) take the spliced form; both forms read every key whole, in order`, async () => {
+      await withDatabase(async db => {
+        await seedTestData(db);
+        const { statements, options } = capturing();
+        const read = async (keyOf: (i: number) => string) => {
+          statements.length = 0;
+          const rows = await db.users
+            .withQueryOptions({ ...options, collectionStrategy: strategy })
+            .orderBy(u => u.id)
+            .select(u => ({ id: u.id, orders: u.orders!.orderBy(o => o.id).select(o => wideOrder(o, 0, 51, keyOf)).toList('orders') }))
+            .toList() as any[];
+
+          return { item: rows[0].orders[0], sql: statements.join('\n') };
+        };
+
+        // r (the derived table's alias), mixed case, 63 bytes, non-ASCII: still identifiers — row_to_json(r.*)
+        const named = (i: number) => (i === 0 ? 'r' : i === 1 ? 'Upper_Case' : i === 2 ? 'x'.repeat(63) : i === 3 ? 'Ünï' : `k${i}`);
+        const asColumns = await read(named);
+        expect(asColumns.sql).toContain('(SELECT row_to_json(r.*) FROM (SELECT ');
+        expect(Object.keys(asColumns.item)).toEqual(keyNames(51, named));
+        expect(typeof asColumns.item.r).toBe('number');
+        expect(asColumns.item[named(2)]).toBe(asColumns.item.k9);
+
+        // 64 bytes (PostgreSQL would truncate the column name) and 32 × é (64 bytes in UTF-8): the spliced texts
+        const long = (i: number) => (i === 0 ? 'x'.repeat(64) : i === 1 ? 'é'.repeat(32) : `k${i}`);
+        const spliced = await read(long);
+        expect(spliced.sql).not.toContain('row_to_json');
+        expect(spliced.sql).toContain(`(left(json_build_object('${long(0)}', `);
+        expect(spliced.sql).toContain(`::text, -1) || ', ' || right(json_build_object('k50', `);
+        expect(Object.keys(spliced.item)).toEqual(keyNames(51, long));
+        expect(spliced.item[long(0)]).toBe(asColumns.item.r);
+        expect(spliced.item[long(1)]).toBe(asColumns.item.Upper_Case);
+      });
+    });
+
+    test(`${strategy}: a nested collection and aggregates in a wide item stay exact (every value is a column of the item's row source)`, async () => {
+      // The row_to_json sub-select evaluates its values one query level down: an aggregate there would count the
+      // sub-select's one row. The builders hand it columns of the item's row source only — a nested collection, a
+      // count() and a sum() included — so a wide item reads what a narrow one does.
+      await withDatabase(async db => {
+        const { orders, tasks } = await seedTestData(db);
+        await db.orderTasks.insert({ orderId: orders.aliceOrder.id, taskId: tasks.task2.id, sortOrder: 5 });
+        const { statements, options } = capturing();
+        const read = async (n: number) => {
+          statements.length = 0;
+          const rows = await db.users
+            .withQueryOptions({ ...options, collectionStrategy: strategy })
+            .orderBy(u => u.id)
+            .select(u => ({
+              id: u.id,
+              orders: u.orders!.orderBy(o => o.id).select(o => ({
+                ...wideOrder(o, 0, n),
+                tasks: o.orderTasks!.orderBy(t => t.sortOrder).select(t => ({ taskId: t.taskId, sortOrder: t.sortOrder })).toList('tasks'),
+                taskCount: o.orderTasks!.count(),
+                sortSum: o.orderTasks!.sum(t => t.sortOrder),
+              })).toList('orders'),
+            }))
+            .toList() as any[];
+
+          return { rows, sql: statements.join('\n') };
+        };
+
+        const narrow = await read(10);
+        const wide = await read(60);
+        expect(wide.sql).toContain('row_to_json(r.*)');
+        expect(narrow.sql).not.toContain('row_to_json');
+
+        const [aliceItem, bobItem] = [wide.rows[0].orders[0], wide.rows[1].orders[0]];
+        expect(aliceItem.tasks).toEqual([{ taskId: tasks.task1.id, sortOrder: 1 }, { taskId: tasks.task2.id, sortOrder: 5 }]);
+        expect([Number(aliceItem.taskCount), Number(aliceItem.sortSum)]).toEqual([2, 6]);
+        expect([Number(bobItem.taskCount), Number(bobItem.sortSum), bobItem.tasks.length]).toEqual([1, 1, 1]);
+        for (const [u, user] of wide.rows.entries()) {
+          for (const [i, item] of user.orders.entries()) {
+            const { tasks: t, taskCount, sortSum } = narrow.rows[u].orders[i];
+            expect({ tasks: item.tasks, taskCount: item.taskCount, sortSum: item.sortSum }).toEqual({ tasks: t, taskCount, sortSum });
+          }
+        }
+      });
+    });
+  }
+
+  test('a withAggregation item reads every key, in order (51 and 120 keys)', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+
+      for (const n of [51, 120]) {
+        const { wide, narrow } = await wideAndNarrow(
+          n,
+          keys => {
+            const cte = new DbCteBuilder().withAggregation('wide_orders', db.orders.select(o => ({ userId: o.userId, ...keys(o) })), o => ({ userId: o.userId }), 'items');
+
+            return db.users
+              .orderBy(u => u.id)
+              .with(cte)
+              .leftJoin(cte, (u, c) => eq(u.id, c.userId), (u, c) => ({ id: u.id, items: c.items }))
+              .toList() as Promise<any[]>;
+          },
+          (a, b) => ({ ...a, items: a.items === null ? null : a.items.map((item: any, i: number) => ({ ...item, ...b.items[i] })) })
+        );
+
+        expect(wide).toEqual(narrow);
+        expect(Object.keys(wide[0].items[0])).toEqual(keyNames(n));
+      }
+    });
+  });
+
+  test('up to 50 keys the object is ONE json_build_object, byte for byte as before; past 50, row_to_json over a sub-select', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+      const pairs = (from: number, to: number, prefix = '') => Array.from({ length: to - from }, (_, i) => `'k${from + i}', "${prefix}k${from + i}"`).join(', ');
+      const columns = (from: number, to: number, prefix = '') => Array.from({ length: to - from }, (_, i) => `"${prefix}k${from + i}" AS "k${from + i}"`).join(', ');
+
+      for (const strategy of ['cte', 'lateral'] as const) {
+        const { statements, options } = capturing();
+        const sqlOf = async (keys: number) => {
+          statements.length = 0;
+          await db.users
+            .withQueryOptions({ ...options, collectionStrategy: strategy })
+            .select(u => ({ id: u.id, orders: u.orders!.select(o => ({ ...wideOrder(o, 0, keys), w: wideOrder(o, 0, keys) })).toList('orders') }))
+            .toList();
+
+          return statements.join('\n');
+        };
+
+        // 49 keys + the nested object: 50 pairs at the item's level, 49 in the nested one — one call each
+        const at49 = await sqlOf(49);
+        expect(at49).toContain(`json_build_object(${pairs(0, 49)}, 'w', json_build_object(${pairs(0, 49, 'w__')}))`);
+        expect(at49).not.toContain('row_to_json');
+
+        // 50 keys + the nested object: the item's 51 keys a row_to_json, the nested object's 50 one call
+        expect(await sqlOf(50)).toContain(
+          `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 50)}, json_build_object(${pairs(0, 50, 'w__')}) AS "w") r)`
+        );
+
+        // 60 and 60: both levels row_to_json, the nested one a column of the item's sub-select
+        expect(await sqlOf(60)).toContain(
+          `(SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60)}, (SELECT row_to_json(r.*) FROM (SELECT ${columns(0, 60, 'w__')}) r) AS "w") r)`
+        );
+      }
     });
   });
 });
