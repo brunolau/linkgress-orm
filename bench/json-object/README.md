@@ -43,39 +43,34 @@ inside `json_agg(…) GROUP BY g % 1000` (a collection's items).
 ## Results
 
 PostgreSQL 18.6 (Homebrew) on localhost (Apple silicon, 18 cores, shared with other work), 200 000 rows, median of 5
-runs, jit off, no parallel workers — 2026-11-17:
+runs, jit off, no parallel workers, load 5.1 falling to 1.8 over the run — 2026-11-17:
 
-| keys | shape | hand-nested µs | jsonb merge µs | row_to_json µs | text splice µs | merge / hand | row_to_json / hand | splice / hand |
-|---|---|---|---|---|---|---|---|---|
-| 51 | select | 5.67 | 11.15 | 4.60 | 8.15 | 1.97× | 0.81× | 1.44× |
-| 51 | json_agg | 6.22 | 11.56 | 5.11 | 8.83 | 1.86× | 0.82× | 1.42× |
-| 60 | select | 6.72 | 12.95 | 5.65 | 9.53 | 1.93× | 0.84× | 1.42× |
-| 60 | json_agg | 7.20 | 13.33 | 6.12 | 9.83 | 1.85× | 0.85× | 1.37× |
-| 120 | select | 13.48 | 28.76 | 14.61 | 18.88 | 2.13× | 1.08× | 1.40× |
-| 120 | json_agg | 14.25 | 29.85 | 15.57 | 19.69 | 2.10× | 1.09× | 1.38× |
-| 200 | select | 23.06 | 51.31 | 40.46 | 42.87 | 2.23× | 1.75× | 1.86× |
-| 200 | json_agg | 30.62 | 69.92 | 40.21 | 38.79 | 2.28× | 1.31× | 1.27× |
-| 51 + 20-child json_agg | select | 15.25 | 30.37 | 14.06 | 20.33 | 1.99× | 0.92× | 1.33× |
-| 51 + 20-child json_agg | json_agg | 16.35 | 34.76 | 14.96 | 20.96 | 2.13× | 0.91× | 1.28× |
+| keys | shape | hand-nested µs | row_to_json µs | JSON_OBJECT µs | text splice µs | jsonb merge µs | JSON_OBJECT jsonb µs | row_to_json / hand | JSON_OBJECT / hand | splice / hand | merge / hand | JSON_OBJECT jsonb / hand |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 51 | select | 8.13 | 6.15 | 7.42 | 11.62 | 11.79 | 8.97 | 0.76× | 0.91× | 1.43× | 1.45× | 1.10× |
+| 51 | json_agg | 7.71 | 6.21 | 6.76 | 10.44 | 12.97 | 10.35 | 0.81× | 0.88× | 1.35× | 1.68× | 1.34× |
+| 60 | select | 8.05 | 6.92 | 7.61 | 11.19 | 11.78 | 8.88 | 0.86× | 0.94× | 1.39× | 1.46× | 1.10× |
+| 60 | json_agg | 7.87 | 6.97 | 7.71 | 10.00 | 12.19 | 10.41 | 0.89× | 0.98× | 1.27× | 1.55× | 1.32× |
+| 120 | select | 13.12 | 14.72 | 12.43 | 18.39 | 22.27 | 14.44 | 1.12× | 0.95× | 1.40× | 1.70× | 1.10× |
+| 120 | json_agg | 14.10 | 15.50 | 13.03 | 19.45 | 26.70 | 18.84 | 1.10× | 0.92× | 1.38× | 1.89× | 1.34× |
+| 200 | select | 22.67 | 31.95 | 21.32 | 31.10 | 39.39 | 24.18 | 1.41× | 0.94× | 1.37× | 1.74× | 1.07× |
+| 200 | json_agg | 23.91 | 34.25 | 22.06 | 33.33 | 47.16 | 31.86 | 1.43× | 0.92× | 1.39× | 1.97× | 1.33× |
+| 51 + 20-child json_agg | select | 11.04 | 10.09 | 10.53 | 14.45 | 18.40 | 15.04 | 0.91× | 0.95× | 1.31× | 1.67× | 1.36× |
+| 51 + 20-child json_agg | json_agg | 11.72 | 10.73 | 11.26 | 15.21 | 22.42 | 18.87 | 0.92× | 0.96× | 1.30× | 1.91× | 1.61× |
 
-`row_to_json / hand` over four runs of the same matrix (load between 3 and 19 — the absolute µs drift with it, the
-ratios much less):
-
-| keys | select | json_agg |
-|---|---|---|
-| 51 | 0.80–0.81× | 0.82–0.88× |
-| 60 | 0.84–0.88× | 0.85–0.87× |
-| 120 | 1.08–1.12× | 1.01–1.09× |
-| 200 | 1.37–1.75× | 1.28–1.44× |
-| 51 + 20-child json_agg (3 runs) | 0.90–0.92× | 0.91–0.92× |
+(`row_to_json` and the splice: the forms below 16 / unknown; the two `JSON_OBJECT` columns: the forms with
+`serverVersion` 16+; jsonb merge and `JSON_OBJECT jsonb`: `jsonbBuildObject()` below and from 16. The run of 1.0.43's
+first form, without the `JSON_OBJECT` columns, measured `row_to_json` / hand at 0.80–0.88× (51–60 keys), 1.01–1.12×
+(120) and 1.28–1.75× (200) over four runs under load 3–19.)
 
 ## Reading it
 
-- **At 51–60 keys `row_to_json` costs less than hand-nesting** (0.80–0.88×; 0.90–0.92× with a nested 20-child
-  json_agg among the values). Its per-column cost grows with the width: +1–12 % at 120 keys and +28–75 % at 200. The
-  crossover lies between 60 and 120 keys and was not measured. A projection of 120 keys or more on a hot path is
-  cheaper nested by hand; correctness does not depend on it.
-- The text splice costs 1.27–1.44× in the run above (1.86× in its 200-key select row, measured under a load spike;
-  `json_in` validates the whole text once) and barely grows with the width: it catches up with `row_to_json` only at
-  200 keys, so it stays the fallback.
-- The jsonb merge costs ~1.85–2.3× everywhere, reorders the keys and rewrites values (`1e-07` → `0.0000001`) — not used.
+- **`JSON_OBJECT` (16+) costs 0.88–0.98× the hand-nested object at every width** (0.95–0.96× with a 20-child
+  `json_agg` among 51 keys): its cost grows linearly with the keys. `row_to_json` is cheaper at 51–60 keys
+  (`JSON_OBJECT` costs +9–21 % over it there, +4–5 % with the 20-child value) and dearer from 120 keys on
+  (`JSON_OBJECT` −16 % at 120, −33–36 % at 200, where `row_to_json` costs 1.41–1.43× hand-nesting).
+- For `jsonbBuildObject()` past 50 keys, `JSON_OBJECT(… RETURNING jsonb)` costs 0.61–0.85× the `||` merge of
+  50-key calls it replaces on 16+.
+- The text splice (below 16: keys that cannot name a column, `jsonBuildObject()`) costs 1.27–1.43× everywhere.
+- A 50 000-row prototype of the same forms (3 runs, load 7–12) gave `JSON_OBJECT` / hand 0.82–1.04× and the same
+  ordering: `row_to_json` ahead up to 60 keys, `JSON_OBJECT` ahead from 120.

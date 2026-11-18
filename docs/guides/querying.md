@@ -2355,7 +2355,10 @@ WHERE "users"."username" = $1
   its keys as quoted literals and needs no such form.
 - Cost per object against nesting the keys by hand into containers of ≤ 50, PostgreSQL 18
   ([bench/json-object](https://github.com/brunolau/linkgress-orm/blob/main/bench/json-object/README.md#results)):
-  BENCH_PROSE_QUERYING
+  `JSON_OBJECT` (16+) 0.88–0.98× at every width from 51 to 200 keys (0.95–0.96× with a 20-child `json_agg` among
+  51); `row_to_json` (below 16 / unknown) 0.76–0.89× at 51–60 keys, 0.91–0.92× at 51 keys one of which is a 20-child
+  `json_agg`, 1.10–1.12× at 120 and 1.41–1.43× at 200 (its per-column cost grows with the width). Below 16, a
+  projection of 120 keys or more that is hot enough to matter is cheaper nested by hand; on 16+ it is not.
 - The values are the columns of the row the object is built from (`"k0"` above is the inner select's column), so
   the sub-select reads them as they are. An aggregate written into the sub-select itself would count ITS one row:
   every builder computes a `count()`, `sum()` or nested collection in the row source and references its column
