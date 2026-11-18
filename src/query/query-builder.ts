@@ -12439,13 +12439,16 @@ export class CollectionQueryBuilder<TItem = any> {
     // subquery reads from the enclosing scope — the row it correlates to (a relation of a table to
     // itself), the row the first hop of its navigation path starts from (`ed.book.editions` from an
     // edition), or an enclosing row its WHERE reads — the same shadowing made those EXISTS true for
-    // every row. A flattened collection (selectMany) names its table by that same rule, for a
+    // every row — or a name one of its own path joins renders under: a navigation named like the
+    // table of the collection it leads to (`ci.product.groupSiblings`, both "product") put
+    // `FROM "product" LEFT JOIN "product" "product"` in one scope (`table name "product" specified
+    // more than once`). A flattened collection (selectMany) names its table by that same rule, for a
     // COUNT too: its hops render under aliases of their own (see renderHops), so only such an
     // enclosing name needs one. Nested in another collection subquery, it never takes a bare name
     // a row outside them is read by (see EnclosingCollectionScope.outerNames): a collection of that
     // row nested in it — which correlates to it by that name — bound to ours.
     const readsOuterNamed = (name: string): boolean =>
-      anchor === name || enclosing?.outerNames.has(name) === true || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
+      anchor === name || pathAliases.includes(name) || enclosing?.outerNames.has(name) === true || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
     const rendering = this.renderedHops;
     const named = rendering !== undefined
       ? readsOuterNamed(targetTable) ? `${this.relationName}__${this.aggregationType === 'COUNT' ? 'count' : 'exists'}` : targetTable
