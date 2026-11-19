@@ -459,6 +459,28 @@ ORDER BY "username" ASC
   a collection summand that reads nothing of the collection it sums: `u.posts!.sum(_p => u.orders!.count())` is refused
   the same way (PostgreSQL: 42803).
 
+### Function calls of more than 100 arguments (refused since 1.0.43)
+
+A function call passes at most 100 arguments, as on PostgreSQL (`FUNC_MAX_ARGS`). A call of more fails while the
+statement is parsed, before any function is looked up, with PostgreSQL's SQLSTATE, message and position; pg raises its
+`DatabaseError`, postgres.js its `PostgresError`:
+
+```text
+select json_build_object('k0', 0, 'k1', 1, …, 'k50', 50)   -- 51 keys = 102 arguments
+54023  cannot pass more than 100 arguments to a function   (position 8)
+```
+
+- An argument passed as `VARIADIC ARRAY[…]` is ONE: `json_build_array(VARIADIC ARRAY[0, 1, …, 199])` runs on both.
+  `WITHIN GROUP` arguments count; a `CALL` is checked the same way. `COALESCE`, `GREATEST` / `LEAST`, `CASE`, `IN (…)`
+  and `ARRAY[…]` are not function calls and take any number of operands, as on PostgreSQL.
+- Before 1.0.43 the engine evaluated such a call, so a statement that failed on every execution against PostgreSQL
+  passed every in-memory test. The ORM itself no longer emits one: an object it builds of more than 50 keys is a
+  `row_to_json` over a sub-select ([Querying](./querying.md#projections-wider-than-50-keys)).
+- Other compile-time limits are still not checked: a table of more than 1 600 columns, a target list of more than
+  1 664 entries, an index of more than 32 columns, a function declared with more than 100 parameters, an array of more
+  than 6 dimensions are all accepted (PostgreSQL: `54011` / `54023` / `54000`). A `ROW(…)` of more than 1 664 entries
+  is refused, with `54000` where PostgreSQL raises `54011`.
+
 ### Transactions, locks and constraints
 
 - Data-modifying CTEs run in the order the main query first reads them (the rest after it), on the

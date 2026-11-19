@@ -9,6 +9,8 @@ import {
 } from '../collection-strategy.interface';
 import { QueryContext } from '../query-builder';
 import { formatJoinValue, buildLiteralOnlyPredicates, quoteTableReference, renderLateralNavigationJoin } from '../join-utils';
+import { renderJsonBuildObject } from '../sql-utils';
+import type { JsonObjectEntry } from '../sql-utils';
 
 /** A column of an aggregation's inner SELECT output: its alias and the (qualified) expression it selects. */
 interface OutputColumn {
@@ -209,22 +211,24 @@ export class CteCollectionStrategy implements ICollectionStrategy {
 
   /**
    * Helper to build json_build_object expression (handles nested structures)
-   * Uses JSON instead of JSONB for better aggregation performance
+   * Uses JSON instead of JSONB for better aggregation performance; past 50 keys a level renders
+   * as renderJsonBuildObject's JSON_OBJECT (PostgreSQL 16+) or row_to_json form (a call takes at
+   * most 100 arguments)
    */
   private buildJsonbObject(fields: SelectedField[], prefix: string = ''): string {
-    const parts: string[] = [];
+    const entries: JsonObjectEntry[] = [];
     for (const field of fields) {
       if (field.nested) {
         // Nested object - recurse
         const nestedJsonb = this.buildJsonbObject(field.nested, prefix ? `${prefix}__${field.alias}` : field.alias);
-        parts.push(`'${field.alias}', ${nestedJsonb}`);
+        entries.push({ key: field.alias, value: nestedJsonb });
       } else {
         // Leaf field - reference the aliased column from subquery
         const fullAlias = prefix ? `${prefix}__${field.alias}` : field.alias;
-        parts.push(`'${field.alias}', "${fullAlias}"`);
+        entries.push({ key: field.alias, value: `"${fullAlias}"` });
       }
     }
-    return `json_build_object(${parts.join(', ')})`;
+    return renderJsonBuildObject(entries);
   }
 
   /**

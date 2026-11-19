@@ -575,7 +575,8 @@ A value for a column with a custom mapper is bound through the mapper's `toDrive
 | `ne(c, null)`, `ne(c, undefined)` | `c IS NOT NULL` | |
 | `gt` / `gte` / `lt` / `lte` / `like` / … with `undefined` | throws before anything is sent | `Cannot use > operator with undefined value on field "users"."age". Pass an explicit value or use eq()/ne() which treat undefined as NULL.` |
 | `between(c, undefined, 50)` | `BETWEEN $1 AND $2` with `[null, 50]` | no error, no rows |
-| `and()`, `or()` with no operands | `WHERE 1=1` | every row |
+| `and()` with no operands | `WHERE 1=1` | every row |
+| `or()` with no operands, e.g. `or(...ids.map(id => eq(c.id, id)))` over an empty `ids` | `WHERE 1=0` | no row (up to 1.0.38: `1=1`, every row) |
 | `and(…, undefined, …)` | throws a `TypeError` | filter unset conditions out first |
 
 ```ts
@@ -638,7 +639,8 @@ reaches the server; a subquery computes the list in the database instead.
 |---|---|---|---|
 | A data-driven list (ids, cart items): the default | `inArrayOpt(col, list)`, `notInArrayOpt` | `IN ($1, …)` up to 8 elements, `= ANY($1::integer[])` above · bounded statement texts | — |
 | One statement text for every length; long lists | `eqAny(col, list)`, `neAll` | `= ANY($1::integer[])` · 1 parameter | constant short lists whose exact estimate matters under a generic plan |
-| Short constant lists (enum members) | `inArray(col, list)`, `notInArray` | `IN ($1, $2, $3)` · 1 parameter per element | data-driven lists (one text per length); more than 65,535 elements (32,767 on PGlite) |
+| Short constant lists (enum members) | `inArray(col, list)`, `notInArray` | `IN ($1, $2, $3)` · 1 parameter per element | data-driven lists (one text per length); more than 65,535 elements (65,533 on postgres.js, 32,767 on PGlite) |
+| Keys of two or more columns | `or(...keys.map(k => and(eq(t.a, k.a), eq(t.b, k.b))))` | as written up to 8 keys, `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))` above · 1 parameter per column (since 1.0.34) | — |
 | Values another query computes | `inSubquery()`, `eqAnySubquery()` | `IN (SELECT …)` | fetching the ids first (2 round trips) |
 
 ### Letting the list length decide: `inArrayOpt` / `notInArrayOpt`
@@ -691,13 +693,13 @@ LinkgressConfig.inArrayOptThreshold = 12;                // property setter
 LinkgressConfig.configure({ inArrayOptThreshold: 12 });  // or several settings at once
 LinkgressConfig.inArrayOptThreshold;                     // -> 12
 new AppDatabase(client, { inArrayOptThreshold: 12 });    // QueryOptions writes the same process-wide value
-LinkgressConfig.resetToDefaults();                       // 8, no padding, inArrayUsesOpt off
+LinkgressConfig.resetToDefaults();                       // 8, no padding, inArrayUsesOpt off, orUsesOpt on
 ```
 
 `0` sends every non-empty list to the array form (`("users"."id" = ANY($1::integer[]))` with `'{1}'`). An
 invalid value (negative, not an integer) throws and keeps the current one.
 
-> **Pitfall:** the threshold, the pad ladder and `inArrayUsesOpt` are process-wide. Constructing ANY context
+> **Pitfall:** the threshold, the pad ladder, `inArrayUsesOpt` and `orUsesOpt` are process-wide. Constructing ANY context
 > with `inArrayOptThreshold: 2` in its options changed the SQL of an already constructed context to
 > `= ANY($1::integer[])` for a 3-element list (verified).
 
@@ -746,7 +748,7 @@ as CTE columns, stay uncast and PostgreSQL infers the array type. An empty list 
 
 | | `inArray` / `notInArray` | `eqAny` / `neAll` |
 |---|---|---|
-| Parameters | one per element (at most 65,535 per statement; 32,767 on PGlite) | always one |
+| Parameters | one per element (at most 65,535 per statement; 65,533 on postgres.js, 32,767 on PGlite) | always one |
 | Statement text | changes with the list length | fixed |
 | Row estimate under a generic plan (`preparedStatements`, after five executions) | exact per element | default selectivity |
 
@@ -852,6 +854,62 @@ threshold, same ladder, same array form above it. The rows never change, only th
 why it is safe to flip for a whole process. Leave it off when hand-tuned queries depend on the planner seeing
 an exact-length `IN` list; explicit `inArrayOpt` calls keep their rendering either way. It is also set by
 `LinkgressConfig.configure({ inArrayUsesOpt: true })` and by `new AppDatabase(client, { inArrayUsesOpt: true })`.
+
+### Lists of keys written as `or()`: `orUsesOpt` (since 1.0.34)
+
+Keys of two or more columns are written as an `or()` of `and(eq(…), eq(…))` — `inArrayOpt` takes one column.
+Written that way every value is a parameter of its own: 40 000 keys of two columns are 80 000 parameters,
+which no driver sends (postgres.js: `MAX_PARAMETERS_EXCEEDED`; pg: `bind message has 14464 parameter formats
+but 0 parameters`; Bun past 65 535; PGlite past 32 767). Past `inArrayOptThreshold` arms (8) such an `or()`
+renders as ONE array parameter per column, matched as a row; up to it, as written. On by default:
+
+```ts
+const keys = [
+  { userId: alice.id, title: 'Alice Post 1' }, { userId: alice.id, title: 'Alice Post 2' }, { userId: bob.id, title: 'Bob Post' },
+  { userId: bob.id, title: 'Alice Post 1' }, { userId: alice.id, title: 'Draft 1' }, { userId: alice.id, title: 'Draft 2' },
+  { userId: bob.id, title: 'Draft 3' }, { userId: bob.id, title: 'Draft 4' }, { userId: 99, title: 'Bob Post' },
+];
+const titles = await db.posts
+  .where(p => or(...keys.map(k => and(eq(p.userId, k.userId), eq(p.title, k.title)))))
+  .select(p => p.title)
+  .toList(); // ['Alice Post 1', 'Alice Post 2', 'Bob Post']
+
+const viewed = await db.posts
+  .where(p => or(...[100, 150, 200, 250, 300, 350, 400, 450, 500].map(v => eq(p.views, v))))
+  .select(p => p.title)
+  .toList();
+```
+
+```sql
+SELECT "posts"."title"
+FROM "posts"
+WHERE (("posts"."user_id", "posts"."title") IN (SELECT "__keys"."k1", "__keys"."k2" FROM unnest($1::integer[], $2::varchar[]) AS "__keys"("k1", "k2")))
+-- params: [ "{1,1,2,2,1,1,2,2,99}", "{\"Alice Post 1\",\"Alice Post 2\",\"Bob Post\",\"Alice Post 1\",\"Draft 1\",\"Draft 2\",\"Draft 3\",\"Draft 4\",\"Bob Post\"}" ]
+
+SELECT "posts"."title"
+FROM "posts"
+WHERE ("posts"."views" = ANY($1::integer[]))
+-- params: [ "{100,150,200,250,300,350,400,450,500}" ]
+```
+
+The first eight of those keys render as written,
+`(("posts"."user_id" = $1 AND "posts"."title" = $2) OR … OR ("posts"."user_id" = $15 AND "posts"."title" = $16))`;
+over one column the list renders what `inArrayOpt` renders.
+
+- **The rows are the OR's.** A row-constructor `IN` is NULL where a key compares NULL and none matches — as the OR of
+  its arms is — so `not()` of it, and a row whose key column is NULL, read as they did.
+- **What is rewritten:** every arm an equality, or an `and()` of equalities, over the same columns (in any order per
+  arm), each comparing a column with a declared type to a plain value that is a string, number, boolean or bigint
+  after the column's mapper (a `HourMinute` mapped to `smallint` qualifies). The column casts like `eqAny`'s
+  (`serial` → `integer[]`, `char` → `bpchar[]`).
+- **What stays as written:** an arm comparing to NULL (`eq` renders `IS NULL`), to another column, an `sql` fragment,
+  a placeholder or a subquery; a column without a declared type (a CTE column), a json/jsonb or array column; a
+  `Date` or other object value its column does not map (pg binds a Date in local time, an array literal in UTC);
+  arms over different columns, or naming a column twice; an arm that is itself an `or()` or a nested `and()`; any
+  `or()` under a grouped `HAVING` or in a `RETURNING` expression.
+- **One statement text** for every key count above the threshold, so it prepares once.
+- **Off:** `LinkgressConfig.orUsesOpt = false` (or `new AppDatabase(client, { orUsesOpt: false })`), process-wide,
+  for a hand-tuned query that depends on the planner seeing the arms. `resetToDefaults()` turns it back on.
 
 <a id="startswith-operator"></a><a id="regex-operators"></a>
 
@@ -2249,6 +2307,64 @@ LIMIT 1
 > **Pitfall:** convert unmapped timestamp values of collection items with `new Date(…)` where you read them.
 > A collection terminal without `select()` (`u.orders!.toList()`) serializes every column of the item into
 > the JSON — project the fields you use.
+
+### Projections wider than 50 keys
+
+PostgreSQL passes at most 100 arguments to a function call, so one `json_build_object` holds at most 50 keys
+(`54023 cannot pass more than 100 arguments to a function` past that, on every execution). Since 1.0.43 every
+object the ORM builds in SQL — a collection item under every strategy, a nested object inside one, a
+`withAggregation()` item, a navigation row rendered as one object, a `MutationBatch` RETURNING list — is built past
+50 keys as ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` when `LinkgressConfig.serverVersion` says PostgreSQL 16
+or newer ([Configuration](./configuration.md#objects-of-more-than-50-keys-on-postgresql-16-serverversion), captured
+SQL there), and otherwise — the default, since linkgress cannot know the server's version before it builds the first
+statement — as `row_to_json` over a one-row sub-select whose columns are named by the keys:
+
+```ts
+// 51 keys per item
+const fiftyMore = (o: Order) => Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`k${i}`, o.totalAmount]));
+const rows = await db.users
+  .where(u => eq(u.username, 'alice'))
+  .select(u => ({ orders: u.orders!.select(o => ({ id: o.id, ...fiftyMore(o) })).toList() }))
+  .toList();
+```
+
+```sql
+-- captured with future().getSql(), serverVersion unset; columns k2 … k47 and the inner select list elided
+SELECT COALESCE("lateral_0".data, '[]'::json) as "orders"
+FROM "users"
+LEFT JOIN LATERAL (SELECT json_agg(
+  (SELECT row_to_json(r.*) FROM (SELECT "id" AS "id", "k0" AS "k0", "k1" AS "k1", …, "k48" AS "k48", "k49" AS "k49") r)
+) as data
+FROM (
+  SELECT "lateral_0_orders"."id" as "id", "lateral_0_orders"."total_amount" as "k0", …
+  FROM "orders" "lateral_0_orders"
+  WHERE "lateral_0_orders"."user_id" = "users"."id"
+) sub) "lateral_0" ON true
+WHERE "users"."username" = $1
+```
+
+- Up to 50 keys the statement is the one call, byte for byte as before 1.0.43 under every `serverVersion`
+  (statement texts, prepared-statement names and plan caches keyed by them do not change).
+- Past 50 keys the object is json with its keys in the written order and every value as `json_build_object` writes
+  it. `JSON_OBJECT` prints the text one call would (`{"id" : 1, "k0" : 99.99}`); `row_to_json`'s text is compact
+  (`{"id":1,"k0":99.99}`), which no reader sees.
+- Below 16 / unknown, a key that cannot name a column — empty, or longer than 63 bytes (PostgreSQL would truncate the
+  name) — and an object of more than 1 664 keys take another form: the json texts of calls of 50 keys spliced into one
+  and cast back to json once, `(left(json_build_object(…50 keys…)::text, -1) || ', ' ||
+  right(json_build_object(…)::text, -1))::json` — the text one call would print, byte for byte. `JSON_OBJECT` takes
+  its keys as quoted literals and needs no such form.
+- Cost per object against nesting the keys by hand into containers of ≤ 50, PostgreSQL 18
+  ([bench/json-object](https://github.com/brunolau/linkgress-orm/blob/main/bench/json-object/README.md#results)):
+  `JSON_OBJECT` (16+) 0.88–0.98× at every width from 51 to 200 keys (0.95–0.96× with a 20-child `json_agg` among
+  51); `row_to_json` (below 16 / unknown) 0.76–0.89× at 51–60 keys, 0.91–0.92× at 51 keys one of which is a 20-child
+  `json_agg`, 1.10–1.12× at 120 and 1.41–1.43× at 200 (its per-column cost grows with the width). Below 16, a
+  projection of 120 keys or more that is hot enough to matter is cheaper nested by hand; on 16+ it is not.
+- The values are the columns of the row the object is built from (`"k0"` above is the inner select's column), so
+  the sub-select reads them as they are. An aggregate written into the sub-select itself would count ITS one row:
+  every builder computes a `count()`, `sum()` or nested collection in the row source and references its column
+  (`JSON_OBJECT` evaluates its values where the object is, so the trap is the `row_to_json` form's alone).
+- The top-level row and a nested object at the top level are flat columns (`__nested__<key>__<col>`), not one
+  object: they need none of this. A target list still takes at most 1 664 entries.
 
 ### Choose a collection strategy
 
@@ -3970,8 +4086,9 @@ WHERE "users"."id" = $1
   returns `base` itself, now filtered by `x`.
 - **Don't** pass an unset filter value to `eq()` / `ne()` → **Do** skip the condition. `eq(col, undefined)`
   renders `IS NULL`; `gt()` & co. throw; `between()` binds NULL and returns no rows.
-- **Don't** spread a possibly empty condition list into `or()` → **Do** check its length. `or()` of nothing renders
-  `WHERE 1=1` and matches every row.
+- **Don't** spread a possibly empty condition list into `or()` when an empty list should mean "no filter" → **Do**
+  skip the `where()` for it. `or()` of nothing renders `WHERE 1=0` and matches no row (up to 1.0.38 it rendered
+  `WHERE 1=1` and matched every row).
 - **Don't** filter a projected `sql` expression after `select()` → **Do** filter before `select()`. WHERE cannot
   see the output alias: `column "loud" does not exist`.
 - **Don't** `count()` a paged or DISTINCT query to count its rows → **Do** use `countOver()`, a `QueryBatch`

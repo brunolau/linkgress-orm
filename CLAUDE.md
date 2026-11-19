@@ -35,12 +35,19 @@ an option):
   `.expectedExecutionTime()`. Precedence in `QueryExecutor.buildExecutionOptions()`:
   per-call → builder override → context option
 - **Process-wide** — `LinkgressConfig` (`src/config/linkgress-config.ts`) is the ONLY exported
-  way to set `inArrayOptThreshold` / `inArrayPadBuckets` / `inArrayUsesOpt`; the underlying
-  setters live next to the operators in `src/query/conditions.ts` and are not exported from the
-  package. `QueryOptions` keys of the same name write the same process-wide values at context
-  construction. `inArrayUsesOpt` (default off) routes plain `inArray`/`notInArray` through the
-  `inArrayOpt` rendering — both paths bottom out in the private `renderInArrayOpt`/
-  `renderNotInArrayOpt`, NEVER in each other, or the pair becomes mutually recursive
+  way to set `inArrayOptThreshold` / `inArrayPadBuckets` / `inArrayUsesOpt` / `orUsesOpt` /
+  `serverVersion`; the underlying setters live next to their readers (`src/query/conditions.ts`,
+  `serverVersion` in `src/query/sql-utils.ts`) and are not exported from the package.
+  `serverVersion` (1.0.43, default unknown) is the PostgreSQL major SQL may assume — 16+ renders
+  objects past 50 keys as `JSON_OBJECT` (see Collection Strategies); `detectServerVersion(client)`
+  sets it from one `SHOW server_version_num`; it has no `QueryOptions` key. `QueryOptions` keys of the same name write the same process-wide values at
+  context construction. `inArrayUsesOpt` (default off) routes plain `inArray`/`notInArray` through
+  the `inArrayOpt` rendering — both paths bottom out in the private `renderInArrayOpt`/
+  `renderNotInArrayOpt`, NEVER in each other, or the pair becomes mutually recursive.
+  `orUsesOpt` (default ON, 1.0.34) renders an `or()` that lists keys — every arm an `EqComparison`,
+  or an `and()` of them, over the same typed columns with plain values — past the threshold as one
+  array per column (`LogicalCondition.renderKeyMembership`: `(a, b) IN (SELECT … FROM unnest(…))`,
+  one column `= ANY(…)`); anything else in an arm, or a `context.substitute`, renders as written
 - **Opt-in query-build caches** — `MockRowCache.setEnabled(true)` also gates `NavigationPathCache`
 
 ## Conventions
@@ -88,7 +95,7 @@ an option):
 - `src/query/query-builder.ts` — `QueryBuilder`, `SelectQueryBuilder`, `ReferenceQueryBuilder`, `CollectionQueryBuilder`
 - `src/query/grouped-query.ts` — `GroupedQueryBuilder`, `GroupedSelectQueryBuilder` (for `.groupBy()` chains). `g.arrayAgg()` / `g.countDistinct()` are `agg` fragments over operands of the grouped row (`listAggregatesOver`); a build collects those operands (`GroupedBuildState.rowOperands`) and `withSubstitutions` renders each where an aggregate's argument renders (`GroupedRenderer.argument`: off the joined rows, or as a `"q1"."__arg<n>"` column of the subquery that computes expression keys) — an operand interpolated as it is names a table the wrapped statement does not have. `listAggregatesOver` hands out ONE operand object per column and per expression (expressions keyed by their rendered SQL + parameters), so an argument and its ORDER BY key written as two equal `sql` fragments are one `__arg<n>`; DISTINCT with any other ORDER BY key is refused at build time
 - `src/query/conditions.ts` — `Condition`, `SqlFragment`, `FieldRef`, WHERE clause building
-- `src/query/subquery.ts` — `Subquery`, `ExistsCondition`, `NotExistsCondition`
+- `src/query/subquery.ts` — `Subquery`, `ExistsCondition`, `NotExistsCondition`. Each subquery comparison helper (`inSubquery`, `notInSubquery`, `eq`/`ne`/`gt`/`gte`/`lt`/`lteSubquery`) has TWO signatures: the first takes `T` from the column alone (`NotInferred`; TypeScript 7 otherwise infers it from a one-column projection's `{ id }` rows), the second is the 1.0.36 one, kept for subqueries wider than their column. Keep both (pinned by `tests/types/subquery-helper-inference.test.ts`)
 - `src/query/join-utils.ts` — Shared `formatJoinValue()` helper for JOIN conditions
 - `src/query/cte-builder.ts` — CTE (Common Table Expression) support
 
@@ -140,6 +147,30 @@ Key config fields in `CollectionAggregationConfig`:
 - `foreignKeyTableAlias`: Used by `selectMany()` when the FK is on an intermediate table, not the target: the alias of the first of its HOPS (`SelectManyHop`), each rendered under `<relation>__bridge<n>` — never its table's name. A hop keeps what was written on its items (filters, and limits: `LevelConstraint` / `LevelRank`); a build renames the refs minted from its item to its alias (`renderHops`) and renders its constraints as WHERE predicates (`levelPredicates` / `rankPredicate`) — a limit as `pk IN (SELECT pk … ORDER BY … LIMIT n)` tied to the row it ranks within where the build is correlated to its parent (correlated subquery, LATERAL), as a `ROW_NUMBER()` ranking in the set-based CTE / temp-table forms. A collection nested in a collection subquery correlates to the ROW that minted it (`mintedBy`), found through `SqlBuildContext.collectionScope` (`EnclosingCollectionScope`: item chains, hop rows, taken aliases, the bare names outer rows are read by — never taken by a nested subquery, its path joins or its item navigations — and, inside the projection of the collection a selector returns, the rows a collection there may belong to), never by a table-name lookup alone
 - `selectorNavigationJoins`: JOINs within the collection's selector (not the outer navigation path)
 
+Every object a query builds in SQL (items of all three strategies, `withAggregation()`, navigation rows rendered as one
+object, MutationBatch RETURNING) renders through `renderJsonBuildObject(entries)` (`src/query/sql-utils.ts`): ONE
+`json_build_object` up to 50 keys, byte for byte under every setting. Past that it depends on the process-wide
+`LinkgressConfig.serverVersion` (module variable in `sql-utils.ts`, read at build time by `usesSqlJsonConstructors()`):
+- **16+**: ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` — a SQL/JSON constructor, not a function call, so no
+  argument cap; keys through `quoteSqlLiteral`. `RETURNING json` is mandatory (a jsonb value otherwise turns the object
+  jsonb, keys re-sorted).
+- **Unknown (the default) or below 16**: `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)` (`r.*`, never a bare
+  `r`: a column named r wins), or — a key empty or over 63 bytes, over 1 664 keys — the json TEXTS of 50-key calls
+  spliced (`spliceJsonTexts`). PostgreSQL 15 cannot parse JSON_OBJECT's VALUE syntax, so this stays the default.
+
+PostgreSQL takes at most 100 arguments per call (54023), and the in-memory engine enforces it too
+(`parseFuncOrColumn`; its `JSON_OBJECT` / `JSON_ARRAY` constructors are `JsonConstructorExpr` nodes, never counted).
+Never emit a `json_build_object(` of a caller-sized list by hand. The LateralSqlCache key carries the setting (`O`).
+- **Values are columns of the object's own row source** (`JsonObjectEntry.value`): a column ref or a nested object of
+  them, never an aggregate / window / set-returning / uncorrelated volatile expression — below 16 / unknown, past 50
+  keys the value is evaluated inside the row_to_json sub-select, one query level down (`count(*)` reads 1 there).
+  Compute such a value in the row source and reference its column, as every builder does (pinned: projection-reads "a
+  nested collection and aggregates in a wide item stay exact", under both settings).
+- The `json(b)BuildObject()` / `json(b)BuildArray()` helpers take arbitrary operands, so past the cap they never use
+  row_to_json: on 16+ one `JSON_OBJECT(… RETURNING json|jsonb)` / `JSON_ARRAY(… NULL ON NULL RETURNING json|jsonb)`
+  (`NULL ON NULL` mandatory: JSON_ARRAY drops NULLs by default); below 16 / unknown json splices the texts
+  (`jsonTextSpliceParts`), jsonb merges with `||`.
+
 ## Custom Type Mappers
 
 ### How They Work
@@ -160,6 +191,7 @@ entity.property(e => e.publishTime)
 - Also attached directly on FieldRefs as `__mapper` (set by `ReferenceQueryBuilder.createMockTargetRow()`). `__mapper` is INHERITED: every expression helper takes its operand's mapper for its own (`pickResultMapper` — `coalesce`, arithmetic, GREATEST / LEAST / NULLIF, CASE, an aggregate fragment), binding its plain operands through `toDriver` and reading its result through `fromDriver`
 - A mapped column of a COLLECTION'S ITEM carries its mapper under `__itemMapper` (`ITEM_COLUMN_MAPPER`, set by `CollectionQueryBuilder.buildMockItemDescriptors()`; absent on an unmapped column) — never under `__mapper`: an expression over an item column binds and reads as it did before 1.0.31. Exactly two readers: `getComparisonMapper()` (conditions.ts — a value compared DIRECTLY with the column: the comparisons, `between`, `IN` / `NOT IN`, the array-parameter membership forms) and `CollectionQueryBuilder.getAggregateReadMapper()` (`min()` / `max()` of the BARE column, read at the root, in a nested item and in a RETURNING; not through a CTE column or a table subquery). A collection's item LISTS read through `selectedFieldConfigs` (`propertyName` / `sourceTable`) — nothing is mapped twice. Do not move the marker to `__mapper` (pinned by `tests/queries/collection-item-mapper-scope.test.ts`)
 - `MockRowCache` keys carry the MODEL (`MockRowCache.modelKey(schemaRegistry)`; an entity-first context registers its registry under its CLASS in the `DataContext` constructor; a schema-first one registers none and keeps the table-name key, `m0`): a prototype holds what its builder read of its model (the registry, a navigation's mappers, an item's), so two context classes naming a table alike never share one
+- A navigation row's key (`ReferenceQueryBuilder.createMockTargetRow`) also carries the navigation's OWN join (`navigationJoinSignature`: foreign keys, principal keys, INNER / LEFT), not only the path above it: the row's collections and deeper navigations carry that hop as the last step of their path, and the source alias does not always name the source table — a table-level RETURNING (`createMockEntity(MUTATION_ROW_ALIAS)`) anchors EVERY table's first hop on `__mutation__`, where `a.user` and `b.user` over different keys used to share one prototype and the key of whichever table minted it first (pinned by `tests/mutations/insert-returning-navigation.test.ts`, "MockRowCache: one navigation name, two tables, two foreign keys"). Anything a prototype's getters close over belongs in its key
 
 ### Shared (immutable) values
 A mapper declared `immutable: true` (`createCustomType`, `customType`, `TypeMapper.immutable`) has its

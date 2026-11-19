@@ -2,7 +2,7 @@
 
 > **For agents:** Which write API changes the rows you need in the fewest statements, and what SQL does each one send?
 > **Use this page when:** inserting, upserting, merging, updating or deleting rows; reading back generated keys or the written rows; replacing a per-row loop with one set-based statement; making several writes atomic. **Look elsewhere when:** reading rows → [Querying](./querying.md); data-modifying CTEs in depth → [CTE Guide](./cte-guide.md); unique indexes, partial indexes and sequences → [Schema Configuration](./schema-configuration.md)
-> **Key APIs:** `insert` · `insertBulk` · `insertFrom` · `fromRows` · `upsertBulk` · `mergeBulk` · `where().update()` · `bulkUpdate` · `where().delete()` · `.returning()` · `.affectedCount()` · `insertWithChildren` · `MutationBatch` (legs `ifFits`, `addUpdateWhereIn` `where`) · `toStatement()` · `db.transaction()` · **Round trips:** 1 per statement; `insertBulk`, `upsertBulk`, `mergeBulk` and `bulkUpdate` send 1 statement per chunk (a chunk is `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, 39 321 for one column, and at most the rows the client binds: `floor(32 767 ÷ keys)` on PGlite); `insertFrom(fromRows(…))` and a `MutationBatch` are 1 for any row count; `db.transaction()` adds BEGIN and COMMIT
+> **Key APIs:** `insert` · `insertBulk` · `insertFrom` · `fromRows` · `upsertBulk` · `mergeBulk` · `where().update()` · `bulkUpdate` · `where().delete()` · `.returning()` · `.affectedCount()` · `insertWithChildren` · `MutationBatch` (legs `ifFits`, `addUpdateWhereIn` `where`) · `toStatement()` · `db.transaction()` · **Round trips:** 1 per statement; `insertBulk`, `upsertBulk`, `mergeBulk` and `bulkUpdate` send 1 statement per chunk (a chunk is `floor(floor(65 535 ÷ columns the rows bind) × 0.6)` rows, 39 321 for one column, and at most the rows the client binds: `floor(32 767 ÷ columns)` on PGlite); `insertFrom(fromRows(…))` and a `MutationBatch` are 1 for any row count; `db.transaction()` adds BEGIN and COMMIT
 
 The examples use the test model `AppDatabase` ([Example Model and Seed Data](../example-model.md)), seeded with the
 users `alice`, `bob` and `charlie` and their posts, orders and tasks. Three features need a table the test model lacks:
@@ -270,7 +270,7 @@ key with the id (`username` above).
 
 | Option | Default | Effect |
 |---|---|---|
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement; more rows are sent as further statements |
+| `chunkSize` | `floor(floor(65 535 ÷ columns the rows bind) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement; more rows are sent as further statements |
 | `onConflictDoNothing` | `false` | `ON CONFLICT DO NOTHING`: rows any unique index rejects are skipped |
 | `overridingSystemValue` | `false` | sends identity columns (otherwise left out) with `OVERRIDING SYSTEM VALUE` |
 
@@ -296,19 +296,25 @@ INSERT INTO "tags" ("id", "name") OVERRIDING SYSTEM VALUE VALUES ($1, $2)
 
 - An empty array sends nothing; `.returning()` then gives `[]`.
 - The column list is the union of the rows' keys. A column no row sets is left out, so its DEFAULT applies; a column any
-  row sets is sent for every row, as NULL where a row lacks it:
+  row sets is sent for every row, as `DEFAULT` where a row lacks it (the key absent or `undefined`), so each row gets
+  what it would get inserted alone (since 1.0.42; before, that cell was NULL, and on a NOT NULL column with a DEFAULT
+  the statement failed with 23502). An explicit `null` stays NULL. A `MutationBatch.addInsertBulk` leg does the same:
 
 ```ts
 await db.users.insertBulk([
   { username: 'mia', email: 'mia@test.com', isActive: false },
-  { username: 'noah', email: 'noah@test.com' },    // isActive is stored as NULL, not the DEFAULT true
+  { username: 'noah', email: 'noah@test.com' },    // isActive is stored as the DEFAULT true
 ]);
 ```
 
 ```sql
-INSERT INTO "users" ("username", "email", "is_active") VALUES ($1, $2, $3), ($4, $5, $6)
--- params: [ "mia", "mia@test.com", false, "noah", "noah@test.com", null ]
+INSERT INTO "users" ("username", "email", "is_active") VALUES ($1, $2, $3), ($4, $5, DEFAULT)
+-- params: [ "mia", "mia@test.com", false, "noah", "noah@test.com" ]
 ```
+
+> **Pitfall:** `upsertBulk`, a `rowGuard` insert and `fromRows()` still send NULL for such a cell: an upsert's DO UPDATE
+> reads the cell through `EXCLUDED` (`DEFAULT` would overwrite the stored value with the default), and a `VALUES` list
+> read as a table cannot hold `DEFAULT`. Give every row the key there.
 
 > **Pitfall:** Chunks are separate statements. Outside a transaction each chunk commits on its own, so a failure in a
 > later chunk leaves the earlier ones written. Wrap the call in `db.transaction()` for all-or-nothing, or use
@@ -338,11 +344,13 @@ INSERT INTO "users" ("username", "email") VALUES ($1, $2)
 ### How many rows one statement carries: chunks within the client's parameter limit (since 1.0.32)
 
 `insertBulk`, `upsertBulk`, `bulkUpdate` and `mergeBulk` split a large input into statements of
-`floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, and never into a chunk that binds more parameters than the
-client takes (`DatabaseClient.maxParameters()`: 65 535; `PGliteClient` 32 767). On PGlite a chunk is therefore at most
-`floor(32 767 ÷ keys)` rows; on PostgreSQL and the in-memory database the chunks are the ones 1.0.31 sent. Before
-1.0.32 the chunk followed PostgreSQL's limit alone, and PGlite refused every chunk binding more than 32 767 parameters.
-Measured with the same inputs on `PgClient` (the in-memory database) and on `PGliteClient`:
+`floor(floor(65 535 ÷ columns) × 0.6)` rows — the columns the rows bind: every key, over ALL the rows, that names a
+column (since 1.0.34; before, the keys of the first row) — and never into a chunk that binds more parameters than the
+client takes (`DatabaseClient.maxParameters()`: 65 535; `PostgresClient` 65 533 since 1.0.34; `PGliteClient` 32 767).
+On PGlite a chunk is therefore at most `floor(32 767 ÷ columns)` rows; on PostgreSQL and the in-memory database the
+chunks are the ones 1.0.31 sent. Before 1.0.32 the chunk followed PostgreSQL's limit alone, and PGlite refused every
+chunk binding more than 32 767 parameters. Measured with the same inputs on `PgClient` (the in-memory database) and on
+`PGliteClient`:
 
 | Call | Rows × keys | `PgClient` (65 535) | `PGliteClient` (32 767) |
 |---|---|---|---|
@@ -352,14 +360,23 @@ Measured with the same inputs on `PgClient` (the in-memory database) and on `PGl
 | `db.tags.upsertBulk(rows)` (`id`, `name`) | 16 384 × 2 | 1: 32 768 | 2: 32 766 + 2 |
 | `db.posts.insertBulk(rows).toStatement()` | 8 192 × 4 | compiled: 32 768 parameters | throws (below) |
 
+- A first row carrying fewer columns than the others no longer sizes the chunk (since 1.0.34): 300 rows of
+  5 nullable columns whose first row carries only its key went as ONE statement of 1 500 parameters on a client that
+  takes 1 000, and now go as 2 (1 000 + 500).
+- A cell holding an `sql` fragment binds the fragment's own parameters, not one: rows with such cells close their
+  statement before it would bind more than a chunk of plain cells does (since 1.0.34). 300 rows of 5 columns whose
+  `b` is ``sql`${x} || ${d} || ${id}` `` bind 7 parameters each: 2 100 in one statement on PostgreSQL; within a limit
+  of 1 000, 994 + 994 + 112 (they bound 1 400 + 700 before).
 - `chunkSize` is used as given, whatever the client takes (`{ chunkSize: 4 }` sent 10 one-column rows as 4 + 4 + 2
-  parameters): on PGlite keep its rows × keys at most 32 767, or leave it out. 11 000 rows of 3 keys went as 2
+  parameters): on PGlite keep its rows × columns at most 32 767, or leave it out. 11 000 rows of 3 keys went as 2
   statements (32 766 + 234 parameters) by default; with `{ chunkSize: 11000 }` PGlite refused the first one:
   `PGliteClient: the statement binds 33000 parameters — PGlite takes at most 32 767 …`.
 - `insertBulk(…).toStatement()` compiles at most one such chunk. On PGlite 8 191 rows of 4 keys compiled (32 764
   parameters) and 8 192 threw `toStatement(): 8192 rows exceed the 8191-row chunk of one insert into "posts" —
   insertBulk() would execute them as 2 statements, a compiled statement is one. Compile the rows in batches of at most
-  that many.`
+  that many.` A compiled insert whose RETURNING takes it over the client's limit is refused at that limit (since
+  1.0.34; it was always PostgreSQL's 65 535): `toStatement(): the compiled INSERT into "<table>" binds 1001
+  parameters — over the 1 000 this client takes` (a limit of 1 000 simulated in the suite).
 - Not chunked: `insertWithChildren` / `insertBulkWithChildren` (one statement, a row budget of their own), `values()`
   (the whole input is one statement) and a `MutationBatch` statement (refused over the client's limit; register a leg
   that may not fit [`ifFits`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032)).
@@ -765,7 +782,7 @@ INSERT INTO "users" ("username", "email", "age") VALUES ($1, $2, $3), ($4, $5, $
 | `updateWhere` | — | `(existing, excluded) => condition`: the `DO UPDATE … WHERE` |
 | `setWhere` | — | the same condition as raw SQL; ANDed with `updateWhere` |
 | `targetWhere` | — | the arbiter predicate of a partial unique index ([below](#upsert-onto-a-partial-unique-index-targetwhere)) |
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
+| `chunkSize` | `floor(floor(65 535 ÷ columns the rows bind) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
 | `overridingSystemValue` | `true` when the first row (or `referenceItem`) carries an identity primary key | `OVERRIDING SYSTEM VALUE` |
 | `referenceItem` | the first row | the row whose keys decide `overridingSystemValue` |
 
@@ -1060,7 +1077,7 @@ MERGE INTO "products" AS t USING (VALUES ($1::varchar, $2::boolean), ($3, $4)) A
 | `matchWhere` | — | raw SQL ANDed into the match; the target row is `t`, the source row `s` |
 | `updateColumns` | every column the rows carry except `on` | the `WHEN MATCHED THEN UPDATE SET` list; `[]` renders `WHEN MATCHED THEN DO NOTHING` (insert only the unmatched) |
 | `updateColumnFilter` | — | `(property) => boolean` over the rows' columns |
-| `chunkSize` | `floor(floor(65 535 ÷ keys of the first row) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
+| `chunkSize` | `floor(floor(65 535 ÷ columns the rows bind) × 0.6)` rows, at most the rows the client binds ([chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)) | rows per statement |
 
 - A target row may be matched by only one source row: two input rows with the same `on` key fail with 21000
   `MERGE command cannot affect row a second time`. Deduplicate the input by `on`.
@@ -1367,7 +1384,7 @@ WHERE t."id" = v."id"
   Rows with only the key and no `set` throw `No columns to update (only primary keys provided)`.
 - RETURNING columns are qualified `t."col"`. A navigation or collection in the selector runs the UPDATE in a
   `"__mutation__"` CTE.
-- Chunking follows the `insertBulk` rule (keys of the first row, within the client's parameter limit:
+- Chunking follows the `insertBulk` rule (the columns the rows bind, within the client's parameter limit:
   [chunks](#how-many-rows-one-statement-carries-chunks-within-the-clients-parameter-limit-since-1032)); `chunkSize`
   overrides it.
 - `MutationBatch.addBulkUpdate` takes the same `primaryKey` / `set` / `where`.
@@ -1724,7 +1741,7 @@ ORDER BY "__mutation__"."__ibwc_child_pk__"
 |---|---|---|
 | Child rows | non-empty; must not carry the foreign key (thrown: `child row at index 0 carries the foreign-key property "userId" — it is sourced from the inserted parent`) | the same, and every parent needs at least one child (`parent at index 1 has no child row …`); `parentIndex` must be in range |
 | Primary key | the parent's: one auto-generated column | both tables: one auto-generated column each |
-| Size limit | child rows ≤ `floor(floor(65 535 ÷ (child columns + 1)) × 0.6)` | parents + children ≤ `floor(floor(65 535 ÷ (child columns + 2)) × 0.6)` |
+| Size limit | child rows ≤ `floor(floor(65 535 ÷ (child columns + 1)) × 0.6)`, at most the rows the client binds | parents + children ≤ `floor(floor(65 535 ÷ (child columns + 2)) × 0.6)`, at most the rows the client binds (child columns: every child row's, since 1.0.34) |
 | Order | child ids ascend in input order; `children` comes back in input order | parents and children come back in input order (serial ids ascend in input order, recovered with `row_number()`) |
 | Guard | `unlessExists`: same snapshot, not race-safe; a match gives `{ parent: null, children: [] }` | none |
 
@@ -1879,10 +1896,11 @@ Members: `size` (registered legs), `parameterCount` (since 1.0.29; the statement
 - Every leg must come from the same context: legs of `db` and of a transaction's `tx` in one batch are refused
   (`MutationBatch: leg "tx" uses a different database client or transaction than the rest of the batch …`). Inside a
   transaction, build every leg from `tx.<table>`.
-- A leg above its own budget, `floor(floor(65 535 ÷ columns of its first row) × 0.6)` rows (a list leg's values, a
+- A leg above its own budget, `floor(floor(65 535 ÷ columns its rows carry) × 0.6)` rows (a list leg's values, a
   children leg's parents and children), throws at registration: `MutationBatch: leg "tags" carries 39322 rows, above
   the ~39321-row single statement budget for 1 columns — execute this mutation standalone (it needs chunking)`.
-  `executeBatch()` refuses a statement over 65 535 parameters (the client's `maxParameters()` when lower: PGlite 32 767)
+  `executeBatch()` refuses a statement over 65 535 parameters (the client's `maxParameters()` when lower: postgres.js
+  65 533 since 1.0.34, PGlite 32 767)
   before sending: `MutationBatch: the statement binds 69000 parameters — over PostgreSQL's 65 535: execute some of its
   legs in another batch ("comments": 39000, "tags": 30000)`. A leg that may not fit: register it
   [`ifFits`](#register-a-leg-only-when-the-statement-can-carry-it-iffits-since-1032), which checks both; `parameterCount`
@@ -1959,8 +1977,8 @@ to, returned as `null` instead of an error:
 
 | Check | Limit | Without `ifFits` | Measured with `ifFits` |
 |---|---|---|---|
-| the leg's own rows (a list leg's values; a children leg's parents and children) | its budget, `floor(floor(65 535 ÷ columns of its first row) × 0.6)` rows: what a standalone write sends in one chunk on PostgreSQL | throws at registration | 39 321 one-column rows: registered; 39 322: `null` |
-| the parameters of the leg plus those of every leg registered before it | the client's `maxParameters()`: 65 535; PGlite 32 767 | `executeBatch()` refuses the statement | 39 000 ids registered, then 30 000 tags: `null` (69 000 > 65 535); on `PGliteClient`, 33 000 one-column rows: `null`, 32 767: registered |
+| the leg's own rows (a list leg's values; a children leg's parents and children) | its budget, `floor(floor(65 535 ÷ columns its rows carry) × 0.6)` rows (a children leg: its parents' columns): what a standalone write sends in one chunk on PostgreSQL | throws at registration | 39 321 one-column rows: registered; 39 322: `null` |
+| the parameters of the leg plus those of every leg registered before it | the client's `maxParameters()`: 65 535; postgres.js 65 533 (since 1.0.34); PGlite 32 767 | `executeBatch()` refuses the statement | 39 000 ids registered, then 30 000 tags: `null` (69 000 > 65 535); on `PGliteClient`, 33 000 one-column rows: `null`, 32 767: registered |
 
 - Checking `parameterCount` is not enough: on an empty batch 39 322 one-column rows are within 65 535 parameters and
   still over the leg's own budget.
@@ -2223,7 +2241,8 @@ SELECT (SELECT count(*)::int FROM "__mb_0") AS "0", (SELECT count(*)::int FROM "
 ### Insert parents and children as a leg: `addInsertBulkWithChildren()`
 
 The `insertBulkWithChildren` persist as one leg (three CTEs). Unlike the standalone call, parents without children are
-allowed. `getAffectedCount` reports the PARENT rows; `parentReturning` reads the parents back in input order (raw JSON).
+allowed — all of them too: with an empty `children.rows` the child CTE is left out and the leg is a plain parent insert.
+`getAffectedCount` reports the PARENT rows; `parentReturning` reads the parents back in input order (raw JSON).
 
 ```ts
 const wc = new MutationBatch();

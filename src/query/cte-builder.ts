@@ -3,6 +3,8 @@ import { CollectionQueryBuilder, QueryBuilder, SelectQueryBuilder, ResolveCollec
 import { Condition, SqlBuildContext, FieldRef, UnwrapSelection, WhereConditionBase } from './conditions';
 import { pgTypeOfValue } from './sql-functions';
 import { renumberPlaceholders } from './query-batch';
+import { renderJsonBuildObject } from './sql-utils';
+import type { JsonObjectEntry } from './sql-utils';
 
 /**
  * Interface for queries that can be used in CTEs
@@ -298,12 +300,13 @@ class StatementCteNames extends Set<string> {
 }
 
 /**
- * The data-modifying CTEs a body reads that the body cannot declare itself: a CTE's body
+ * The CTEs a body reads that the body cannot declare itself: a CTE's body
  * ({@link DbCteBuilder.with}, {@link DbCteBuilder.withAggregation}) or a statement compiled with `toStatement()`
  * (a data-modifying CTE's body, see {@link DbCteBuilder.withMutation}). PostgreSQL allows a data-modifying CTE
  * only in the WITH of the statement that executes — so the body reads it by name, and the CTE built over the
  * body carries it (`DbCte.dependencies`): every statement that declares that CTE declares these before it
- * (see {@link withCteDependencies}). A plain CTE the body reads is declared inside it, as before.
+ * (see {@link withCteDependencies}). A plain CTE the body reads is declared inside it, as before — unless the body
+ * lists it in `with(name, query, { reads })`, which records it here from the start and reads it by name.
  * @internal
  */
 export class CteDependencies {
@@ -440,7 +443,17 @@ export function sameCteDefinition(a: DbCte<any>, b: DbCte<any>): boolean {
     && a.materialized === b.materialized
     && a.params.length === b.params.length
     && cteBodyAt(a, 1) === cteBodyAt(b, 1)
-    && a.params.every((param, index) => sameBoundValue(param, b.params[index]));
+    && a.params.every((param, index) => sameBoundValue(param, b.params[index]))
+    && sameDependencies(a, b);
+}
+
+/**
+ * Whether two CTEs read the same CTEs by name (`DbCte.dependencies`): bodies of one text read different rows when
+ * the CTE a name stands for differs — each dependency of one must be the same CTE by content as one of the other.
+ */
+function sameDependencies(a: DbCte<any>, b: DbCte<any>): boolean {
+  return a.dependencies.length === b.dependencies.length
+    && a.dependencies.every(dependency => b.dependencies.some(other => sameCteDefinition(dependency, other)));
 }
 
 /**
@@ -675,10 +688,11 @@ export class DbCte<TColumns> {
   public readonly paramBase: number;
 
   /**
-   * The data-modifying CTEs this CTE's body reads (by name — PostgreSQL allows them only in the WITH of the
-   * statement that executes): every statement that declares this CTE declares them first, each once (see
-   * {@link withCteDependencies}). A data-modifying CTE over a compiled statement that reads an earlier one —
-   * `afterMutation(closed)`, `db.selectFromCte(closed)…` — and a plain CTE over a query that reads one.
+   * The CTEs this CTE's body reads by name: every statement that declares this CTE declares them first, each once
+   * (see {@link withCteDependencies}). The data-modifying CTEs it reads (PostgreSQL allows them only in the WITH of
+   * the statement that executes) — a data-modifying CTE over a compiled statement that reads an earlier one
+   * (`afterMutation(closed)`, `db.selectFromCte(closed)…`) and a plain CTE over a query that reads one — and the
+   * plain CTEs `with(name, query, { reads })` lists.
    */
   public readonly dependencies: readonly DbCte<any>[];
 
@@ -828,6 +842,12 @@ export class DbCteBuilder {
    *       postCount: u.posts.count()
    *     }))
    * );
+   *
+   * @example
+   * // A body that reads another CTE by name: the statement declares `older` once, the body's EXISTS reads it
+   * const body = cteBuilder.with('older_posts', db.posts
+   *   .where(p => exists(db.selectFromCte(older.cte).where(r => eq(r.id, p.userId)).select(r => ({ id: r.id })).asSubquery()))
+   *   .select(p => ({ userId: p.userId })), { reads: [older.cte] });
    */
   with<TSelection extends Record<string, unknown>>(
     cteName: string,
@@ -840,13 +860,35 @@ export class DbCteBuilder {
        * candidate-set CTEs that must drive the outer join order.
        */
       materialized?: boolean;
+      /**
+       * CTEs the body reads — `db.selectFromCte(other)` in its WHERE, a join, a projected subquery. A body is
+       * rendered right here, before any statement exists, so without this it declares every CTE it reads INSIDE
+       * itself (`EXISTS (WITH "other" AS (…) SELECT …)`), even when the statement declares `other` too — a copy
+       * written, bound and planned per occurrence, which PostgreSQL cannot pull up into a semi-join. Listed here,
+       * `other` is read by name instead, and whoever declares this CTE (a statement's `.with()`, the subquery that
+       * reads it) declares `other` just before it, once — unless the statement declared it already. The statement
+       * may declare a CTE of that name only if it is the same CTE by content (see {@link sameCteDefinition}).
+       */
+      reads?: readonly DbCte<any>[];
     }
   ): { cte: DbCte<TSelection> } {
-    // A CTE body is nested in the statement that declares it: a data-modifying CTE it reads — one the
-    // query carries, or reads in a subquery — is read by name there, and declared by every statement that
-    // declares this CTE, before it (see CteDependencies)
+    // A CTE body is nested in the statement that declares it: a CTE it reads — a data-modifying one it
+    // reaches anywhere, a plain one it lists in `reads` — is read by name there, and declared by every
+    // statement that declares this CTE, before it (see CteDependencies)
     const dependencies = new CteDependencies();
-    const hoistedCteNames = dependencies.scope();
+    const reads = options?.reads ?? [];
+
+    for (const read of reads) {
+      if (!(read instanceof DbCte)) {
+        throw new TypeError(`with("${cteName}"): reads: expected DbCte entries — a CTE from DbCteBuilder.with / withAggregation / withMutation`);
+      }
+
+      dependencies.record(read);
+    }
+
+    // The body renders with what it reads already declared — and what THOSE read: a nested read of `posts` that
+    // reads `older` itself must not declare `older` again inside the body
+    const hoistedCteNames = declareStatementCtes(dependencies.scope(), withCteDependencies(reads));
 
     if (typeof (query as any)._getAttachedCtes === 'function') {
       assertStatementLevelCtes((query as any)._getAttachedCtes(), hoistedCteNames);
@@ -1076,18 +1118,18 @@ export class DbCteBuilder {
     // One key of an aggregated item: a column of the inner query, or — for a nested object (a
     // navigation row) it rendered as flattened `__nested__<path>` columns — the object rebuilt from
     // them. It used to name a column `"<key>"` the inner query does not have
-    const jsonPart = (key: string, metaValue: unknown, column: string): string => {
+    const jsonEntry = (key: string, metaValue: unknown, column: string): JsonObjectEntry => {
       const nested = nestedProjectionMeta(metaValue);
 
       if (nested === undefined) {
-        return `'${key}', "${column}"`;
+        return { key, value: `"${column}"` };
       }
 
       // A nested value is always rendered (an undefined one as NULL, see renderFlatNestedLeaf)
       const prefix = column.startsWith('__nested__') ? column : `__nested__${column}`;
-      const parts = Object.keys(nested).map(leaf => jsonPart(leaf, nested[leaf], `${prefix}__${leaf}`));
+      const entries = Object.keys(nested).map(leaf => jsonEntry(leaf, nested[leaf], `${prefix}__${leaf}`));
 
-      return `'${key}', json_build_object(${parts.join(', ')})`;
+      return { key, value: renderJsonBuildObject(entries) };
     };
 
     // Build the aggregation expression
@@ -1096,9 +1138,10 @@ export class DbCteBuilder {
     // The result is functionally equivalent for read operations
     let aggregationExpression: string;
     if (aggregatedColumns.length > 0) {
-      // Use json_build_object for better performance - only include non-groupBy columns
-      const jsonParts = aggregatedColumns.map(col => jsonPart(col, innerSelectionMetadata![col], col)).join(', ');
-      aggregationExpression = `json_agg(json_build_object(${jsonParts}))`;
+      // Use json_build_object for better performance - only include non-groupBy columns (past 50
+      // keys renderJsonBuildObject's JSON_OBJECT / row_to_json form: a call takes at most 100 arguments)
+      const entries = aggregatedColumns.map(col => jsonEntry(col, innerSelectionMetadata![col], col));
+      aggregationExpression = `json_agg(${renderJsonBuildObject(entries)})`;
     } else {
       // Fallback to to_json(t.*) if we can't determine columns
       aggregationExpression = `json_agg(to_json(t.*))`;

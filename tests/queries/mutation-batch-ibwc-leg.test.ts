@@ -14,7 +14,8 @@ import { EntityMetadataStore } from '../../src/entity/entity-base';
  * Same v1 guarantees as the standalone form: parents insert ORDER BY an input
  * ordinal (serial ids ascend in input order), a row_number-over-pk CTE
  * recovers each parent's input index for the child FK join; single-column
- * serial PKs, flat columns, every parent referenced by at least one child.
+ * serial PKs, flat columns. Unlike the standalone form a parent may have no
+ * child — and with no child row at all the leg is a plain parent insert.
  *
  * `getAffectedCount` reports PARENT rows; `options.parentReturning` (prop
  * names) exposes the parent rows — input-ordinal order — via `getLegRows`
@@ -170,6 +171,92 @@ describe('MutationBatch insertBulkWithChildren leg', () => {
 		expect(parents.map(p => p.label)).toEqual(['fresh']);
 		const children = await db.mbwChildren.toList();
 		expect(children.map(c => c.note)).toEqual(['fresh-child']);
+	});
+
+	test('parents with NO child rows at all ride the batch as plain parent inserts', async () => {
+		await client.query('TRUNCATE mbw_child_test, mbw_parent_test RESTART IDENTITY CASCADE');
+
+		const batch = new MutationBatch();
+		const tasks = batch.addInsertBulkWithChildren(
+			db.mbwParents,
+			{
+				rows: [
+					{ label: 'email', kind: 30 },
+					{ label: 'accounting', kind: 2 },
+				],
+				children: {
+					table: db.mbwChildren,
+					foreignKey: 'parentId',
+					rows: [],
+				},
+			},
+			'tasks',
+			{ parentReturning: ['id', 'label'] },
+		);
+
+		const querySpy = jest.spyOn(client, 'query');
+
+		try {
+			await batch.executeBatch();
+
+			expect(querySpy).toHaveBeenCalledTimes(1);
+		} finally {
+			querySpy.mockRestore();
+		}
+
+		expect(batch.getAffectedCount(tasks!)).toBe(2);
+
+		const parents = batch.getLegRows(tasks!) as Array<{ id: number; label: string }>;
+		expect(parents.map(p => p.label)).toEqual(['email', 'accounting']);
+		expect(parents[0].id).toBeLessThan(parents[1].id);
+		expect(await db.mbwChildren.toList()).toEqual([]);
+	});
+
+	test('a childless leg without parentReturning rides next to another leg in the same statement', async () => {
+		await client.query('TRUNCATE mbw_child_test, mbw_parent_test RESTART IDENTITY CASCADE');
+
+		const batch = new MutationBatch();
+		const fields = batch.addInsertBulkWithChildren(
+			db.mbwParents,
+			{
+				rows: [{ label: 'free-text', kind: 0 }],
+				children: { table: db.mbwChildren, foreignKey: 'parentId', rows: [] },
+			},
+			'fields',
+		);
+		const members = batch.addInsertBulk(db.mbwParents, [{ label: 'member', kind: 1 }], 'members');
+
+		const querySpy = jest.spyOn(client, 'query');
+
+		try {
+			await batch.executeBatch();
+
+			expect(querySpy).toHaveBeenCalledTimes(1);
+		} finally {
+			querySpy.mockRestore();
+		}
+
+		expect(batch.getAffectedCount(fields!)).toBe(1);
+		expect(batch.getAffectedCount(members!)).toBe(1);
+		expect((await db.mbwParents.toList()).map(p => p.label).sort()).toEqual(['free-text', 'member']);
+		expect(await db.mbwChildren.toList()).toEqual([]);
+	});
+
+	test('a misspelled child foreign key still throws when there are no child rows', async () => {
+		const batch = new MutationBatch();
+
+		expect(() => batch.addInsertBulkWithChildren(
+			db.mbwParents,
+			{
+				rows: [{ label: 'solo', kind: 1 }],
+				children: {
+					table: db.mbwChildren,
+					foreignKey: 'parentIdd',
+					rows: [],
+				},
+			},
+			'typo',
+		)).toThrow(/foreign-key/);
 	});
 
 	test('a child with an out-of-range parentIndex throws at registration', async () => {

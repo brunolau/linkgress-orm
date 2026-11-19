@@ -390,6 +390,19 @@ export function notExists(source: Subquery | CollectionSubquerySource): NotExist
 type NonUndefined<T> = T extends undefined ? never : T;
 
 /**
+ * `T` itself, but nothing is inferred from it.
+ *
+ * The helpers below take it in their FIRST signature, where `T` is the column's type alone: a subquery's rows need
+ * not have it (a one-column projection's are `{ id: number }`), and through the published declarations a subquery's
+ * `TResult` constrains nothing. TypeScript 7 otherwise took the rows' type for `T` and reported TS2345 on the column;
+ * 6 and earlier took the column's. The SECOND signature is the 1.0.36 one, unchanged, so a call that compiled before
+ * still does: a subquery whose rows are wider than the column (`unknown[]`, `(number | null)[]`), which linkgress's
+ * own sources check, widens `T` there as it did. `NoInfer` would read the same from TypeScript 5.4 on; this form
+ * holds in every version a consumer may compile with.
+ */
+type NotInferred<T> = [T][T extends any ? 0 : never];
+
+/**
  * IN subquery condition
  *
  * Supports both required and optional fields:
@@ -398,6 +411,15 @@ type NonUndefined<T> = T extends undefined ? never : T;
  *
  * For optional fields, use non-null assertion (!) or check for undefined before calling.
  */
+export function inSubquery<T>(
+  field: FieldRef<any, NonUndefined<T>>,
+  subquery: Subquery<NotInferred<NonUndefined<T>>[], 'array'>
+): InSubqueryCondition<NonUndefined<T>>;
+/** IN subquery condition, `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function inSubquery<T>(
+  field: FieldRef<any, NonUndefined<T>>,
+  subquery: Subquery<NonUndefined<T>[], 'array'>
+): InSubqueryCondition<NonUndefined<T>>;
 export function inSubquery<T>(
   field: FieldRef<any, NonUndefined<T>>,
   subquery: Subquery<NonUndefined<T>[], 'array'>
@@ -416,6 +438,15 @@ export function inSubquery<T>(
  */
 export function notInSubquery<T>(
   field: FieldRef<any, NonUndefined<T>>,
+  subquery: Subquery<NotInferred<NonUndefined<T>>[], 'array'>
+): NotInSubqueryCondition<NonUndefined<T>>;
+/** NOT IN subquery condition, `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function notInSubquery<T>(
+  field: FieldRef<any, NonUndefined<T>>,
+  subquery: Subquery<NonUndefined<T>[], 'array'>
+): NotInSubqueryCondition<NonUndefined<T>>;
+export function notInSubquery<T>(
+  field: FieldRef<any, NonUndefined<T>>,
   subquery: Subquery<NonUndefined<T>[], 'array'>
 ): NotInSubqueryCondition<NonUndefined<T>> {
   return new NotInSubqueryCondition(field, subquery);
@@ -426,11 +457,29 @@ export function notInSubquery<T>(
  */
 export function eqSubquery<T>(
   field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function eqSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
+export function eqSubquery<T>(
+  field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>
 ): ScalarSubqueryComparison<T> {
   return new ScalarSubqueryComparison(field, '=', subquery);
 }
 
+export function neSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function neSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
 export function neSubquery<T>(
   field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>
@@ -440,11 +489,29 @@ export function neSubquery<T>(
 
 export function gtSubquery<T>(
   field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function gtSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
+export function gtSubquery<T>(
+  field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>
 ): ScalarSubqueryComparison<T> {
   return new ScalarSubqueryComparison(field, '>', subquery);
 }
 
+export function gteSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function gteSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
 export function gteSubquery<T>(
   field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>
@@ -454,11 +521,29 @@ export function gteSubquery<T>(
 
 export function ltSubquery<T>(
   field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function ltSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
+export function ltSubquery<T>(
+  field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>
 ): ScalarSubqueryComparison<T> {
   return new ScalarSubqueryComparison(field, '<', subquery);
 }
 
+export function lteSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<NotInferred<T>, 'scalar'>
+): ScalarSubqueryComparison<T>;
+/** `T` inferred from the subquery as well: the 1.0.36 signature (see {@link NotInferred}). */
+export function lteSubquery<T>(
+  field: FieldRef<any, T>,
+  subquery: Subquery<T, 'scalar'>
+): ScalarSubqueryComparison<T>;
 export function lteSubquery<T>(
   field: FieldRef<any, T>,
   subquery: Subquery<T, 'scalar'>

@@ -33,6 +33,8 @@ import { createSetRow, holdsSetReturningValue, lateralSetJoinsSql, lateralSetRef
 import type { LateralSetJoin, SetRow } from './set-returning';
 import { countedOnce, forResultSet, sharesValues, valuesAt } from './shared-values';
 import type { ValueCount } from './shared-values';
+import { renderJsonBuildObject } from './sql-utils';
+import type { JsonObjectEntry } from './sql-utils';
 
 /**
  * Field type categories for optimized result transformation
@@ -280,9 +282,10 @@ export function getDbToPropertyMapForSchema(schema: TableSchema): Map<string, st
  * Building a reference mock row costs O(columns + relations) `Object.defineProperty`
  * calls plus fresh closures per row — and deep selectors (cart → items → product →
  * price → …) rebuild that graph from scratch on EVERY query build. All of it is
- * deterministic in (target schema, relation alias, navigation path), so the property
- * descriptors are built once per signature and reused: each new mock row is a bare
- * object + one `Object.defineProperties` call with the shared descriptor map.
+ * deterministic in (target schema, relation alias, source alias, navigation path, and the
+ * navigation's own join keys), so the property descriptors are built once per signature
+ * and reused: each new mock row is a bare object + one `Object.defineProperties` call with
+ * the shared descriptor map.
  *
  * Per-instance state (the lazy FieldRef cache and the memoized navigation rows)
  * lives in symbol-keyed slots read by the shared getters through `this`, so sharing
@@ -309,8 +312,12 @@ type MockRowSlots = {
   [MOCK_ROW_CHAIN_ID]?: string | number;
 };
 
+/** A navigation hop's own join as a cache-key part: its key columns on both sides, and INNER / LEFT. */
+const navigationJoinSignature = (foreignKeys: readonly string[] | undefined, matches: readonly string[] | undefined, isMandatory: boolean | undefined): string =>
+  `${(foreignKeys ?? []).join('+')}:${(matches ?? []).join('+')}:${isMandatory ? 1 : 0}`;
+
 const navigationPathSignature = (path: NavigationJoin[]): string => path
-  .map(step => `${step.alias}:${step.targetTable}:${(step.foreignKeys ?? []).join('+')}:${(step.matches ?? []).join('+')}:${step.isMandatory ? 1 : 0}:${step.sourceAlias ?? ''}`)
+  .map(step => `${step.alias}:${step.targetTable}:${navigationJoinSignature(step.foreignKeys, step.matches, step.isMandatory)}:${step.sourceAlias ?? ''}`)
   .join('>');
 
 /**
@@ -497,6 +504,13 @@ const rootOrderByFieldOf = (key: any, direction: OrderDirection): RootOrderByFie
 
 /** The column an expression key's ref stands for: a projected column's key (see createOrderByProxy) stands for its column. */
 const orderKeyColumnRef = (ref: any): FieldRef => (ref?.[ORDER_KEY] as OrderKeyMeta | undefined)?.ref ?? ref;
+
+/**
+ * A projected collection aggregate an `orderBy` key names by its output alias (see createOrderByProxy):
+ * MIN, MAX and SUM. COUNT and EXISTS stay expression keys — they render as their own subquery.
+ */
+const isOrderableCollectionAggregate = (aggregationType: string | undefined): boolean =>
+  aggregationType === 'MIN' || aggregationType === 'MAX' || aggregationType === 'SUM';
 
 /** The parenthesized SQL of an ORDER BY expression key, built in `context`'s parameter sequence. */
 const buildOrderByExpressionSql = (
@@ -2262,6 +2276,13 @@ export class SelectQueryBuilder<TSelection> {
 
         if (value && typeof value === 'object' && '__fieldName' in value && '__dbColumnName' in value) {
           return orderKey(prop, alias, { ref: value, nested });
+        }
+
+        // A projected MIN / MAX / SUM of a collection: ordered by its output alias — the value the
+        // projection already computes (as an expression it has no SQL of its own: buildSql() renders
+        // only EXISTS and COUNT, and would evaluate the aggregate a second time)
+        if (value instanceof CollectionQueryBuilder && isOrderableCollectionAggregate(value.getAggregationType())) {
+          return orderKey(prop, alias, { nested });
         }
 
         // Navigation builders pass through untouched (see createFieldRefProxy)
@@ -7426,14 +7447,14 @@ ${joinClauses.join('\n')}`;
 
                 // Select all columns from the target table and group them
                 // We'll need to use JSON object building in SQL
-                const fieldParts: string[] = [];
+                const fieldParts: JsonObjectEntry[] = [];
                 // Performance: Use cached column name map
                 const targetColMap = getColumnNameMapForSchema(targetSchema);
                 for (const [colKey, dbColName] of targetColMap) {
-                  fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                  fieldParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                 }
 
-                selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
+                selectParts.push(`${renderJsonBuildObject(fieldParts)} as "${key}"`);
               } else {
                 // No target schema available, skip
                 continue;
@@ -7463,12 +7484,12 @@ ${joinClauses.join('\n')}`;
                       if (planned !== undefined && planned.targetSchema && (planned.parent !== undefined || planned.alias !== planned.relationName)) {
                         this.addPlannedJoins(planned, joins);
 
-                        const plannedParts: string[] = [];
+                        const plannedParts: JsonObjectEntry[] = [];
                         for (const [colKey, dbColName] of getColumnNameMapForSchema(planned.targetSchema)) {
-                          plannedParts.push(`'${colKey}', "${planned.alias}"."${dbColName}"`);
+                          plannedParts.push({ key: colKey, value: `"${planned.alias}"."${dbColName}"` });
                         }
 
-                        selectParts.push(`json_build_object(${plannedParts.join(', ')}) as "${key}"`);
+                        selectParts.push(`${renderJsonBuildObject(plannedParts)} as "${key}"`);
                         continue;
                       }
 
@@ -7482,12 +7503,12 @@ ${joinClauses.join('\n')}`;
                       if (explicitTarget) {
                         addExplicitJoinPath(joinPath, joins);
 
-                        const explicitParts: string[] = [];
+                        const explicitParts: JsonObjectEntry[] = [];
                         for (const [colKey, dbColName] of getColumnNameMapForSchema(explicitTarget)) {
-                          explicitParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                          explicitParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                         }
 
-                        selectParts.push(`json_build_object(${explicitParts.join(', ')}) as "${key}"`);
+                        selectParts.push(`${renderJsonBuildObject(explicitParts)} as "${key}"`);
                         continue;
                       }
 
@@ -7517,14 +7538,14 @@ ${joinClauses.join('\n')}`;
                           }
 
                           // Select all columns from the target table and group them into a JSON object
-                          const fieldParts: string[] = [];
+                          const fieldParts: JsonObjectEntry[] = [];
                           // Performance: Use cached column name map
                           const targetColMap = getColumnNameMapForSchema(targetSchema);
                           for (const [colKey, dbColName] of targetColMap) {
-                            fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                            fieldParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                           }
 
-                          selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
+                          selectParts.push(`${renderJsonBuildObject(fieldParts)} as "${key}"`);
                           continue;
                         }
                       }
@@ -10206,9 +10227,15 @@ export class ReferenceQueryBuilder<TItem = any> {
     if (this.targetTableSchema) {
       // Prototype-level cache — see MockRowCache's doc. Everything the getters close over
       // is fully determined by (target schema object identity, relationName, sourceAlias,
-      // navigation-path content), so rows with the same signature can share one prebuilt
+      // navigation-path content, and this navigation's OWN join: foreign keys, principal keys,
+      // INNER / LEFT), so rows with the same signature can share one prebuilt
       // PROTOTYPE carrying every column/relation getter; a new row is then `Object.create`
       // plus its two own state slots — O(1) instead of one property definition per column.
+      // The own join is in the key because the getters carry it — it is the last hop of the
+      // path every collection and deeper navigation of the row records — and the source alias
+      // does not always name the source table: a table-level RETURNING anchors EVERY table's
+      // first hop on "__mutation__", where `a.user` and `b.user` (different keys) used to share
+      // one prototype, and with it the key of whichever table minted it first.
       // The cross-row cache is OPT-IN via the static switch (MockRowCache.setEnabled — the
       // host app flips it from its own config): with it off, each row gets a FRESH
       // prototype (the pre-0.4.66 memory profile — nothing retained beyond the row's
@@ -10228,6 +10255,7 @@ export class ReferenceQueryBuilder<TItem = any> {
         prototype = MockRowCache.getOrBuild(
           enabled
             ? `${MockRowCache.modelKey(this.schemaRegistry)}|${this.targetTable}|${this.relationName}|${this.sourceAlias ?? ''}|${navigationPathSignature(this.navigationPath)}`
+              + `|${navigationJoinSignature(this.foreignKeys, this.matches, this.isMandatory)}`
               + (this.explicitAlias !== undefined ? `|@${this.explicitAlias}` : '')
             : '',
           () => Object.defineProperties({}, this.buildMockRowDescriptors()),
@@ -12497,13 +12525,16 @@ export class CollectionQueryBuilder<TItem = any> {
     // subquery reads from the enclosing scope — the row it correlates to (a relation of a table to
     // itself), the row the first hop of its navigation path starts from (`ed.book.editions` from an
     // edition), or an enclosing row its WHERE reads — the same shadowing made those EXISTS true for
-    // every row. A flattened collection (selectMany) names its table by that same rule, for a
+    // every row — or a name one of its own path joins renders under: a navigation named like the
+    // table of the collection it leads to (`ci.product.groupSiblings`, both "product") put
+    // `FROM "product" LEFT JOIN "product" "product"` in one scope (`table name "product" specified
+    // more than once`). A flattened collection (selectMany) names its table by that same rule, for a
     // COUNT too: its hops render under aliases of their own (see renderHops), so only such an
     // enclosing name needs one. Nested in another collection subquery, it never takes a bare name
     // a row outside them is read by (see EnclosingCollectionScope.outerNames): a collection of that
     // row nested in it — which correlates to it by that name — bound to ours.
     const readsOuterNamed = (name: string): boolean =>
-      anchor === name || enclosing?.outerNames.has(name) === true || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
+      anchor === name || pathAliases.includes(name) || enclosing?.outerNames.has(name) === true || this.getOuterFieldRefs().some(ref => (ref as any).__tableAlias === name);
     const rendering = this.renderedHops;
     const named = rendering !== undefined
       ? readsOuterNamed(targetTable) ? `${this.relationName}__${this.aggregationType === 'COUNT' ? 'count' : 'exists'}` : targetTable

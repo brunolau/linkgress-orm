@@ -24,6 +24,9 @@ export interface ParityCase {
 
 const p = (sql: string, ...params: unknown[]): ParityStatement => ({ sql, params });
 
+/** `n` comma-separated items: `0, 1, …` or what `render` makes of each index. */
+const argList = (n: number, render: (i: number) => string = i => String(i)): string => Array.from({ length: n }, (_, i) => render(i)).join(', ');
+
 export const sqlParityCorpus: ParityCase[] = [
   {
     name: 'literals and casts',
@@ -167,6 +170,105 @@ export const sqlParityCorpus: ParityCase[] = [
       'SELECT ARRAY[1, 2] || ARRAY[[3, 4]]',
       "SELECT ARRAY['a'] || 'b'::text, ARRAY[1.5, 2]::int[], ARRAY['1', 'x']::int[]",
       'SELECT array_reverse(ARRAY[1,2,3]), array_sort(ARRAY[3,1,2])',
+    ],
+  },
+  {
+    // FUNC_MAX_ARGS: a call passes at most 100 arguments (54023 while the statement is parsed); a VARIADIC array is one.
+    name: 'function calls of at most 100 arguments',
+    statements: [
+      `SELECT concat(${argList(101)})`,
+      `SELECT 1 + length(concat(${argList(101)}))`,
+      `SELECT json_build_object(${argList(51, i => `'k${i}', ${i}`)})`,
+      `SELECT jsonb_build_array(${argList(101)})`,
+      `SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM (VALUES (1)) v(x) WHERE num_nulls(${argList(100)}) = 0`,
+      `SELECT length(concat(${argList(100)})), json_build_object(${argList(50, i => `'k${i}', ${i}`)}), json_build_array(${argList(100)})`,
+      `SELECT json_array_length(json_build_array(VARIADIC ARRAY[${argList(200)}])), jsonb_array_length(jsonb_build_array(VARIADIC ARRAY[${argList(200)}]))`,
+    ],
+  },
+  {
+    // The forms linkgress renders for an object of more than 50 keys (renderJsonBuildObject): `(SELECT row_to_json(r.*)
+    // FROM (SELECT v AS "k", …) r)` wherever a builder puts one — keys in written order, every value as json_build_object
+    // writes it — and the json TEXT SPLICE of 50-key calls (keys that cannot name a column, the jsonBuildObject() /
+    // jsonBuildArray() helpers): its text is the text ONE call prints, byte for byte (compared on small calls, where
+    // the one call exists). The jsonb helpers merge with ||. The values are columns of the row the object is built from:
+    // an aggregate inside the sub-select would be evaluated one level down (here: count(*) = 1 per row on both).
+    name: 'objects of more than 50 keys: row_to_json(r.*) and the json text splice',
+    statements: [
+      "SET LOCAL TimeZone = 'UTC'",
+      `CREATE TABLE wide_t (id int PRIMARY KEY, g int, r int, n int8, x numeric(8,2), ts timestamptz, d date, j json, jb jsonb, arr int[], b bytea, f float8, t text)`,
+      `INSERT INTO wide_t VALUES
+        (1, 1, 7, 9007199254740993, 1.50, '2024-01-02 03:04:05.678+00', '2024-02-29', '{"q" : [1, {"z":2}], "q":0}', '{"b":1,"a":[2]}', '{1,NULL,3}', '\\xdeadbeef', 'NaN', 'a"b\\é'),
+        (2, 1, 8, -1, 0.00, NULL, 'infinity', '[]', 'null', '{}', '\\x', 'Infinity', ''),
+        (3, 2, NULL, 0, 99.99, '1999-12-31 23:59:59.123456+00', NULL, 'null', '{"x":[true,null]}', NULL, NULL, '-Infinity', NULL)`,
+      // 120 keys, in written order; a key named r (r.* still the row); every type of the table
+      `SELECT w.id, (SELECT row_to_json(r.*) FROM (SELECT ${argList(120, i => `${['w.id', 'w.r', 'w.n', 'w.x', 'w.ts', 'w.d', 'w.j', 'w.jb', 'w.arr', 'w.b', 'w.f', 'w.t'][i % 12]} AS "${i === 1 ? 'r' : `k${i}`}"`)}) r)::text FROM wide_t w ORDER BY w.id`,
+      // per value: what json_build_object writes for it, and what row_to_json writes
+      `SELECT w.id, ${['id', 'r', 'n', 'x', 'ts', 'd', 'j', 'jb', 'arr', 'b', 'f', 't'].map(c => `(json_build_object('v', w.${c})->'v')::text = ((SELECT row_to_json(r.*) FROM (SELECT w.${c} AS "v") r)->'v')::text AS same_${c}`).join(', ')} FROM wide_t w ORDER BY w.id`,
+      // inside json_agg(… ORDER BY … FILTER …) per group, a GROUP BY key among the values
+      `SELECT w.g, json_agg((SELECT row_to_json(r.*) FROM (SELECT ${argList(60, i => (i === 0 ? 'w.g AS "g"' : `w.id + ${i} AS "k${i}"`))}) r) ORDER BY w.id DESC) FILTER (WHERE w.id <> 2)::text FROM wide_t w GROUP BY w.g ORDER BY w.g`,
+      // a LATERAL item list and a CTE item list, as the collection strategies render them; a nested row_to_json
+      `SELECT w.id, l.data::text FROM wide_t w LEFT JOIN LATERAL (SELECT json_agg((SELECT row_to_json(r.*) FROM (SELECT ${argList(55, i => `"c${i}" AS "k${i}"`)}, (SELECT row_to_json(r.*) FROM (SELECT ${argList(52, i => `"c${i}" AS "n${i}"`)}) r) AS "nested") r) ORDER BY "c0") AS data FROM (SELECT ${argList(55, i => `s.v * ${i} AS "c${i}"`)} FROM generate_series(1, w.id) s(v)) sub) l ON true ORDER BY w.id`,
+      `WITH items AS (SELECT w.g, json_agg((SELECT row_to_json(r.*) FROM (SELECT ${argList(51, i => `w.id * ${i} AS "k${i}"`)}) r) ORDER BY w.id) AS data FROM wide_t w GROUP BY w.g) SELECT g, data::text FROM items ORDER BY g`,
+      // a writable CTE's RETURNING rows read back as objects (MutationBatch), then the count(*) trap of the sub-select
+      `WITH ins AS (INSERT INTO wide_t (id, g, x) SELECT 10 + v, 3, v FROM generate_series(1, 3) v RETURNING *) SELECT (SELECT COALESCE(json_agg((SELECT row_to_json(r.*) FROM (SELECT ${argList(51, i => `o.id + ${i} AS "k${i}"`)}) r) ORDER BY o.id), '[]'::json) FROM ins o)::text`,
+      `SELECT w.g, count(*), (SELECT row_to_json(r.*) FROM (SELECT count(*) AS "inner", w.g AS "g") r)::text FROM wide_t w GROUP BY w.g ORDER BY w.g`,
+      // the text splice: exactly the one call's text (2 and 4 calls), json-typed, over any operand (aggregates included)
+      `SELECT w.id, (left(json_build_object('a', w.id, 'b', w.t)::text, -1) || ', ' || right(json_build_object('c', w.j, 'd', w.jb, 'a', w.f)::text, -1))::json::text
+        = json_build_object('a', w.id, 'b', w.t, 'c', w.j, 'd', w.jb, 'a', w.f)::text AS same, pg_typeof((left(json_build_object('a', 1)::text, -1) || ', ' || right(json_build_object('b', 2)::text, -1))::json) FROM wide_t w ORDER BY w.id`,
+      `SELECT (left(json_build_object('k0', w.n)::text, -1) || ', ' || left(right(json_build_object('k1', w.x, 'k2', w.ts)::text, -1), -1) || ', ' || left(right(json_build_object('k3', w.arr)::text, -1), -1) || ', ' || right(json_build_object('k4', w.b, 'k5', w.d)::text, -1))::json::text FROM wide_t w ORDER BY w.id`,
+      `SELECT (left(json_build_array(w.id, w.j)::text, -1) || ', ' || right(json_build_array(w.jb, w.t)::text, -1))::json::text = json_build_array(w.id, w.j, w.jb, w.t)::text FROM wide_t w ORDER BY w.id`,
+      `SELECT w.g, (left(json_build_object('n', count(*))::text, -1) || ', ' || right(json_build_object('s', sum(w.id))::text, -1))::json::text FROM wide_t w GROUP BY w.g ORDER BY w.g`,
+      `SELECT (jsonb_build_object(${argList(50, i => `'k${i}', ${i}`)}) || jsonb_build_object('k50', 1.50::numeric, 'b', true, 'n', NULL))::text, (jsonb_build_array(${argList(100)}) || jsonb_build_array('x', NULL))::text`,
+    ],
+  },
+  {
+    // PostgreSQL 16+ SQL/JSON constructors — what linkgress renders past 50 keys under LinkgressConfig.serverVersion 16+:
+    // JSON_OBJECT('k' VALUE v, … RETURNING json|jsonb) and JSON_ARRAY(v, … NULL ON NULL RETURNING json|jsonb). Not
+    // function calls, so no 100-argument cap; each builds what json(b)_build_object / _array builds. Defaults:
+    // JSON_OBJECT NULL ON NULL, JSON_ARRAY ABSENT ON NULL, the result jsonb once an argument is jsonb (no RETURNING).
+    name: 'SQL/JSON constructors: JSON_OBJECT and JSON_ARRAY',
+    statements: [
+      "SET LOCAL TimeZone = 'UTC'",
+      `CREATE TABLE ctor_t (id int PRIMARY KEY, g int, n int8, x numeric(8,2), ts timestamptz, d date, j json, jb jsonb, arr int[], b bytea, f float8, t text)`,
+      `INSERT INTO ctor_t VALUES
+        (1, 1, 9007199254740993, 1.50, '2024-01-02 03:04:05.678+00', '2024-02-29', '{"q" : [1, {"z":2}], "q":0}', '{"b":1,"a":[2]}', '{1,NULL,3}', '\\xdeadbeef', 'NaN', 'a"b\\é'),
+        (2, 1, -1, 0.00, NULL, 'infinity', '[]', 'null', '{}', '\\x', 'Infinity', ''),
+        (3, 2, 0, 99.99, '1999-12-31 23:59:59.123456+00', NULL, 'null', '{"x":[true,null]}', NULL, NULL, '-Infinity', NULL)`,
+      // every type, RETURNING json and jsonb, as an object and as an array
+      ...['json', 'jsonb'].map(flavor => `SELECT w.id, JSON_OBJECT(${['id', 'n', 'x', 'ts', 'd', 'j', 'jb', 'arr', 'b', 'f', 't'].map(c => `'${c}' VALUE w.${c}`).join(', ')} RETURNING ${flavor})::text, `
+        + `JSON_ARRAY(${['id', 'n', 'x', 'ts', 'd', 'j', 'jb', 'arr', 'b', 'f', 't'].map(c => `w.${c}`).join(', ')} NULL ON NULL RETURNING ${flavor})::text FROM ctor_t w ORDER BY w.id`),
+      // 120 and 2 000 keys (past the 1 664-entry target list), 150 elements with NULLs: no argument cap
+      `SELECT w.id, JSON_OBJECT(${argList(120, i => `'k${i}' VALUE ${['w.id', 'w.n', 'w.x', 'w.ts', 'w.j', 'w.jb', 'w.t'][i % 7]}`)} RETURNING json)::text FROM ctor_t w ORDER BY w.id`,
+      `SELECT length(JSON_OBJECT(${argList(2000, i => `'k${i}' VALUE ${i}`)} RETURNING json)::text), JSON_OBJECT(${argList(2000, i => `'k${i}' VALUE ${i}`)} RETURNING jsonb)->'k1999'`,
+      `SELECT JSON_ARRAY(${argList(150, i => (i % 7 === 0 ? 'NULL' : String(i)))} NULL ON NULL RETURNING json)::text, JSON_ARRAY(${argList(150, i => (i % 7 === 0 ? 'NULL' : String(i)))} NULL ON NULL RETURNING jsonb)::text`,
+      // NULL / ABSENT ON NULL, the JSON_ARRAY default, result types and column names, empty constructors
+      `SELECT JSON_ARRAY(1, NULL, 'x')::text, JSON_ARRAY(1, NULL, 'x' NULL ON NULL)::text, JSON_ARRAY(1, NULL ABSENT ON NULL RETURNING jsonb)::text, JSON_OBJECT('a' VALUE NULL, 'b' VALUE 1)::text, JSON_OBJECT('a' VALUE NULL, 'b' VALUE 1 ABSENT ON NULL)::text, JSON_OBJECT('a' VALUE NULL, 'b' VALUE 1 ABSENT ON NULL RETURNING jsonb)::text, JSON_OBJECT(NULL::text : NULL ABSENT ON NULL)::text`,
+      // jsonb drops a JSON null too under ABSENT ON NULL (its object is de-duplicated after it is built); json and arrays keep it
+      `SELECT JSON_OBJECT('a' VALUE 'null'::jsonb, 'b' VALUE 1 ABSENT ON NULL RETURNING jsonb)::text, JSON_OBJECT('a' VALUE 'null'::json, 'b' VALUE 1 ABSENT ON NULL RETURNING json)::text, JSON_ARRAY('null'::jsonb, 1 ABSENT ON NULL RETURNING jsonb)::text`,
+      `SELECT JSON_OBJECT('a' VALUE 1), JSON_ARRAY(1, 2), JSON_OBJECT(), JSON_ARRAY(), JSON_OBJECT(RETURNING jsonb), JSON_ARRAY(RETURNING jsonb), JSON_OBJECT('a' VALUE '{"b": 1, "a": 2}'::jsonb, 'c' VALUE 1), JSON_ARRAY(1, '[1]'::jsonb), JSON_OBJECT('a' VALUE '{"b": 1}'::jsonb RETURNING json), JSON_OBJECT('a' VALUE 1 RETURNING text), JSON_ARRAY(1, 'x' RETURNING text)`,
+      // the ':' form, keys of any expression and type, FORMAT JSON on a string, an untyped literal value
+      `SELECT JSON_OBJECT('a' : 1, w.t || 'x' : w.id, w.id VALUE w.t, 'f' VALUE '{"q": [1]}' FORMAT JSON, 'g' VALUE '{"q": [1]}', 'h' VALUE w.j FORMAT JSON RETURNING json)::text FROM ctor_t w WHERE w.id = 2`,
+      `SELECT JSON_OBJECT('it''s' VALUE 1, 'a"b' VALUE 2, '' VALUE 3, E'a\\\\b' VALUE 4, '${'x'.repeat(70)}' VALUE 5 RETURNING json)::text`,
+      // WITH UNIQUE KEYS: a repeated key is refused (its text in the json message), a skipped NULL pair still counts
+      `SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 2 WITH UNIQUE KEYS)::text, JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 WITHOUT UNIQUE)::text, JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 RETURNING jsonb)::text`,
+      `SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 WITH UNIQUE KEYS)`,
+      `SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 WITH UNIQUE RETURNING jsonb)`,
+      `SELECT JSON_OBJECT('a' VALUE NULL, 'a' VALUE 1 ABSENT ON NULL WITH UNIQUE KEYS)`,
+      // a NULL key: json and jsonb raise their own errors — json_build_object / jsonb_build_object alike
+      `SELECT JSON_OBJECT(NULL::text : 1)`,
+      `SELECT JSON_OBJECT('a' VALUE 1, NULL::text : 1 RETURNING jsonb)`,
+      `SELECT json_build_object('a', 1, NULL::text, 2)`,
+      `SELECT jsonb_build_object('a', 1, NULL::text, 2)`,
+      // aggregates and windows evaluate where the constructor is (no sub-select)
+      `SELECT w.g, JSON_OBJECT('n' VALUE count(*), 's' VALUE sum(w.id), 'm' VALUE max(w.t COLLATE "C") RETURNING json)::text FROM ctor_t w GROUP BY w.g ORDER BY w.g`,
+      `SELECT w.id, JSON_OBJECT('r' VALUE row_number() OVER (ORDER BY w.id), 'c' VALUE count(*) OVER () RETURNING json)::text FROM ctor_t w ORDER BY w.id`,
+      // inside json_agg(… ORDER BY …) FILTER per group, a LATERAL item list, a CTE item list, nested
+      `SELECT w.g, json_agg(JSON_OBJECT(${argList(60, i => (i === 0 ? `'g' VALUE w.g` : `'k${i}' VALUE w.id + ${i}`))} RETURNING json) ORDER BY w.id DESC) FILTER (WHERE w.id <> 2)::text FROM ctor_t w GROUP BY w.g ORDER BY w.g`,
+      `SELECT w.id, l.data::text FROM ctor_t w LEFT JOIN LATERAL (SELECT json_agg(JSON_OBJECT(${argList(55, i => `'k${i}' VALUE "c${i}"`)}, 'nested' VALUE JSON_OBJECT(${argList(52, i => `'n${i}' VALUE "c${i}"`)} RETURNING json) RETURNING json) ORDER BY "c0") AS data FROM (SELECT ${argList(55, i => `s.v * ${i} AS "c${i}"`)} FROM generate_series(1, w.id) s(v)) sub) l ON true ORDER BY w.id`,
+      `WITH items AS (SELECT w.g, json_agg(JSON_OBJECT(${argList(51, i => `'k${i}' VALUE w.id * ${i}`)} RETURNING json) ORDER BY w.id) AS data FROM ctor_t w GROUP BY w.g) SELECT g, data::text FROM items ORDER BY g`,
+      // the legacy json_object(text[]) function keeps working; a bound parameter as a value
+      `SELECT json_object('{a,1,b,2}')::text, json_object(ARRAY['x', 'y'])::text, json_object('{{a,1},{b,2}}')::text`,
+      p(`SELECT JSON_OBJECT('a' VALUE $1::int, 'b' VALUE $2::text RETURNING json)::text, JSON_ARRAY($1::int, NULL, $2::text NULL ON NULL RETURNING jsonb)::text`, 7, 'x'),
     ],
   },
   {

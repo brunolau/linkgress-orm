@@ -1,7 +1,7 @@
 # Configuration and Options
 
 > **For agents:** Which setting controls a behaviour, what it defaults to, where it is set (connection, context, transaction, query, statement or process), and which value wins when several apply.
-> **Use this page when:** you turn on statement logging, failure logging or slow-statement notices; send statements named (server-side prepared); cancel statements that run too long; switch the collection strategy; bound the statement texts of list filters; enable the query-build caches; read the SQL a query sends. **Look elsewhere when:** you choose how to fetch data → [Choosing the right query](../choosing-the-right-query.md); you want fewer round trips → [Batching and prepared queries](./batching-and-prepared-queries.md)
+> **Use this page when:** you turn on statement logging, failure logging or slow-statement notices; send statements named (server-side prepared); cancel statements that run too long; switch the collection strategy; bound the statement texts of list filters; tell linkgress the PostgreSQL major it may target (`serverVersion`); enable the query-build caches; read the SQL a query sends. **Look elsewhere when:** you choose how to fetch data → [Choosing the right query](../choosing-the-right-query.md); you want fewer round trips → [Batching and prepared queries](./batching-and-prepared-queries.md)
 > **Key APIs:** `QueryOptions` · `withQueryOptions()` · `withPreparedStatements()` · `withTimeout()` · `expectedExecutionTime()` · `TransactionOptions` · `LinkgressConfig` · `MockRowCache` · **Round trips:** no option adds a statement, except `withTimeout()` on `PostgresClient` (+3 per query), `TransactionOptions.timeoutMs` (+1 per transaction) and `collectionStrategy: 'temptable'` (+5 per collection on `PgClient`, up to +1 per collection on the other clients); `preparedStatements` removes postgres.js's describe exchange from the second execution of a text on a connection
 
 ## Contents
@@ -41,6 +41,8 @@ Most settings change logging, timing, statement naming or caching, not the rows 
 | Skip parse and plan of repeated statements (postgres.js) | `preparedStatements: true`; per query `.withPreparedStatements(bool)` | same text, sent named · 2 network round trips on first use per connection, then 1 (unnamed with parameters: 2 every time) | statements whose text varies per call; `PgClient`, `BunClient`, `PGliteClient` (ignored) |
 | Change how collections in a projection are aggregated | `collectionStrategy: 'lateral' \| 'cte' \| 'temptable'` | `lateral`, `cte`: 1 statement; `temptable` on `PgClient`: 1 + 5 per collection, on the other clients 1 to 1 + 1 per collection | `temptable` without measuring it first; `temptable` inside `db.transaction()` on `PostgresClient`, `BunClient`, `PGliteClient` |
 | Fewer distinct statement texts for list filters of varying length | `inArrayOpt()` (or plain `inArray` under `LinkgressConfig.inArrayUsesOpt`), tuned by `LinkgressConfig.inArrayOptThreshold` and `inArrayPadBuckets`; `eqAny()` for one text at every length | `IN ($1, …)` up to the threshold (default 8), `= ANY($1::type[])` above it · +0 | per-context values: these are process-wide |
+| A list of composite keys written as `or(...keys.map(k => and(eq(…), eq(…))))` | nothing: past the threshold such an `or()` binds one array per column (`LinkgressConfig.orUsesOpt`, on by default since 1.0.34) | `(a, b) IN (SELECT … FROM unnest($1::ta[], $2::tb[]))` · 1 parameter per column instead of 1 per value · +0 | turning it off to keep the arms: 40 000 two-column keys are 80 000 parameters, a statement no driver sends |
+| Objects of more than 50 keys (collection items, `jsonBuildObject()`) as ONE constructor on PostgreSQL 16+ | `LinkgressConfig.serverVersion = 16` or more, or `await LinkgressConfig.detectServerVersion(client)` at boot (since 1.0.43) | `JSON_OBJECT('k' VALUE v, … RETURNING json)` instead of `(SELECT row_to_json(r.*) FROM (SELECT …) r)` · +0 (+1 statement once, for `detectServerVersion`) | a value above the oldest server the process talks to: PostgreSQL 15 cannot parse the constructor |
 | Cut CPU spent building queries | `MockRowCache.setEnabled(true)` | identical SQL · +0 | processes that build mostly one-off query shapes |
 | Find where one query's time goes | `traceTime: true` plus an executor duty | unchanged · +0 | `traceTime` alone: prints nothing |
 | Raw driver values for an export | `disableMappers: true` or `rawResult: true`, plus an executor duty | unchanged · +0 | typed application code: `rawResult` keeps the mapped TypeScript type |
@@ -68,7 +70,8 @@ context's executor resolves it, internally `QueryExecutor.buildExecutionOptions(
 | Slow-statement threshold | query: `.expectedExecutionTime()` → transaction: `expectedExecutionMs`, else its `timeoutMs` → context: `longRunningQueryThreshold` → 10000 ms |
 | Collection strategy | query: `withQueryOptions({ collectionStrategy })` → context: `collectionStrategy` → `'lateral'` |
 | Any other `QueryOptions` key | query: `withQueryOptions()`, merged over the context's options (read only when the merged options contain an executor duty) → context → default |
-| `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt` | the last write in the process, through `LinkgressConfig` or through any context constructed with the key |
+| `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt`, `orUsesOpt` | the last write in the process, through `LinkgressConfig` or through any context constructed with the key |
+| `serverVersion` | the last write in the process, through `LinkgressConfig` only (no `QueryOptions` key) |
 
 ## Configure a context: `QueryOptions`
 
@@ -120,6 +123,7 @@ Every key of `QueryOptions` (`src/entity/db-context.ts`):
 | `inArrayOptThreshold` | `number` · `8` | Writes `LinkgressConfig.inArrayOptThreshold`, process-wide | at construction |
 | `inArrayPadBuckets` | `readonly number[] \| null` · `null` | Writes `LinkgressConfig.inArrayPadBuckets`, process-wide | at construction |
 | `inArrayUsesOpt` | `boolean` · `false` | Writes `LinkgressConfig.inArrayUsesOpt`, process-wide | at construction |
+| `orUsesOpt` | `boolean` · `true` | Writes `LinkgressConfig.orUsesOpt`, process-wide (since 1.0.34) | at construction |
 | `traceTime` | `boolean` · `false` | Per-phase timing of one query (build, execution, result processing) on `'timing'` | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
 | `disableMappers` | `boolean` · `false` | Results skip `fromDriver` (raw driver values); `toDriver` still converts bound values | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
 | `rawResult` | `boolean` · `false` | Returns the driver's rows without any shaping | with an executor duty; [not on every read path](#read-raw-driver-values-or-time-one-query) |
@@ -698,8 +702,10 @@ import { LinkgressConfig, inArray, inArrayOpt } from 'linkgress-orm';
 LinkgressConfig.inArrayOptThreshold = 8;                // default 8
 LinkgressConfig.inArrayPadBuckets = [1, 2, 8];          // opt-in; default null
 LinkgressConfig.inArrayUsesOpt = true;                  // opt-in; default false
+LinkgressConfig.orUsesOpt = false;                      // opt-out; default true (since 1.0.34)
+LinkgressConfig.serverVersion = 18;                     // opt-in; default undefined (since 1.0.43)
 LinkgressConfig.configure({ inArrayOptThreshold: 12 }); // several at once; omitted keys keep their value
-LinkgressConfig.resetToDefaults();                      // back to 8, null, false
+LinkgressConfig.resetToDefaults();                      // back to 8, null, false, true, undefined
 
 const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const products = await db.products
@@ -725,6 +731,25 @@ instead of through these settings.
 | `inArrayOptThreshold` | `8` (`LinkgressConfig.DEFAULT_IN_ARRAY_OPT_THRESHOLD`) | list length up to which `inArrayOpt` / `notInArrayOpt` render `IN (…)`; above it `= ANY($1::type[])` / `<> ALL($1::type[])`. `0` sends every non-empty list to the array form | a non-negative integer |
 | `inArrayPadBuckets` | `null` (one text per length) | rounds a list that renders as `IN (…)` up to the next rung, repeating its last element; a list longer than the top rung is widened to the threshold. `LinkgressConfig.DEFAULT_IN_ARRAY_PAD_BUCKETS` is `[1, 4, 8]`, a ladder to assign, not applied by default | positive integers, strictly ascending, stored as a frozen copy (changing the array you passed changes nothing); `null` switches padding off |
 | `inArrayUsesOpt` | `false` | plain `inArray` / `notInArray` render what `inArrayOpt` / `notInArrayOpt` render | a boolean |
+| `orUsesOpt` | `true` (since 1.0.34) | an `or()` that lists keys — every arm an equality, or an `and()` of equalities, of the same typed columns with plain values — renders past `inArrayOptThreshold` arms as one array parameter per column; off, every `or()` renders as written | a boolean |
+| `serverVersion` | `undefined` (unknown; since 1.0.43) | the PostgreSQL major every server of the process runs at least; 16+ builds objects of more than 50 keys as one `JSON_OBJECT` — see [below](#objects-of-more-than-50-keys-on-postgresql-16-serverversion) | an integer of 12 or more, or `undefined` |
+
+With `orUsesOpt` on (the default), nine `(user, title)` keys written as an `or()` bind two parameters:
+
+```ts
+await db.posts.where(p => or(...keys.map(k => and(eq(p.userId, k.userId), eq(p.title, k.title))))).select(p => p.title).toList();
+```
+
+```sql
+SELECT "posts"."title"
+FROM "posts"
+WHERE (("posts"."user_id", "posts"."title") IN (SELECT "__keys"."k1", "__keys"."k2" FROM unnest($1::integer[], $2::varchar[]) AS "__keys"("k1", "k2")))
+-- params: ["{1,1,2,2,1,1,2,2,99}", "{\"Alice Post 1\",\"Alice Post 2\",\"Bob Post\",…}"]
+```
+
+Eight keys, and every key count with `orUsesOpt = false`, render the `or()` as written:
+`(("posts"."user_id" = $1 AND "posts"."title" = $2) OR …)`. What qualifies, and what stays as written:
+[Querying](./querying.md#lists-of-keys-written-as-or-orusesopt-since-1034).
 
 With `inArrayPadBuckets = [1, 2, 8]` three ids fill the rung of 8:
 
@@ -755,8 +780,9 @@ WHERE ("products"."id" = ANY($1::integer[]))
 ```
 
 An invalid value throws and keeps the current one, for example
-`inArrayOpt threshold must be a non-negative integer, got -1` and
-`inArrayOpt pad buckets must be in strictly ascending order, got [4, 2]`.
+`inArrayOpt threshold must be a non-negative integer, got -1`,
+`inArrayOpt pad buckets must be in strictly ascending order, got [4, 2]` and
+`orUsesOpt must be a boolean, got no`.
 
 > **Efficiency:** an `IN` list gives the planner an exact row estimate and, under `preparedStatements`,
 > one cached plan per length; the array form is one text for every length. A padded statement is planned
@@ -766,6 +792,62 @@ An invalid value throws and keeps the current one, for example
 
 > **Pitfall:** the last write wins for the whole process. `new AppDatabase(client, { inArrayOptThreshold: 2 })`
 > changed the SQL of every other context too (verified). Set these once at boot.
+
+### Objects of more than 50 keys on PostgreSQL 16+: `serverVersion`
+
+One `json_build_object` call holds at most 50 keys (PostgreSQL passes at most 100 arguments to a function). Past
+that, linkgress builds the object in a form every server from 12 parses — `row_to_json` over a one-row sub-select, or
+spliced calls ([Querying](./querying.md#projections-wider-than-50-keys)) — unless it knows the server runs PostgreSQL
+16 or newer, whose SQL/JSON constructors are not function calls and take any number of keys. It cannot learn that
+before the first statement is built, so you tell it once, at boot:
+
+```ts
+import { LinkgressConfig } from 'linkgress-orm';
+
+LinkgressConfig.serverVersion = 18;                      // the major of the OLDEST server this process talks to
+// or read it from the server: one SHOW server_version_num through any client, pooled connection or transaction
+const major = await LinkgressConfig.detectServerVersion(client); // 18 — and serverVersion is now 18
+
+const rows = await db.users
+  .where(u => eq(u.username, 'alice'))
+  .select(u => ({ orders: u.orders!.select(o => ({ id: o.id, ...fiftyMore(o) })).toList() })) // 51 keys per item
+  .toList();
+```
+
+```sql
+-- captured with future().getSql(); keys k2 … k47 and the inner select list elided
+SELECT COALESCE("lateral_0".data, '[]'::json) as "orders"
+FROM "users"
+LEFT JOIN LATERAL (SELECT json_agg(
+  JSON_OBJECT('id' VALUE "id", 'k0' VALUE "k0", 'k1' VALUE "k1", …, 'k48' VALUE "k48", 'k49' VALUE "k49" RETURNING json)
+) as data
+FROM (
+  SELECT "lateral_0_orders"."id" as "id", "lateral_0_orders"."total_amount" as "k0", …
+  FROM "orders" "lateral_0_orders"
+  WHERE "lateral_0_orders"."user_id" = "users"."id"
+) sub) "lateral_0" ON true
+WHERE "users"."username" = $1
+```
+
+- **What changes**: only objects of more than 50 keys — collection items under every strategy, nested objects in
+  them, `withAggregation()` items, a navigation row rendered as one object, a `MutationBatch` RETURNING list — become
+  ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)`, and the `jsonBuildObject()` / `jsonbBuildObject()` /
+  `jsonBuildArray()` / `jsonbBuildArray()` helpers past 50 keys / 100 elements one `JSON_OBJECT(… RETURNING
+  json|jsonb)` / `JSON_ARRAY(… NULL ON NULL RETURNING json|jsonb)`. Up to 50 keys (100 elements) the SQL is byte for
+  byte the same under every value; unknown or below 16 it is exactly the SQL with the setting never touched.
+- **Same rows**: the constructor builds what `json_build_object` builds (PostgreSQL runs the same code for both), keys
+  in written order, each value evaluated where the object is — any key works (empty, longer than 63 bytes, quoted),
+  and there is no sub-select whose level an aggregate could slip into.
+- **Cost**: at 51–60 keys the constructor costs a little more than `row_to_json`, from about 120 keys less — measured
+  per object in [bench/json-object](https://github.com/brunolau/linkgress-orm/blob/main/bench/json-object/README.md#results).
+- An invalid value throws a `RangeError` and keeps the current one: `serverVersion takes a PostgreSQL major of 12 or
+  more, or undefined, got 16.5`. `configure({ serverVersion: undefined })` sets it back to unknown (a key left out of
+  `configure()` keeps the value).
+
+> **Pitfall:** set the LOWEST major of every server the process sends statements to (a replica, a failover target, a
+> second database). A PostgreSQL 15 server answers `JSON_OBJECT('k' VALUE …)` with `syntax error at or near "VALUE"`.
+> Set it before queries are built: a `.prepare()`d query keeps the text it was built with (the lateral strategy's SQL
+> cache keys on the setting).
 
 ## Cut query-build CPU: `MockRowCache`
 
@@ -1019,8 +1101,11 @@ await countingDb.users.select(u => ({ id: u.id, posts: u.posts!.select(p => ({ t
   and writes; keep `db.query()` for statements they do not cover (`EXPLAIN`, `SET TRANSACTION`,
   `SAVEPOINT`).
 - **Don't** set `LinkgressConfig` values per request or per context → **Do** set them once at boot. A
-  context constructed with `inArrayOptThreshold`, `inArrayPadBuckets` or `inArrayUsesOpt` rewrites them
-  for every context in the process.
+  context constructed with `inArrayOptThreshold`, `inArrayPadBuckets`, `inArrayUsesOpt` or `orUsesOpt`
+  rewrites them for every context in the process.
+- **Don't** set `LinkgressConfig.serverVersion` to the newest server you run → **Do** set the oldest one's major
+  (or `detectServerVersion()` against it). One PostgreSQL 15 server among them fails every object of more than 50
+  keys with `syntax error at or near "VALUE"`.
 - **Don't** use `collectionStrategy: 'temptable'` inside `db.transaction()` on `PostgresClient`,
   `BunClient` or `PGliteClient` → **Do** use `lateral` or `cte` there. A parameterless base query fails
   (`Fully optimized mode requires querySimpleMulti support`, or `querySimpleMulti not supported by this

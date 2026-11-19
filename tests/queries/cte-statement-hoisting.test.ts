@@ -438,6 +438,232 @@ describe('statement-level CTE hoisting', () => {
   });
 });
 
+/**
+ * `with(name, query, { reads })`: a CTE body renders when `with()` is called, before any statement exists, so a
+ * `selectFromCte(other)` read inside it used to declare `other` INSIDE itself — `EXISTS (WITH "other" AS (…) SELECT …)` —
+ * even when the statement declares `other`, which PostgreSQL cannot pull up into a semi-join. A body that lists `other`
+ * in `reads` reads it by name, and whoever declares the body declares `other` just before it, once (DbCte.dependencies).
+ */
+describe('a CTE body that reads another CTE by name: with(name, query, { reads })', () => {
+  let db: AppDatabase;
+
+  beforeAll(async () => {
+    db = getSharedDatabase();
+    await setupDatabase(db);
+    await seedTestData(db);
+  });
+
+  /** posts of the users `older` holds, through an EXISTS over the CTE */
+  const olderPosts = (older: ReturnType<typeof olderUsers>, reads: boolean, extra = 0) => new DbCteBuilder().with(
+    'older_posts',
+    db.posts
+      .where(p => and(
+        exists(db.selectFromCte(older.cte).where(r => eq(r.id, p.userId)).select(r => ({ id: r.id })).asSubquery()),
+        gt(p.views, extra),
+      ))
+      .select(p => ({ userId: p.userId, title: p.title })),
+    reads ? { reads: [older.cte] } : undefined,
+  );
+
+  /** a scalar per user: how many `posts.cte` rows it has */
+  const countsPerUser = (posts: ReturnType<typeof olderPosts>) => (u: { id: any; username: any }) => ({
+    name: u.username,
+    posts: db.selectFromCte(posts.cte).where(r => eq(r.userId, u.id)).select(() => sql<number>`count(*)`.mapWith(Number)).asSubquery('scalar'),
+  });
+
+  const byName = (rows: Array<{ name: string; posts: number }>) => new Map(rows.map(row => [row.name, row.posts]));
+
+  test('the statement declares the CTE: the body reads it by name — declared once, its params bound once', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, true);
+    let rows: Array<{ name: string; posts: number }> = [];
+
+    const [statement] = await capture(db, async () => {
+      rows = await db.users.with(older.cte).select(u => countsPerUser(posts)(u)).toList();
+    });
+
+    expect(byName(rows)).toEqual(new Map([['alice', 0], ['bob', 1], ['charlie', 0]]));
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+    expect(statement.sql.startsWith('WITH "older_users" AS (')).toBe(true);
+    // the body is declared in the scalar subquery that reads it, and its EXISTS reads the statement's CTE by name
+    expect(statement.sql).toContain('(WITH "older_posts" AS (');
+    expect(statement.sql).not.toContain('(WITH "older_users"');
+    expect(statement.sql).not.toContain('EXISTS (WITH');
+    expect(statement.params).toEqual([OLDER_THAN, 0]);
+  });
+
+  test('the statement does not declare it: the declaration that carries the body declares the CTE first, once', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, true);
+    let rows: Array<{ name: string; posts: number }> = [];
+
+    // inside the subquery that declares the body …
+    const [nested] = await capture(db, async () => {
+      rows = await db.users.select(u => countsPerUser(posts)(u)).toList();
+    });
+    expect(byName(rows)).toEqual(new Map([['alice', 0], ['bob', 1], ['charlie', 0]]));
+    expect(declarations(nested.sql, 'older_users')).toBe(1);
+    expect(nested.sql).toMatch(/\(WITH "older_users" AS \([^]*?\), "older_posts" AS \(/);
+    expect(nested.sql).not.toContain('EXISTS (WITH');
+    expect(nested.params).toEqual([OLDER_THAN, 0]);
+
+    // … and at statement level, where `.with(body)` is all the statement says
+    const [statement] = await capture(db, async () => {
+      rows = await db.users.with(posts.cte).select(u => countsPerUser(posts)(u)).toList();
+    });
+    expect(byName(rows)).toEqual(new Map([['alice', 0], ['bob', 1], ['charlie', 0]]));
+    expect(statement.sql).toMatch(/^WITH "older_users" AS \([^]*?\), "older_posts" AS \(/);
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+    expect(declarations(statement.sql, 'older_posts')).toBe(1);
+    expect(statement.params).toEqual([OLDER_THAN, 0]);
+  });
+
+  test('a grouped body whose WHERE reads the CTE — the shape of a per-product aggregate', async () => {
+    const older = olderUsers(db);
+    const views = new DbCteBuilder().with(
+      'older_views',
+      db.posts
+        .where(p => exists(db.selectFromCte(older.cte).where(r => eq(r.id, p.userId)).select(r => ({ id: r.id })).asSubquery()))
+        .select(p => ({ userId: p.userId, views: p.views }))
+        .groupBy(p => ({ userId: p.userId }))
+        .select(g => ({ userId: g.key.userId, views: g.sum(p => p.views) })),
+      { reads: [older.cte] },
+    );
+    let rows: Array<{ name: string; views: number | undefined }> = [];
+
+    const [statement] = await capture(db, async () => {
+      rows = await db.users.with(older.cte).select(u => ({
+        name: u.username,
+        views: db.selectFromCte(views.cte).where(r => eq(r.userId, u.id)).select(r => r.views).asSubquery('scalar'),
+      })).toList();
+    });
+
+    expect(new Map(rows.map(row => [row.name, row.views == null ? null : Number(row.views)]))).toEqual(new Map([
+      ['alice', null],
+      ['bob', 200],
+      ['charlie', null],
+    ]));
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+    expect(statement.sql).not.toContain('EXISTS (WITH');
+    expect(statement.params).toEqual([OLDER_THAN]);
+  });
+
+  test('a grouped body that joins one CTE and reads another in its WHERE: the statement declares one, `reads` brings the other', async () => {
+    const older = olderUsers(db);
+    const builder = new DbCteBuilder();
+    const ages = builder.with('user_ages', db.users.select(u => ({ id: u.id, age: u.age })));
+    const views = new DbCteBuilder().with(
+      'older_views',
+      db.posts
+        .where(p => exists(db.selectFromCte(older.cte).where(r => eq(r.id, p.userId)).select(r => ({ id: r.id })).asSubquery()))
+        .select(p => ({ userId: p.userId, views: p.views }))
+        .groupBy(p => ({ userId: p.userId }))
+        .select(g => ({ userId: g.key.userId, views: g.sum(p => p.views) }))
+        .leftJoin(ages.cte, (g, a) => eq(g.userId, a.id), (g, a) => ({ userId: g.userId, views: g.views, age: a.age })),
+      { reads: [older.cte, ages.cte] },
+    );
+    let rows: Array<{ name: string; age: number | undefined }> = [];
+
+    // the statement declares `older_users`; `user_ages` — joined by the body, never declared by the statement — comes with the body
+    const [statement] = await capture(db, async () => {
+      rows = await db.users.with(older.cte).select(u => ({
+        name: u.username,
+        age: db.selectFromCte(views.cte).where(r => eq(r.userId, u.id)).select(r => r.age).asSubquery('scalar'),
+      })).toList();
+    });
+
+    expect(new Map(rows.map(row => [row.name, row.age ?? null]))).toEqual(new Map([['alice', null], ['bob', 35], ['charlie', null]]));
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+    expect(declarations(statement.sql, 'user_ages')).toBe(1);
+    expect(statement.sql).toMatch(/\(WITH "user_ages" AS \([^]*?\), "older_views" AS \(/);
+    expect(statement.sql).not.toContain('EXISTS (WITH');
+    expect(statement.params).toEqual([OLDER_THAN]);
+  });
+
+  test('a body that reads a body that reads a CTE: every level declared once, in the order they read each other', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, true);
+    const authors = new DbCteBuilder().with(
+      'post_authors',
+      db.users.where(u => inSubquery(u.id, db.selectFromCte(posts.cte).select(r => r.userId).asSubquery('array'))).select(u => ({ id: u.id, name: u.username })),
+      { reads: [posts.cte] },
+    );
+
+    const [statement] = await capture(db, async () => {
+      expect(await db.selectFromCte(authors.cte).select(r => r.name).toList()).toEqual(['bob']);
+    });
+
+    expect(statement.sql).toMatch(/^WITH "older_users" AS \([^]*?\), "older_posts" AS \([^]*?\), "post_authors" AS \(/);
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+    expect(declarations(statement.sql, 'older_posts')).toBe(1);
+    expect(statement.sql).not.toContain('(WITH ');
+    expect(statement.params).toEqual([OLDER_THAN, 0]);
+  });
+
+  test('numbering: the statement\'s own params, the CTE read\'s, then the body\'s — each from where its own land', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, true, 120);
+    const postUsers = db.selectFromCte(posts.cte).select(r => r.userId).asSubquery('array');
+    let names: string[] = [];
+
+    // `20` is bound by the WHERE; the body (views > 120) is declared inside the subquery, the CTE it reads by the statement
+    const [statement] = await capture(db, async () => {
+      names = await db.users.where(u => and(gt(u.age, 20), inSubquery(u.id, postUsers))).with(older.cte).select(u => u.username).toList();
+    });
+
+    expect(names).toEqual(['bob']);
+    expect(statement.params).toEqual([OLDER_THAN, 20, 120]);
+    expect(statement.sql).toContain('"users"."age" > $2');
+    expect(statement.sql).toContain('"posts"."views" > $3');
+    expect(declarations(statement.sql, 'older_users')).toBe(1);
+  });
+
+  test('a different CTE under a name the statement declares is refused — the body would read its rows', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, true);
+    const young = new DbCteBuilder().with('older_users', db.users.where(u => lt(u.age, 30)).select(u => ({ id: u.id, age: u.age })));
+
+    await expectToReject(
+      () => db.users.with(young.cte).select(u => countsPerUser(posts)(u)).toList(),
+      /The CTE "older_users" a nested query attaches is not the CTE "older_users" its statement declares/,
+    );
+  });
+
+  test('without `reads` the body still declares the CTE inside itself, as before', async () => {
+    const older = olderUsers(db);
+    const posts = olderPosts(older, false);
+    let rows: Array<{ name: string; posts: number }> = [];
+
+    const [statement] = await capture(db, async () => {
+      rows = await db.users.with(older.cte).select(u => countsPerUser(posts)(u)).toList();
+    });
+
+    expect(byName(rows)).toEqual(new Map([['alice', 0], ['bob', 1], ['charlie', 0]]));
+    expect(statement.sql).toContain('EXISTS (WITH "older_users" AS (');
+    expect(declarations(statement.sql, 'older_users')).toBe(2);
+  });
+
+  test('reads is checked: a CTE of the body\'s own name, or something that is no CTE, is refused', () => {
+    const older = olderUsers(db);
+
+    expect(() => new DbCteBuilder().with('older_users', db.users.select(u => ({ id: u.id })), { reads: [older.cte] }))
+      .toThrow(/reads a CTE of its own name/);
+    expect(() => new DbCteBuilder().with('x', db.users.select(u => ({ id: u.id })), { reads: [{ name: 'older_users' } as any] }))
+      .toThrow(/reads: expected DbCte/);
+  });
+
+  test('two bodies with the same text are one CTE only if they read the same CTEs', () => {
+    const older = olderUsers(db);
+    const young = new DbCteBuilder().with('older_users', db.users.where(u => lt(u.age, 30)).select(u => ({ id: u.id, age: u.age })));
+    const read = (reads: DbCte<any>[]) => new DbCte('b', 'SELECT 1', [], {}, undefined, undefined, undefined, undefined, undefined, reads);
+
+    expect(sameCteDefinition(read([older.cte]), read([older.cte]))).toBe(true);
+    expect(sameCteDefinition(read([older.cte]), read([olderUsers(db).cte]))).toBe(true);
+    expect(sameCteDefinition(read([older.cte]), read([young.cte]))).toBe(false);
+    expect(sameCteDefinition(read([older.cte]), read([]))).toBe(false);
+  });
+});
+
 describe('data-modifying CTEs: typed rows, declared once, refused when nested', () => {
   test('a mutation CTE read from the WHERE and from two projected scalars runs its UPDATE exactly once', async () => {
     await withDatabase(async db => {

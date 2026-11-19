@@ -240,9 +240,11 @@ export abstract class DatabaseClient {
 
   /**
    * The most parameters one statement may bind through this client: 65 535 — PostgreSQL's protocol counts
-   * them in an unsigned 16-bit field. PGlite counts them in a SIGNED one: 32 767 (more desynchronized its
-   * session — that statement and the next ones returned no rows; {@link PGliteClient} refuses them). A batch
-   * that fuses statements (MutationBatch) refuses a statement over it before sending anything.
+   * them in an unsigned 16-bit field (pg and Bun's SQL send that many). postgres.js refuses 65 534 and more
+   * itself: 65 533 ({@link PostgresClient}). PGlite counts them in a SIGNED field: 32 767 (more desynchronized
+   * its session — that statement and the next ones returned no rows; {@link PGliteClient} refuses them). A
+   * batch that fuses statements (MutationBatch) refuses a statement over it before sending anything; the
+   * bulk writes size their chunks, and `toStatement()` refuses a compiled insert, within it.
    */
   maxParameters(): number {
     return 65535;

@@ -450,6 +450,8 @@ function figureColnameInternal(node: A.Expr): { name: string | null; strength: n
       return { name: node.name[node.name.length - 1], strength: 2 };
     case 'JsonFuncExpr':
       return node.op === 'is_json' ? { name: null, strength: 0 } : { name: node.op, strength: 2 };
+    case 'JsonConstructorExpr':
+      return { name: node.ctor === 'object' ? 'json_object' : 'json_array', strength: 2 };
     case 'AExpr':
       if (node.exprKind === 'NULLIF') {
         return { name: 'nullif', strength: 2 };

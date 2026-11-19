@@ -26,6 +26,8 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import {
+  and,
+  boolean,
   createCustomType,
   DatabaseClient,
   DbColumn,
@@ -35,7 +37,9 @@ import {
   DbModelConfig,
   eq,
   integer,
+  LateralSqlCache,
   MockRowCache,
+  NavigationPathCache,
   varchar,
 } from '../../src';
 import { expectToReject } from '../utils/expect-rejects';
@@ -1374,5 +1378,392 @@ describe('non-colliding RETURNING SQL is unchanged', () => {
       await fx.db.libEditions.where(ed => eq(ed.bookId, result.parent!.id)).delete();
       await fx.db.libBooks.where(b => eq(b.id, result.parent!.id)).delete();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MockRowCache: two tables that reach ONE table by the same navigation name, through different keys
+//
+// THE BUG (1.0.7 to 1.0.35, MockRowCache on): a table-level RETURNING — `insert`, `insertBulk`,
+// `upsert`, `upsertBulk`, `mergeBulk`, the children of `insertWithChildren` / `insertBulkWithChildren`
+// — evaluates its selector on a row anchored on "__mutation__", so every table's one-hop navigation
+// mints its row from the SAME source alias with an empty path. The prototype key of a navigation row
+// (model | target | relation | source alias | path) carried nothing of the navigation's own join, so
+// `pass.member` (holder_id) and `line.member` (member_id) shared ONE prototype — and its collection
+// getters had captured the join of whichever table minted it first. For the life of the process every
+// collection off the other table's navigation then correlated through the first table's key:
+//
+//   LEFT JOIN "ck_members" "member" ON "__mutation__"."holder_id" = "member"."id"
+//
+// → `column __mutation__.holder_id does not exist` on every such RETURNING until a restart, or — when
+// the mutated table has a column of that name and the RETURNING reads it — the WRONG member's rows.
+// Which table won depended on nothing but which RETURNING the process happened to run first.
+//
+// THE FIX: a navigation row's prototype key carries the navigation's own join (foreign keys, principal
+// keys, INNER / LEFT), as the key already did for every hop of the path above it.
+// ---------------------------------------------------------------------------
+
+class CkMember extends DbEntity {
+  id!: DbColumn<number>;
+  name!: DbColumn<string>;
+  sponsorId?: DbColumn<number | null>;
+
+  /** Another member — a second hop below `member`, onto the same table. */
+  sponsor?: CkMember;
+  badges?: CkBadge[];
+}
+
+class CkBadge extends DbEntity {
+  id!: DbColumn<number>;
+  memberId!: DbColumn<number>;
+  kind!: DbColumn<string>;
+  active!: DbColumn<boolean>;
+}
+
+/** Reaches its member through `holder_id`. */
+class CkPass extends DbEntity {
+  id!: DbColumn<number>;
+  holderId!: DbColumn<number>;
+  label!: DbColumn<string>;
+
+  member?: CkMember;
+}
+
+class CkBasket extends DbEntity {
+  id!: DbColumn<number>;
+  label!: DbColumn<string>;
+}
+
+/** Reaches its member through `member_id` — and has a `holder_id` of its own that names ANOTHER member. */
+class CkBasketLine extends DbEntity {
+  id!: DbColumn<number>;
+  basketId!: DbColumn<number>;
+  memberId!: DbColumn<number>;
+  holderId?: DbColumn<number | null>;
+  label!: DbColumn<string>;
+
+  member?: CkMember;
+}
+
+/** A badge predicate kept in a static helper, the way an application shares one definition of it. */
+class CkBadgeRules {
+  static activeOfKind(badge: any, kind: string) {
+    return and(eq(badge.active, true), eq(badge.kind, kind));
+  }
+}
+
+class CkDatabase extends DbContext {
+  get ckMembers(): DbEntityTable<CkMember> {
+    return this.table(CkMember);
+  }
+
+  get ckBadges(): DbEntityTable<CkBadge> {
+    return this.table(CkBadge);
+  }
+
+  get ckPasses(): DbEntityTable<CkPass> {
+    return this.table(CkPass);
+  }
+
+  get ckBaskets(): DbEntityTable<CkBasket> {
+    return this.table(CkBasket);
+  }
+
+  get ckBasketLines(): DbEntityTable<CkBasketLine> {
+    return this.table(CkBasketLine);
+  }
+
+  protected override setupModel(model: DbModelConfig): void {
+    model.entity(CkMember, entity => {
+      entity.toTable('ck_members');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'ck_members_id_seq' }));
+      entity.property(e => e.name).hasType(varchar('name', 50)).isRequired();
+      entity.property(e => e.sponsorId).hasType(integer('sponsor_id'));
+
+      entity.hasOne(e => e.sponsor, () => CkMember)
+        .withForeignKey(m => m.sponsorId!)
+        .withPrincipalKey(s => s.id);
+
+      entity.hasMany(e => e.badges, () => CkBadge)
+        .withForeignKey(b => b.memberId)
+        .withPrincipalKey(m => m.id);
+    });
+
+    model.entity(CkBadge, entity => {
+      entity.toTable('ck_badges');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'ck_badges_id_seq' }));
+      entity.property(e => e.memberId).hasType(integer('member_id')).isRequired();
+      entity.property(e => e.kind).hasType(varchar('kind', 20)).isRequired();
+      entity.property(e => e.active).hasType(boolean('active')).isRequired();
+    });
+
+    model.entity(CkPass, entity => {
+      entity.toTable('ck_passes');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'ck_passes_id_seq' }));
+      entity.property(e => e.holderId).hasType(integer('holder_id')).isRequired();
+      entity.property(e => e.label).hasType(varchar('label', 50)).isRequired();
+
+      entity.hasOne(e => e.member, () => CkMember)
+        .withForeignKey(p => p.holderId)
+        .withPrincipalKey(m => m.id);
+    });
+
+    model.entity(CkBasket, entity => {
+      entity.toTable('ck_baskets');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'ck_baskets_id_seq' }));
+      entity.property(e => e.label).hasType(varchar('label', 50)).isRequired();
+    });
+
+    model.entity(CkBasketLine, entity => {
+      entity.toTable('ck_basket_lines');
+      entity.property(e => e.id).hasType(integer('id').primaryKey().generatedAlwaysAsIdentity({ name: 'ck_basket_lines_id_seq' }));
+      entity.property(e => e.basketId).hasType(integer('basket_id')).isRequired();
+      entity.property(e => e.memberId).hasType(integer('member_id')).isRequired();
+      entity.property(e => e.holderId).hasType(integer('holder_id'));
+      entity.property(e => e.label).hasType(varchar('label', 50)).isRequired();
+
+      entity.hasOne(e => e.member, () => CkMember)
+        .withForeignKey(l => l.memberId)
+        .withPrincipalKey(m => m.id);
+    });
+  }
+}
+
+const CK_TABLES = ['ck_basket_lines', 'ck_baskets', 'ck_passes', 'ck_badges', 'ck_members'];
+
+const dropCkTables = async (client: DatabaseClient): Promise<void> => {
+  for (const table of CK_TABLES) {
+    await client.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+  }
+};
+
+describe('MockRowCache: one navigation name, two tables, two foreign keys (a schema of their own)', () => {
+  const CK_NOTE = 'ck';
+  const captured: string[] = [];
+  let client: DatabaseClient;
+  let db: CkDatabase;
+  /** The basket line's member: gold + silver badges. */
+  let ann: number;
+  let annGold: number;
+  /** The pass holder — and the line's own `holder_id`: gold + bronze badges. */
+  let ben: number;
+  let benGold: number;
+
+  /** The last RETURNING statement that inserted into `table`. */
+  const lastReturningInto = (table: string): string => {
+    const all = captured.filter(entry => !entry.trimStart().startsWith('['));
+
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (all[i].includes('"__mutation__"') && all[i].includes(`INSERT INTO "${table}"`)) {
+        return all[i];
+      }
+    }
+
+    return '';
+  };
+
+  beforeAll(async () => {
+    client = createFreshClient();
+    db = new CkDatabase(client, {
+      logQueries: true,
+      logParameters: false,
+      collectionStrategy: 'lateral',
+      logger: (message: string) => {
+        captured.push(message);
+      },
+    });
+    await dropCkTables(client);
+    await db.getSchemaManager().ensureCreated();
+
+    const [annRow, benRow] = await db.ckMembers.insertBulk([{ name: 'Ann' }, { name: 'Ben' }]).returning();
+    ann = annRow.id;
+    ben = benRow.id;
+    // Ann's sponsor is Ben; Ben has none
+    await db.ckMembers.where(m => eq(m.id, ann)).update({ sponsorId: ben });
+
+    const [annGoldRow, , benGoldRow] = await db.ckBadges.insertBulk([
+      { memberId: ann, kind: 'gold', active: true },
+      { memberId: ann, kind: 'silver', active: true },
+      { memberId: ben, kind: 'gold', active: true },
+      { memberId: ben, kind: 'bronze', active: true },
+    ]).returning();
+    annGold = annGoldRow.id;
+    benGold = benGoldRow.id;
+  });
+
+  afterAll(async () => {
+    MockRowCache.reset();
+    await dropCkTables(client);
+    await db.dispose();
+  });
+
+  beforeEach(() => {
+    // Every test is a fresh process: empty query-build caches, switched on as a host switches them on at boot
+    MockRowCache.reset();
+    LateralSqlCache.reset();
+    NavigationPathCache.reset();
+    MockRowCache.setEnabled(true);
+    captured.length = 0;
+  });
+
+  afterEach(async () => {
+    MockRowCache.reset();
+    await db.ckBasketLines.where(l => eq(l.label, CK_NOTE)).delete();
+    await db.ckBaskets.where(b => eq(b.label, CK_NOTE)).delete();
+    await db.ckPasses.where(p => eq(p.label, CK_NOTE)).delete();
+  });
+
+  const passRow = () => ({ holderId: ben, label: CK_NOTE });
+
+  /** What a ticket write reads back: its holder's columns, through `member` (holder_id). */
+  const HOLDER = (p: any) => ({ id: p.id, holder: p.member.name });
+
+  /**
+   * A table-level RETURNING over `ck_passes` on each code path that mints `member` on the "__mutation__" anchor
+   * (`insert` is `insertBulk`'s, `upsert` is `upsertBulk`'s).
+   */
+  const PASS_RETURNINGS: Array<{ name: string; run: () => PromiseLike<unknown> }> = [
+    { name: 'insert', run: () => db.ckPasses.insert(passRow()).returning(HOLDER) },
+    { name: 'upsertBulk', run: () => db.ckPasses.upsertBulk([passRow()] as any, { primaryKey: 'id' }).returning(HOLDER) },
+    { name: 'mergeBulk', run: () => db.ckPasses.mergeBulk([passRow()], { on: ['holderId', 'label'] }).returning(HOLDER) },
+  ];
+
+  /** Two picks through a shared predicate, a list and a count — all off `line.member.badges` (member_id). */
+  const BADGES = (ln: any) => ({
+    id: ln.id,
+    member: ln.member.name,
+    gold: ln.member.badges.where((b: any) => CkBadgeRules.activeOfKind(b, 'gold')).select((b: any) => ({ id: b.id, kind: b.kind })).firstOrDefault('gold'),
+    silver: ln.member.badges.where((b: any) => CkBadgeRules.activeOfKind(b, 'silver')).select((b: any) => ({ kind: b.kind })).firstOrDefault('silver'),
+    kinds: ln.member.badges.orderBy((b: any) => b.kind).select((b: any) => ({ kind: b.kind })).toList('kinds'),
+    count: ln.member.badges.count(),
+  });
+
+  type LineSelector = (ln: any) => Record<string, any>;
+
+  /** A table-level RETURNING over `ck_basket_lines` on each code path — Ann's line, whose `holder_id` is Ben. */
+  const LINE_RETURNINGS: Array<{ name: string; run: (selector: LineSelector) => Promise<Record<string, any>> }> = [
+    {
+      name: 'insertWithChildren (children)',
+      run: async selector => (await db.ckBaskets.insertWithChildren({
+        row: { label: CK_NOTE },
+        children: { table: db.ckBasketLines, foreignKey: 'basketId', rows: [{ memberId: ann, holderId: ben, label: CK_NOTE }] },
+        returning: { parent: b => ({ id: b.id }), children: selector },
+      })).children[0],
+    },
+    {
+      name: 'insertBulkWithChildren (children)',
+      run: async selector => (await db.ckBaskets.insertBulkWithChildren({
+        rows: [{ label: CK_NOTE }],
+        children: { table: db.ckBasketLines, foreignKey: 'basketId', rows: [{ parentIndex: 0, row: { memberId: ann, holderId: ben, label: CK_NOTE } }] },
+        returning: { parents: b => ({ id: b.id }), children: selector },
+      })).children[0],
+    },
+    {
+      name: 'insert',
+      run: async selector => {
+        const [basket] = await db.ckBaskets.insertBulk([{ label: CK_NOTE }]).returning();
+
+        return db.ckBasketLines.insert({ basketId: basket.id, memberId: ann, holderId: ben, label: CK_NOTE }).returning(selector);
+      },
+    },
+  ];
+
+  /** Ann's badges — Ben's would be gold (another id) + bronze. */
+  const expectAnnsBadges = (row: Record<string, any>): void => {
+    expect({ member: row.member, gold: row.gold, silver: row.silver, kinds: row.kinds, count: Number(row.count) }).toEqual({
+      member: 'Ann',
+      gold: { id: annGold, kind: 'gold' },
+      silver: { kind: 'silver' },
+      kinds: [{ kind: 'gold' }, { kind: 'silver' }],
+      count: 2,
+    });
+  };
+
+  /** The navigation join INSIDE the line's laterals (the outer one renders `AS "member"`). */
+  const LINE_PATH_JOIN = 'LEFT JOIN "ck_members" "member" ON "__mutation__"."member_id" = "member"."id"';
+  const PASS_KEY_ON_A_JOIN = 'ON "__mutation__"."holder_id" = "member"."id"';
+
+  for (const pass of PASS_RETURNINGS) {
+    for (const line of LINE_RETURNINGS) {
+      test(`${pass.name} over the passes first, then ${line.name} over the lines: the line's collections correlate through member_id`, async () => {
+        await pass.run();
+        const row = await line.run(BADGES);
+
+        expectAnnsBadges(row);
+
+        const statement = lastReturningInto('ck_basket_lines');
+        expect(statement).toContain(LINE_PATH_JOIN);
+        expect(statement).not.toContain(PASS_KEY_ON_A_JOIN);
+      });
+    }
+  }
+
+  test('a line RETURNING that also reads its own holder_id still reads its MEMBER\'s badges, not the holder\'s', async () => {
+    // The column the pass's key names exists on the line and the CTE returns it: a line correlated through
+    // the pass's key would run, and silently read Ben's badges
+    await PASS_RETURNINGS[0].run();
+    const row = await LINE_RETURNINGS[0].run(ln => ({ ...BADGES(ln), holderId: ln.holderId }));
+
+    expect(row.holderId).toBe(ben);
+    expect(row.gold).not.toEqual({ id: benGold, kind: 'gold' });
+    expectAnnsBadges(row);
+  });
+
+  test('a collection two hops below the shared name (member → sponsor, the same table) correlates through the line\'s key', async () => {
+    // The deeper hop's row is minted by the `member` row's getter: it inherits that row's path, key included
+    await PASS_RETURNINGS[0].run();
+    const row = await LINE_RETURNINGS[0].run(ln => ({
+      id: ln.id,
+      sponsor: ln.member.sponsor.name,
+      sponsorKinds: ln.member.sponsor.badges.orderBy((b: any) => b.kind).select((b: any) => ({ kind: b.kind })).toList('sponsorKinds'),
+    }));
+
+    // Ann's sponsor is Ben: his badges, read through Ann's line
+    expect({ sponsor: row.sponsor, sponsorKinds: row.sponsorKinds }).toEqual({
+      sponsor: 'Ben',
+      sponsorKinds: [{ kind: 'bronze' }, { kind: 'gold' }],
+    });
+
+    const statement = lastReturningInto('ck_basket_lines');
+    expect(statement).toContain(LINE_PATH_JOIN);
+    expect(statement).toContain('LEFT JOIN "ck_members" "sponsor" ON "member"."sponsor_id" = "sponsor"."id"');
+    expect(statement).not.toContain(PASS_KEY_ON_A_JOIN);
+  });
+
+  test('the other order: the lines first, then a collection off the pass\'s navigation correlates through holder_id', async () => {
+    expectAnnsBadges(await LINE_RETURNINGS[0].run(BADGES));
+
+    const pass = await db.ckPasses.insert(passRow()).returning((p: any) => ({
+      id: p.id,
+      holder: p.member.name,
+      gold: p.member.badges.where((b: any) => CkBadgeRules.activeOfKind(b, 'gold')).select((b: any) => ({ id: b.id })).firstOrDefault('gold'),
+      kinds: p.member.badges.orderBy((b: any) => b.kind).select((b: any) => ({ kind: b.kind })).toList('kinds'),
+    }));
+
+    expect({ holder: pass.holder, gold: pass.gold, kinds: pass.kinds }).toEqual({
+      holder: 'Ben',
+      gold: { id: benGold },
+      kinds: [{ kind: 'bronze' }, { kind: 'gold' }],
+    });
+    expect(lastReturningInto('ck_passes')).toContain('LEFT JOIN "ck_members" "member" ON "__mutation__"."holder_id" = "member"."id"');
+  });
+
+  test('the line\'s statement is the one the cache-off build renders', async () => {
+    const lineStatement = async (): Promise<string> => {
+      captured.length = 0;
+      await PASS_RETURNINGS[0].run();
+      await LINE_RETURNINGS[0].run(BADGES);
+
+      return lastReturningInto('ck_basket_lines');
+    };
+
+    const cached = await lineStatement();
+
+    MockRowCache.reset();
+    const uncached = await lineStatement();
+
+    expect(MockRowCache.isEnabled()).toBe(false);
+    expect(uncached).toContain(LINE_PATH_JOIN);
+    expect(cached).toBe(uncached);
   });
 });

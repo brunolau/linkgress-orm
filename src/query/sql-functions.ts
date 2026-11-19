@@ -22,6 +22,7 @@ import {
   WhereConditionBase,
 } from './conditions';
 import { readerThrough } from './shared-values';
+import { chunkJsonBuildArgs, JSON_BUILD_OBJECT_MAX_PAIRS, jsonTextSpliceParts, POSTGRES_FUNC_MAX_ARGS, usesSqlJsonConstructors } from './sql-utils';
 
 /**
  * SQL expression helpers — the built-in spelling of the expressions that otherwise end up
@@ -908,7 +909,8 @@ export function length(value: SqlOperand<string | null | undefined>): SqlFragmen
 
 /**
  * `concat(a, b, …)` — text concatenation that treats NULL as the empty string (unlike `||`,
- * which turns the whole result NULL).
+ * which turns the whole result NULL). One function call: at most 100 operands (past that 54023 on
+ * PostgreSQL and on the in-memory database) — split a longer list.
  */
 export function concat(...values: SqlOperand[]): SqlFragment<string> {
   if (values.length === 0) {
@@ -918,7 +920,9 @@ export function concat(...values: SqlOperand[]): SqlFragment<string> {
 }
 
 /**
- * `concat_ws(separator, a, b, …)` — joins the non-NULL operands with the separator.
+ * `concat_ws(separator, a, b, …)` — joins the non-NULL operands with the separator. One function
+ * call: at most 99 operands after the separator (past that 54023 on PostgreSQL and on the in-memory
+ * database) — split a longer list.
  *
  * @example
  * db.members.select(m => ({ fullName: concatWs(' ', m.firstName, m.lastName) }))
@@ -1511,13 +1515,31 @@ function jsonBuildOperand(flavor: JsonFlavor, value: unknown): unknown {
   return typedOperand(value);
 }
 
+/**
+ * The object of `entries`: ONE `<flavor>_build_object` call up to 50 keys (a call takes at most 100 arguments), as it
+ * always was; past that, on PostgreSQL 16+ ({@link usesSqlJsonConstructors}) one {@link jsonConstructorCall}, below 16
+ * or unknown runs of 50 keys joined by {@link joinJsonCalls}.
+ */
 function buildJsonObject<T>(flavor: JsonFlavor, fnName: string, entries: Record<string, unknown>): SqlFragment<T> {
   if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
     throw new TypeError(`${fnName} expects an object of key → value`);
   }
 
-  const call = `${flavor}_build_object(`;
   const keys = Object.keys(entries);
+  if (keys.length <= JSON_BUILD_OBJECT_MAX_PAIRS) {
+    return jsonObjectCall<T>(flavor, keys, entries);
+  }
+
+  if (usesSqlJsonConstructors()) {
+    return jsonConstructorCall<T>(flavor, keys, keys.map(key => entries[key]));
+  }
+
+  return joinJsonCalls<T>(flavor, chunkJsonBuildArgs(keys, JSON_BUILD_OBJECT_MAX_PAIRS).map(chunk => jsonObjectCall(flavor, chunk, entries)));
+}
+
+/** `<flavor>_build_object('key', value, …)` over `keys` of `entries`, each value as a `flavor` builder takes it (jsonBuildOperand). */
+function jsonObjectCall<T>(flavor: JsonFlavor, keys: readonly string[], entries: Record<string, unknown>): SqlFragment<T> {
+  const call = `${flavor}_build_object(`;
   if (keys.length === 0) {
     return new SqlFragment<T>([`${call})`], [], DRIVER_VALUE_MAPPER);
   }
@@ -1533,7 +1555,39 @@ function buildJsonObject<T>(flavor: JsonFlavor, fnName: string, entries: Record<
   return new SqlFragment<T>(parts, values, DRIVER_VALUE_MAPPER);
 }
 
+/**
+ * The array of `values`: ONE `<flavor>_build_array` call up to 100 elements, as it always was; past that, on PostgreSQL
+ * 16+ one {@link jsonConstructorCall}, below 16 or unknown runs of 100 joined by {@link joinJsonCalls}, the elements in
+ * order.
+ */
 function buildJsonArray<T>(flavor: JsonFlavor, values: readonly unknown[]): SqlFragment<T> {
+  if (values.length <= POSTGRES_FUNC_MAX_ARGS) {
+    return jsonArrayCall<T>(flavor, values);
+  }
+
+  if (usesSqlJsonConstructors()) {
+    return jsonConstructorCall<T>(flavor, null, values);
+  }
+
+  return joinJsonCalls<T>(flavor, chunkJsonBuildArgs(values, POSTGRES_FUNC_MAX_ARGS).map(chunk => jsonArrayCall(flavor, chunk)));
+}
+
+/**
+ * PostgreSQL 16+, past one call's cap: `JSON_OBJECT('k' VALUE v, … RETURNING <flavor>)` (`keys` given) or
+ * `JSON_ARRAY(v, … NULL ON NULL RETURNING <flavor>)` — SQL/JSON constructors, not function calls, so no argument cap;
+ * the value one `<flavor>_build_object` / `_build_array` call builds (the server runs the same code), any operand
+ * evaluated where it is written, each value once and in order. Both clauses are load-bearing: JSON_ARRAY drops NULL
+ * elements by default (ABSENT ON NULL), and either constructor returns jsonb once one value is jsonb.
+ */
+function jsonConstructorCall<T>(flavor: JsonFlavor, keys: readonly string[] | null, values: readonly unknown[]): SqlFragment<T> {
+  const parts = values.map((_, i) => (i === 0 ? (keys ? 'JSON_OBJECT(' : 'JSON_ARRAY(') : ', ') + (keys ? `${quoteSqlLiteral(keys[i])} VALUE ` : ''));
+  parts.push(`${keys ? '' : ' NULL ON NULL'} RETURNING ${flavor})`);
+
+  return new SqlFragment<T>(parts, values.map(value => jsonBuildOperand(flavor, value)), DRIVER_VALUE_MAPPER);
+}
+
+/** `<flavor>_build_array(a, b, …)` over `values`, each as a `flavor` builder takes it (jsonBuildOperand). */
+function jsonArrayCall<T>(flavor: JsonFlavor, values: readonly unknown[]): SqlFragment<T> {
   const call = `${flavor}_build_array(`;
   if (values.length === 0) {
     return new SqlFragment<T>([`${call})`], [], DRIVER_VALUE_MAPPER);
@@ -1546,6 +1600,21 @@ function buildJsonArray<T>(flavor: JsonFlavor, values: readonly unknown[]): SqlF
   parts.push(')');
 
   return new SqlFragment<T>(parts, values.map(value => jsonBuildOperand(flavor, value)), DRIVER_VALUE_MAPPER);
+}
+
+/**
+ * Below PostgreSQL 16 or unknown: two or more `<flavor>_build_object` / `_build_array` calls joined into the one value
+ * a single call would build:
+ * json — their texts spliced (`(left(a::text, -1) || ', ' || right(b::text, -1))::json`, jsonTextSpliceParts), the text
+ * one call prints byte for byte; jsonb — `(a || b)`, which merges the objects (their keys are distinct) and
+ * concatenates the arrays in order: the jsonb one call builds. Never the row_to_json sub-select renderJsonBuildObject uses:
+ * a helper's operands are anything (an aggregate, a window, `random()`), and inside a sub-select they would be
+ * evaluated one query level down. Each call appears once: its parameters bind once, in order.
+ */
+function joinJsonCalls<T>(flavor: JsonFlavor, calls: SqlFragment[]): SqlFragment<T> {
+  const parts = flavor === 'json' ? jsonTextSpliceParts(calls.length) : ['(', ...calls.slice(1).map(() => ' || '), ')'];
+
+  return new SqlFragment<T>(parts, calls, DRIVER_VALUE_MAPPER);
 }
 
 /**
@@ -1572,7 +1641,12 @@ export function jsonbBuildArray<T = unknown[]>(...values: unknown[]): SqlFragmen
  * bound typed from their JS type; conditions as booleans; nested plain objects / arrays as nested
  * json_build_object / json_build_array calls). `json` keeps the keys in the written order (jsonb
  * sorts them) and is cheaper to build when the value is only shipped to the client. Reads back as
- * the driver-parsed JSON.
+ * the driver-parsed JSON. Past 50 keys (100 elements for the arrays) one call would exceed
+ * PostgreSQL's 100 arguments of a function call: with `LinkgressConfig.serverVersion` 16 or more the
+ * value is ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` / `JSON_ARRAY(v, … NULL ON NULL RETURNING
+ * json)` (jsonb: `RETURNING jsonb`); below 16 or unknown the json texts of calls of 50 keys (100
+ * elements) are spliced and cast back to json once — the text one call would print, keys in written
+ * order — and jsonbBuildObject() / jsonbBuildArray() merge their jsonb runs with `||`.
  *
  * @example
  * db.loans.select(l => ({ summary: jsonBuildObject({ id: l.id, dueAt: l.dueAt }) }))

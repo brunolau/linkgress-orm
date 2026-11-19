@@ -337,6 +337,15 @@ export class PostgresClient extends DatabaseClient {
   }
 
   /**
+   * 65 533 — two below PostgreSQL's protocol limit: postgres.js refuses a statement of 65 534 parameters or more
+   * before sending it (`MAX_PARAMETERS_EXCEEDED: Max number of parameters (65534) exceeded`, measured on
+   * postgres 3.4). `MutationBatch`, the bulk-write chunks and `toStatement()` stay within it.
+   */
+  maxParameters(): number {
+    return 65533;
+  }
+
+  /**
    * postgres library supports multiple SQL statements using .simple() mode
    * This allows true single round-trip optimization
    */

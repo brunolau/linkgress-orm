@@ -755,7 +755,10 @@ export class UnionQueryBuilder<TSelection> {
    *
    * @template TMode - 'scalar' for a single value, 'array' for column list (use
    *   with `inSubquery(...)`), 'table' for full rows
-   * @returns Subquery that can be passed to `inSubquery`, `exists`, etc.
+   * @returns Subquery that can be passed to `inSubquery`, `exists`, etc. A `'table'` subquery's
+   *   rows are the union's rows, and its columns read and bind the way the FIRST leg's columns do
+   *   (see {@link getSelectionMetadata}) — a mapped column through its mapper — as a select's table
+   *   subquery does.
    *
    * @example
    * ```typescript
@@ -779,7 +782,7 @@ export class UnionQueryBuilder<TSelection> {
   asSubquery<TMode extends 'scalar' | 'array' | 'table' = 'table'>(
     mode: TMode = 'table' as TMode
   ): Subquery<
-    TMode extends 'scalar' ? TSelection : TMode extends 'array' ? TSelection[] : TSelection[],
+    TMode extends 'scalar' ? TSelection : TMode extends 'array' ? TSelection[] : TSelection,
     TMode
   > {
     const sqlBuilder = (outerContext: SqlBuildContext & { tableAlias?: string }): string => {
@@ -792,8 +795,12 @@ export class UnionQueryBuilder<TSelection> {
     const outerFieldRefs = this.components.flatMap(component => component.ownerBuilder?._getOuterFieldRefs?.() ?? []);
     // A scalar union of one column reads like the first leg's column (see scalarSubqueryRead)
     const scalarRead = mode === 'scalar' ? scalarSubqueryRead(this.firstLegSelection()) : undefined;
+    // A table union's columns read and bind like the first leg's (its mapper, its SQL type), as a select's table
+    // subquery keeps its own selection: without it a joined union's mapped column read the driver value and bound a
+    // compared value raw (a Date against an integer column)
+    const selectionMetadata = mode === 'table' ? this.firstLegSelection() : undefined;
 
-    return new Subquery(sqlBuilder, mode, undefined, outerFieldRefs, scalarRead) as any;
+    return new Subquery(sqlBuilder, mode, selectionMetadata, outerFieldRefs, scalarRead) as any;
   }
 
   /**
