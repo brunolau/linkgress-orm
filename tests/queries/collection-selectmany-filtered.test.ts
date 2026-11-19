@@ -3300,6 +3300,36 @@ describe('the correlated subquery: navigations named like the table they point a
     ]);
   });
 
+  test('a collection over the table a navigation of its path is named like, at the root', async () => {
+    // `b.nt_shelf.nt_library.shelves` joins its path inside the subquery — `"nt_shelf"` first — and
+    // reads shelves: under its bare name the collection's own table shared that alias with the
+    // join (1.0.42: `table name "nt_shelf" specified more than once`)
+    takeStatements();
+    const books = await db.ntBooks
+      .where(b => exists(b.nt_shelf!.nt_library!.shelves!.where(s => eq(s.code, 'D'))))
+      .orderBy(b => b.id)
+      .select(b => ({ title: b.title }))
+      .toList();
+    const [statement] = takeStatements();
+    // The same beside a root join of that navigation, and as the collection's own exists()
+    const beside = await db.ntBooks
+      .where(b => and(ne(b.nt_shelf!.code, 'D'), b.nt_shelf!.nt_library!.shelves!.where(s => eq(s.code, 'D')).exists()))
+      .orderBy(b => b.id)
+      .select(b => ({ title: b.title }))
+      .toList();
+
+    // Only South has a shelf D, and only c1 stands in South: a correlation bound to the inner shelf
+    // itself answers every book, one bound to the book's own shelf (on no D) none
+    expect(books.map(book => book.title)).toEqual(['c1']);
+    expect(beside.map(book => book.title)).toEqual(['c1']);
+    expect(statement).toBe(
+      'SELECT "nt_book"."title" as "title"\nFROM "nt_book"\nWHERE EXISTS (SELECT 1 FROM "nt_shelf" "shelves__exists"\n'
+      + 'LEFT JOIN "nt_shelf" "nt_shelf" ON "nt_book"."shelf_id" = "nt_shelf"."id"\n'
+      + 'LEFT JOIN "nt_library" "nt_library" ON "nt_shelf"."library_id" = "nt_library"."id"\n'
+      + 'WHERE "shelves__exists"."library_id" = "nt_library"."id" AND "shelves__exists"."code" = $1)\nORDER BY "nt_book"."id" ASC',
+    );
+  });
+
   test('one level deep, a navigation named like the parent keeps its 1.0.10 SQL (unchanged)', async () => {
     takeStatements();
     const books = await db.ntBooks
