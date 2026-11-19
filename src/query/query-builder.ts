@@ -33,6 +33,8 @@ import { createSetRow, holdsSetReturningValue, lateralSetJoinsSql, lateralSetRef
 import type { LateralSetJoin, SetRow } from './set-returning';
 import { countedOnce, forResultSet, sharesValues, valuesAt } from './shared-values';
 import type { ValueCount } from './shared-values';
+import { renderJsonBuildObject } from './sql-utils';
+import type { JsonObjectEntry } from './sql-utils';
 
 /**
  * Field type categories for optimized result transformation
@@ -7430,14 +7432,14 @@ ${joinClauses.join('\n')}`;
 
                 // Select all columns from the target table and group them
                 // We'll need to use JSON object building in SQL
-                const fieldParts: string[] = [];
+                const fieldParts: JsonObjectEntry[] = [];
                 // Performance: Use cached column name map
                 const targetColMap = getColumnNameMapForSchema(targetSchema);
                 for (const [colKey, dbColName] of targetColMap) {
-                  fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                  fieldParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                 }
 
-                selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
+                selectParts.push(`${renderJsonBuildObject(fieldParts)} as "${key}"`);
               } else {
                 // No target schema available, skip
                 continue;
@@ -7467,12 +7469,12 @@ ${joinClauses.join('\n')}`;
                       if (planned !== undefined && planned.targetSchema && (planned.parent !== undefined || planned.alias !== planned.relationName)) {
                         this.addPlannedJoins(planned, joins);
 
-                        const plannedParts: string[] = [];
+                        const plannedParts: JsonObjectEntry[] = [];
                         for (const [colKey, dbColName] of getColumnNameMapForSchema(planned.targetSchema)) {
-                          plannedParts.push(`'${colKey}', "${planned.alias}"."${dbColName}"`);
+                          plannedParts.push({ key: colKey, value: `"${planned.alias}"."${dbColName}"` });
                         }
 
-                        selectParts.push(`json_build_object(${plannedParts.join(', ')}) as "${key}"`);
+                        selectParts.push(`${renderJsonBuildObject(plannedParts)} as "${key}"`);
                         continue;
                       }
 
@@ -7486,12 +7488,12 @@ ${joinClauses.join('\n')}`;
                       if (explicitTarget) {
                         addExplicitJoinPath(joinPath, joins);
 
-                        const explicitParts: string[] = [];
+                        const explicitParts: JsonObjectEntry[] = [];
                         for (const [colKey, dbColName] of getColumnNameMapForSchema(explicitTarget)) {
-                          explicitParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                          explicitParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                         }
 
-                        selectParts.push(`json_build_object(${explicitParts.join(', ')}) as "${key}"`);
+                        selectParts.push(`${renderJsonBuildObject(explicitParts)} as "${key}"`);
                         continue;
                       }
 
@@ -7521,14 +7523,14 @@ ${joinClauses.join('\n')}`;
                           }
 
                           // Select all columns from the target table and group them into a JSON object
-                          const fieldParts: string[] = [];
+                          const fieldParts: JsonObjectEntry[] = [];
                           // Performance: Use cached column name map
                           const targetColMap = getColumnNameMapForSchema(targetSchema);
                           for (const [colKey, dbColName] of targetColMap) {
-                            fieldParts.push(`'${colKey}', "${alias}"."${dbColName}"`);
+                            fieldParts.push({ key: colKey, value: `"${alias}"."${dbColName}"` });
                           }
 
-                          selectParts.push(`json_build_object(${fieldParts.join(', ')}) as "${key}"`);
+                          selectParts.push(`${renderJsonBuildObject(fieldParts)} as "${key}"`);
                           continue;
                         }
                       }

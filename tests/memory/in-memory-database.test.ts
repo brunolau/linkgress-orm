@@ -287,6 +287,57 @@ describe('in-memory database API', () => {
     await client.end();
   });
 
+  test('a function call passes at most 100 arguments, as on PostgreSQL (54023 through both drivers); JSON_OBJECT / JSON_ARRAY take any number', async () => {
+    // FUNC_MAX_ARGS: PostgreSQL refuses a call of 101 arguments while it parses the statement — a json_build_object of
+    // 51 keys among them. The engine used to evaluate it, so a projection that failed on every execution against a
+    // server passed every in-memory test. A VARIADIC array is ONE argument, whatever its length. (The corpus compares
+    // the same statements with PostgreSQL's answers, position included.)
+    const list = (n: number, render: (i: number) => string = i => String(i)) => Array.from({ length: n }, (_, i) => render(i)).join(', ');
+    const db = createInMemoryDatabase();
+    const client = new Client(db.pgPoolConfig());
+    await client.connect();
+
+    for (const statement of [`select concat(${list(101)})`, `select json_build_object(${list(51, i => `'k${i}', ${i}`)})`]) {
+      const e = await expectToReject(client.query(statement));
+
+      expect(e.constructor.name).toBe('DatabaseError');
+      expect({ code: (e as { code?: string }).code, message: (e as Error).message, position: (e as { position?: string }).position })
+        .toEqual({ code: '54023', message: 'cannot pass more than 100 arguments to a function', position: '8' });
+    }
+
+    // The SQL/JSON constructors (PostgreSQL 16+, what linkgress renders past 50 keys under serverVersion 16+) are not
+    // function calls: 200 keys and 150 elements (NULLs kept by NULL ON NULL) pass, as on PostgreSQL
+    const constructors = `select JSON_OBJECT(${list(200, i => `'k${i}' VALUE ${i}`)} RETURNING json) as wide, `
+      + `JSON_ARRAY(${list(150, i => (i % 50 === 0 ? 'NULL' : String(i)))} NULL ON NULL RETURNING jsonb) as long`;
+    const expectConstructors = (r: { wide: Record<string, number>; long: unknown[] }) => {
+      expect(Object.keys(r.wide)).toEqual(Array.from({ length: 200 }, (_, i) => `k${i}`));
+      expect(r.wide.k199).toBe(199);
+      expect(r.long).toEqual(Array.from({ length: 150 }, (_, i) => (i % 50 === 0 ? null : i)));
+    };
+    const [row] = (await client.query(
+      `select length(concat(${list(100)})) as hundred, json_build_object(${list(50, i => `'k${i}', ${i}`)}) as fifty, `
+      + `json_array_length(json_build_array(VARIADIC ARRAY[${list(200)}])) as variadic`
+    )).rows;
+    expect(row.hundred).toBe(190);
+    expect(Object.keys(row.fifty)).toHaveLength(50);
+    expect(row.variadic).toBe(200);
+    expectConstructors((await client.query(constructors)).rows[0]);
+    await client.end();
+
+    // postgres.js raises its own error class with the same code
+    const sql = postgres(db.postgresOptions({ max: 1 }));
+    try {
+      const e = await expectToReject(sql.unsafe(`select concat(${list(101)})`));
+
+      expect(e.constructor.name).toBe('PostgresError');
+      expect((e as { code?: string }).code).toBe('54023');
+      expect((e as Error).message).toBe('cannot pass more than 100 arguments to a function');
+      expectConstructors((await sql.unsafe(constructors))[0] as any);
+    } finally {
+      await sql.end();
+    }
+  });
+
   test('a plpgsql statement may carry only one INTO target list', async () => {
     // The behaviour of `RETURNING ... INTO` itself is pinned by the differential corpus; this one
     // cannot live there because PostgreSQL reports a POSITION for a plpgsql parse error and the

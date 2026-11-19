@@ -1,5 +1,6 @@
 import type { TableSchema } from '../schema/table-builder';
 import { isForeignChainRef } from './query-utils';
+import { identifierBytes, POSTGRES_MAX_IDENTIFIER_BYTES } from './sql-utils';
 
 /**
  * Literal value prefix used in navigation key parts.
@@ -176,18 +177,6 @@ export function buildCollectionCorrelationWhere(
  * able to tell which relation the ref navigates.
  */
 const renamedNavigationRefs = new WeakMap<object, string>();
-
-/** UTF-8 length of an identifier — what PostgreSQL's 63-byte limit counts. */
-const identifierBytes = (identifier: string): number => {
-  let bytes = 0;
-
-  for (const char of identifier) {
-    const code = char.codePointAt(0)!;
-    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
-  }
-
-  return bytes;
-};
 
 /**
  * One reference-navigation hop that a build's field refs traverse, identified by its RELATION PATH
@@ -612,14 +601,14 @@ export class NavigationAliasPlan {
   private secondaryPathAlias(node: NavigationPathNode): string {
     const alias = `${this.parentAliasOf(node)}__${node.relationName}`;
 
-    if (identifierBytes(alias) <= 63) {
+    if (identifierBytes(alias) <= POSTGRES_MAX_IDENTIFIER_BYTES) {
       return alias;
     }
 
     for (let n = 2; ; n++) {
       const candidate = `${node.relationName}__${n}`;
 
-      if (identifierBytes(candidate) > 63) {
+      if (identifierBytes(candidate) > POSTGRES_MAX_IDENTIFIER_BYTES) {
         // A relation name itself near the limit: refused as any other path alias
         return this.pathAlias(node);
       }
@@ -635,7 +624,7 @@ export class NavigationAliasPlan {
   private pathAlias(node: NavigationPathNode): string {
     const alias = `${this.parentAliasOf(node)}__${node.relationName}`;
 
-    if (identifierBytes(alias) > 63) {
+    if (identifierBytes(alias) > POSTGRES_MAX_IDENTIFIER_BYTES) {
       const owner = this.owners.get(node.relationName);
 
       throw new Error(

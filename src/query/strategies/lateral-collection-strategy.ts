@@ -11,6 +11,8 @@ import {
 import { QueryContext } from '../query-builder';
 import { formatJoinValue, buildCollectionCorrelationWhere, quoteTableReference, renderLateralNavigationJoin } from '../join-utils';
 import { LateralSqlCache } from '../lateral-sql-cache';
+import { renderJsonBuildObject, usesSqlJsonConstructors } from '../sql-utils';
+import type { JsonObjectEntry } from '../sql-utils';
 
 /** Key-part separator: a control character no alias, column name or SQL text contains. */
 const KEY_SEP = String.fromCharCode(1);
@@ -56,7 +58,8 @@ const appendFieldsKey = (key: string, fields: SelectedField[]): string => {
  * The LateralSqlCache key of an aggregation: every input `LateralCollectionStrategy.render` and
  * its helpers read, in order — the alias inputs (counter, relation, tables), the correlation
  * columns, the clause TEXT (which already carries the `$n` placeholder numbering), the scalar
- * flags and limits, both navigation-join lists with their alias-map resolution, and the
+ * flags and limits, the process-wide form of a wide object (`O`: LinkgressConfig.serverVersion 16+
+ * renders JSON_OBJECT), both navigation-join lists with their alias-map resolution, and the
  * projection. Parameter VALUES never enter the strategy and never enter the key. Built by plain
  * concatenation (a rope V8 flattens once, on the lookup) — cheaper than an array join.
  */
@@ -68,7 +71,8 @@ export const lateralShapeKey = (config: CollectionAggregationConfig, context: Qu
     + (config.whereClause ?? '') + KEY_SEP + (config.orderByClause ?? '') + KEY_SEP
     + (config.orderByFields?.map(field => field.table ?? '').join(',') ?? '') + KEY_SEP
     + (config.limitValue ?? '') + KEY_SEP + (config.offsetValue ?? '') + KEY_SEP
-    + (config.isDistinct === true ? 'D' : '') + (config.isSingleResult === true ? 'S' : '') + (config.useJsonArrayAggregation === true ? 'J' : '') + KEY_SEP
+    + (config.isDistinct === true ? 'D' : '') + (config.isSingleResult === true ? 'S' : '') + (config.useJsonArrayAggregation === true ? 'J' : '')
+    + (usesSqlJsonConstructors() ? 'O' : '') + KEY_SEP
     + config.aggregationType + KEY_SEP + (config.aggregateField ?? '') + KEY_SEP + (config.aggregateExpression ?? '') + KEY_SEP
     + (config.arrayField ?? '') + KEY_SEP + config.defaultValue + KEY_SEP;
   key = appendNavigationJoinsKey(key, config.navigationJoins, aliasMap);
@@ -498,14 +502,16 @@ WHERE ${whereSQL})`;
   }
 
   /**
-   * Renders the selected fields in ONE recursive pass: returns the `json_build_object(...)` text
-   * of this level and appends the flattened inner select list and the nested lateral joins to
-   * `out` (same order as the three separate walks this replaces — depth first, own join before
-   * the nested ones). No intermediate arrays: the select list of a wide collection projection was
-   * three allocations per field and three joins per statement.
+   * Renders the selected fields in ONE recursive pass: returns the object text of this level
+   * (renderJsonBuildObject: `json_build_object(...)` up to 50 keys, a call takes at most 100
+   * arguments; past that JSON_OBJECT on PostgreSQL 16+, else row_to_json) and appends the flattened inner select list and the nested lateral joins to `out`
+   * (same order as the three separate walks this replaces — depth first, own join before the nested
+   * ones). One list of entries per level, every value a column of the inner select (or a nested
+   * object of them): the select list of a wide collection projection was three allocations per
+   * field and three joins per statement.
    */
   private renderFields(fields: SelectedField[], prefix: string, targetTable: string, innerTableAlias: string, out: { select: string; joins: string }): string {
-    let json = '';
+    const entries: JsonObjectEntry[] = [];
     for (const field of fields) {
       const alias = field.alias;
       const fullAlias = prefix ? prefix + '__' + alias : alias;
@@ -514,15 +520,15 @@ WHERE ${whereSQL})`;
       }
       if (field.nested) {
         const nestedJson = this.renderFields(field.nested, fullAlias, targetTable, innerTableAlias, out);
-        json += (json ? ', ' : '') + "'" + alias + "', " + nestedJson;
+        entries.push({ key: alias, value: nestedJson });
       } else {
-        json += (json ? ', ' : '') + "'" + alias + "', \"" + fullAlias + '"';
+        entries.push({ key: alias, value: '"' + fullAlias + '"' });
         if (field.expression) {
           out.select += (out.select ? ', ' : '') + this.renderLeafSelect(field.expression, fullAlias, targetTable, innerTableAlias);
         }
       }
     }
-    return 'json_build_object(' + json + ')';
+    return renderJsonBuildObject(entries);
   }
 
   /**

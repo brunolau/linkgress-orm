@@ -1,4 +1,4 @@
-import type { JsonFuncSpec } from '../../analyze/expr';
+import type { JsonCtorSpec, JsonFuncSpec } from '../../analyze/expr';
 import { Catalog, TypeOid } from '../../catalog/catalog';
 import { PgError, SqlState } from '../../errors';
 import { formatDate, formatTimestampJson } from '../../types/datetime';
@@ -565,18 +565,97 @@ function jsonbCastError(v: JsonbValue, target: string): PgError {
   return new PgError(SqlState.INVALID_PARAMETER_VALUE, `cannot cast jsonb ${jsonbTypeofName(v)} to type ${target}`);
 }
 
-function buildObjectArgs(a: unknown[], fc: FnCall, fnName: string): void {
+function buildObjectArgs(a: unknown[], fnName: string): void {
   if (a.length % 2 !== 0) {
     throw new PgError(SqlState.INVALID_PARAMETER_VALUE, 'argument list must have even number of elements', {
       hint: `The arguments of ${fnName}() must consist of alternating keys and values.`,
     });
   }
+}
+
+/**
+ * json_build_object_worker: the json text of alternating keys and values — what json_build_object() and
+ * JSON_OBJECT(… RETURNING json) build. `absentOnNull` drops a pair whose value is SQL NULL (its key still counts for
+ * `unique`, which refuses a repeated key text).
+ */
+function buildJsonObjectText(a: unknown[], types: number[], fc: FnCall, absentOnNull: boolean, unique: boolean): string {
+  const seen = unique ? new Set<string>() : null;
+  let text = '{';
+  let sep = '';
   for (let i = 0; i < a.length; i += 2) {
+    const skip = absentOnNull && a[i + 1] === null;
+    if (skip && !seen) {
+      continue;
+    }
     if (a[i] === null) {
-      throw new PgError(SqlState.NULL_VALUE_NOT_ALLOWED, `argument ${i + 1}: key must not be null`);
+      throw new PgError(SqlState.NULL_VALUE_NOT_ALLOWED, 'null value not allowed for object key');
+    }
+    const key = datumToJson(a[i], types[i], fc, true);
+    if (seen) {
+      if (seen.has(key)) {
+        throw new PgError(SqlState.DUPLICATE_JSON_OBJECT_KEY_VALUE, `duplicate JSON object key value: ${key}`);
+      }
+      seen.add(key);
+    }
+    if (!skip) {
+      text += sep + key + ' : ' + datumToJson(a[i + 1], types[i + 1], fc);
+      sep = ', ';
     }
   }
-  void fc;
+  return text + '}';
+}
+
+/** jsonb_build_object_worker: jsonb_build_object() and JSON_OBJECT(… RETURNING jsonb); ABSENT ON NULL drops every null value. */
+function buildJsonbObject(a: unknown[], types: number[], fc: FnCall, absentOnNull: boolean, unique: boolean): JsonbObject {
+  const pairs: [string, JsonbValue][] = [];
+  for (let i = 0; i < a.length; i += 2) {
+    if (a[i] === null) {
+      throw new PgError(SqlState.INVALID_PARAMETER_VALUE, `argument ${i + 1}: key must not be null`);
+    }
+    if (absentOnNull && a[i + 1] === null && !unique) {
+      continue;
+    }
+    const k = datumToJsonb(a[i], types[i], fc, true);
+    pairs.push([typeof k === 'string' ? k : jsonbToText(k), datumToJsonb(a[i + 1], types[i + 1], fc)]);
+  }
+  if (unique && new Set(pairs.map((p) => p[0])).size < pairs.length) {
+    throw new PgError(SqlState.DUPLICATE_JSON_OBJECT_KEY_VALUE, 'duplicate JSON object key value');
+  }
+  return JsonbObject.fromPairs(absentOnNull ? pairs.filter((p) => p[1] !== JNULL) : pairs);
+}
+
+/** json(b)_build_array_worker: json_build_array() / jsonb_build_array() and JSON_ARRAY(…); `absentOnNull` skips SQL NULLs. */
+function buildJsonArrayText(a: unknown[], types: number[], fc: FnCall, absentOnNull: boolean): string {
+  let text = '[';
+  let sep = '';
+  for (let i = 0; i < a.length; i++) {
+    if (!(absentOnNull && a[i] === null)) {
+      text += sep + datumToJson(a[i], types[i], fc);
+      sep = ', ';
+    }
+  }
+  return text + ']';
+}
+
+function buildJsonbArray(a: unknown[], types: number[], fc: FnCall, absentOnNull: boolean): JsonbValue[] {
+  const out: JsonbValue[] = [];
+  for (let i = 0; i < a.length; i++) {
+    if (!(absentOnNull && a[i] === null)) {
+      out.push(datumToJsonb(a[i], types[i], fc));
+    }
+  }
+  return out;
+}
+
+/** JSON_OBJECT(…) / JSON_ARRAY(…): the constructor's spec (JsonCtorSpec) first, then its keys and values in order. */
+function jsonConstructor(args: unknown[], fc: FnCall): unknown {
+  const spec = JSON.parse(args[0] as string) as JsonCtorSpec;
+  const a = args.slice(1);
+  const types = fc.argTypes.slice(1);
+  if (spec.ctor === 'array') {
+    return spec.jsonb ? buildJsonbArray(a, types, fc, spec.absentOnNull) : buildJsonArrayText(a, types, fc, spec.absentOnNull);
+  }
+  return spec.jsonb ? buildJsonbObject(a, types, fc, spec.absentOnNull, spec.unique) : buildJsonObjectText(a, types, fc, spec.absentOnNull, spec.unique);
 }
 
 function variadicArgs(a: unknown[], fc: FnCall): { values: unknown[]; types: number[] } {
@@ -590,6 +669,7 @@ function variadicArgs(a: unknown[], fc: FnCall): { values: unknown[]; types: num
 
 export const JSON_FUNCS: Record<string, FnImpl> = {
   __linkgress_json_func: (a, fc) => jsonFunc(a, fc),
+  __linkgress_json_ctor: (a, fc) => jsonConstructor(a, fc),
   // constructors
   to_json: (a, fc) => datumToJson(a[0], fc.argTypes[0], fc),
   to_jsonb: (a, fc) => datumToJsonb(a[0], fc.argTypes[0], fc),
@@ -599,38 +679,24 @@ export const JSON_FUNCS: Record<string, FnImpl> = {
   array_to_json_pretty: (a, fc) => arrayToJson(a[0] as unknown[], fc.st.catalog.getType(fc.argTypes[0])?.elem ?? TypeOid.text, fc, a[1] === true),
   json_build_object: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
-    buildObjectArgs(a, fc, 'json_build_object');
-    let text = '{';
-    for (let i = 0; i < a.length; i += 2) {
-      const key = datumToJson(a[i], types[i], fc, true);
-      text += (i === 0 ? '' : ', ') + key + ' : ' + datumToJson(a[i + 1], types[i + 1], fc);
-    }
-    return text + '}';
+    buildObjectArgs(a, 'json_build_object');
+    return buildJsonObjectText(a, types, fc, false, false);
   },
   json_build_object_noargs: () => '{}',
   json_build_array: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
-    let text = '[';
-    for (let i = 0; i < a.length; i++) {
-      text += (i === 0 ? '' : ', ') + datumToJson(a[i], types[i], fc);
-    }
-    return text + ']';
+    return buildJsonArrayText(a, types, fc, false);
   },
   json_build_array_noargs: () => '[]',
   jsonb_build_object: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
-    buildObjectArgs(a, fc, 'jsonb_build_object');
-    const pairs: [string, JsonbValue][] = [];
-    for (let i = 0; i < a.length; i += 2) {
-      const k = datumToJsonb(a[i], types[i], fc, true);
-      pairs.push([typeof k === 'string' ? k : jsonbToText(k), datumToJsonb(a[i + 1], types[i + 1], fc)]);
-    }
-    return JsonbObject.fromPairs(pairs);
+    buildObjectArgs(a, 'jsonb_build_object');
+    return buildJsonbObject(a, types, fc, false, false);
   },
   jsonb_build_object_noargs: () => new JsonbObject(),
   jsonb_build_array: (args, fc) => {
     const { values: a, types } = variadicArgs(args, fc);
-    return a.map((v, i) => datumToJsonb(v, types[i], fc));
+    return buildJsonbArray(a, types, fc, false);
   },
   jsonb_build_array_noargs: () => [],
   json_object: (a) => {
