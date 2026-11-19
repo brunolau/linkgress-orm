@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { DbCteBuilder, JoinQueryBuilder, LinkgressConfig, eq, gt, sql } from '../../src';
+import { DbCteBuilder, JoinQueryBuilder, LinkgressConfig, coalesce, eq, gt, sql } from '../../src';
 import type { QueryOptions } from '../../src';
 import { expectToReject } from '../utils/expect-rejects';
 import { seedTestData, withDatabase } from '../utils/test-database';
@@ -354,6 +354,46 @@ describe('navigation columns', () => {
       const rows = await db.postComments.orderBy(c => c.id).select(c => ({ total: c.order!.totalAmount })).toList();
 
       expect(rows).toEqual([{ total: 99.99 }, { total: 149.99 }, { total: 149.99 }]);
+    });
+  });
+});
+
+describe('coalesce over columns', () => {
+  // COALESCE's result has the type of its operands: over text columns a digits-only value is a name (a
+  // document number), not a number. It used to read through the untyped conversion — '90003526000000034'
+  // came back as the number 90003526000000030 (rounded past 2^53), '01234' as 1234.
+  test('over text columns a digits-only value stays text — root, navigation, nested, literal fallback', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+      const zip = await db.users.insert({ username: '90003526000000034', email: '01234', age: 7 }).returning();
+      await db.posts.insert({ title: 'coalesce post', userId: zip.id, views: 1 });
+
+      const root = await db.users
+        .where(u => eq(u.id, zip.id))
+        .select(u => ({
+          number: coalesce(u.username, u.email),
+          fallback: coalesce(u.email, ''),
+          nested: { number: coalesce(u.username, u.email) },
+        }))
+        .first();
+      const navigated = await db.posts
+        .where(p => eq(p.title, 'coalesce post'))
+        .select(p => ({ number: coalesce(p.user!.username, p.title) }))
+        .first();
+
+      expect(root).toEqual({ number: '90003526000000034', fallback: '01234', nested: { number: '90003526000000034' } });
+      expect(navigated).toEqual({ number: '90003526000000034' });
+    });
+  });
+
+  test('over a numeric column it keeps reading as a number', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+      const zip = await db.users.insert({ username: 'coalesce-age', email: 'a@x', age: 7 }).returning();
+
+      const row = await db.users.where(u => eq(u.id, zip.id)).select(u => ({ age: coalesce(u.age, 0) })).first();
+
+      expect(row).toEqual({ age: 7 });
     });
   });
 });

@@ -1716,8 +1716,18 @@ export function coalesce(
   const values = mapper
     ? all.map(value => isSqlFragmentLiteral(value) ? applyToDriverMapper(value, mapper) : value)
     : all;
+  const fragment = new SqlFragment<any>(parts, values, mapper);
 
-  return new SqlFragment<any>(parts, values, mapper);
+  if (mapper !== undefined) {
+    return fragment;
+  }
+
+  // No operand maps the result: it reads as a column of the type its operands declare (PostgreSQL resolves
+  // them to one type). Without it the value read through the untyped conversion, so a text column's
+  // digits-only '90003526000000034' came back as a number, rounded past 2^53.
+  const readType = all.map(operandSqlType).find(type => type !== undefined && PG_TYPE_NAME_PATTERN.test(type));
+
+  return readType === undefined ? fragment : fragment.withReadType(readType);
 }
 
 /**
@@ -2481,6 +2491,17 @@ export function pickResultMapper(values: readonly unknown[]): any | undefined {
   }
 
   return fallback;
+}
+
+/** A column's declared SQL type, when the ref carries it (schema-aware mock rows do). @internal */
+export function declaredSqlType(column: unknown): string | undefined {
+  const sqlType = (column as { __sqlType?: unknown } | null | undefined)?.__sqlType;
+  return typeof sqlType === 'string' && sqlType !== 'array' ? sqlType : undefined;
+}
+
+/** The SQL type an operand is known to have: a column's declared type, or a fragment's read type. @internal */
+export function operandSqlType(operand: unknown): string | undefined {
+  return declaredSqlType(operand) ?? (operand instanceof SqlFragment ? operand.getReadType() : undefined);
 }
 
 /**

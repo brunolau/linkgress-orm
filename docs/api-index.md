@@ -232,7 +232,7 @@ A helper renders one operand of the statement that uses it and sends nothing on 
 
 - `caseWhen(condition, then).when(condition, then).else(value)` — searched CASE (`CaseWhenExpression`); without `.else()` an unmatched row gives NULL. [guide](./guides/sql-expressions.md#choose-a-value-by-condition-casewhen-caseof)
 - `caseOf(subject).when(match, then).else(value)` — simple CASE (`CaseOfBuilder` → `CaseOfExpression`), compared with `=`, so a NULL subject matches no branch. [guide](./guides/sql-expressions.md#choose-a-value-by-condition-casewhen-caseof)
-- `coalesce(a, b, …)` — `COALESCE`; the first operand that carries a mapper reads the result. [guide](./guides/sql-expressions.md#handle-nulls-and-compare-null-safely-coalesce-nullif-greatest-isdistinctfrom)
+- `coalesce(a, b, …)` — `COALESCE`; the first operand that carries a mapper reads the result, else the type of the first typed operand (a column; since 1.0.45). [guide](./guides/sql-expressions.md#handle-nulls-and-compare-null-safely-coalesce-nullif-greatest-isdistinctfrom)
 - `nullIf(value, other)` — `NULLIF`. [guide](./guides/sql-expressions.md#handle-nulls-and-compare-null-safely-coalesce-nullif-greatest-isdistinctfrom)
 - `greatest(a, b, …)` / `least(a, b, …)` — `GREATEST` / `LEAST`, at least two operands. [guide](./guides/sql-expressions.md#handle-nulls-and-compare-null-safely-coalesce-nullif-greatest-isdistinctfrom)
 - `isDistinctFrom(a, b)` / `isNotDistinctFrom(a, b)` — NULL-safe comparison, as a condition or a value. [guide](./guides/sql-expressions.md#handle-nulls-and-compare-null-safely-coalesce-nullif-greatest-isdistinctfrom)
