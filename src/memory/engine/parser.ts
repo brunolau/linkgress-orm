@@ -1,5 +1,5 @@
 import * as A from './ast';
-import { syntaxError } from './errors';
+import { notSupported, syntaxError } from './errors';
 import { Token, tokenize } from './lexer';
 
 /**
@@ -2043,12 +2043,70 @@ export class Parser {
     return node;
   }
 
-  private parseJsonFormatClause(): void {
+  /** `[FORMAT JSON [ENCODING name]]`; true when given. */
+  private parseJsonFormatClause(): boolean {
     if (this.acceptKws('FORMAT', 'JSON')) {
       if (this.acceptKw('ENCODING')) {
         this.parseColId();
       }
+      return true;
     }
+    return false;
+  }
+
+  /**
+   * JSON_OBJECT( … ) / JSON_ARRAY( … ), the SQL/JSON constructors (gram.y json_object_constructor /
+   * json_array_constructor, PostgreSQL 16+). `JSON_OBJECT(expr [, …])` with neither VALUE nor `:` after its first
+   * expression is the legacy json_object(text[]) call: null, the caller parses it as a function call.
+   */
+  private parseJsonConstructor(loc: number): A.JsonConstructorExpr | null {
+    const start = this.p;
+    const ctor = this.next().kw === 'JSON_OBJECT' ? 'object' : 'array';
+    this.expectPunct('(');
+    const node: A.JsonConstructorExpr = { kind: 'JsonConstructorExpr', ctor, items: [], absentOnNull: ctor === 'array', unique: false, returning: null, loc };
+    if (ctor === 'array' && this.atKw('SELECT', 'VALUES', 'TABLE', 'WITH')) {
+      throw notSupported('JSON_ARRAY(query)');
+    }
+    if (!this.atPunct(')') && !this.atKw('RETURNING')) {
+      do {
+        let key: A.Expr | null = null;
+        if (ctor === 'object') {
+          const first = node.items.length === 0;
+          try {
+            key = this.parseExpr();
+          } catch (e) {
+            if (!first) {
+              throw e;
+            }
+          }
+          if (!(key && (this.acceptKw('VALUE') || this.acceptPunct(':')))) {
+            if (!first) {
+              this.error();
+            }
+            this.p = start;
+            return null;
+          }
+        }
+        const value = this.parseExpr();
+        node.items.push({ key, value, formatJson: this.parseJsonFormatClause() });
+      } while (this.acceptPunct(','));
+      if (this.atKw('NULL', 'ABSENT') && this.isKw(this.peek(1), 'ON')) {
+        node.absentOnNull = this.next().kw === 'ABSENT';
+        this.expectKw('ON');
+        this.expectKw('NULL');
+      }
+      if (ctor === 'object' && this.atKw('WITH', 'WITHOUT') && this.isKw(this.peek(1), 'UNIQUE')) {
+        node.unique = this.next().kw === 'WITH';
+        this.next();
+        this.acceptKw('KEYS');
+      }
+    }
+    if (this.acceptKw('RETURNING')) {
+      node.returning = this.parseTypeName();
+      this.parseJsonFormatClause();
+    }
+    this.expectPunct(')');
+    return node;
   }
 
   private parseJsonBehavior(op: A.JsonFuncExpr['op']): A.JsonBehavior {
@@ -2539,6 +2597,15 @@ export class Parser {
         case 'JSON_EXISTS':
           if (this.atPunct('(', 1)) {
             return this.parseJsonQueryFunc(loc);
+          }
+          break;
+        case 'JSON_OBJECT':
+        case 'JSON_ARRAY':
+          if (this.atPunct('(', 1)) {
+            const ctor = this.parseJsonConstructor(loc);
+            if (ctor) {
+              return ctor;
+            }
           }
           break;
         case 'OVERLAY':

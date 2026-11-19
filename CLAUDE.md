@@ -35,9 +35,12 @@ an option):
   `.expectedExecutionTime()`. Precedence in `QueryExecutor.buildExecutionOptions()`:
   per-call → builder override → context option
 - **Process-wide** — `LinkgressConfig` (`src/config/linkgress-config.ts`) is the ONLY exported
-  way to set `inArrayOptThreshold` / `inArrayPadBuckets` / `inArrayUsesOpt` / `orUsesOpt`; the
-  underlying setters live next to the operators in `src/query/conditions.ts` and are not exported
-  from the package. `QueryOptions` keys of the same name write the same process-wide values at
+  way to set `inArrayOptThreshold` / `inArrayPadBuckets` / `inArrayUsesOpt` / `orUsesOpt` /
+  `serverVersion`; the underlying setters live next to their readers (`src/query/conditions.ts`,
+  `serverVersion` in `src/query/sql-utils.ts`) and are not exported from the package.
+  `serverVersion` (1.0.43, default unknown) is the PostgreSQL major SQL may assume — 16+ renders
+  objects past 50 keys as `JSON_OBJECT` (see Collection Strategies); `detectServerVersion(client)`
+  sets it from one `SHOW server_version_num`; it has no `QueryOptions` key. `QueryOptions` keys of the same name write the same process-wide values at
   context construction. `inArrayUsesOpt` (default off) routes plain `inArray`/`notInArray` through
   the `inArrayOpt` rendering — both paths bottom out in the private `renderInArrayOpt`/
   `renderNotInArrayOpt`, NEVER in each other, or the pair becomes mutually recursive.
@@ -143,6 +146,30 @@ Key config fields in `CollectionAggregationConfig`:
 - `aggregationType`: `'jsonb' | 'array' | 'count' | 'min' | 'max' | 'sum' | 'exists'`
 - `foreignKeyTableAlias`: Used by `selectMany()` when the FK is on an intermediate table, not the target: the alias of the first of its HOPS (`SelectManyHop`), each rendered under `<relation>__bridge<n>` — never its table's name. A hop keeps what was written on its items (filters, and limits: `LevelConstraint` / `LevelRank`); a build renames the refs minted from its item to its alias (`renderHops`) and renders its constraints as WHERE predicates (`levelPredicates` / `rankPredicate`) — a limit as `pk IN (SELECT pk … ORDER BY … LIMIT n)` tied to the row it ranks within where the build is correlated to its parent (correlated subquery, LATERAL), as a `ROW_NUMBER()` ranking in the set-based CTE / temp-table forms. A collection nested in a collection subquery correlates to the ROW that minted it (`mintedBy`), found through `SqlBuildContext.collectionScope` (`EnclosingCollectionScope`: item chains, hop rows, taken aliases, the bare names outer rows are read by — never taken by a nested subquery, its path joins or its item navigations — and, inside the projection of the collection a selector returns, the rows a collection there may belong to), never by a table-name lookup alone
 - `selectorNavigationJoins`: JOINs within the collection's selector (not the outer navigation path)
+
+Every object a query builds in SQL (items of all three strategies, `withAggregation()`, navigation rows rendered as one
+object, MutationBatch RETURNING) renders through `renderJsonBuildObject(entries)` (`src/query/sql-utils.ts`): ONE
+`json_build_object` up to 50 keys, byte for byte under every setting. Past that it depends on the process-wide
+`LinkgressConfig.serverVersion` (module variable in `sql-utils.ts`, read at build time by `usesSqlJsonConstructors()`):
+- **16+**: ONE `JSON_OBJECT('k' VALUE v, … RETURNING json)` — a SQL/JSON constructor, not a function call, so no
+  argument cap; keys through `quoteSqlLiteral`. `RETURNING json` is mandatory (a jsonb value otherwise turns the object
+  jsonb, keys re-sorted).
+- **Unknown (the default) or below 16**: `(SELECT row_to_json(r.*) FROM (SELECT v AS "k", …) r)` (`r.*`, never a bare
+  `r`: a column named r wins), or — a key empty or over 63 bytes, over 1 664 keys — the json TEXTS of 50-key calls
+  spliced (`spliceJsonTexts`). PostgreSQL 15 cannot parse JSON_OBJECT's VALUE syntax, so this stays the default.
+
+PostgreSQL takes at most 100 arguments per call (54023), and the in-memory engine enforces it too
+(`parseFuncOrColumn`; its `JSON_OBJECT` / `JSON_ARRAY` constructors are `JsonConstructorExpr` nodes, never counted).
+Never emit a `json_build_object(` of a caller-sized list by hand. The LateralSqlCache key carries the setting (`O`).
+- **Values are columns of the object's own row source** (`JsonObjectEntry.value`): a column ref or a nested object of
+  them, never an aggregate / window / set-returning / uncorrelated volatile expression — below 16 / unknown, past 50
+  keys the value is evaluated inside the row_to_json sub-select, one query level down (`count(*)` reads 1 there).
+  Compute such a value in the row source and reference its column, as every builder does (pinned: projection-reads "a
+  nested collection and aggregates in a wide item stay exact", under both settings).
+- The `json(b)BuildObject()` / `json(b)BuildArray()` helpers take arbitrary operands, so past the cap they never use
+  row_to_json: on 16+ one `JSON_OBJECT(… RETURNING json|jsonb)` / `JSON_ARRAY(… NULL ON NULL RETURNING json|jsonb)`
+  (`NULL ON NULL` mandatory: JSON_ARRAY drops NULLs by default); below 16 / unknown json splices the texts
+  (`jsonTextSpliceParts`), jsonb merges with `||`.
 
 ## Custom Type Mappers
 

@@ -47,6 +47,9 @@ const AGG_FORBIDDEN: Record<string, string> = {
 
 const WINDOW_ALLOWED = new Set(['select', 'order_by']);
 
+/** PostgreSQL's FUNC_MAX_ARGS (pg_config_manual.h, fixed at compile time): the most arguments a function call passes. */
+const FUNC_MAX_ARGS = 100;
+
 function displayArgTypes(an: Analyzer, types: number[]): string {
   return types.map((t) => an.types.formatType(t, -1, false)).join(', ');
 }
@@ -130,6 +133,11 @@ export function transformProcedureCall(an: Analyzer, pstate: ParseState, node: A
 }
 
 export function parseFuncOrColumn(an: Analyzer, pstate: ParseState, node: A.FuncCall, args: TExpr[], procCall = false): TExpr {
+  // ParseFuncOrColumn: no call passes more than FUNC_MAX_ARGS arguments, counted as written (a VARIADIC array is one,
+  // WITHIN GROUP arguments count), before any lookup — PostgreSQL's parser sizes its argument arrays by it
+  if (args.length > FUNC_MAX_ARGS) {
+    throw new PgError(SqlState.TOO_MANY_ARGUMENTS, `cannot pass more than ${FUNC_MAX_ARGS} arguments to a function`);
+  }
   const names = node.name;
   const isAggDecorated = node.aggStar || node.aggDistinct || node.aggOrder.length > 0 || node.aggFilter !== null || node.aggWithinGroup;
   const argTypes = args.map((a) => a.type);

@@ -1,6 +1,6 @@
 import type * as A from '../ast';
 import { COLL_DEFAULT, TypeOid } from '../catalog/catalog';
-import { PgError, SqlState } from '../errors';
+import { notSupported, PgError, SqlState } from '../errors';
 import { PgNumeric } from '../types/numeric';
 import { PgBits } from '../types/values';
 import type { Analyzer } from './analyzer';
@@ -70,6 +70,8 @@ function transformExprNode(an: Analyzer, pstate: ParseState, node: A.Expr): TExp
       return transformFuncCall(an, pstate, node);
     case 'JsonFuncExpr':
       return transformJsonFuncExpr(an, pstate, node);
+    case 'JsonConstructorExpr':
+      return transformJsonConstructor(an, pstate, node);
     case 'CaseExpr':
       return transformCaseExpr(an, pstate, node);
     case 'CoalesceExpr': {
@@ -306,6 +308,74 @@ function transformJsonFuncExpr(an: Analyzer, pstate: ParseState, node: A.JsonFun
     variadic: false,
     strict: false,
   };
+}
+
+/** Settings of a JSON_OBJECT / JSON_ARRAY constructor, passed to the executor as its first (constant text) argument. */
+export interface JsonCtorSpec {
+  ctor: A.JsonConstructorExpr['ctor'];
+  /** built as jsonb (RETURNING jsonb, or no RETURNING and a jsonb argument), else as json */
+  jsonb: boolean;
+  absentOnNull: boolean;
+  unique: boolean;
+}
+
+/**
+ * transformJsonObjectConstructor / transformJsonArrayConstructor: keys as written, each value through
+ * transformJsonValueExpr (unknown → text; FORMAT JSON turns a string into json); the result is built as json or jsonb
+ * (transformJsonConstructorOutput: RETURNING jsonb, or no RETURNING and any argument jsonb) and coerced to the
+ * RETURNING type at assignment level, as makeJsonConstructorExpr does.
+ */
+function transformJsonConstructor(an: Analyzer, pstate: ParseState, node: A.JsonConstructorExpr): TExpr {
+  const constructName = node.ctor === 'object' ? 'JSON_OBJECT()' : 'JSON_ARRAY()';
+  const args: TExpr[] = [];
+  for (const item of node.items) {
+    if (item.key) {
+      args.push(transformExprRecurse(an, pstate, item.key));
+    }
+    let value = transformExprRecurse(an, pstate, item.value);
+    if (value.type === TypeOid.unknown) {
+      value = an.coerceToSpecificType(value, TypeOid.text, constructName);
+    }
+    if (item.formatJson && value.type !== TypeOid.json && value.type !== TypeOid.jsonb) {
+      if (value.type === TypeOid.bytea) {
+        throw notSupported('FORMAT JSON of a bytea value');
+      }
+      if (!an.types.isStringCategory(value.type)) {
+        throw positioned(new PgError(SqlState.DATATYPE_MISMATCH, 'cannot use non-string types with explicit FORMAT JSON clause'), exprLocation(value));
+      }
+      value = an.coerceToTargetType(value, TypeOid.json, -1, 'explicit', 'explicit_cast')!;
+    }
+    args.push(value);
+  }
+  const returning = node.returning
+    ? atPosition(node.returning.loc ?? node.loc, () => an.types.lookupTypeName(node.returning!, an.env.relationSearchPath()))
+    : null;
+  const jsonb = returning ? returning.oid === TypeOid.jsonb : args.some((a) => a.type === TypeOid.jsonb);
+  const spec: JsonCtorSpec = { ctor: node.ctor, jsonb, absentOnNull: node.absentOnNull, unique: node.unique };
+  const type = jsonb ? TypeOid.jsonb : TypeOid.json;
+  const built: TExpr = {
+    k: 'func',
+    funcOid: 0,
+    funcName: node.ctor === 'object' ? 'json_object' : 'json_array',
+    funcSrc: '__linkgress_json_ctor',
+    args: [{ k: 'const', type: TypeOid.text, typmod: -1, collation: COLL_DEFAULT, value: JSON.stringify(spec), isNull: false }, ...args],
+    type,
+    typmod: -1,
+    collation: 0,
+    inputCollation: 0,
+    retset: false,
+    format: 'call',
+    variadic: false,
+    strict: false,
+  };
+  if (!returning || returning.oid === type) {
+    return built;
+  }
+  const coerced = an.coerceToTargetType(built, returning.oid, returning.typmod, 'assignment', 'implicit_cast');
+  if (!coerced) {
+    throw new PgError(SqlState.CANNOT_COERCE, `cannot cast type ${an.types.formatType(type, -1, false)} to ${an.types.formatType(returning.oid, -1, false)}`);
+  }
+  return coerced;
 }
 
 export function transformTypeCast(an: Analyzer, pstate: ParseState, node: A.TypeCast): TExpr {

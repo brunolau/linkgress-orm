@@ -610,6 +610,8 @@ ORDER BY "title" ASC
   the planner.
 - `concatStrict()` needs at least two operands; a plain value binds as `CAST($n AS text)`, `null` / `undefined` as
   `CAST(NULL AS text)`. A digits-only result stays a string.
+- `concat()` takes at most 100 operands and `concatWs()` 99 after the separator (one function call: past that `54023`,
+  on PostgreSQL and, since 1.0.43, on the in-memory database): split a longer list into several calls.
 - `substring(x, pattern)` always renders the function-call form `substring(x, 'pattern')`, never
   `SUBSTRING(x FROM …)`, which is the expression an index written that way holds.
 - `searchNormalize()` calls `public.search_normalize()` (`lower(unaccent(x))`), which the schema manager creates for an
@@ -948,6 +950,15 @@ LIMIT 1
 - No mapper applies inside JSON: a `timestamp` arrives as JSON text (`'2024-03-10T08:30:00'`, no zone), a mapped column
   as its stored value. To get typed values, project the columns themselves; a nested object in `select()` renders as
   columns read through their mappers.
+- A function call takes at most 100 arguments on PostgreSQL (since 1.0.43; before, `54023` on every execution past
+  50 keys / 100 elements). With `LinkgressConfig.serverVersion` 16 or more the builders render one SQL/JSON
+  constructor past the cap: `JSON_OBJECT('k' VALUE v, … RETURNING json|jsonb)`, `JSON_ARRAY(v, … NULL ON NULL
+  RETURNING json|jsonb)` ([Configuration](./configuration.md#objects-of-more-than-50-keys-on-postgresql-16-serverversion)).
+  Unknown (the default) or below 16, calls of 50 (100) joined into the one value: `jsonBuildObject()` /
+  `jsonBuildArray()` splice their json texts, `(left(json_build_object(…50 keys…)::text, -1) || ', ' ||
+  right(json_build_object(…)::text, -1))::json` — the text one call would print, keys in written order;
+  `jsonbBuildObject()` / `jsonbBuildArray()` merge their jsonb with `||`. Any operand keeps its meaning, an aggregate
+  or a window included: there is no sub-select ([Projections wider than 50 keys](./querying.md#projections-wider-than-50-keys)).
 - `json` keeps the written key order and is cheaper to build when the value only travels to the client; `jsonb` does
   not keep the order.
 
