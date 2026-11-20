@@ -359,9 +359,9 @@ describe('navigation columns', () => {
 });
 
 describe('coalesce over columns', () => {
-  // COALESCE's result has the type of its operands: over text columns a digits-only value is a name (a
-  // document number), not a number. It used to read through the untyped conversion — '90003526000000034'
-  // came back as the number 90003526000000030 (rounded past 2^53), '01234' as 1234.
+  // Over text columns COALESCE's result is a text: a digits-only value is a name (a document number), not a
+  // number. It used to read through the untyped conversion — '90003526000000034' came back as the number
+  // 90003526000000030 (rounded past 2^53), '01234' as 1234.
   test('over text columns a digits-only value stays text — root, navigation, nested, literal fallback', async () => {
     await withDatabase(async db => {
       await seedTestData(db);
@@ -386,14 +386,22 @@ describe('coalesce over columns', () => {
     });
   });
 
-  test('over a numeric column it keeps reading as a number', async () => {
+  // Only a text result is typed. A grouped select hands back a numeric as the driver delivers it (its exact
+  // string); typed by its column the coalesce would read a number there, and an int8 past 2^53 would lose digits.
+  test('over a numeric column a grouped select keeps the value as the driver delivers it', async () => {
     await withDatabase(async db => {
       await seedTestData(db);
-      const zip = await db.users.insert({ username: 'coalesce-age', email: 'a@x', age: 7 }).returning();
 
-      const row = await db.users.where(u => eq(u.id, zip.id)).select(u => ({ age: coalesce(u.age, 0) })).first();
+      const rows = await db.postComments
+        .select(c => ({ total: c.order!.totalAmount }))
+        .groupBy(r => ({ total: r.total }))
+        .select(g => ({ total: g.key.total, coalesced: coalesce(g.key.total, 0) }))
+        .toList();
 
-      expect(row).toEqual({ age: 7 });
+      expect([...rows].sort((a, b) => Number(a.total) - Number(b.total)) as unknown).toEqual([
+        { total: '99.99', coalesced: '99.99' },
+        { total: '149.99', coalesced: '149.99' },
+      ]);
     });
   });
 });

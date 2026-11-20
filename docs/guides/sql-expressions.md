@@ -177,11 +177,11 @@ A projected value reads back by one of these rules; the helper decides which:
 | A helper with an explicit result type: casts (except `castAsNumeric`), `literal()` of a string / boolean / bigint, `param()`, `typedNull()`, string helpers, JSON paths and builders, `jsonbSet` / `jsonbRemoveKey` / `jsonbRemovePath`, `jsonbTypeOf`, `jsonbArrayLength`, `atTimeZone`, `dateTrunc`, `toChar`, `toInterval`, `addInterval`, `subInterval`, `arrayLength()`, CASE, `nullIf`, `greatest`, `least` | the driver's value as delivered: `'007'` stays a string, NULL is `null` |
 | A numeric helper: `castAsNumeric`, `literal(<number>)`, `round`, `floor`, `ceil`, `abs`, `mod`, `modulo`, `datePart`, `agg.count` / `countDistinct` / `sum` / `avg` / `bitOr` / `bitAnd`, `win.*` | a JS `number` (numeric and int8 text converted with `Number()`); NULL is `null` |
 | CASE, `coalesce`, `greatest`, `least`, `nullIf` or an arithmetic helper with an operand that carries a custom mapper | through that mapper: `caseWhen(…, p.customDate)` reads a `Date` |
-| `coalesce` with no mapped operand but a typed one (a column, a read-typed fragment) (since 1.0.45) | as a column of the first typed operand's type: over a text column `'007'` stays a string, over a numeric column the value is a number |
+| `coalesce` with no mapped operand, over `text` / `varchar` operands (since 1.0.45) | as a `text` column: `'007'` stays a string; NULL is `undefined` at the top level of a projection and `null` inside a nested object |
 | `agg.min()` / `agg.max()` | through the operand's mapper; a JS number for a numeric or int8 operand; else as delivered |
 | `agg.arrayAgg()` | an array; each element through the operand's mapper |
 | `agg.jsonAgg()` / `agg.jsonbAgg()`, the JSON builders | the driver-parsed JSON, no per-element mapping |
-| A fragment without a mapper: an `sql` template, a scalar subquery's `asExpression()`, a predicate helper (`jsonbContains`, `arrayIsEmpty`, `isDistinctFrom`, …), `jsonbSelect` / `jsonbSelectText`, `jsonbMerge`, `arrayAppendUnique` / `arrayRemove`, `currentTimestamp()` and its siblings, `coalesce` with no mapped or typed operand, the arithmetic helpers when no operand carries a mapper | the generic conversion: a numeric-looking string becomes a number (`'007'` → `7`); NULL is `undefined` at the top level of a projection and `null` inside a nested object |
+| A fragment without a mapper: an `sql` template, a scalar subquery's `asExpression()`, a predicate helper (`jsonbContains`, `arrayIsEmpty`, `isDistinctFrom`, …), `jsonbSelect` / `jsonbSelectText`, `jsonbMerge`, `arrayAppendUnique` / `arrayRemove`, `currentTimestamp()` and its siblings, `coalesce` over any other operands when none carries a mapper, the arithmetic helpers when no operand carries a mapper | the generic conversion: a numeric-looking string becomes a number (`'007'` → `7`); NULL is `undefined` at the top level of a projection and `null` inside a nested object |
 | The same fragment in a grouped select (`groupBy(…).select(…)`) | the driver's value as delivered: int8 / numeric as strings, NULL as `null` |
 
 `.withReadType(pgType)` makes a fragment read the way a COLUMN of `pgType` reads, with no change to the SQL.
@@ -503,7 +503,7 @@ For a plain NULL test use `isNull()` / `isNotNull()` ([Querying](./querying.md))
 | Helper (over `posts`) | Renders | Reads as |
 |---|---|---|
 | `coalesce(nullIf(p.subtitle, ''), p.title)` | `COALESCE(NULLIF("posts"."subtitle", $1), "posts"."title")` | the first non-NULL operand |
-| `coalesce(p.subtitle, 'none')` | `COALESCE("posts"."subtitle", $2)` | as the `subtitle` column reads: `'007'` stays `'007'` (see below) |
+| `coalesce(p.subtitle, 'none')` | `COALESCE("posts"."subtitle", $2)` | a text, as `subtitle` is: `'007'` stays `'007'` (see below) |
 | `coalesce(p.customDate, new Date(…))` | `COALESCE("posts"."custom_date", $3)`, parameter `-31622400` | `Date`: the mapper converts the fallback and the result |
 | `greatest(p.views, 120)` | `GREATEST("posts"."views", $4)` | the largest operand; NULL operands are ignored |
 | `least(p.views, 120, 130)` | `LEAST("posts"."views", $5, $6)` | the smallest operand |
@@ -529,18 +529,19 @@ FROM "posts"
 WHERE ("posts"."subtitle" IS DISTINCT FROM NULL)
 ```
 
-`coalesce()` without an operand that carries a mapper reads as a column of the type its first typed operand (a
-column, a read-typed fragment) declares (since 1.0.45): over a text column a digits-only value stays text, over a
-numeric column it reads as a number. Only when no operand declares a type (plain values, an `sql` template) does it
-read through the generic conversion, where `'007'` becomes `7`; keep the text there with a `literal()` fallback,
-`.withReadType('text')` or a cast:
+`coalesce()` over text reads as a text (since 1.0.45): when no operand carries a mapper, at least one operand
+declares a type and every one that does declares `text` or `varchar`, a digits-only value stays a string. An
+operand's type is a column's, a read-typed fragment's, or the one a scalar subquery of one unmapped column reads as.
+Every other `coalesce()` without a mapped operand reads through the generic conversion as before, where `'007'`
+becomes `7`: a number or a date, `char(n)`, `citext`, a mix of types, or operands that declare no type (plain
+values, an `sql` template). Keep a text there with a `literal()` fallback, `.withReadType('text')` or a cast:
 
 ```ts
 // posts.subtitle of post 1 is '007'
 const codes = await db.posts
   .where(p => eq(p.id, 1))
   .select(p => ({
-    columnTyped: coalesce(p.subtitle, 'none'),                    // '007' (1.0.44 and earlier: 7)
+    textColumn: coalesce(p.subtitle, 'none'),                     // '007' (1.0.44 and earlier: 7)
     literalFallback: coalesce(p.subtitle, literal('none')),       // '007'
     readAsText: coalesce(p.subtitle, 'none').withReadType('text'), // '007'
     cast: castAsString(coalesce(p.subtitle, 'none')),             // '007'
@@ -550,7 +551,7 @@ const codes = await db.posts
 ```
 
 ```sql
-SELECT COALESCE("posts"."subtitle", $1) as "columnTyped",
+SELECT COALESCE("posts"."subtitle", $1) as "textColumn",
   COALESCE("posts"."subtitle", 'none') as "literalFallback",
   COALESCE("posts"."subtitle", $2) as "readAsText",
   CAST(COALESCE("posts"."subtitle", $3) AS text) as "cast",
@@ -562,8 +563,8 @@ LIMIT 1
 ```
 
 - `coalesce()` takes two or more operands. The first operand mapper wins (a mapped column reads as its mapped type),
-  and its `toDriver` converts the plain fallbacks; the fallbacks bind untyped. Without a mapper, the first operand
-  with a declared type sets how the result reads.
+  and its `toDriver` converts the plain fallbacks; the fallbacks bind untyped. Without a mapper, `text` / `varchar`
+  operands make the result read as a text; nothing else is typed.
 - `greatest()` / `least()` need at least two operands and type plain operands only when every operand is plain;
   `nullIf()`, `greatest()` and `least()` read the driver's value (or through a mapped operand's mapper).
 - `IS [NOT] DISTINCT FROM` is not served by a btree index. For a plain NULL test use `isNull()` / `isNotNull()`; for
@@ -1565,9 +1566,9 @@ SELECT username, email FROM users WHERE age >= $1 ORDER BY id
   numeric → **Do** use `jsonbPathText()`. Mapper-less fragments read `'007'` as `7`.
 - **Don't** expect `cast<number>(x, 'numeric')` to return a number → **Do** use `castAsNumeric()`, or keep the string
   for exact decimals. The type parameter only types the result; the value is the driver's string (`'50.0'`).
-- **Don't** `coalesce()` only untyped operands (an `sql` template, plain values) when the text can be digits only →
-  **Do** add a `literal()` fallback, `.withReadType('text')` or `castAsString(…)`. Without a mapped or typed operand
-  the result reads `'007'` as `7`; a column operand types it (since 1.0.45).
+- **Don't** `coalesce()` untyped operands (an `sql` template, plain values) or a `char(n)` / `citext` column when
+  the text can be digits only → **Do** add a `literal()` fallback, `.withReadType('text')` or `castAsString(…)`.
+  Only `text` / `varchar` operands make the result a text (since 1.0.45); otherwise it reads `'007'` as `7`.
 - **Don't** pass two plain values to `add` / `sub` / `mul` / `div` → **Do** compute them in JS or type one with
   `param(v, 'integer')`. Two untyped parameters fail: `operator is not unique: unknown + unknown`.
 - **Don't** divide two integers expecting a fraction → **Do** `div(castAsDouble(a), b)`. `div(userId, 2)` reads `0`.
@@ -1602,9 +1603,9 @@ SELECT username, email FROM users WHERE age >= $1 ORDER BY id
 
 ## Version notes
 
-- 1.0.45: `coalesce()` with no mapped operand reads as the type of its first typed operand (a column, a read-typed
-  fragment). Over a text column a digits-only value stays text; before, it read through the generic conversion
-  (`'007'` → `7`, and a 17-digit number lost its last digits past 2^53).
+- 1.0.45: `coalesce()` with no mapped operand reads as a text when its typed operands are all `text` / `varchar`.
+  A digits-only value stays a string; before, it read through the generic conversion (`'007'` → `7`, and a 17-digit
+  number lost its last digits past 2^53). Over any other type it reads as before.
 - 1.0.31 added `arrayAppendUnique()` and `arrayRemove()`, and the grouped row's `g.arrayAgg()` / `g.countDistinct()`
   ([Querying](./querying.md)).
 - 1.0.21 added `win.rowNumber()`, `win.rank()`, `win.denseRank()`.

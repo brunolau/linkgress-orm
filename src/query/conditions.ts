@@ -1722,12 +1722,42 @@ export function coalesce(
     return fragment;
   }
 
-  // No operand maps the result: it reads as a column of the type its operands declare (PostgreSQL resolves
-  // them to one type). Without it the value read through the untyped conversion, so a text column's
-  // digits-only '90003526000000034' came back as a number, rounded past 2^53.
-  const readType = all.map(operandSqlType).find(type => type !== undefined && PG_TYPE_NAME_PATTERN.test(type));
+  // No operand maps the result. Over text columns the result is a text and reads as one: through the untyped
+  // conversion a digits-only '90003526000000034' came back as a number, rounded past 2^53. Over any other
+  // operand type the fragment stays as it was, so the value reads (and a CTE column of it compares) as before.
+  return coalescesText(all) ? fragment.withReadType('text') : fragment;
+}
 
-  return readType === undefined ? fragment : fragment.withReadType(readType);
+/** `text` and `varchar` / `character varying`, with or without a length. */
+const TEXT_OPERAND_TYPE = /^\s*(?:text|varchar|character varying)\s*(?:\(\s*\d+\s*\))?\s*$/i;
+
+/**
+ * Whether a COALESCE over `operands` is known to be a text: at least one operand declares a type, and every
+ * one that does declares `text` or `varchar`. An operand's type is a column's declared type, a fragment's read
+ * type, or the type a scalar subquery of one unmapped column reads as. A number, a date, `char(n)`, `citext`
+ * or a mix answers false: PostgreSQL's result type is then not one this helper may name.
+ */
+function coalescesText(operands: readonly unknown[]): boolean {
+  let typed = false;
+
+  for (const operand of operands) {
+    const scalarRead = typeof (operand as { getScalarRead?: unknown } | null | undefined)?.getScalarRead === 'function'
+      ? (operand as Subquery<any, any>).getScalarRead()
+      : undefined;
+    const sqlType = scalarRead === undefined ? operandSqlType(operand) : scalarRead.mapper === undefined ? scalarRead.readType : undefined;
+
+    if (sqlType === undefined) {
+      continue;
+    }
+
+    if (!TEXT_OPERAND_TYPE.test(sqlType)) {
+      return false;
+    }
+
+    typed = true;
+  }
+
+  return typed;
 }
 
 /**
