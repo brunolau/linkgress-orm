@@ -1,6 +1,7 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, spyOn } from 'bun:test';
 import { withDatabase, seedTestData } from '../utils/test-database';
-import { eq, gt, gte, lt, lte, ne, inArray, notInArray, between, and, or, sql } from '../../src';
+import { eq, gt, gte, lt, lte, ne, inArray, notInArray, between, and, or, sql, caseWhen } from '../../src';
+import { pgIntDatetime } from '../../debug/types/int-datetime';
 import PgIntDateTimeUtils from '../../debug/types/pgIntDatetimeUtils';
 
 /**
@@ -875,6 +876,101 @@ describe('toDriver Mapper Tests', () => {
         results.forEach(r => {
           expect(typeof r.userId).toBe('number');
           expect(typeof r.postCount).toBe('number');
+        });
+      });
+    });
+
+    // A comparison in the projection a grouped query reads binds its value through the column's mapper,
+    // as it does in a plain select or where. The grouped row's columns used to carry no mapper: the raw Date
+    // went to the driver for an integer column (PostgreSQL refuses it, the in-memory engine compares wrong).
+    describe('a comparison inside the pre-projected row binds through the column mapper', () => {
+      // Between the seeded dates: Alice's 2024-01-16 post is later, her and Bob's 2024-01-15 posts are not
+      const cutoff = new Date('2024-01-16T00:00:00Z');
+      const boundCutoff = pgIntDatetime.toDriver(cutoff);
+
+      const paramsOfStatementsOn = async (db: any, column: string, run: () => Promise<unknown>): Promise<unknown[][]> => {
+        const spy = spyOn(db.client, 'query');
+
+        try {
+          await run();
+
+          return spy.mock.calls.filter(call => String(call[0]).includes(column)).map(call => call[1] as unknown[]);
+        } finally {
+          spy.mockRestore();
+        }
+      };
+
+      test('an aggregate argument (sum over a CASE)', async () => {
+        await withDatabase(async (db) => {
+          await seedTestData(db);
+          const users = await db.users.toList();
+          const idOf = (name: string) => users.find(u => u.username === name)!.id;
+
+          let rows: { userId: number; later: number }[] = [];
+          const params = await paramsOfStatementsOn(db, '"custom_date"', async () => {
+            rows = await db.posts
+              .select(p => ({ userId: p.userId, later: caseWhen(gt(p.customDate, cutoff), 1).else(0) }))
+              .groupBy(r => ({ userId: r.userId }))
+              .select(g => ({ userId: g.key.userId, later: g.sum(r => r.later) }))
+              .toList();
+          });
+
+          expect(params).toHaveLength(1);
+          expect(params[0]).toContain(boundCutoff);
+          expect(params[0].some(param => param instanceof Date)).toBe(false);
+          expect(rows.sort((a, b) => a.userId - b.userId)).toEqual([
+            { userId: idOf('alice'), later: 1 },
+            { userId: idOf('bob'), later: 0 },
+          ]);
+        });
+      });
+
+      test('a grouping key (the same CASE)', async () => {
+        await withDatabase(async (db) => {
+          await seedTestData(db);
+
+          let rows: { later: number; count: number }[] = [];
+          const params = await paramsOfStatementsOn(db, '"custom_date"', async () => {
+            rows = await db.posts
+              .select(p => ({ id: p.id, later: caseWhen(gt(p.customDate, cutoff), 1).else(0) }))
+              .groupBy(r => ({ later: r.later }))
+              .select(g => ({ later: g.key.later, count: g.count() }))
+              .toList();
+          });
+
+          expect(params).toHaveLength(1);
+          expect(params[0]).toContain(boundCutoff);
+          expect(params[0].some(param => param instanceof Date)).toBe(false);
+          expect(rows.sort((a, b) => a.later - b.later)).toEqual([
+            { later: 0, count: 2 },
+            { later: 1, count: 1 },
+          ]);
+        });
+      });
+
+      test('a grouped column in the condition of a join to the grouped query', async () => {
+        await withDatabase(async (db) => {
+          await seedTestData(db);
+
+          let rows: { name: string; customDate: Date | undefined }[] = [];
+          const params = await paramsOfStatementsOn(db, '"custom_date"', async () => {
+            rows = await db.posts
+              .select(p => ({ userId: p.userId, customDate: p.customDate }))
+              .groupBy(r => ({ userId: r.userId, customDate: r.customDate }))
+              .select(g => ({ userId: g.key.userId, customDate: g.key.customDate, posts: g.count() }))
+              .innerJoin(
+                db.users.select(u => ({ id: u.id, username: u.username })).asSubquery('table'),
+                (l, u) => and(eq(l.userId, u.id), gt(l.customDate, cutoff)),
+                (l, u) => ({ name: u.username, customDate: l.customDate }),
+                'u'
+              )
+              .toList();
+          });
+
+          expect(params).toHaveLength(1);
+          expect(params[0]).toContain(boundCutoff);
+          expect(params[0].some(param => param instanceof Date)).toBe(false);
+          expect(rows).toEqual([{ name: 'alice', customDate: new Date('2024-01-16T10:00:00Z') }]);
         });
       });
     });
