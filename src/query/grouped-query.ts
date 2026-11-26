@@ -15,6 +15,7 @@ import {
   fromDriverMapper,
   getColumnNameMapForSchema,
   getRelationEntriesForSchema,
+  getSchemaColumnMeta,
   getTargetSchemaForRelation,
   mapAggregatedItems,
   projectionLiteralSql,
@@ -1261,10 +1262,11 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
     // that's what the subquery SELECT clause uses as the alias
     const wrapped: any = {};
     for (const [key, value] of Object.entries(mockResult as object)) {
-      // Preserve mapper if present
+      // Preserve mapper if present: an expression's, or a column's own (a value compared with the
+      // column in the join condition binds through its toDriver)
       const mapper = (typeof value === 'object' && value !== null && typeof (value as any).getMapper === 'function')
         ? { getMapper: () => (value as any).getMapper() }
-        : {};
+        : isFieldRefValue(value) && (value as any).__mapper ? { __mapper: (value as any).__mapper } : {};
 
       wrapped[key] = {
         __fieldName: key,
@@ -2035,6 +2037,7 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
 
     // Add columns as FieldRef objects - use pre-computed column name map if available
     const columnNameMap = getColumnNameMapForSchema(this.schema);
+    const columnMeta = getSchemaColumnMeta(this.schema);
 
     // Performance: Lazy-cache FieldRef objects
     const fieldRefCache: Record<string, any> = {};
@@ -2048,6 +2051,10 @@ export class GroupedSelectQueryBuilder<TSelection, TOriginalRow, TGroupingKey> {
               __fieldName: colName,
               __dbColumnName: dbColumnName,
               __tableAlias: tableAlias,
+              // Its mapper, as the root mock row of a plain query carries it: a value compared with the
+              // column binds through toDriver — in the grouped row's projection, its grouping key, an
+              // aggregate's argument and a HAVING over a key
+              __mapper: columnMeta.get(colName)?.mapper,
             };
           }
           return cached;
