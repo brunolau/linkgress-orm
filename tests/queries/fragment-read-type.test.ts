@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import {
-  and, caseWhen, DbCteBuilder, eq, exists, FieldRef, gt, literal, ne, notExists, QueryBatch, searchNormalize, sql,
-  SqlFragment, Subquery,
+  agg, and, caseWhen, coalesce, DbCteBuilder, eq, eqAny, exists, FieldRef, gt, literal, ne, notExists, QueryBatch,
+  searchNormalize, sql, SqlFragment, Subquery,
 } from '../../src';
 import { DRIVER_VALUE_MAPPER, SqlBuildContext } from '../../src/query/conditions';
 import { build, ClubFixture, createClubFixture, disposeClubFixture, ref } from '../utils/club-fixture';
@@ -367,6 +367,104 @@ describe('SqlFragment.withReadType()', () => {
         .firstOrDefault();
 
       expect(row).toEqual({ nicks: [{ n: '007' }] });
+    });
+  });
+});
+
+/**
+ * `coalesce()` with no mapped operand read through the generic conversion: over text columns a digits-only
+ * value came back as a number, a 17-digit document number rounded past 2^53. Over text it now reads as a
+ * text. Over any other type it stays untyped, so nothing that reads or compares it changes.
+ */
+describe('coalesce() reads as a text over text columns, and as before over any other', () => {
+  const nickname = ref('nickname', { sqlType: 'text' });
+  const scalar = (read: { mapper?: unknown; readType?: string }) => new Subquery(() => 'SELECT 1', 'scalar', undefined, [], read);
+
+  test('text and varchar operands make it a text, with the SQL it always rendered', () => {
+    expect(coalesce(nickname, ref('name', { sqlType: 'varchar(64)' })).getReadType()).toBe('text');
+    expect(coalesce(ref('name', { sqlType: 'character varying(64)' }), 'none').getReadType()).toBe('text');
+    expect(coalesce(sql`x`.withReadType('varchar'), sql`y`).getReadType()).toBe('text');
+    expect(coalesce(scalar({ readType: 'text' }), '').getReadType()).toBe('text');
+    expect(build(coalesce(nickname, 'none'))).toEqual({ sql: 'COALESCE("fx_members"."nickname", $1)', params: ['none'] });
+  });
+
+  test('any other operand type, a mix of types or no typed operand leaves it untyped', () => {
+    for (const sqlType of ['integer', 'smallint', 'bigint', 'numeric(10, 2)', 'date', 'timestamptz', 'uuid', 'jsonb', 'char(8)', 'citext']) {
+      expect(coalesce(ref('a', { sqlType }), ref('b', { sqlType })).getReadType()).toBeUndefined();
+    }
+
+    expect(coalesce(nickname, ref('points', { sqlType: 'integer' })).getReadType()).toBeUndefined();
+    expect(coalesce(sql`x`, 'none').getReadType()).toBeUndefined();
+    expect(coalesce(scalar({ mapper: DRIVER_VALUE_MAPPER, readType: 'text' }), '').getReadType()).toBeUndefined();
+  });
+
+  describe('against the database', () => {
+    let fixture: ClubFixture;
+
+    beforeAll(async () => {
+      fixture = await createClubFixture();
+    });
+
+    afterAll(async () => {
+      await disposeClubFixture(fixture);
+    });
+
+    test('a digits-only text stays a string: text with varchar, a scalar subquery operand, a QueryBatch part', async () => {
+      const db = fixture.db;
+      const query = () => db.members
+        .where(m => eq(m.id, 4))
+        .select(m => ({
+          mixed: coalesce(m.nickname, m.name),
+          scalar: coalesce(db.members.where(o => eq(o.id, 4)).select(o => o.nickname).asSubquery('scalar'), ''),
+        }));
+      const standalone = await query().firstOrDefault();
+
+      const batch = new QueryBatch();
+      const key = batch.addFirstOrDefault(query(), 'probe');
+      await batch.executeBatch();
+
+      expect(standalone).toEqual({ mixed: '007', scalar: '007' });
+      expect(batch.getItem(key)).toEqual(standalone);
+    });
+
+    test('a CTE column of it reads as a text and matches a text list', async () => {
+      const db = fixture.db;
+      const names = new DbCteBuilder().with(
+        'member_names',
+        db.members.select(m => ({ memberId: m.id, n: coalesce(m.nickname, m.name) })),
+      );
+
+      const rows = await db.selectFromCte(names.cte)
+        .where(r => eqAny(r.n, ['007', 'bob']))
+        .select(r => ({ id: r.memberId, n: r.n }))
+        .toList();
+
+      expect([...rows].sort((a, b) => a.id - b.id)).toEqual([{ id: 2, n: 'bob' }, { id: 4, n: '007' }]);
+      expect(fixture.lastStatement('member_names')).toContain('= ANY($1::text[])');
+    });
+
+    // COALESCE(smallint, integer) is an integer: typed by its first operand, the list bound against the CTE
+    // column was cast to smallint[] and 40000 was out of range
+    test('a CTE column of a smallint and an integer matches a list beyond smallint', async () => {
+      const db = fixture.db;
+      const keys = new DbCteBuilder().with(
+        'member_keys',
+        db.members.select(m => ({ memberId: m.id, k: coalesce(m.flags, m.points) })),
+      );
+
+      const rows = await db.selectFromCte(keys.cte)
+        .where(r => eqAny(r.k, [1, 40000]))
+        .select(r => ({ id: r.memberId, k: r.k }))
+        .toList();
+
+      expect(rows).toEqual([{ id: 1, k: 1 }]);
+      expect(fixture.lastStatement('member_keys')).not.toContain('::smallint[]');
+    });
+
+    test('agg.max over a numeric coalesce keeps the value as the driver delivers it', async () => {
+      const row = await fixture.db.members.select(m => ({ top: agg.max(coalesce(m.score, 0)) })).firstOrDefault();
+
+      expect(row).toEqual({ top: '3.00' as unknown as number });
     });
   });
 });

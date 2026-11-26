@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { DbCteBuilder, JoinQueryBuilder, LinkgressConfig, eq, gt, sql } from '../../src';
+import { DbCteBuilder, JoinQueryBuilder, LinkgressConfig, coalesce, eq, gt, sql } from '../../src';
 import type { QueryOptions } from '../../src';
 import { expectToReject } from '../utils/expect-rejects';
 import { seedTestData, withDatabase } from '../utils/test-database';
@@ -354,6 +354,54 @@ describe('navigation columns', () => {
       const rows = await db.postComments.orderBy(c => c.id).select(c => ({ total: c.order!.totalAmount })).toList();
 
       expect(rows).toEqual([{ total: 99.99 }, { total: 149.99 }, { total: 149.99 }]);
+    });
+  });
+});
+
+describe('coalesce over columns', () => {
+  // Over text columns COALESCE's result is a text: a digits-only value is a name (a document number), not a
+  // number. It used to read through the untyped conversion — '90003526000000034' came back as the number
+  // 90003526000000030 (rounded past 2^53), '01234' as 1234.
+  test('over text columns a digits-only value stays text — root, navigation, nested, literal fallback', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+      const zip = await db.users.insert({ username: '90003526000000034', email: '01234', age: 7 }).returning();
+      await db.posts.insert({ title: 'coalesce post', userId: zip.id, views: 1 });
+
+      const root = await db.users
+        .where(u => eq(u.id, zip.id))
+        .select(u => ({
+          number: coalesce(u.username, u.email),
+          fallback: coalesce(u.email, ''),
+          nested: { number: coalesce(u.username, u.email) },
+        }))
+        .first();
+      const navigated = await db.posts
+        .where(p => eq(p.title, 'coalesce post'))
+        .select(p => ({ number: coalesce(p.user!.username, p.title) }))
+        .first();
+
+      expect(root).toEqual({ number: '90003526000000034', fallback: '01234', nested: { number: '90003526000000034' } });
+      expect(navigated).toEqual({ number: '90003526000000034' });
+    });
+  });
+
+  // Only a text result is typed. A grouped select hands back a numeric as the driver delivers it (its exact
+  // string); typed by its column the coalesce would read a number there, and an int8 past 2^53 would lose digits.
+  test('over a numeric column a grouped select keeps the value as the driver delivers it', async () => {
+    await withDatabase(async db => {
+      await seedTestData(db);
+
+      const rows = await db.postComments
+        .select(c => ({ total: c.order!.totalAmount }))
+        .groupBy(r => ({ total: r.total }))
+        .select(g => ({ total: g.key.total, coalesced: coalesce(g.key.total, 0) }))
+        .toList();
+
+      expect([...rows].sort((a, b) => Number(a.total) - Number(b.total)) as unknown).toEqual([
+        { total: '99.99', coalesced: '99.99' },
+        { total: '149.99', coalesced: '149.99' },
+      ]);
     });
   });
 });

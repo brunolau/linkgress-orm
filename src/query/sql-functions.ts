@@ -6,12 +6,14 @@ import {
   assertPgTypeName,
   castTo,
   Condition,
+  declaredSqlType,
   DRIVER_VALUE_MAPPER,
   FieldLike,
   FieldRef,
   getValueMapper,
   isPlainSqlValue,
   numericTypeName,
+  operandSqlType,
   PgCastType,
   pickResultMapper,
   Placeholder,
@@ -197,12 +199,6 @@ function callFunction<T>(name: string, args: readonly unknown[], mapper: any = D
 /** `name()` with no arguments, or a bare keyword such as CURRENT_DATE. */
 function sqlKeyword<T>(text: string): SqlFragment<T> {
   return new SqlFragment<T>([text], []);
-}
-
-/** A column's declared SQL type, when the ref carries it (schema-aware mock rows do). */
-function declaredSqlType(column: unknown): string | undefined {
-  const sqlType = (column as { __sqlType?: unknown } | null | undefined)?.__sqlType;
-  return typeof sqlType === 'string' && sqlType !== 'array' ? sqlType : undefined;
 }
 
 function requireOperand(name: string, value: unknown): void {
@@ -1984,11 +1980,6 @@ const TEXT_ELEMENT_TYPE = /^\s*(bigint|int8|bigserial|serial8|numeric|decimal|mo
 
 /** Numeric types whose MIN / MAX reads back as a JS number (the drivers deliver numeric and int8 as text). */
 const NUMERIC_EXTREME_TYPE = /^\s*(smallint|integer|int|int2|int4|int8|bigint|smallserial|serial|serial2|serial4|bigserial|serial8|decimal|numeric|real|float4|float8|double precision)\b/i;
-
-/** The SQL type an operand is known to have: a column's declared type, or a fragment's read type. */
-function operandSqlType(operand: unknown): string | undefined {
-  return declaredSqlType(operand) ?? (operand instanceof SqlFragment ? operand.getReadType() : undefined);
-}
 
 function deliversElementsAsText(argument: unknown): boolean {
   const sqlType = operandSqlType(argument);
